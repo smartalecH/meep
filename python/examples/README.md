@@ -65,6 +65,8 @@ Computes the band diagram of the infinite periodic waveguide by itself with no d
 
 * __`mode-decomposition.ipynb`__ - Computes the reflectance and fundamental mode of a linear waveguide taper. Explores features like `EigenModeSource`, `get_eigenmode_coefficients`, `eig_parity`, and how to extract S Parameters.
 
+* __`s-parameters-mmi.ipynb`__ - Extracts the S parameters of an MMI coupler with dispersive materials. Explores features like `EigenModeSource`, `get_eigenmode_coefficients`, `eig_parity`, the `Courant` factor, and how to visualize the steady state field distribution at a single frequency without the CW solver.
+
 * __`binary_grating.ipynb`__ - Computes the diffraction orders of a periodic grating in fuzed quartz as a function of wavelength. Explores planewave sources using `EigenModeSource`, `get_eigenmode_coefficients` with a specified polarization constraint, mode decomposition using materials with dispersion, Bloch-periodic boundaries via the `k_point` parameter, and how to compute diffraction angles from mode coefficients.
 
 * __`binary_grating_oblique.ipynb`__ - Computes the diffraction orders of a periodic grating when a planewave is launched at an arbitrary angle. Explores user defined source profiles via `amp_func`, and compares the frequency domain solver `solve_cw` to the time domain solutions.
