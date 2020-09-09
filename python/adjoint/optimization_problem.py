@@ -61,9 +61,12 @@ class OptimizationProblem(object):
                 decay_dt=50,
                 decay_fields=[mp.Ez],
                 decay_by=1e-6,
-                minimum_run_time=0
+                minimum_run_time=0,
+                max_run_time=np.inf
                  ):
-
+        if max_run_time < minimum_run_time:
+            raise ValueError("The maximum runtime ({}) must be greater than the minimum run time ({})".format(max_run_time,minimum_run_time))
+        
         self.sim = simulation
 
         if isinstance(objective_functions, list):
@@ -105,6 +108,7 @@ class OptimizationProblem(object):
         self.decay_fields=decay_fields
         self.decay_dt=decay_dt
         self.minimum_run_time=minimum_run_time
+        self.max_run_time=max_run_time
 
         # store sources for finite difference estimations
         self.forward_sources = self.sim.sources
@@ -198,7 +202,7 @@ class OptimizationProblem(object):
         self.prepare_forward_run()
 
         # Forward run
-        self.sim.run(until_after_sources=stop_when_dft_decayed(self.sim, self.design_region_monitors, self.decay_dt, self.decay_fields, self.fcen_idx, self.decay_by, True, self.minimum_run_time))
+        self.sim.run(until_after_sources=stop_when_dft_decayed(self.sim, self.design_region_monitors, self.decay_dt, self.decay_fields, self.fcen_idx, self.decay_by, True, self.minimum_run_time, self.max_run_time))
 
         # record objective quantities from user specified monitors
         self.results_list = []
@@ -244,7 +248,7 @@ class OptimizationProblem(object):
         self.prepare_adjoint_run(objective_idx)
 
         # Adjoint run
-        self.sim.run(until_after_sources=stop_when_dft_decayed(self.sim, self.design_region_monitors, self.decay_dt, self.decay_fields, self.fcen_idx, self.decay_by, True, self.minimum_run_time))
+        self.sim.run(until_after_sources=stop_when_dft_decayed(self.sim, self.design_region_monitors, self.decay_dt, self.decay_fields, self.fcen_idx, self.decay_by, True, self.minimum_run_time, self.max_run_time))
 
         # Store adjoint fields for each design set of design variables in array (x,y,z,field_components,frequencies)
         self.a_E.append([[np.zeros((self.nf,c[0],c[1],c[2]),dtype=np.complex128) for c in dg] for dg in self.design_grids])
@@ -394,7 +398,7 @@ class OptimizationProblem(object):
 
         self.sim.plot2D(**kwargs)
 
-def stop_when_dft_decayed(simob, mon, dt, c, fcen_idx, decay_by, yee_grid=False, minimum_run_time=0):
+def stop_when_dft_decayed(simob, mon, dt, c, fcen_idx, decay_by, yee_grid=False, minimum_run_time=0,max_run_time=np.inf):
     '''Step function that monitors the relative change in DFT fields for a list of monitors.
 
     mon ............. a list of monitors
@@ -435,7 +439,7 @@ def stop_when_dft_decayed(simob, mon, dt, c, fcen_idx, decay_by, yee_grid=False,
                         current_fields[mi][ic] = atleast_3d(sim.get_dft_array(m, cc, fcen_idx))
                     else:
                         raise TypeError("Monitor of type {} not supported".format(type(m)))
-                    relative_change_raw = np.abs(previous_fields[mi][ic] - current_fields[mi][ic]) / np.abs(previous_fields[mi][ic])
+                    relative_change_raw = np.nan_to_num(np.abs(previous_fields[mi][ic] - current_fields[mi][ic]) / np.abs(previous_fields[mi][ic]))
                     relative_change.append(np.mean(relative_change_raw.flatten())) # average across space and frequency
             relative_change = np.mean(relative_change) # average across monitors
             closure['previous_fields'] = current_fields
@@ -444,7 +448,7 @@ def stop_when_dft_decayed(simob, mon, dt, c, fcen_idx, decay_by, yee_grid=False,
             if mp.verbosity > 0:
                 fmt = "DFT decay(t = {0:1.1f}): {1:0.4e}"
                 print(fmt.format(sim.meep_time(), np.real(relative_change)))
-            return relative_change <= decay_by and sim.round_time() >= minimum_run_time
+            return ((relative_change <= decay_by and sim.round_time() >= minimum_run_time) or (sim.round_time() >= max_run_time))
     return _stop
 
 

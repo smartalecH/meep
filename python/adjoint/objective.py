@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 import numpy as np
 import meep as mp
 from .filter_source import FilteredSource
+from .optimization_problem import Grid,YeeDims,atleast_3d
 
 class ObjectiveQuantitiy(ABC):
     @abstractmethod
@@ -21,6 +22,75 @@ class ObjectiveQuantitiy(ABC):
     @abstractmethod
     def get_evaluation(self):
         return
+class FourierCoefficient(ObjectiveQuantitiy):
+    def __init__(self, sim, volume, component):
+
+        self.sim = sim
+        self.volume=volume
+        self.eval = None
+        self.component = component
+
+        return
+
+    def register_monitors(self,frequencies):
+        self.frequencies = np.asarray(frequencies)
+        self.num_freq = len(self.frequencies)
+        self.monitor = self.sim.add_dft_fields([self.component], self.frequencies, where=self.volume, yee_grid=False)
+
+        return self.monitor
+
+    def place_adjoint_source(self,dJ):
+
+        dt = self.sim.fields.dt
+
+        if self.sim.cell_size.y == 0:
+            dV = 1/self.sim.resolution
+        elif self.sim.cell_size.z == 0:
+            dV = 1/self.sim.resolution * 1/self.sim.resolution
+        else:
+            dV = 1/self.sim.resolution * 1/self.sim.resolution * 1/self.sim.resolution
+
+        self.sources = []
+
+        if self.num_freq == 1:
+            scale = dV * 1j * 2 * np.pi * self.frequencies[0] / self.time_src.fourier_transform(self.frequencies[0])
+            amp = -atleast_3d(dJ[0]) * scale
+            if self.component in [mp.Hx, mp.Hy, mp.Hz]:
+                amp = -amp
+            for zi in range(len(self.dg.z)):
+                for yi in range(len(self.dg.y)):
+                    for xi in range(len(self.dg.x)):
+                        if amp[xi, yi, zi] != 0:
+                            self.sources += [mp.Source(self.time_src, component=self.component, amplitude= amp[xi, yi, zi],
+                            center=mp.Vector3(self.dg.x[xi], self.dg.y[yi], self.dg.z[zi]))]
+        else:
+            dJ_4d = np.array([atleast_3d(dJ[f]) for f in range(self.num_freq)])
+            if self.component in [mp.Hx, mp.Hy, mp.Hz]:
+                dJ_4d = -dJ_4d
+            for zi in range(len(self.dg.z)):
+                for yi in range(len(self.dg.y)):
+                    for xi in range(len(self.dg.x)):
+                        scale = -dJ_4d[:,xi,yi,zi] * dV * 1j * 2 * np.pi * self.frequencies / np.array([self.time_src.fourier_transform(f) for f in self.frequencies])
+                        src = FilteredSource(self.time_src.frequency,self.frequencies,scale,dt,self.time_src)
+                        self.sources += [mp.Source(src, component=self.component, amplitude= 1,
+                                center=mp.Vector3(self.dg.x[xi], self.dg.y[yi], self.dg.z[zi]))]
+
+        return self.sources
+
+    def __call__(self):
+        self.time_src = self.sim.sources[0].src
+
+        self.dg = Grid(*self.sim.get_array_metadata(dft_cell=self.monitor))
+        self.eval = np.array([self.sim.get_dft_array(self.monitor, self.component, i) for i in range(self.num_freq)]) #Shape = (num_freq, [pts])
+        return self.eval
+
+    def get_evaluation(self):
+
+        try:
+            return self.eval
+        except AttributeError:
+            raise RuntimeError("You must first run a forward simulation.")
+
 
 class EigenmodeCoefficient(ObjectiveQuantitiy):
     def __init__(self,sim,volume,mode,forward=True,kpoint_func=None,**kwargs):
