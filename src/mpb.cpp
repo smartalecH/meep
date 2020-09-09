@@ -596,38 +596,34 @@ void *fields::get_eigenmode(double frequency, direction d, const volume where, c
     scalar_complex p = {real(dp->get_p()),imag(dp->get_p())};
 
     // compute sum of (kparallel+G)^2 in all the periodic directions
-    double k2sum = 0;
+    double k2sum = 0, ktmp = 0;
+    int m = 0;
     LOOP_OVER_DIRECTIONS(v.dim, dd) {
-      double ktmp = 0;
-      int m = 0;
-      if ((float(eig_vol.in_direction(dd)) == float(v.in_direction(dd))) &&
-          (boundaries[High][dd] == Periodic && boundaries[Low][dd] == Periodic)) {
-        m = dp->get_g()[dd - X];
-        ktmp = kpoint.in_direction(dd) + m/v.in_direction(dd);
-        k2sum += ktmp*ktmp;
-      }
+      m = dp->get_g()[dd - X];
+      ktmp = kpoint.in_direction(dd);
+      if (eig_vol.in_direction(dd) != 0)
+        ktmp += m/eig_vol.in_direction(dd);
+      k2sum += ktmp*ktmp;
     }
 
     // compute kperp (if it is non evanescent) OR
     // frequency from kperp^2 and sum of (kparallel+G)^2
-    LOOP_OVER_DIRECTIONS(v.dim, dd) {
-      if ((float(eig_vol.in_direction(dd)) != float(v.in_direction(dd))) &&
-          (boundaries[High][dd] == Periodic && boundaries[Low][dd] == Periodic)) {
-        if (match_frequency) {
-          vec cen = eig_vol.center();
-          double nn = sqrt(real(get_eps(cen, frequency)) * real(get_mu(cen, frequency)));
-          double k2 = frequency*frequency*nn*nn - k2sum;
-          if (k2 < 0) {
-            master_printf("WARNING: diffraction order for g=(%d,%d,%d) is evanescent!\n",
-                          dp->get_g()[0],dp->get_g()[1],dp->get_g()[2]);
-            return NULL;
-          }
-          else if (k2 > 0)
-            k[dd - X] = sqrt(k2);
+    {
+      direction dd = eig_vol.normal_direction();
+      if (match_frequency) {
+        vec cen = eig_vol.center();
+        double nn = sqrt(real(get_eps(cen, frequency)) * real(get_mu(cen, frequency)));
+        double k2 = frequency*frequency*nn*nn - k2sum;
+        if (k2 < 0) {
+          master_printf("WARNING: diffraction order for g=(%d,%d,%d) is evanescent!\n",
+                        dp->get_g()[0],dp->get_g()[1],dp->get_g()[2]);
+          return NULL;
         }
-        else
-          frequency = sqrt(kpoint.in_direction(dd)*kpoint.in_direction(dd) + k2sum);
+        else if (k2 > 0)
+          k[dd - X] = sqrt(k2);
       }
+      else
+        frequency = sqrt(kpoint.in_direction(dd)*kpoint.in_direction(dd) + k2sum);
     }
 
     if (am_master()) {
@@ -793,7 +789,8 @@ void fields::add_eigenmode_source(component c0, const src_time &src, direction d
                                   const volume &where, const volume &eig_vol, int band_num,
                                   const vec &kpoint, bool match_frequency, int parity,
                                   double resolution, double eigensolver_tol, complex<double> amp,
-                                  complex<double> A(const vec &)) {
+                                  complex<double> A(const vec &),
+                                  diffractedplanewave *dp) {
   /*--------------------------------------------------------------*/
   /* step 1: call MPB to compute the eigenmode                    */
   /*--------------------------------------------------------------*/
@@ -802,7 +799,8 @@ void fields::add_eigenmode_source(component c0, const src_time &src, direction d
   am_now_working_on(MPBTime);
   global_eigenmode_data =
       (eigenmode_data *)get_eigenmode(frequency, d, where, eig_vol, band_num, kpoint,
-                                      match_frequency, parity, resolution, eigensolver_tol);
+                                      match_frequency, parity, resolution, eigensolver_tol,
+                                      NULL, NULL, dp);
   finished_working();
 
   /* add_volume_source amp_fun coordinates are relative to where.center();
@@ -983,7 +981,7 @@ void fields::add_eigenmode_source(component c0, const src_time &src, direction d
                                   const volume &where, const volume &eig_vol, int band_num,
                                   const vec &kpoint, bool match_frequency, int parity,
                                   double resolution, double eigensolver_tol, complex<double> amp,
-                                  complex<double> A(const vec &)) {
+                                  complex<double> A(const vec &), diffractedplanewave *dp) {
   (void)c0;
   (void)src;
   (void)d;
@@ -997,6 +995,7 @@ void fields::add_eigenmode_source(component c0, const src_time &src, direction d
   (void)eigensolver_tol;
   (void)amp;
   (void)A;
+  (void)dp;
   abort("Meep must be configured/compiled with MPB for add_eigenmode_source");
 }
 

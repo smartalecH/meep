@@ -99,14 +99,50 @@ def py_v3_to_vec(dims, iterable, is_cylindrical=False):
     else:
         raise ValueError("Invalid dimensions in Volume: {}".format(dims))
 
+def bands_to_diffractedplanewave(where,bands):
+    if bands.axis is None:
+        if where.in_direction(mp.X) != 0:
+            axis = np.array([1, 0, 0], dtype=np.float64)
+        elif where.in_direction(mp.Y) != 0:
+            axis = np.array([0, 1, 0], dtype=np.float64)
+        elif where.in_direction(mp.Z) != 0:
+            axis = np.array([0, 0, 1], dtype=np.float64)
+        else:
+            raise ValueError("axis parameter of DiffractedPlanewave must be a non-zero Vector3")
+    elif isinstance(bands.axis,mp.Vector3):
+        axis = np.array([bands.axis.x, bands.axis.y, bands.axis.z], dtype=np.float64)
+    else:
+        raise TypeError("axis parameter of DiffractedPlanewave must be a Vector3")
+    diffractedplanewave_args = [
+        np.array(bands.g, dtype=np.intc),
+        axis,
+        bands.s * 1.0,
+        bands.p * 1.0
+    ]
+    return mp.diffractedplanewave(*diffractedplanewave_args)
+
 class DiffractedPlanewave(object):
+    """
+    For mode decomposition or eigenmode source, specify a diffracted planewave in homogeneous media. Should be passed as the `bands` argument of `get_eigenmode_coefficients`, `band_num` of `get_eigenmode`, or `eig_band` of `EigenModeSource`.
+    """
     def __init__(self,
                  g=None,
                  axis=None,
                  s=None,
                  p=None):
+        """
+        Construct a `DiffractedPlanewave`.
+
+        + **`g` [ list of 3 `integer`s ]** — The diffraction order $(m_x,m_y,m_z)$ corresponding to the wavevector $(k_x+2\pi m_x/\Lambda_x,k_y+2\pi m_y/\Lambda_y,k_z+2\pi m_z/\Lambda_z)$. The diffraction order $m_{x,y,z}$ should be non-zero only in the $d$-1 periodic directions of a $d$ dimensional cell (e.g., a plane in 3d) in which the mode monitor or source extends the entire length of the cell.
+
+        + **`axis` [ `Vector3` ]** — The plane of incidence for each planewave (used to define the $\mathcal{S}$ and $\mathcal{P}$ polarizations below) is defined to be the plane that contains the `axis` vector and the planewave's wavevector. If `None`, `axis` defaults to the first direction that lies in the plane of the monitor or source (e.g., $y$ direction for a $yz$ plane in 3d, either $x$ or $y$ in 2d).
+
+        + **`s` [ `complex` ]** — The complex amplitude of the $\mathcal{S}$ polarziation (i.e., electric field perpendicular to the plane of incidence).
+
+        + **`p` [ `complex` ]** — The complex amplitude of the $\mathcal{P}$ polarziation (i.e., electric field parallel to the plane of incidence).
+        """
         self._g = g
-        self._axis = Vector3(*axis)
+        self._axis = axis
         self._s = complex(s)
         self._p = complex(p)
 
@@ -126,6 +162,8 @@ class DiffractedPlanewave(object):
     def p(self):
         return self._p
 
+DefaultPMLProfile = lambda u: u * u
+
 class PML(object):
     """
     This class is used for specifying the PML absorbing boundary layers around the cell,
@@ -141,7 +179,7 @@ class PML(object):
                  side=mp.ALL,
                  R_asymptotic=1e-15,
                  mean_stretch=1.0,
-                 pml_profile=lambda u: u * u):
+                 pml_profile=DefaultPMLProfile):
         """
         + **`thickness` [`number`]** — The spatial thickness of the PML layer which
           extends from the boundary towards the *inside* of the cell. The thinner it is,
@@ -526,6 +564,7 @@ class DftObj(object):
     swigobj_attr and return the property they requested.
     """
     def __init__(self, func, args):
+        """Construct a `DftObj`."""
         self.func = func
         self.args = args
         self.swigobj = None
@@ -565,6 +604,7 @@ class DftFlux(DftObj):
     """
 
     def __init__(self, func, args):
+        """Construct a `DftFlux`."""
         super(DftFlux, self).__init__(func, args)
         self.nfreqs = len(args[0])
         self.regions = args[1]
@@ -603,6 +643,7 @@ class DftForce(DftObj):
     """
 
     def __init__(self, func, args):
+        """Construct a `DftForce`."""
         super(DftForce, self).__init__(func, args)
         self.nfreqs = len(args[0])
         self.regions = args[1]
@@ -633,6 +674,7 @@ class DftNear2Far(DftObj):
     """
 
     def __init__(self, func, args):
+        """Construct a `DftNear2Far`."""
         super(DftNear2Far, self).__init__(func, args)
         self.nfreqs = len(args[0])
         self.nperiods = args[1]
@@ -678,6 +720,7 @@ class DftEnergy(DftObj):
     """
 
     def __init__(self, func, args):
+        """Construct a `DftEnergy`."""
         super(DftEnergy, self).__init__(func, args)
         self.nfreqs = len(args[0])
         self.regions = args[1]
@@ -704,6 +747,7 @@ class DftFields(DftObj):
     """
 
     def __init__(self, func, args):
+        """Construct a `DftFields`."""
         super(DftFields, self).__init__(func, args)
         self.nfreqs = len(args[4])
         self.regions = [FieldsRegion(where=args[1], center=args[2], size=args[3])]
@@ -720,6 +764,7 @@ Mode = namedtuple('Mode', ['freq', 'decay', 'Q', 'amp', 'err'])
 class EigenmodeData(object):
 
     def __init__(self, band_num, freq, group_velocity, k, swigobj, kdom):
+        """Construct an `EigenmodeData`."""
         self.band_num = band_num
         self.freq = freq
         self.group_velocity = group_velocity
@@ -2254,13 +2299,19 @@ class Simulation(object):
             eig_vol = Volume(src.eig_lattice_center, src.eig_lattice_size, self.dimensions,
                              is_cylindrical=self.is_cylindrical).swigobj
 
+            if isinstance(src.eig_band, DiffractedPlanewave):
+                eig_band = 1
+                diffractedplanewave = bands_to_diffractedplanewave(where, src.eig_band)
+            elif isinstance(src.eig_band, int):
+                eig_band = src.eig_band
+
             add_eig_src_args = [
                 src.component,
                 src.src.swigobj,
                 direction,
                 where,
                 eig_vol,
-                src.eig_band,
+                eig_band,
                 py_v3_to_vec(self.dimensions, src.eig_kpoint, is_cylindrical=self.is_cylindrical),
                 src.eig_match_freq,
                 src.eig_parity,
@@ -2270,8 +2321,8 @@ class Simulation(object):
             ]
             add_eig_src = functools.partial(self.fields.add_eigenmode_source, *add_eig_src_args)
 
-            if src.amp_func is None:
-                add_eig_src()
+            if isinstance(src.eig_band, DiffractedPlanewave):
+                add_eig_src(src.amp_func, diffractedplanewave)
             else:
                 add_eig_src(src.amp_func)
         elif isinstance (src, GaussianBeamSource):
@@ -3313,13 +3364,7 @@ class Simulation(object):
             coeffs = np.zeros(2 * num_bands * flux.freq.size(), dtype=np.complex128)
             vgrp = np.zeros(num_bands * flux.freq.size())
             cscale = np.zeros(num_bands * flux.freq.size())
-            diffractedplanewave_args = [
-                np.array(bands.g, dtype=np.intc),
-                np.array([bands.axis.x, bands.axis.y, bands.axis.z], dtype=np.float64),
-                bands.s * 1.0,
-                bands.p * 1.0
-                ]
-            diffractedplanewave = mp.diffractedplanewave(*diffractedplanewave_args)
+            diffractedplanewave = bands_to_diffractedplanewave(flux.where, bands)
 
             kpoints, kdom = mp.get_eigenmode_coefficients_and_kpoints(
                 self.fields,
