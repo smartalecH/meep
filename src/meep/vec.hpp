@@ -154,8 +154,8 @@ component first_field_component(field_type ft);
        d < (dim == meep::Dcyl ? meep::NO_DIRECTION : meep::R); d = meep::direction(d + 1))
 
 // loop over indices idx from is to ie (inclusive) in gv
-#define LOOP_OVER_IVECS(gv, is, ie, idx)                                                           \
-  for (ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),                       \
+#define PLOOP_OVER_IVECS(gv, is, ie, idx)			                                                     \
+for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),                          \
                  loop_is3 = (is).yucky_val(2), loop_n1 = ((ie).yucky_val(0) - loop_is1) / 2 + 1,   \
                  loop_n2 = ((ie).yucky_val(1) - loop_is2) / 2 + 1,                                 \
                  loop_n3 = ((ie).yucky_val(2) - loop_is3) / 2 + 1,                                 \
@@ -167,21 +167,55 @@ component first_field_component(field_type ft);
                  idx0 = (is - (gv).little_corner()).yucky_val(0) / 2 * loop_s1 +                   \
                         (is - (gv).little_corner()).yucky_val(1) / 2 * loop_s2 +                   \
                         (is - (gv).little_corner()).yucky_val(2) / 2 * loop_s3,                    \
-                 loop_i1 = 0;                                                                      \
-       loop_i1 < loop_n1; loop_i1++)                                                               \
-    for (int loop_i2 = 0; loop_i2 < loop_n2; loop_i2++)                                            \
-      for (ptrdiff_t idx = idx0 + loop_i1 * loop_s1 + loop_i2 * loop_s2, loop_i3 = 0;              \
-           loop_i3 < loop_n3; loop_i3++, idx += loop_s3)
+                  idx, dummy_last, loop_i1, loop_i2, loop_i3, \
+                  dummy_first=0;dummy_first<1;dummy_first++)                                       \
+_Pragma("omp parallel for collapse(3)")				                                                     \
+  for (loop_i1 = 0; loop_i1 < loop_n1; loop_i1++)                                        \
+    for (loop_i2 = 0; loop_i2 < loop_n2; loop_i2++)                                      \
+      for (loop_i3 = 0; loop_i3 < loop_n3; loop_i3++)                                    \
+        for (idx = idx0 + loop_i1*loop_s1 + loop_i2*loop_s2 +                            \
+           loop_i3*loop_s3, dummy_last=0;dummy_last<1;dummy_last++)
+
+// loop over indices idx from is to ie (inclusive) in gv
+#define LOOP_OVER_IVECS(gv, is, ie, idx)			                                                   \
+for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),                          \
+                 loop_is3 = (is).yucky_val(2), loop_n1 = ((ie).yucky_val(0) - loop_is1) / 2 + 1,   \
+                 loop_n2 = ((ie).yucky_val(1) - loop_is2) / 2 + 1,                                 \
+                 loop_n3 = ((ie).yucky_val(2) - loop_is3) / 2 + 1,                                 \
+                 loop_d1 = (gv).yucky_direction(0), loop_d2 = (gv).yucky_direction(1),             \
+                 loop_d3 = (gv).yucky_direction(2),                                                \
+                 loop_s1 = (gv).stride((meep::direction)loop_d1),                                  \
+                 loop_s2 = (gv).stride((meep::direction)loop_d2),                                  \
+                 loop_s3 = (gv).stride((meep::direction)loop_d3),                                  \
+                 idx0 = (is - (gv).little_corner()).yucky_val(0) / 2 * loop_s1 +                   \
+                        (is - (gv).little_corner()).yucky_val(1) / 2 * loop_s2 +                   \
+                        (is - (gv).little_corner()).yucky_val(2) / 2 * loop_s3,                    \
+                  dummy_first=0;dummy_first<1;dummy_first++)                                       \
+  for (ptrdiff_t loop_i1 = 0; loop_i1 < loop_n1; loop_i1++)                                        \
+    for (ptrdiff_t loop_i2 = 0; loop_i2 < loop_n2; loop_i2++)                                      \
+      for (ptrdiff_t loop_i3 = 0; loop_i3 < loop_n3; loop_i3++)                                    \
+        for (ptrdiff_t idx = idx0 + loop_i1*loop_s1 + loop_i2*loop_s2 +                            \
+           loop_i3*loop_s3, dummy_last=0;dummy_last<1;dummy_last++)
 
 #define LOOP_OVER_VOL(gv, c, idx)                                                                  \
   LOOP_OVER_IVECS(gv, (gv).little_corner() + (gv).iyee_shift(c),                                   \
                   (gv).big_corner() + (gv).iyee_shift(c), idx)
 
+#define PLOOP_OVER_VOL(gv, c, idx)                                                                  \
+  PLOOP_OVER_IVECS(gv, (gv).little_corner() + (gv).iyee_shift(c),                                   \
+                  (gv).big_corner() + (gv).iyee_shift(c), idx)
+
 #define LOOP_OVER_VOL_OWNED(gv, c, idx)                                                            \
   LOOP_OVER_IVECS(gv, (gv).little_owned_corner(c), (gv).big_corner(), idx)
 
+#define PLOOP_OVER_VOL_OWNED(gv, c, idx)                                                            \
+  PLOOP_OVER_IVECS(gv, (gv).little_owned_corner(c), (gv).big_corner(), idx)
+
 #define LOOP_OVER_VOL_OWNED0(gv, c, idx)                                                           \
   LOOP_OVER_IVECS(gv, (gv).little_owned_corner0(c), (gv).big_corner(), idx)
+
+#define PLOOP_OVER_VOL_OWNED0(gv, c, idx)                                                           \
+  PLOOP_OVER_IVECS(gv, (gv).little_owned_corner0(c), (gv).big_corner(), idx)
 
 #define LOOP_OVER_VOL_NOTOWNED(gv, c, idx)                                                         \
   for (ivec loop_notowned_is((gv).dim, 0), loop_notowned_ie((gv).dim, 0);                          \
@@ -190,6 +224,14 @@ component first_field_component(field_type ft);
          (gv).get_boundary_icorners(c, loop_ibound, &loop_notowned_is, &loop_notowned_ie);         \
          loop_ibound++)                                                                            \
   LOOP_OVER_IVECS(gv, loop_notowned_is, loop_notowned_ie, idx)
+
+#define PLOOP_OVER_VOL_NOTOWNED(gv, c, idx)                                                         \
+  for (ivec loop_notowned_is((gv).dim, 0), loop_notowned_ie((gv).dim, 0);                          \
+       loop_notowned_is == zero_ivec((gv).dim);)                                                   \
+    for (int loop_ibound = 0;                                                                      \
+         (gv).get_boundary_icorners(c, loop_ibound, &loop_notowned_is, &loop_notowned_ie);         \
+         loop_ibound++)                                                                            \
+  PLOOP_OVER_IVECS(gv, loop_notowned_is, loop_notowned_ie, idx)
 
 #define LOOPS_ARE_STRIDE1(gv) ((gv).stride((gv).yucky_direction(2)) == 1)
 
@@ -231,15 +273,46 @@ component first_field_component(field_type ft);
   for (ptrdiff_t idx = idx0 + loop_i1 * loop_s1 + loop_i2 * loop_s2, loop_i3 = 0;                  \
        loop_i3 < loop_n3; loop_i3++, idx++)
 
+// loop over indices idx from is to ie (inclusive) in gv
+#define PS1LOOP_OVER_IVECS(gv, is, ie, idx)                                                         \
+for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),                       \
+                 loop_is3 = (is).yucky_val(2), loop_n1 = ((ie).yucky_val(0) - loop_is1) / 2 + 1,   \
+                 loop_n2 = ((ie).yucky_val(1) - loop_is2) / 2 + 1,                                 \
+                 loop_n3 = ((ie).yucky_val(2) - loop_is3) / 2 + 1,                                 \
+                 loop_d1 = (gv).yucky_direction(0), loop_d2 = (gv).yucky_direction(1),             \
+                 loop_s1 = (gv).stride((meep::direction)loop_d1),                                  \
+                 loop_s2 = (gv).stride((meep::direction)loop_d2), loop_s3 = 1,                     \
+                 idx0 = (is - (gv).little_corner()).yucky_val(0) / 2 * loop_s1 +                   \
+                        (is - (gv).little_corner()).yucky_val(1) / 2 * loop_s2 +                   \
+                        (is - (gv).little_corner()).yucky_val(2) / 2 * loop_s3,                    \
+                  idx, dummy_last, loop_i1, loop_i2, loop_i3,                                      \
+                  dummy_first=0;dummy_first<1;dummy_first++)                                       \
+_Pragma("omp parallel for")				                                                     \
+  for (loop_i1 = 0; loop_i1 < loop_n1; loop_i1++)                                        \
+    for (loop_i2 = 0; loop_i2 < loop_n2; loop_i2++)                                      \
+      IVDEP \
+      for (loop_i3 = 0; loop_i3 < loop_n3; loop_i3++)                                    \
+        for (idx = idx0 + loop_i1 * loop_s1 + loop_i2 * loop_s2 + loop_i3, dummy_last=0;dummy_last<1;dummy_last++)
+
 #define S1LOOP_OVER_VOL(gv, c, idx)                                                                \
   S1LOOP_OVER_IVECS(gv, (gv).little_corner() + (gv).iyee_shift(c),                                 \
+                    (gv).big_corner() + (gv).iyee_shift(c), idx)
+
+#define PS1LOOP_OVER_VOL(gv, c, idx)                                                                \
+  PS1LOOP_OVER_IVECS(gv, (gv).little_corner() + (gv).iyee_shift(c),                                 \
                     (gv).big_corner() + (gv).iyee_shift(c), idx)
 
 #define S1LOOP_OVER_VOL_OWNED(gv, c, idx)                                                          \
   S1LOOP_OVER_IVECS(gv, (gv).little_owned_corner(c), (gv).big_corner(), idx)
 
+#define PS1LOOP_OVER_VOL_OWNED(gv, c, idx)                                                          \
+  PS1LOOP_OVER_IVECS(gv, (gv).little_owned_corner(c), (gv).big_corner(), idx)
+
 #define S1LOOP_OVER_VOL_OWNED0(gv, c, idx)                                                         \
   S1LOOP_OVER_IVECS(gv, (gv).little_owned_corner0(c), (gv).big_corner(), idx)
+
+#define PS1LOOP_OVER_VOL_OWNED0(gv, c, idx)                                                         \
+  PS1LOOP_OVER_IVECS(gv, (gv).little_owned_corner0(c), (gv).big_corner(), idx)
 
 #define S1LOOP_OVER_VOL_NOTOWNED(gv, c, idx)                                                       \
   for (ivec loop_notowned_is((gv).dim, 0), loop_notowned_ie((gv).dim, 0);                          \
@@ -248,6 +321,14 @@ component first_field_component(field_type ft);
          (gv).get_boundary_icorners(c, loop_ibound, &loop_notowned_is, &loop_notowned_ie);         \
          loop_ibound++)                                                                            \
   S1LOOP_OVER_IVECS(gv, loop_notowned_is, loop_notowned_ie, idx)
+
+#define PS1LOOP_OVER_VOL_NOTOWNED(gv, c, idx)                                                       \
+  for (ivec loop_notowned_is((gv).dim, 0), loop_notowned_ie((gv).dim, 0);                          \
+       loop_notowned_is == meep::zero_ivec((gv).dim);)                                             \
+    for (int loop_ibound = 0;                                                                      \
+         (gv).get_boundary_icorners(c, loop_ibound, &loop_notowned_is, &loop_notowned_ie);         \
+         loop_ibound++)                                                                            \
+  PS1LOOP_OVER_IVECS(gv, loop_notowned_is, loop_notowned_ie, idx)
 
 #define IVEC_LOOP_AT_BOUNDARY                                                                      \
   ((loop_s1 != 0 && (loop_i1 == 0 || loop_i1 == loop_n1 - 1)) ||                                   \
