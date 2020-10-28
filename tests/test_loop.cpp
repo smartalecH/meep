@@ -64,16 +64,11 @@ int test_normal_loop() {
       master_printf("\n---------------------------------\n");
 
       
-      PLOOP_OVER_VOL(f.chunks[i]->gv, Hx, idx) {
       int my_thread=omp_get_thread_num();
         if (my_thread == 0)
           master_printf("%td ",idx);
       }
-  }
-  return 1;
-}
-
-int main(int argc, char **argv) {
+      
   initialize mpi(argc, argv);
   verbosity = 0;
   master_printf("Testing 2D...\n");
