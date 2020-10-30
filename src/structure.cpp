@@ -764,7 +764,7 @@ void structure_chunk::update_condinv() {
     direction d = component_direction(c);
     if (conductivity[c][d]) {
       if (!condinv[c][d]) condinv[c][d] = new realnum[gv.ntot()];
-      LOOP_OVER_VOL(gv, c, i) { condinv[c][d][i] = 1 / (1 + conductivity[c][d][i] * dt * 0.5); }
+      PLOOP_OVER_VOL(gv, c, i) { condinv[c][d][i] = 1 / (1 + conductivity[c][d][i] * dt * 0.5); }
     }
     else if (condinv[c][d]) { // condinv not needed
       delete[] condinv[c][d];
@@ -880,7 +880,7 @@ void structure_chunk::set_chi3(component c, material_function &epsilon) {
 
   if (!chi3[c]) chi3[c] = new realnum[gv.ntot()];
   bool trivial = true;
-  LOOP_OVER_VOL(gv, c, i) {
+  PLOOP_OVER_VOL(gv, c, i) {
     IVEC_LOOP_LOC(gv, here);
     chi3[c][i] = epsilon.chi3(c, here);
     trivial = trivial && (chi3[c][i] == 0.0);
@@ -916,7 +916,7 @@ void structure_chunk::set_chi2(component c, material_function &epsilon) {
 
   if (!chi2[c]) chi2[c] = new realnum[gv.ntot()];
   bool trivial = true;
-  LOOP_OVER_VOL(gv, c, i) {
+  PLOOP_OVER_VOL(gv, c, i) {
     IVEC_LOOP_LOC(gv, here);
     chi2[c][i] = epsilon.chi2(c, here);
     trivial = trivial && (chi2[c][i] == 0.0);
@@ -955,14 +955,14 @@ void structure_chunk::set_conductivity(component c, material_function &C) {
   bool trivial = true;
   realnum *cnd = conductivity[c_C][c_d];
   if (multby) {
-    LOOP_OVER_VOL(gv, c_C, i) {
+    PLOOP_OVER_VOL(gv, c_C, i) {
       IVEC_LOOP_LOC(gv, here);
       cnd[i] = C.conductivity(c, here) * multby[i];
       trivial = trivial && (cnd[i] == 0.0);
     }
   }
   else {
-    LOOP_OVER_VOL(gv, c_C, i) {
+    PLOOP_OVER_VOL(gv, c_C, i) {
       IVEC_LOOP_LOC(gv, here);
       cnd[i] = C.conductivity(c, here);
       trivial = trivial && (cnd[i] == 0.0);

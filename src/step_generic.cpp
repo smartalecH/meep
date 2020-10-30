@@ -5,7 +5,7 @@
 #define DPR double *restrict
 #define RPR realnum *restrict
 
-/* These macros get into the guts of the LOOP_OVER_VOL loops to
+/* These macros get into the guts of the PLOOP_OVER_VOL loops to
    efficiently construct the index k into a PML sigma array.
    Basically, k needs to increment by 2 for each increment of one of
    LOOP's for-loops, starting at the appropriate corner of the grid_volume,
