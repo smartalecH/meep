@@ -24,10 +24,6 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 
-#if defined(_OPENMP)
-#include <omp.h>
-#endif
-
 using namespace std;
 
 typedef complex<double> cdouble;
@@ -106,22 +102,8 @@ dft_chunk::dft_chunk(fields_chunk *fc_, ivec is_, ivec ie_, vec s0_, vec s1_, ve
   N = 1;
   LOOP_OVER_DIRECTIONS(is.dim, d) { N *= (ie.in_direction(d) - is.in_direction(d)) / 2 + 1; }
   dft = new complex<realnum>[N * Nomega];
-
-  size_t idx_dft = 0;
-  PLOOP_OVER_IVECS_C(fc->gv, is, ie, idx,"omp parallel for ordered collapse(3), firstprivate(idx_dft)") {
-    size_t base_idx = 0;
-    #if defined(_OPENMP)
-    base_idx = N / omp_get_num_threads() * omp_get_thread_num();
-    if (N < size_t(omp_get_num_threads())) base_idx=omp_get_thread_num(); 
-    #endif
-    for (int i = 0; i < Nomega; ++i)
-      dft[Nomega * (base_idx + idx_dft) + i] = 0.0;
-    
-    idx_dft++;
-    (void)idx; //unused
-  }
-    
-  
+  for (size_t i = 0; i < N * Nomega; ++i)
+    dft[i] = 0.0;
   for (int i = 0; i < 5; ++i)
     empty_dim[i] = data->empty_dim[i];
 
@@ -244,47 +226,39 @@ void dft_chunk::update_dft(double time) {
 
   int numcmp = fc->f[c][1] ? 2 : 1;
 
-    size_t idx_dft = 0;
-    PLOOP_OVER_IVECS_C(fc->gv, is, ie, idx,"omp parallel for ordered collapse(3), firstprivate(idx_dft)") {
-      size_t base_idx = 0;
-      #if defined(_OPENMP)
-      base_idx = N / omp_get_num_threads() * omp_get_thread_num();
-      if (N < size_t(omp_get_num_threads())) base_idx=omp_get_thread_num();
-      #endif
-      double w;
-      if (include_dV_and_interp_weights) {
-        w = IVEC_LOOP_WEIGHT(s0, s1, e0, e1, dV0 + dV1 * loop_i2);
-        if (sqrt_dV_and_interp_weights) w = sqrt(w);
-      }
-      else
-        w = 1.0;
-      double f[2]; // real/imag field value at epsilon point
-      if (avg2)
-        for (int cmp = 0; cmp < numcmp; ++cmp)
-          f[cmp] = (w * 0.25) * (fc->f[c][cmp][idx] + fc->f[c][cmp][idx + avg1] +
-                                fc->f[c][cmp][idx + avg2] + fc->f[c][cmp][idx + (avg1 + avg2)]);
-      else if (avg1)
-        for (int cmp = 0; cmp < numcmp; ++cmp)
-          f[cmp] = (w * 0.5) * (fc->f[c][cmp][idx] + fc->f[c][cmp][idx + avg1]);
-      else
-        for (int cmp = 0; cmp < numcmp; ++cmp)
-          f[cmp] = w * fc->f[c][cmp][idx];
-
-      if (numcmp == 2) {
-        complex<realnum> fc(f[0], f[1]);
-        IVDEP
-        for (int i = 0; i < Nomega; ++i)
-          dft[Nomega * (base_idx+idx_dft) + i] += dft_phase[i] * fc;
-      }
-      else {
-        realnum fr = f[0];
-        IVDEP
-        for (int i = 0; i < Nomega; ++i)
-          dft[Nomega * (base_idx+idx_dft) + i] += dft_phase[i] * fr;
-      }
-      idx_dft++;
-      (void)idx; //unused
+  size_t idx_dft = 0;
+  LOOP_OVER_IVECS(fc->gv, is, ie, idx) {
+    double w;
+    if (include_dV_and_interp_weights) {
+      w = IVEC_LOOP_WEIGHT(s0, s1, e0, e1, dV0 + dV1 * loop_i2);
+      if (sqrt_dV_and_interp_weights) w = sqrt(w);
     }
+    else
+      w = 1.0;
+    double f[2]; // real/imag field value at epsilon point
+    if (avg2)
+      for (int cmp = 0; cmp < numcmp; ++cmp)
+        f[cmp] = (w * 0.25) * (fc->f[c][cmp][idx] + fc->f[c][cmp][idx + avg1] +
+                               fc->f[c][cmp][idx + avg2] + fc->f[c][cmp][idx + (avg1 + avg2)]);
+    else if (avg1)
+      for (int cmp = 0; cmp < numcmp; ++cmp)
+        f[cmp] = (w * 0.5) * (fc->f[c][cmp][idx] + fc->f[c][cmp][idx + avg1]);
+    else
+      for (int cmp = 0; cmp < numcmp; ++cmp)
+        f[cmp] = w * fc->f[c][cmp][idx];
+
+    if (numcmp == 2) {
+      complex<realnum> fc(f[0], f[1]);
+      for (int i = 0; i < Nomega; ++i)
+        dft[Nomega * idx_dft + i] += dft_phase[i] * fc;
+    }
+    else {
+      realnum fr = f[0];
+      for (int i = 0; i < Nomega; ++i)
+        dft[Nomega * idx_dft + i] += dft_phase[i] * fr;
+    }
+    idx_dft++;
+  }
 }
 
 void dft_chunk::scale_dft(complex<double> scale) {
@@ -829,16 +803,10 @@ cdouble dft_chunk::process_dft_component(int rank, direction *ds, ivec min_corne
   /* loop over all grid points in our piece of the volume        */
   /***************************************************************/
   vec rshift(shift * (0.5 * fc->gv.inva));
-  size_t chunk_idx = 0;
+  int chunk_idx = 0;
   cdouble integral = 0.0;
   component c_conjugate = (component)(ic_conjugate >= 0 ? ic_conjugate : -ic_conjugate);
-  PLOOP_OVER_IVECS_C(fc->gv, is, ie, idx,"omp parallel for ordered collapse(3), firstprivate(chunk_idx)") {
-    size_t base_idx = 0;
-    #if defined(_OPENMP)
-    base_idx = N / omp_get_num_threads() * omp_get_thread_num();
-    if (N < size_t(omp_get_num_threads())) base_idx=omp_get_thread_num();
-    #endif
-    
+  LOOP_OVER_IVECS(fc->gv, is, ie, idx) {
     IVEC_LOOP_LOC(fc->gv, loc);
     loc = S.transform(loc, sn) + rshift;
     double w = IVEC_LOOP_WEIGHT(s0, s1, e0, e1, dV0 + dV1 * loop_i2);
@@ -851,7 +819,7 @@ cdouble dft_chunk::process_dft_component(int rank, direction *ds, ivec min_corne
                    ? parent->get_eps(loc)
                    : c_conjugate == Permeability
                          ? parent->get_mu(loc)
-                         : dft[omega.size() * (base_idx+(chunk_idx++)) + num_freq] / stored_weight);
+                         : dft[omega.size() * (chunk_idx++) + num_freq] / stored_weight);
     if (include_dV_and_interp_weights) dft_val /= (sqrt_dV_and_interp_weights ? sqrt(w) : w);
 
     cdouble mode1val = 0.0, mode2val = 0.0;
@@ -890,7 +858,7 @@ cdouble dft_chunk::process_dft_component(int rank, direction *ds, ivec min_corne
       else
         integral += w * mode1val * dft_val;
     }
-  (void)idx; //unused
+
   } // LOOP_OVER_IVECS(fc->gv, is, ie, idx)
 
   if (file) file->write_chunk(rank, start, file_count, buffer);
