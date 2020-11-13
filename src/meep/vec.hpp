@@ -204,9 +204,12 @@ without having to change any other code
 in the main codebase. We can proceed to do
 a collapse over all three main loops. */
 
+#define CHUNK_OPENMP _Pragma("omp parallel for")
+
 // the most generic use case where the user
 // can specify a custom clause
 #define PLOOP_OVER_IVECS_C(gv, is, ie, idx, clause)			                                                     \
+_Pragma("unroll(1") \
 for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),                          \
                  loop_is3 = (is).yucky_val(2), loop_n1 = ((ie).yucky_val(0) - loop_is1) / 2 + 1,   \
                  loop_n2 = ((ie).yucky_val(1) - loop_is2) / 2 + 1,                                 \
@@ -220,17 +223,19 @@ for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),       
                         (is - (gv).little_corner()).yucky_val(1) / 2 * loop_s2 +                   \
                         (is - (gv).little_corner()).yucky_val(2) / 2 * loop_s3,                    \
                   dummy_first=0;dummy_first<1;dummy_first++)                                       \
-_Pragma(clause)				                                                     \
+_Pragma(clause)     				                                                     \
   for (ptrdiff_t loop_i1 = 0; loop_i1 < loop_n1; loop_i1++)                                        \
     for (ptrdiff_t loop_i2 = 0; loop_i2 < loop_n2; loop_i2++)                                      \
       for (ptrdiff_t loop_i3 = 0; loop_i3 < loop_n3; loop_i3++)                                    \
+      _Pragma("unroll(1") \
         for (ptrdiff_t idx = idx0 + loop_i1*loop_s1 + loop_i2*loop_s2 +                            \
            loop_i3*loop_s3, dummy_last=0;dummy_last<1;dummy_last++)
 
 // For the main timestepping events, we know
 // we want to do a simple collapse
 #define PLOOP_OVER_IVECS(gv, is, ie, idx)                                                          \
-  PLOOP_OVER_IVECS_C(gv, is, ie, idx, "omp parallel for ordered collapse(3)")
+  /*master_printf("Entered ploop\n");*/ \
+  PLOOP_OVER_IVECS_C(gv, is, ie, idx, "omp parallel for collapse(3)")
 
 #define PLOOP_OVER_VOL(gv, c, idx)                                                                  \
   PLOOP_OVER_IVECS(gv, (gv).little_corner() + (gv).iyee_shift(c),                                   \
@@ -316,6 +321,7 @@ We can use simd vectorization in addition
 to the usual par for optimization */
 // loop over indices idx from is to ie (inclusive) in gv
 #define PS1LOOP_OVER_IVECS(gv, is, ie, idx)                                                        \
+_Pragma("unroll(1") \
 for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),                          \
                  loop_is3 = (is).yucky_val(2), loop_n1 = ((ie).yucky_val(0) - loop_is1) / 2 + 1,   \
                  loop_n2 = ((ie).yucky_val(1) - loop_is2) / 2 + 1,                                 \
@@ -327,10 +333,12 @@ for(ptrdiff_t loop_is1 = (is).yucky_val(0), loop_is2 = (is).yucky_val(1),       
                         (is - (gv).little_corner()).yucky_val(1) / 2 * loop_s2 +                   \
                         (is - (gv).little_corner()).yucky_val(2) / 2 * loop_s3,                    \
                   dummy_first=0;dummy_first<1;dummy_first++)                                       \
-_Pragma("omp parallel for simd ordered collapse(3)")				                                                     \
+_Pragma("omp parallel for collapse(2)")				                                                     \
   for (ptrdiff_t loop_i1 = 0; loop_i1 < loop_n1; loop_i1++)                                        \
     for (ptrdiff_t loop_i2 = 0; loop_i2 < loop_n2; loop_i2++)                                      \
+      _Pragma("omp simd") \
       for (ptrdiff_t loop_i3 = 0; loop_i3 < loop_n3; loop_i3++)                                    \
+        _Pragma("unroll(1") \
         for (ptrdiff_t idx = idx0 + loop_i1 * loop_s1 + loop_i2 * loop_s2 + loop_i3, dummy_last=0;dummy_last<1;dummy_last++)
 
 #define PS1LOOP_OVER_VOL(gv, c, idx)                                                                \
