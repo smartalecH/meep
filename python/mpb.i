@@ -241,6 +241,10 @@ static mpb_real field_integral_energy_callback(mpb_real energy, mpb_real epsilon
     }
 }
 
+%typemap(in, fragment="NumPy_Macros") double* v {
+    $1 = (double *)array_data($input);
+}
+
 %typemap(in) matrix3x3 {
    if (!pymatrix_to_matrix($input, &$1)) {
        PyErr_PrintEx(0);
