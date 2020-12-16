@@ -77,14 +77,6 @@ class Simulation(object):
 The `Simulation` [class](#classes) contains all the attributes that you can set to
 control various parameters of the Meep computation.
 
-#### Output File Names
-
-The output filenames used by Meep, e.g. for HDF5 files, are automatically prefixed by
-the `filename_prefix` parameter. If `filename_prefix` is `None` (the default),
-however, then Meep constructs a default prefix based on the current Python filename
-with `".py"` replaced by `"-"`: e.g. `test.py` implies a prefix of `"test-"`. You can
-get this prefix by calling `get_filename_prefix`.
-
 </div>
 
 
@@ -168,9 +160,8 @@ Python. `Vector3` is a `meep` class.
   optimized. See `dimensions` below. **Note:** because Maxwell's equations are
   scale invariant, you can use any units of distance you want to specify the cell
   size: nanometers, microns, centimeters, etc. However, it is usually convenient
-  to pick some characteristic lengthscale of your problem and set that length to
-  1. See also [Units](Introduction.md#units-in-meep). Required argument (no
-  default).
+  to pick some characteristic lengthscale of your problem and set that length to 1.
+  See also [Units](Introduction.md#units-in-meep). Required argument (no default).
 
 + **`default_material` [`Medium` class ]** — Holds the default material that is
   used for points not in any object of the geometry list. Defaults to `air` (ε=1).
@@ -283,10 +274,10 @@ Python. `Vector3` is a `meep` class.
   simulate all fields, even those that remain zero throughout the simulation, by
   setting `force_all_components` to `True`.
 
-+ **`filename_prefix` [`string`]** — A string prepended to all output filenames.
-  If empty (the default), then Meep uses the name of the current Python file, with
-  ".py" replaced by "-" (e.g. `foo.py` uses a `"foo-"` prefix). See also [Output
-  File Names](Python_User_Interface.md#output-file-names).
++ **`filename_prefix` [`string`]** — A string prepended to all output filenames
+  (e.g., for HDF5 files). If `None` (the default), then Meep constructs a default
+  prefix based on the current Python filename ".py" replaced by "-" (e.g. `foo.py`
+  uses a `"foo-"` prefix). You can get this prefix by calling `get_filename_prefix`.
 
 + **`Courant` [`number`]** — Specify the
   [Courant factor](https://en.wikipedia.org/wiki/Courant%E2%80%93Friedrichs%E2%80%93Lewy_condition)
@@ -2466,6 +2457,9 @@ plt.show()
 plt.savefig('sim_domain.png')
 ```
 
+Note: When running a [parallel simulation](Parallel_Meep.md), the `plot2D` function must be called
+from all parallel processes, but only produces a plot on the `meep.am_master()` process.
+
 **Parameters:**
 
 * `ax`: a `matplotlib` axis object. `plot2D()` will add plot objects, like lines,
@@ -2484,13 +2478,15 @@ plt.savefig('sim_domain.png')
     - `interpolation='spline36'`: interpolation algorithm used to upsample the pixels.
     - `cmap='binary'`: the color map of the geometry
     - `alpha=1.0`: transparency of geometry
+    - `contour=False`: if `True`, plot a contour of the geometry rather than its image
+    - `contour_linewidth=1`: line width of the contour lines if `contour=True`
 * `boundary_parameters`: a `dict` of optional plotting parameters that override
   the default parameters for the boundary layers.
     - `alpha=1.0`: transparency of boundary layers
     - `facecolor='g'`: color of polygon face
     - `edgecolor='g'`: color of outline stroke
     - `linewidth=1`: line width of outline stroke
-    - `hatch=''`: hatching pattern
+    - `hatch='\'`: hatching pattern
 * `source_parameters`: a `dict` of optional plotting parameters that override the
   default parameters for the sources.
     - `color='r'`: color of line and pt sources
@@ -2498,7 +2494,7 @@ plt.savefig('sim_domain.png')
     - `facecolor='none'`: color of polygon face for planar sources
     - `edgecolor='r'`: color of outline stroke for planar sources
     - `linewidth=1`: line width of outline stroke
-    - `hatch=''`: hatching pattern
+    - `hatch='\'`: hatching pattern
     - `label_color='r'`: color of source labels
     - `label_alpha=0.3`: transparency of source label box
     - `offset=20`: distance from source center and label box
@@ -2509,7 +2505,7 @@ plt.savefig('sim_domain.png')
     - `facecolor='none'`: color of polygon face for planar monitors
     - `edgecolor='r'`: color of outline stroke for planar monitors
     - `linewidth=1`: line width of outline stroke
-    - `hatch=''`: hatching pattern
+    - `hatch='\'`: hatching pattern
     - `label_color='g'`: color of source labels
     - `label_alpha=0.3`: transparency of monitor label box
     - `offset=20`: distance from monitor center and label box
@@ -3462,7 +3458,7 @@ def get_array_metadata(self,
 
 This routine provides geometric information useful for interpreting the arrays
 returned by `get_array` or `get_dft_array` for the spatial region defined by `vol`
-or `center/size`. In both cases, the return value is a tuple `(x,y,z,w)`, where:
+or `center`/`size`. In both cases, the return value is a tuple `(x,y,z,w)`, where:
 
 + `x,y,z` are 1d NumPy arrays storing the $x,y,z$ coordinates of the points in the
   grid slice
@@ -3490,7 +3486,7 @@ then the entire cell is used.
 
 </div>
 
-This routine provides geometric information useful for interpreting the arrays returned by `get_array` or `get_dft_array` for the spatial region defined by `vol` or `center/size`. Here are some examples of how array metadata can be used:
+The following are some examples of how array metadata can be used.
 
 **Labeling Axes in Plots of Grid Quantities**
 
@@ -4034,13 +4030,21 @@ Creates a `Medium` object.
   which takes a `Vector3` to give the $\sigma_B$ tensor diagonal. See also
   [Conductivity](Materials.md#conductivity-and-complex).
 
-+ **`chi2` [`number`]** — The nonlinear
++ **`chi2` [`number`]** — The nonlinear electric
   [Pockels](https://en.wikipedia.org/wiki/Pockels_effect) susceptibility
-  $\chi^{(2)}$. Default is 0. See also [Nonlinearity](Materials.md#nonlinearity).
+  $\chi^{(2)}$ (quadratic nonlinearity). Default is 0. See also [Nonlinearity](Materials.md#nonlinearity).
+  This is equivalent to setting `E_chi2`; alternatively, an analogous magnetic
+  nonlinearity can be specified using `H_chi2`. These are isotropic nonlinearities,
+  but *diagonal* anisotropic polarizations of the form $\chi_i^{(2)} E_i^2$ can
+  be specified with `E_chi2_diag` (which defaults to `[E_chi2,E_chi2,E_chi2]`).
 
-+ **`chi3` [`number`]** — The nonlinear
-  [Kerr](https://en.wikipedia.org/wiki/Kerr_effect) susceptibility $\chi^{(3)}$.
-  Default is 0. See also [Nonlinearity](Materials.md#nonlinearity).
++ **`chi3` [`number`]** — The nonlinear electric
+  [Kerr](https://en.wikipedia.org/wiki/Kerr_effect) susceptibility $\chi^{(3)}$
+  (cubic nonlinearity). Default is 0. See also [Nonlinearity](Materials.md#nonlinearity).
+  This is equivalent to setting `E_chi3`; alternatively, an analogous magnetic nonlinearity
+  can be specified using `H_chi3`. These are isotropic nonlinearities, but *diagonal*
+  anisotropic polarizations of the form $\chi_i^{(3)} |E|^2 E_i$ can be specified with
+  `E_chi3_diag` (which defaults to `[E_chi3,E_chi3,E_chi3]`).
 
 + **`E_susceptibilities` [ list of `Susceptibility` class ]** — List of dispersive
   susceptibilities (see below) added to the dielectric constant ε in order to
@@ -5300,7 +5304,7 @@ def __init__(self, **kwargs):
 
 <div class="method_docstring" markdown="1">
 
-Construct an `Ellipsiod`.
+Construct an `Ellipsoid`.
 
 </div>
 
@@ -5802,7 +5806,10 @@ Construct a `Source`.
   region instead of a `center` and a `size`.
 
 + **`amplitude` [`complex`]** — An overall complex amplitude multiplying the
-  current source. Default is 1.0.
+  current source. Default is 1.0. Note that specifying a complex `amplitude`
+  imparts a phase shift to the real part of the overall current and thus
+  does *not* require using complex fields for the entire simulation
+  (via `force_complex_fields=True`).
 
 + **`amp_func` [`function`]** — A Python function of a single argument, that takes
   a `Vector3` giving a position and returns a complex current amplitude for that
@@ -7572,7 +7579,7 @@ Given a frequency `frequency`, (provided as a keyword argument) output $\varepsi
 permittivity); for an anisotropic $\varepsilon$ tensor the output is the [harmonic
 mean](https://en.wikipedia.org/wiki/Harmonic_mean) of the $\varepsilon$ eigenvalues. If
 `frequency` is non-zero, the output is complex; otherwise it is the real,
-frequency-independent part of $arepsilon$ (the $\omega\to\infty$ limit).
+frequency-independent part of $\varepsilon$ (the $\omega\to\infty$ limit).
 When called as part of a [step function](Python_User_Interface.md#controlling-when-a-step-function-executes),
 the `sim` argument specifying the `Simulation` object can be omitted, e.g.,
 `sim.run(mp.at_beginning(mp.output_epsilon(frequency=1/0.7)),until=10)`.

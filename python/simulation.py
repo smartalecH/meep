@@ -930,14 +930,6 @@ class Simulation(object):
     """
     The `Simulation` [class](#classes) contains all the attributes that you can set to
     control various parameters of the Meep computation.
-
-    #### Output File Names
-
-    The output filenames used by Meep, e.g. for HDF5 files, are automatically prefixed by
-    the `filename_prefix` parameter. If `filename_prefix` is `None` (the default),
-    however, then Meep constructs a default prefix based on the current Python filename
-    with `".py"` replaced by `"-"`: e.g. `test.py` implies a prefix of `"test-"`. You can
-    get this prefix by calling `get_filename_prefix`.
     """
     def __init__(self,
                  cell_size,
@@ -1010,9 +1002,8 @@ class Simulation(object):
           optimized. See `dimensions` below. **Note:** because Maxwell's equations are
           scale invariant, you can use any units of distance you want to specify the cell
           size: nanometers, microns, centimeters, etc. However, it is usually convenient
-          to pick some characteristic lengthscale of your problem and set that length to
-          1. See also [Units](Introduction.md#units-in-meep). Required argument (no
-          default).
+          to pick some characteristic lengthscale of your problem and set that length to 1.
+          See also [Units](Introduction.md#units-in-meep). Required argument (no default).
 
         + **`default_material` [`Medium` class ]** — Holds the default material that is
           used for points not in any object of the geometry list. Defaults to `air` (ε=1).
@@ -1125,10 +1116,10 @@ class Simulation(object):
           simulate all fields, even those that remain zero throughout the simulation, by
           setting `force_all_components` to `True`.
 
-        + **`filename_prefix` [`string`]** — A string prepended to all output filenames.
-          If empty (the default), then Meep uses the name of the current Python file, with
-          ".py" replaced by "-" (e.g. `foo.py` uses a `"foo-"` prefix). See also [Output
-          File Names](Python_User_Interface.md#output-file-names).
+        + **`filename_prefix` [`string`]** — A string prepended to all output filenames
+          (e.g., for HDF5 files). If `None` (the default), then Meep constructs a default
+          prefix based on the current Python filename ".py" replaced by "-" (e.g. `foo.py`
+          uses a `"foo-"` prefix). You can get this prefix by calling `get_filename_prefix`.
 
         + **`Courant` [`number`]** — Specify the
           [Courant factor](https://en.wikipedia.org/wiki/Courant%E2%80%93Friedrichs%E2%80%93Lewy_condition)
@@ -3254,7 +3245,7 @@ class Simulation(object):
         """
         This routine provides geometric information useful for interpreting the arrays
         returned by `get_array` or `get_dft_array` for the spatial region defined by `vol`
-        or `center/size`. In both cases, the return value is a tuple `(x,y,z,w)`, where:
+        or `center`/`size`. In both cases, the return value is a tuple `(x,y,z,w)`, where:
 
         + `x,y,z` are 1d NumPy arrays storing the $x,y,z$ coordinates of the points in the
           grid slice
@@ -3858,6 +3849,9 @@ class Simulation(object):
         plt.savefig('sim_domain.png')
         ```
 
+        Note: When running a [parallel simulation](Parallel_Meep.md), the `plot2D` function expects to be called
+        on all processes, but only generates a plot on the master process.
+
         **Parameters:**
 
         * `ax`: a `matplotlib` axis object. `plot2D()` will add plot objects, like lines,
@@ -3876,13 +3870,15 @@ class Simulation(object):
             - `interpolation='spline36'`: interpolation algorithm used to upsample the pixels.
             - `cmap='binary'`: the color map of the geometry
             - `alpha=1.0`: transparency of geometry
+            - `contour=False`: if `True`, plot a contour of the geometry rather than its image
+            - `contour_linewidth=1`: line width of the contour lines if `contour=True`
         * `boundary_parameters`: a `dict` of optional plotting parameters that override
           the default parameters for the boundary layers.
             - `alpha=1.0`: transparency of boundary layers
             - `facecolor='g'`: color of polygon face
             - `edgecolor='g'`: color of outline stroke
             - `linewidth=1`: line width of outline stroke
-            - `hatch='\'`: hatching pattern
+            - `hatch='\\'`: hatching pattern
         * `source_parameters`: a `dict` of optional plotting parameters that override the
           default parameters for the sources.
             - `color='r'`: color of line and pt sources
@@ -3890,7 +3886,7 @@ class Simulation(object):
             - `facecolor='none'`: color of polygon face for planar sources
             - `edgecolor='r'`: color of outline stroke for planar sources
             - `linewidth=1`: line width of outline stroke
-            - `hatch='\'`: hatching pattern
+            - `hatch='\\'`: hatching pattern
             - `label_color='r'`: color of source labels
             - `label_alpha=0.3`: transparency of source label box
             - `offset=20`: distance from source center and label box
@@ -3901,7 +3897,7 @@ class Simulation(object):
             - `facecolor='none'`: color of polygon face for planar monitors
             - `edgecolor='r'`: color of outline stroke for planar monitors
             - `linewidth=1`: line width of outline stroke
-            - `hatch='\'`: hatching pattern
+            - `hatch='\\'`: hatching pattern
             - `label_color='g'`: color of source labels
             - `label_alpha=0.3`: transparency of monitor label box
             - `offset=20`: distance from monitor center and label box
