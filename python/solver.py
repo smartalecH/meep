@@ -1125,6 +1125,12 @@ class ModeSolver(object):
 
     def get_dominant_planewave(self, band):
         return self.mode_solver.get_dominant_planewave(band)
+    
+    def compute_gradient(self,material_grid,band,scalegrad=1):
+        grid_size = (int(material_grid.grid_size.x),int(material_grid.grid_size.y),int(material_grid.grid_size.z))
+        gradient_v = np.zeros(grid_size)
+        self.mode_solver.material_grids_addgradient(gradient_v, scalegrad, band)
+        return gradient_v
 
 
 # Predefined output functions (functions of the band index), for passing to `run`

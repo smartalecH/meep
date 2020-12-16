@@ -192,6 +192,11 @@ struct mode_solver {
 
   vector3 get_dominant_planewave(int band);
 
+  void compute_field_squared(void);
+  meep::realnum get_material_gradient(meep::realnum u,meep_geom::material_data *md);
+  void material_grids_addgradient_point(meep::realnum *v, vector3 p, meep::realnum scalegrad);
+  void material_grids_addgradient(double *v,double scalegrad, int band);
+
 private:
   int kpoint_index;
   scalar_complex *curfield;
