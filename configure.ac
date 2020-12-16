@@ -194,6 +194,12 @@ if test "x$have_mpb" = "xyes"; then
     AC_DEFINE([HAVE_MPB_PRINTF_CALLBACK], [1], [If we have the mpb_printf_callback variable]))
 fi
 
+AC_ARG_WITH(efence, [AC_HELP_STRING([--with-efence],[use ElectricFence library])], ok=$withval, ok=no)
+if test "$ok" = "yes"; then
+	AC_CHECK_LIB(efence, malloc)
+fi
+
+
 ##############################################################################
 # GNU Scientific Library
 

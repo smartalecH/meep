@@ -65,7 +65,7 @@ struct mode_solver {
   int iterations;
   double eigensolver_flops;
 
-  geom_box_tree geometry_tree;
+  geom_box_tree geometry_tree, geometry_tree_adjoint;
 
   mpb_real vol;
 
@@ -195,7 +195,7 @@ struct mode_solver {
   void compute_field_squared(void);
   meep::realnum get_material_gradient(meep::realnum u,meep_geom::material_data *md);
   void material_grids_addgradient_point(meep::realnum *v, vector3 p, meep::realnum scalegrad);
-  void material_grids_addgradient(double *v,double scalegrad, int band);
+  void material_grids_addgradient(geometric_object_list geometry, double *v,double scalegrad, int band);
 
 private:
   int kpoint_index;

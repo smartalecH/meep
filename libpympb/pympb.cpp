@@ -212,6 +212,7 @@ mode_solver::mode_solver(int num_bands, double resolution[3], lattice lat, doubl
   dimensions = dims;
   ensure_periodicity = periodicity;
   geometry_tree = NULL;
+  geometry_tree_adjoint = NULL;
   H.data = NULL;
   Hblock.data = NULL;
   muinvH.data = NULL;
@@ -240,6 +241,7 @@ mode_solver::~mode_solver() {
   destroy_maxwell_data(mdata);
   destroy_maxwell_target_data(mtdata);
   destroy_geom_box_tree(geometry_tree);
+  destroy_geom_box_tree(geometry_tree_adjoint);
   destroy_evectmatrix(H);
 
   for (int i = 0; i < nwork_alloc; ++i) {
@@ -2716,27 +2718,26 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
   meep_geom::material_data *mg, *mg_sum;
   meep::realnum uval;
   int kind;
-  tp = geom_tree_search(p, geometry_tree, &oi);
-  if (oi > 0)
-  if (tp->objects[oi].o == NULL) meep::abort("NULL\n");
-  meep::master_printf("x: %f y %f z %f c: %d\n",p.x,p.y,p.z,oi);
-
+  tp = geom_tree_search(p, geometry_tree_adjoint, &oi);
+  int tree_depth;
+  int tree_nobjects;
+  /*geom_box_tree_stats(geometry_tree_adjoint, &tree_depth, &tree_nobjects);
+    meep::master_printf("Geometric object tree has depth %d and %d object nodes"
+                        " (vs. %d actual objects)\n",
+                        tree_depth, tree_nobjects, geometry.num_items);*/
   if (tp &&
       ((meep_geom::material_type)tp->objects[oi].o->material)->which_subclass == meep_geom::material_data::MATERIAL_GRID)
         mg = (meep_geom::material_data *)tp->objects[oi].o->material;
   else if (!tp && ((meep_geom::material_type)default_material)->which_subclass == meep_geom::material_data::MATERIAL_GRID)
     mg = (meep_geom::material_data *)default_material;
-  else{
-    meep::master_printf("No\n");
+  else
     return; /* no material grids at this point */
-  }
-    
-
+  
   // Calculate the number of material grids if we are averaging values
   if ((tp) && ((kind = mg->material_grid_kinds) == meep_geom::material_data::U_SUM)) {
     int matgrid_val_count = 0;
     geom_box_tree tp_sum;
-    tp_sum = geom_tree_search(p, geometry_tree, &ois);
+    tp_sum = geom_tree_search(p, geometry_tree_adjoint, &ois);
     mg_sum = (meep_geom::material_data *)tp_sum->objects[ois].o->material;
     do {
       tp_sum = geom_tree_search_next(p, tp_sum, &ois);
@@ -2745,7 +2746,7 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
     } while (tp_sum && is_material_grid(mg_sum));
     scalegrad /= matgrid_val_count;
   }
-
+  
   // Iterate through grids and add weights as needed
   if (tp) {
     /*NOTE in the future, it may be nice to be able to have *different*
@@ -2763,7 +2764,6 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
     ucur = mg->design_parameters;
     uval = matgrid_val(p, tp, oi, mg);
     do {
-      meep::master_printf("Alec\n");
       vector3 pb = to_geom_box_coords(p, &tp->objects[oi]);
       meep_geom::add_interpolate_weights(pb.x, pb.y, pb.z, vcur, sz.x, sz.y, sz.z, 1, get_material_gradient(uval,mg)*scalegrad, ucur, kind, uval);
       if (kind == meep_geom::material_data::U_DEFAULT) break;
@@ -2782,7 +2782,7 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
   }
 }
 
-void mode_solver::material_grids_addgradient(double *v, double scalegrad, int band)
+void mode_solver::material_grids_addgradient(geometric_object_list geometry, double *v, double scalegrad, int band)
 {
      int i, j, k, n1, n2, n3, n_other, n_last, rank, last_dim;
 #ifdef HAVE_MPI
@@ -2812,6 +2812,24 @@ void mode_solver::material_grids_addgradient(double *v, double scalegrad, int ba
      c1 = n1 <= 1 ? 0 : geometry_lattice.size.x * 0.5;
      c2 = n2 <= 1 ? 0 : geometry_lattice.size.y * 0.5;
      c3 = n3 <= 1 ? 0 : geometry_lattice.size.z * 0.5;
+
+    // Replace 0 with 1e-20 for no size
+    vector3 tmp_size;
+    tmp_size.x = geometry_lattice.size.x == 0 ? 1e-20 : geometry_lattice.size.x;
+    tmp_size.y = geometry_lattice.size.y == 0 ? 1e-20 : geometry_lattice.size.y;
+    tmp_size.z = geometry_lattice.size.z == 0 ? 1e-20 : geometry_lattice.size.z;
+
+    geom_box b0;
+    b0.low = vector3_plus(geometry_center, vector3_scale(-0.5, tmp_size));
+    b0.high = vector3_plus(geometry_center, vector3_scale(0.5, tmp_size));
+    /* pad tree boundaries to allow for sub-pixel averaging */
+    b0.low.x -= tmp_size.x / mdata->nx;
+    b0.low.y -= tmp_size.y / mdata->ny;
+    b0.low.z -= tmp_size.z / mdata->nz;
+    b0.high.x += tmp_size.x / mdata->nx;
+    b0.high.y += tmp_size.y / mdata->ny;
+    b0.high.z += tmp_size.z / mdata->nz;
+    geometry_tree_adjoint = create_geom_box_tree0(geometry, b0);
     
     // loop over entire simulation grid
      LOOP_XYZ(mdata) {
@@ -2840,7 +2858,7 @@ void mode_solver::material_grids_addgradient(double *v, double scalegrad, int ba
 			 p.y = i2c * s2 - c2;
 			 p.z = i3c * s3 - c3;
 
-			 material_grids_addgradient_point(v,p,Esqr[xyz_index]*scalegrad,geometry_tree);
+			 material_grids_addgradient_point(v,p,Esqr[xyz_index]*scalegrad);
 		    }
 	       }
 #endif /* !SCALAR_COMPLEX */
