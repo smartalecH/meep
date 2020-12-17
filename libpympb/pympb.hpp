@@ -192,6 +192,11 @@ struct mode_solver {
 
   vector3 get_dominant_planewave(int band);
 
+  static void add_interpolate_weights(mpb_real rx, mpb_real ry, mpb_real rz, mpb_real *data,
+				    int nx, int ny, int nz, int stride,
+				    double scaleby,
+				    const mpb_real *udata,
+				    int ukind, double uval);
   void compute_field_squared(void);
   meep::realnum get_material_gradient(meep::realnum u,meep_geom::material_data *md);
   void material_grids_addgradient_point(meep::realnum *v, vector3 p, meep::realnum scalegrad);

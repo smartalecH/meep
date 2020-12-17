@@ -241,7 +241,6 @@ mode_solver::~mode_solver() {
   destroy_maxwell_data(mdata);
   destroy_maxwell_target_data(mtdata);
   destroy_geom_box_tree(geometry_tree);
-  destroy_geom_box_tree(geometry_tree_adjoint);
   destroy_evectmatrix(H);
 
   for (int i = 0; i < nwork_alloc; ++i) {
@@ -2684,24 +2683,22 @@ bool with_hermitian_epsilon() {
 #endif
 }
 
-void mode_solver::compute_field_squared(void)
-{
-     real comp_sum[6]; /* unused */
+void mode_solver::compute_field_squared(void) {
+  real comp_sum[6]; /* unused */
 
-     if (!curfield || !strchr("dhbecv", curfield_type)) {
-          meep::abort("A vector field must be loaded first.\n");
-     }
+  if (!curfield || !strchr("dhbecv", curfield_type)) {
+    meep::abort("A vector field must be loaded first.\n");
+  }
 
-     curfield_type = 'c';  /* force it to just square the field */
-     compute_field_energy_internal(comp_sum);
-     curfield_type = 'R'; /* generic real scalar field */
+  curfield_type = 'c'; /* force it to just square the field */
+  compute_field_energy_internal(comp_sum);
+  curfield_type = 'R'; /* generic real scalar field */
 }
 
 /* Note that the current implementation assumes that
 no materials are isotropic.
 */
 meep::realnum mode_solver::get_material_gradient(meep::realnum u, meep_geom::material_data *md) {
-
 
   const meep_geom::medium_struct *mm = &(md->medium);
   const meep_geom::medium_struct *m1 = &(md->medium_1);
@@ -2711,8 +2708,69 @@ meep::realnum mode_solver::get_material_gradient(meep::realnum u, meep_geom::mat
   return m2->epsilon_diag.x - m1->epsilon_diag.x;
 }
 
+static int mirrorindex(int i, int n) { return i >= n ? 2 * n - 1 - i : (i < 0 ? -1 - i : i); }
+
+void mode_solver::add_interpolate_weights(mpb_real rx, mpb_real ry, mpb_real rz, mpb_real *data, int nx,
+                                    int ny, int nz, int stride, double scaleby,
+                                    const mpb_real *udata, int ukind, double uval) {
+  int x, y, z, x2, y2, z2;
+  mpb_real dx, dy, dz, u;
+
+  /* mirror boundary conditions for r just beyond the boundary */
+  rx = rx < 0.0 ? -rx : (rx > 1.0 ? 1.0 - rx : rx);
+  ry = ry < 0.0 ? -ry : (ry > 1.0 ? 1.0 - ry : ry);
+  rz = rz < 0.0 ? -rz : (rz > 1.0 ? 1.0 - rz : rz);
+
+  /* get the point corresponding to r in the epsilon array grid: */
+  x = mirrorindex(int(rx * nx), nx);
+  y = mirrorindex(int(ry * ny), ny);
+  z = mirrorindex(int(rz * nz), nz);
+
+  /* get the difference between (x,y,z) and the actual point */
+  dx = rx * nx - x - 0.5;
+  dy = ry * ny - y - 0.5;
+  dz = rz * nz - z - 0.5;
+
+  /* get the other closest point in the grid, with mirror boundaries: */
+  x2 = mirrorindex(dx >= 0.0 ? x + 1 : x - 1, nx);
+  y2 = mirrorindex(dy >= 0.0 ? y + 1 : y - 1, ny);
+  z2 = mirrorindex(dz >= 0.0 ? z + 1 : z - 1, nz);
+
+  /* take abs(d{xyz}) to get weights for {xyz} and {xyz}2: */
+  dx = fabs(dx);
+  dy = fabs(dy);
+  dz = fabs(dz);
+
+  /* define a macro to give us data(x,y,z) on the grid,
+     in row-major order (the order used by HDF5): */
+#define D(x, y, z) (data[(((x)*ny + (y)) * nz + (z)) * stride])
+#define U(x, y, z) (udata[(((x)*ny + (y)) * nz + (z)) * stride])
+
+  u = (((U(x, y, z) * (1.0 - dx) + U(x2, y, z) * dx) * (1.0 - dy) +
+        (U(x, y2, z) * (1.0 - dx) + U(x2, y2, z) * dx) * dy) *
+           (1.0 - dz) +
+       ((U(x, y, z2) * (1.0 - dx) + U(x2, y, z2) * dx) * (1.0 - dy) +
+        (U(x, y2, z2) * (1.0 - dx) + U(x2, y2, z2) * dx) * dy) *
+           dz);
+
+  if (ukind == meep_geom::material_data::U_MIN && u != uval) return; // TODO look into this
+  if (ukind == meep_geom::material_data::U_PROD) scaleby *= uval / u;
+
+  D(x, y, z) += (1.0 - dx) * (1.0 - dy) * (1.0 - dz) * scaleby;
+  D(x2, y, z) += dx * (1.0 - dy) * (1.0 - dz) * scaleby;
+  D(x, y2, z) += (1.0 - dx) * dy * (1.0 - dz) * scaleby;
+  D(x2, y2, z) += dx * dy * (1.0 - dz) * scaleby;
+  D(x, y, z2) += (1.0 - dx) * (1.0 - dy) * dz * scaleby;
+  D(x2, y, z2) += dx * (1.0 - dy) * dz * scaleby;
+  D(x, y2, z2) += (1.0 - dx) * dy * dz * scaleby;
+  D(x2, y2, z2) += dx * dy * dz * scaleby;
+
+#undef D
+}
+
 /* Borrowed from meep... which was borrowed from mpb... */
-void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, meep::realnum scalegrad) {
+void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p,
+                                                   meep::realnum scalegrad) {
   geom_box_tree tp;
   int oi, ois;
   meep_geom::material_data *mg, *mg_sum;
@@ -2725,14 +2783,15 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
     meep::master_printf("Geometric object tree has depth %d and %d object nodes"
                         " (vs. %d actual objects)\n",
                         tree_depth, tree_nobjects, geometry.num_items);*/
-  if (tp &&
-      ((meep_geom::material_type)tp->objects[oi].o->material)->which_subclass == meep_geom::material_data::MATERIAL_GRID)
-        mg = (meep_geom::material_data *)tp->objects[oi].o->material;
-  else if (!tp && ((meep_geom::material_type)default_material)->which_subclass == meep_geom::material_data::MATERIAL_GRID)
+  if (tp && ((meep_geom::material_type)tp->objects[oi].o->material)->which_subclass ==
+                meep_geom::material_data::MATERIAL_GRID)
+    mg = (meep_geom::material_data *)tp->objects[oi].o->material;
+  else if (!tp && ((meep_geom::material_type)default_material)->which_subclass ==
+                      meep_geom::material_data::MATERIAL_GRID)
     mg = (meep_geom::material_data *)default_material;
   else
     return; /* no material grids at this point */
-  
+
   // Calculate the number of material grids if we are averaging values
   if ((tp) && ((kind = mg->material_grid_kinds) == meep_geom::material_data::U_SUM)) {
     int matgrid_val_count = 0;
@@ -2746,7 +2805,7 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
     } while (tp_sum && is_material_grid(mg_sum));
     scalegrad /= matgrid_val_count;
   }
-  
+
   // Iterate through grids and add weights as needed
   if (tp) {
     /*NOTE in the future, it may be nice to be able to have *different*
@@ -2765,7 +2824,9 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
     uval = matgrid_val(p, tp, oi, mg);
     do {
       vector3 pb = to_geom_box_coords(p, &tp->objects[oi]);
-      meep_geom::add_interpolate_weights(pb.x, pb.y, pb.z, vcur, sz.x, sz.y, sz.z, 1, get_material_gradient(uval,mg)*scalegrad, ucur, kind, uval);
+      mode_solver::add_interpolate_weights(pb.x, pb.y, pb.z, vcur, sz.x, sz.y, sz.z, 1,
+                                         get_material_gradient(uval, mg) * scalegrad, ucur, kind,
+                                         uval);
       if (kind == meep_geom::material_data::U_DEFAULT) break;
       tp = geom_tree_search_next(p, tp, &oi);
     } while (tp && is_material_grid((meep_geom::material_data *)tp->objects[oi].o->material));
@@ -2777,92 +2838,73 @@ void mode_solver::material_grids_addgradient_point(meep::realnum *v, vector3 p, 
     meep::realnum *vcur = v, *ucur;
     ucur = mg->design_parameters;
     uval = matgrid_val(p, tp, oi, mg);
-    meep_geom::add_interpolate_weights(pb.x, pb.y, pb.z, vcur, sz.x, sz.y, sz.z, 1, get_material_gradient(uval,mg)*scalegrad,ucur, kind, uval);
+    mode_solver::add_interpolate_weights(pb.x, pb.y, pb.z, vcur, sz.x, sz.y, sz.z, 1,
+                                       get_material_gradient(uval, mg) * scalegrad, ucur, kind,
+                                       uval);
     tp = geom_tree_search_next(p, tp, &oi);
   }
 }
 
-void mode_solver::material_grids_addgradient(geometric_object_list geometry, double *v, double scalegrad, int band)
-{
-     int i, j, k, n1, n2, n3, n_other, n_last, rank, last_dim;
-#ifdef HAVE_MPI
-     int local_n2, local_y_start, local_n3;
-#endif
-     real s1, s2, s3, c1, c2, c3;
-     real *Esqr;
+void mode_solver::material_grids_addgradient(geometric_object_list geometry, double *v,
+                                             double scalegrad, int band) {
+  int i, j, k, n1, n2, n3, n_other, n_last, rank, last_dim;
+  real s1, s2, s3, c1, c2, c3;
+  real *Esqr;
 
-     CHECK(band <= num_bands, "addgradient called for uncomputed band");
-     if (band) {
-	  scalegrad *= -freqs[band - 1]/2;
-	  get_efield(band);
-     }
-     compute_field_squared();
-     Esqr = (real *) curfield;
-     scalegrad *= vol / H.N;
+  CHECK(band <= num_bands, "addgradient called for uncomputed band");
+  if (band) {
+    scalegrad *= -freqs[band - 1] / 2;
+    get_efield(band);
+  }
+  compute_field_squared();
+  Esqr = (real *)curfield;
+  scalegrad *= vol / H.N;
 
-     n1 = mdata->nx; n2 = mdata->ny; n3 = mdata->nz;
-     n_other = mdata->other_dims;
-     n_last = mdata->last_dim_size / (sizeof(scalar_complex)/sizeof(scalar));
-     last_dim = mdata->last_dim;
-     rank = (n3 == 1) ? (n2 == 1 ? 1 : 2) : 3;
+  n1 = mdata->nx;
+  n2 = mdata->ny;
+  n3 = mdata->nz;
+  n_other = mdata->other_dims;
+  n_last = mdata->last_dim_size / (sizeof(scalar_complex) / sizeof(scalar));
+  last_dim = mdata->last_dim;
+  rank = (n3 == 1) ? (n2 == 1 ? 1 : 2) : 3;
 
-     s1 = geometry_lattice.size.x / n1;
-     s2 = geometry_lattice.size.y / n2;
-     s3 = geometry_lattice.size.z / n3;
-     c1 = n1 <= 1 ? 0 : geometry_lattice.size.x * 0.5;
-     c2 = n2 <= 1 ? 0 : geometry_lattice.size.y * 0.5;
-     c3 = n3 <= 1 ? 0 : geometry_lattice.size.z * 0.5;
+  s1 = geometry_lattice.size.x / n1;
+  s2 = geometry_lattice.size.y / n2;
+  s3 = geometry_lattice.size.z / n3;
+  c1 = n1 <= 1 ? 0 : geometry_lattice.size.x * 0.5;
+  c2 = n2 <= 1 ? 0 : geometry_lattice.size.y * 0.5;
+  c3 = n3 <= 1 ? 0 : geometry_lattice.size.z * 0.5;
 
-    // Replace 0 with 1e-20 for no size
-    vector3 tmp_size;
-    tmp_size.x = geometry_lattice.size.x == 0 ? 1e-20 : geometry_lattice.size.x;
-    tmp_size.y = geometry_lattice.size.y == 0 ? 1e-20 : geometry_lattice.size.y;
-    tmp_size.z = geometry_lattice.size.z == 0 ? 1e-20 : geometry_lattice.size.z;
+  // Replace 0 with 1e-20 for no size
+  vector3 tmp_size;
+  tmp_size.x = geometry_lattice.size.x == 0 ? 1e-20 : geometry_lattice.size.x;
+  tmp_size.y = geometry_lattice.size.y == 0 ? 1e-20 : geometry_lattice.size.y;
+  tmp_size.z = geometry_lattice.size.z == 0 ? 1e-20 : geometry_lattice.size.z;
 
-    geom_box b0;
-    b0.low = vector3_plus(geometry_center, vector3_scale(-0.5, tmp_size));
-    b0.high = vector3_plus(geometry_center, vector3_scale(0.5, tmp_size));
-    /* pad tree boundaries to allow for sub-pixel averaging */
-    b0.low.x -= tmp_size.x / mdata->nx;
-    b0.low.y -= tmp_size.y / mdata->ny;
-    b0.low.z -= tmp_size.z / mdata->nz;
-    b0.high.x += tmp_size.x / mdata->nx;
-    b0.high.y += tmp_size.y / mdata->ny;
-    b0.high.z += tmp_size.z / mdata->nz;
-    geometry_tree_adjoint = create_geom_box_tree0(geometry, b0);
-    
-    // loop over entire simulation grid
-     LOOP_XYZ(mdata) {
-	       vector3 p;
-	       p.x = i1 * s1 - c1; p.y = i2 * s2 - c2; p.z = i3 * s3 - c3;
-	       material_grids_addgradient_point(v,p,Esqr[xyz_index]*scalegrad);
+  geom_box b0;
+  b0.low = vector3_plus(geometry_center, vector3_scale(-0.5, tmp_size));
+  b0.high = vector3_plus(geometry_center, vector3_scale(0.5, tmp_size));
+  /* pad tree boundaries to allow for sub-pixel averaging */
+  b0.low.x -= tmp_size.x / mdata->nx;
+  b0.low.y -= tmp_size.y / mdata->ny;
+  b0.low.z -= tmp_size.z / mdata->nz;
+  b0.high.x += tmp_size.x / mdata->nx;
+  b0.high.y += tmp_size.y / mdata->ny;
+  b0.high.z += tmp_size.z / mdata->nz;
+  geometry_tree_adjoint = create_geom_box_tree0(geometry, b0);
+  // loop over entire simulation grid
+  int i1, i2, i3;
+  for (i1 = 0; i1 < n1; ++i1)
+    for (i2 = 0; i2 < n2; ++i2)
+      for (i3 = 0; i3 < n3; ++i3) {
+        int xyz_index = ((i1 * n2 + i2) * n3 + i3);
+        vector3 p;
+        p.x = i1 * s1 - c1;
+        p.y = i2 * s2 - c2;
+        p.z = i3 * s3 - c3;
+        material_grids_addgradient_point(v, p, Esqr[xyz_index] * scalegrad);
+      }
 
-#ifndef SCALAR_COMPLEX
-	       {
-		    int last_index;
-#  ifdef HAVE_MPI
-		    if (n3 == 1)
-			 last_index = j + local_y_start;
-		    else
-			 last_index = k;
-#  else
-		    last_index = j;
-#  endif
-
-		    if (last_index != 0 && 2*last_index != last_dim) {
-			 int i1c, i2c, i3c;
-			 i1c = i1 ? (n1 - i1) : 0;
-			 i2c = i2 ? (n2 - i2) : 0;
-			 i3c = i3 ? (n3 - i3) : 0;
-			 p.x = i1c * s1 - c1;
-			 p.y = i2c * s2 - c2;
-			 p.z = i3c * s3 - c3;
-
-			 material_grids_addgradient_point(v,p,Esqr[xyz_index]*scalegrad);
-		    }
-	       }
-#endif /* !SCALAR_COMPLEX */
-
-	}}}
+  destroy_geom_box_tree(geometry_tree_adjoint);
 }
 } // namespace meep_mpb
