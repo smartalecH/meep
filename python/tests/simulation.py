@@ -373,10 +373,10 @@ class TestSimulation(unittest.TestCase):
         mp.output_tot_pwr(sim)
         mp.output_efield(sim)
 
-        eps_arr = sim.get_epsilon()
-        efield_z_arr = sim.get_efield_z()
-        energy_arr = sim.get_tot_pwr()
-        efield_arr = sim.get_efield()
+        eps_arr = sim.get_epsilon(snap=True)
+        efield_z_arr = sim.get_efield_z(snap=True)
+        energy_arr = sim.get_tot_pwr(snap=True)
+        efield_arr = sim.get_efield(snap=True)
 
         fname_fmt = os.path.join(self.temp_dir, 'test_get_array_output-{}-000020.00.h5')
 
@@ -577,9 +577,19 @@ class TestSimulation(unittest.TestCase):
 
     def test_source_slice(self):
         sim = self.init_simple_simulation()
-        sim.run(until=5)
-        slice = sim.get_source(mp.Ez)
-        print(slice)
+        sim.run(until=1)
+
+        vol1d = mp.Volume(center=mp.Vector3(0.1234,0), size=mp.Vector3(0,5.07))
+        source_slice = sim.get_source(mp.Ez, vol=vol1d)
+        x,y,z,w = sim.get_array_metadata(vol=vol1d)
+        self.assertEqual(source_slice.shape, w.shape)
+        self.assertEqual(np.sum(source_slice), 0)
+
+        vol2d = mp.Volume(center=mp.Vector3(-0.541,0.791), size=mp.Vector3(3.5,2.8))
+        source_slice = sim.get_source(mp.Ez, vol=vol2d)
+        x,y,z,w = sim.get_array_metadata(vol=vol2d)
+        self.assertEqual(source_slice.shape, w.shape)
+        self.assertNotEqual(np.sum(source_slice), 0)
 
     def test_has_mu(self):
 
