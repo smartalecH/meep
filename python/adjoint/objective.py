@@ -59,7 +59,7 @@ class EigenmodeCoefficient(ObjectiveQuantitiy):
             elif self.normal_direction == 1:
                 k0 = direction_scalar * mp.Vector3(y=1)
             elif self.normal_direction == 2:
-                k0 == direction_scalar * mp.Vector3(z=1)
+                k0 = direction_scalar * mp.Vector3(z=1)
         else:
             k0 = direction_scalar * self.kpoint_func(self.time_src.frequency,1)
         if dJ.ndim == 2:
