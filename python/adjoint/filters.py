@@ -407,7 +407,8 @@ def harmonic_dilation(x,radius,alpha):
     [1] Svanberg, K., & Svärd, H. (2013). Density filters for topology optimization based on the 
     Pythagorean means. Structural and Multidisciplinary Optimization, 48(5), 859-875.
     '''
-    
+    if radius < 1:
+        return x
     x_hat = 1 / (1 - x + alpha)
     return 1 - 1 / cylindrical_filter(x_hat,radius) + alpha
 
@@ -608,7 +609,11 @@ def indicator_solid(x,c,filter_f,threshold_f,resolution):
     design_field = threshold_f(filtered_field)
     gradient_filtered_field = npj.gradient(filtered_field,resolution)
     #gradient_filtered_field = gradient_filtered_field if isinstance(gradient_filtered_field,list) else [gradient_filtered_field]
-    grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    if gradient_filtered_field.ndim > 1:
+        grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    else:
+        grad_mag = npj.array(gradient_filtered_field)**2
+    
     return design_field * npj.exp(-c * grad_mag)
 
 def constraint_solid(x,c,eta_e,filter_f,threshold_f,resolution=1):
@@ -678,7 +683,10 @@ def indicator_void(x,c,filter_f,threshold_f,resolution):
     design_field = threshold_f(filtered_field)
     gradient_filtered_field = npj.gradient(filtered_field,resolution)
     #gradient_filtered_field = gradient_filtered_field if isinstance(list, gradient_filtered_field) else [gradient_filtered_field]
-    grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    if gradient_filtered_field.ndim > 1:
+        grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    else:
+        grad_mag = npj.array(gradient_filtered_field)**2
     return (1 - design_field) * npj.exp(-c * grad_mag)
 
 def constraint_void(x,c,eta_d,filter_f,threshold_f,resolution=1):
