@@ -3,11 +3,10 @@ General filter functions to be used in other projection and morphological transf
 """
 
 import numpy as np
-import jax
-from jax import numpy as npj
+from autograd import numpy as npj
 import meep as mp
 from scipy import special
-import jax.numpy.fft as fft
+import autograd.numpy.fft as fft
 
 def centered(arr, newshape):
     '''Helper function that reformats the padded array of the fft filter operation.
@@ -47,6 +46,15 @@ def _centered(arr, newshape):
     myslice = [slice(startind[k], endind[k]) for k in range(len(endind))]
     return arr[tuple(myslice)]
 
+def pad_edge(x,npad):
+    ndims = x.ndim
+    start = npj.zeros((ndims,))
+    stop = npj.zeros((ndims,))
+    if ndims == 1:
+        return npj.concatenate((x[0]*npj.ones((npad[0][1],)),x,x[-1]*npj.ones((npad[0][1],))))
+    else:
+        raise NotImplementedError("only 1d supported right now")
+
 def meep_filter(x,kernel):
     '''
     General convolution for 1D, 2D, and 3D design spaces.
@@ -81,8 +89,8 @@ def meep_filter(x,kernel):
     
     # edge pad
     npad = *((s,s) for s in x_shape),
-    kernelp = npj.pad(kernel,npad,mode='edge')
-    xp = npj.pad(x,npad,mode='edge')
+    kernelp = pad_edge(kernel,npad)
+    xp = pad_edge(x,npad)
 
     # convolve
     '''
@@ -96,8 +104,8 @@ def meep_filter(x,kernel):
     to somewhat compensate for this.
     '''
 
-    yp = fft.fftshift(fft.ifftn(fft.fftn(xp) * (fft.fftn(kernelp)))).real
-    yp = npj.flip(fft.fftshift(fft.ifftn(fft.fftn(npj.flip(yp,axis=None)) * fft.fftn(kernelp))).real,axis=None)
+    yp = npj.real(fft.fftshift(fft.ifftn(fft.fftn(xp) * (fft.fftn(kernelp)))))
+    #yp = npj.real(npj.flip(fft.fftshift(fft.ifftn(fft.fftn(npj.flip(yp,axis=None)) * fft.fftn(kernelp))),axis=None))
     
     # remove paddings
     return _centered(yp,x_shape)
@@ -407,7 +415,8 @@ def harmonic_dilation(x,radius,alpha):
     [1] Svanberg, K., & Svärd, H. (2013). Density filters for topology optimization based on the 
     Pythagorean means. Structural and Multidisciplinary Optimization, 48(5), 859-875.
     '''
-    
+    if radius < 1:
+        return x
     x_hat = 1 / (1 - x + alpha)
     return 1 - 1 / cylindrical_filter(x_hat,radius) + alpha
 
@@ -606,9 +615,13 @@ def indicator_solid(x,c,filter_f,threshold_f,resolution):
     
     filtered_field = filter_f(x)
     design_field = threshold_f(filtered_field)
-    gradient_filtered_field = npj.gradient(filtered_field,resolution)
+    gradient_filtered_field = npj.gradient(filtered_field)*resolution
     #gradient_filtered_field = gradient_filtered_field if isinstance(gradient_filtered_field,list) else [gradient_filtered_field]
-    grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    if gradient_filtered_field.ndim > 1:
+        grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    else:
+        grad_mag = npj.array(gradient_filtered_field)**2
+    
     return design_field * npj.exp(-c * grad_mag)
 
 def constraint_solid(x,c,eta_e,filter_f,threshold_f,resolution=1):
@@ -676,9 +689,12 @@ def indicator_void(x,c,filter_f,threshold_f,resolution):
     
     filtered_field = filter_f(x)
     design_field = threshold_f(filtered_field)
-    gradient_filtered_field = npj.gradient(filtered_field,resolution)
+    gradient_filtered_field = npj.gradient(filtered_field)*resolution
     #gradient_filtered_field = gradient_filtered_field if isinstance(list, gradient_filtered_field) else [gradient_filtered_field]
-    grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    if gradient_filtered_field.ndim > 1:
+        grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
+    else:
+        grad_mag = npj.array(gradient_filtered_field)**2
     return (1 - design_field) * npj.exp(-c * grad_mag)
 
 def constraint_void(x,c,eta_d,filter_f,threshold_f,resolution=1):
