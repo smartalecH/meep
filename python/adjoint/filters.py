@@ -48,12 +48,31 @@ def _centered(arr, newshape):
 
 def pad_edge(x,npad):
     ndims = x.ndim
-    start = npj.zeros((ndims,))
-    stop = npj.zeros((ndims,))
     if ndims == 1:
         return npj.concatenate((x[0]*npj.ones((npad[0][1],)),x,x[-1]*npj.ones((npad[0][1],))))
+    elif ndims ==2:
+        # fill sides
+        left = npj.tile(x[0, :], (npad[0][0], 1))  # left side
+        right = npj.tile(x[-1, :], (npad[0][1], 1))  # right side
+        top = npj.tile(x[:, 0], (npad[1][0], 1)).transpose()  # top side
+        bottom = npj.tile(x[:, -1], (npad[1][1], 1)).transpose()  # bottom side)
+
+        # fill corners
+        top_left = npj.tile(x[0, 0], (npad[0][0], npad[1][0]))  # top left
+        top_right = npj.tile(x[-1, 0], (npad[0][1], npad[1][0]))  # top right
+        bottom_left = npj.tile(x[0, -1], (npad[0][0], npad[1][1]))  # bottom left
+        bottom_right = npj.tile(x[-1, -1],
+                                (npad[0][1], npad[1][1]))  # bottom right
+
+        out = npj.concatenate((npj.concatenate(
+            (top_left, top, top_right)), npj.concatenate((left, x, right)),
+                            npj.concatenate(
+                                (bottom_left, bottom, bottom_right))),
+                            axis=1)
+
+        return out
     else:
-        raise NotImplementedError("only 1d supported right now")
+        raise NotImplementedError("only 1d and 2d supported right now")
 
 def meep_filter(x,kernel):
     '''
