@@ -634,7 +634,8 @@ def indicator_solid(x,c,filter_f,threshold_f,resolution):
     
     filtered_field = filter_f(x)
     design_field = threshold_f(filtered_field)
-    gradient_filtered_field = npj.gradient(filtered_field)*resolution
+    gradient_filtered_field = npj.gradient(filtered_field)
+    gradient_filtered_field = npj.array(gradient_filtered_field)*resolution
     #gradient_filtered_field = gradient_filtered_field if isinstance(gradient_filtered_field,list) else [gradient_filtered_field]
     if gradient_filtered_field.ndim > 1:
         grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
@@ -708,8 +709,9 @@ def indicator_void(x,c,filter_f,threshold_f,resolution):
     
     filtered_field = filter_f(x)
     design_field = threshold_f(filtered_field)
-    gradient_filtered_field = npj.gradient(filtered_field)*resolution
+    gradient_filtered_field = npj.gradient(filtered_field)
     #gradient_filtered_field = gradient_filtered_field if isinstance(list, gradient_filtered_field) else [gradient_filtered_field]
+    gradient_filtered_field = npj.array(gradient_filtered_field)*resolution
     if gradient_filtered_field.ndim > 1:
         grad_mag = npj.sum(npj.array(gradient_filtered_field)**2,axis=0)
     else:
