@@ -35,12 +35,14 @@ ADJOINT_TESTS =                                \
     $(TEST_DIR)/test_adjoint_utils.py          \
     $(TEST_DIR)/test_adjoint_cyl.py            \
     $(TEST_DIR)/test_adjoint_protocol.py       \
+    $(TEST_DIR)/test_angular_spectrum.py       \
     $(TEST_DIR)/test_adjoint_jax.py
 
 TESTS =                                        \
     $(TEST_DIR)/test_3rd_harm_1d.py            \
     $(TEST_DIR)/test_absorber_1d.py            \
     $(TEST_DIR)/test_adjoint_protocol.py       \
+    $(TEST_DIR)/test_angular_spectrum.py       \
     $(TEST_DIR)/test_antenna_radiation.py      \
     $(TEST_DIR)/test_array_metadata.py         \
     $(TEST_DIR)/test_bend_flux.py              \
