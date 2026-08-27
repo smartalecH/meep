@@ -28,6 +28,7 @@
 #include "backend/halo_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/step_plan.hpp"
+#include "backend/descriptors.hpp"
 
 using namespace std;
 
@@ -82,6 +83,7 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
   array_catalog = new CpuArrayCatalog;
   storage_plan = new StoragePlan;
   step_plans[0] = step_plans[1] = NULL;
+  descriptors = new DescriptorSet;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -142,6 +144,7 @@ fields::fields(const fields &thef)
   array_catalog = new CpuArrayCatalog;
   storage_plan = new StoragePlan;
   step_plans[0] = step_plans[1] = NULL;
+  descriptors = new DescriptorSet;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -159,6 +162,7 @@ fields::~fields() {
   delete storage_plan;
   delete step_plans[0];
   delete step_plans[1];
+  delete descriptors;
   for (int i = 0; i < num_chunks; i++)
     delete chunks[i];
   delete[] chunks;
