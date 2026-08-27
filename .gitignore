@@ -103,6 +103,9 @@ tests/h5test
 tests/harmonics
 tests/integrate
 tests/known_results
+tests/classification
+tests/classification.log
+tests/classification.trs
 tests/halo_plan
 tests/storage_plan
 tests/storage_plan.log

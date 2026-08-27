@@ -31,30 +31,10 @@ void fields::update_eh(field_type ft, bool skip_w_components) {
   if (ft != E_stuff && ft != H_stuff) meep::abort("update_eh only works with E/H");
   prepare_storage_if_stale(ft); // see the note in fields::step_db
 
-  // split the chunks' volume into subdomains for tiled execution of update_eh loop
-  /* This consumer has moved off `changed_materials` onto the generation
-     comparison; the shadow assertion holds them together until PR 2 deletes
-     the flag. (The re-tiling itself becomes a preparation output in PR 4.) */
-  assert_local_invalidation_shadow(*this, changed_materials, "update_eh retile");
-  for (int i = 0; i < num_chunks; i++)
-    if (chunks[i]->is_mine() && needs_connection_sync(*this)) {
-      bool is_aniso = false;
-      FOR_FT_COMPONENTS(ft, cc) {
-        const direction d_c = component_direction(cc);
-        const direction d_1 = cycle_direction(chunks[i]->gv.dim, d_c, 1);
-        const direction d_2 = cycle_direction(chunks[i]->gv.dim, d_c, 2);
-        if (chunks[i]->s->chi1inv[cc][d_1] && chunks[i]->s->chi1inv[cc][d_2]) {
-          is_aniso = true;
-          break;
-        }
-      }
-      if (!chunks[i]->gvs_eh[ft].empty()) chunks[i]->gvs_eh[ft].clear();
-      if (loop_tile_base_eh > 0 && is_aniso) {
-        split_into_tiles(chunks[i]->gv, &chunks[i]->gvs_eh[ft], loop_tile_base_eh);
-        check_tiles(chunks[i]->gv, chunks[i]->gvs_eh[ft]);
-      }
-      else { chunks[i]->gvs_eh[ft].push_back(chunks[i]->gv); }
-    }
+  /* The gvs_eh tiling used to be recomputed here, as a step-scoped side effect
+     on any step where changed_materials was set. It is a preparation output
+     now: apply_classification() publishes it from the same
+     chi1inv[cc][d_1] && chi1inv[cc][d_2] test. */
 
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
