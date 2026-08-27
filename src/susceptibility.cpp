@@ -630,11 +630,21 @@ void gyrotropic_susceptibility::dump_params(h5file *h5f, size_t *start) {
 
 namespace meep {
 
+/* The Lorentzian family's internal blob is
+     { size_t sz_data; size_t ntot; realnum *P[c][cmp]; realnum *P_prev[c][cmp];
+       realnum data[]; }
+   with P and P_prev laid out consecutively, 2*ntot realnums per (c, cmp) that
+   needs P. Offsets are reported in realnum units from the blob start, which is
+   the convention the halo plans already use for polarization internals.
+
+   Derived from the pointers the object itself computed rather than recomputed
+   from the layout rule: if the two ever disagree, the object is right and this
+   is wrong, and tests/descriptors.cpp asserts they agree. */
 bool lorentzian_susceptibility::internal_layout(std::vector<InternalArrayLayout> &out,
                                                 const grid_volume &gv,
                                                 void *P_internal_data) const {
   out.clear();
-  if (!P_internal_data) return true;
+  if (!P_internal_data) return true; // no state allocated: an empty layout is correct
   lorentzian_data *d = (lorentzian_data *)P_internal_data;
   const realnum *base = (const realnum *)P_internal_data;
   const size_t ntot = gv.ntot();
