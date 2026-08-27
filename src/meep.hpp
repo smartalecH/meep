@@ -1916,6 +1916,11 @@ public:
      set. Preparation is per field type because the lazy allocation it replaces
      was -- see the note in backend/prepare.cpp. */
   uint32_t storage_prepared_mask;
+  /* Classification (src/backend/classification.{hpp,cpp}). Only a change in the
+     hash forces storage to be rebuilt; a material *value* change that leaves
+     every nontrivial array nontrivial reuses everything. */
+  uint64_t prepared_classification_hash;
+  uint32_t classification_reentries;
   uint32_t nonfinite_flag;
   int32_t first_bad_step;
   int32_t first_bad_component;
@@ -2318,6 +2323,7 @@ private:
   void prepare_storage();                        // all four field types
   void prepare_storage_for(field_type ft);       // one field type
   void prepare_storage_if_stale(field_type ft);  // no-op if already prepared
+  void classify_and_finalize();                  // preparation pass 2
   void step_once(); // one timestep; advance(n) calls this n times
   void check_finite_fields();
   void phase_material();
