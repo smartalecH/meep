@@ -14,7 +14,8 @@ $(BACKEND_HDRS)
 # (global rule 5 -- meep.hpp is the SWIG surface).
 BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp \
 backend/array_ref.hpp backend/halo_plan.hpp \
-backend/prepare.hpp backend/storage_plan.hpp backend/classification.hpp
+backend/prepare.hpp backend/storage_plan.hpp backend/classification.hpp \
+backend/step_plan.hpp
 
 libmeep_la_SOURCES = array_slice.cpp anisotropic_averaging.cpp 		\
 bands.cpp boundaries.cpp bicgstab.cpp casimir.cpp 	\
@@ -27,6 +28,7 @@ susceptibility.cpp time.cpp update_eh.cpp mpb.cpp update_pols.cpp 	\
 vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
 backend/lifecycle.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
 backend/prepare.cpp backend/storage_plan.cpp backend/classification.cpp 	\
+backend/step_plan.cpp 	\
 $(HDRS) $(BUILT_SOURCES)
 
 SUBDIRS = support
