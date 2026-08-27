@@ -21,6 +21,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/prepare.hpp"
 
 using namespace std;
 
@@ -75,34 +76,10 @@ bool fields_chunk::update_eh(field_type ft, bool skip_w_components) {
   field_type ft2 = ft == E_stuff ? D_stuff : B_stuff; // for sources etc.
   bool allocated_eh = false;
 
-  bool have_int_sources = false;
-  if (!doing_solve_cw) {
-    for (const src_vol &sv : sources[ft2]) {
-      if (sv.t()->is_integrated) {
-        have_int_sources = true;
-        break;
-      }
-    }
-  }
+  /* f_minus_p used to be allocated -- and deleted -- right here, from
+     have_int_sources and needs_P(). prepare_update_eh() does both now. */
+  assert_update_eh_prepared(*this, ft, skip_w_components);
 
-  FOR_FT_COMPONENTS(ft, ec) {
-    component dc = field_type_component(ft2, ec);
-    DOCMP {
-      bool need_fmp = false;
-      if (f[ec][cmp]) {
-        need_fmp = have_int_sources;
-        for (polarization_state *p = pol[ft]; p && !need_fmp; p = p->next)
-          need_fmp = need_fmp || p->s->needs_P(ec, cmp, f);
-      }
-      if (need_fmp) {
-        if (!f_minus_p[dc][cmp]) f_minus_p[dc][cmp] = new realnum[gv.ntot()];
-      }
-      else if (f_minus_p[dc][cmp]) { // remove unneeded f_minus_p
-        delete[] f_minus_p[dc][cmp];
-        f_minus_p[dc][cmp] = 0;
-      }
-    }
-  }
   bool have_f_minus_p = false;
   FOR_FT_COMPONENTS(ft2, dc) {
     if (f_minus_p[dc][0]) {
@@ -170,30 +147,18 @@ bool fields_chunk::update_eh(field_type ft, bool skip_w_components) {
         direction dsigw0 = d_ec;
         direction dsigw = s->sigsize[dsigw0] > 1 ? dsigw0 : NO_DIRECTION;
 
-        // lazily allocate any E/H fields that are needed (H==B initially)
-        if (i == 0 && f[ec][cmp] == f[dc][cmp] &&
-            (s->chi1inv[ec][d_ec] || have_f_minus_p || dsigw != NO_DIRECTION)) {
-          f[ec][cmp] = new realnum[gv.ntot()];
-          memcpy(f[ec][cmp], f[dc][cmp], gv.ntot() * sizeof(realnum));
-          allocated_eh = true;
-        }
-
-        // lazily allocate W auxiliary field
-        if (i == 0 && !f_w[ec][cmp] && dsigw != NO_DIRECTION) {
-          f_w[ec][cmp] = new realnum[gv.ntot()];
-          memcpy(f_w[ec][cmp], f[ec][cmp], gv.ntot() * sizeof(realnum));
-          if (needs_W_notowned(ec)) allocated_eh = true; // communication needed
-        }
+        /* The E/H split (which breaks the H == B alias), f_w and f_w_prev
+           were all lazily allocated here. prepare_update_eh() realizes them;
+           only the per-step *copy* into f_w_prev remains, since that is a
+           value update rather than an allocation. */
 
         // for solve_cw, when W exists we get W and E from special variables
         if (f_w[ec][cmp] && skip_w_components) continue;
 
         // save W field from this timestep in f_w_prev if needed by pols
-        if (i == 0 && needs_W_prev(ec)) {
-          if (!f_w_prev[ec][cmp]) f_w_prev[ec][cmp] = new realnum[gv.ntot()];
+        if (i == 0 && needs_W_prev(ec))
           memcpy(f_w_prev[ec][cmp], f_w[ec][cmp] ? f_w[ec][cmp] : f[ec][cmp],
                  sizeof(realnum) * gv.ntot());
-        }
 
         if (f[ec][cmp] != f[dc][cmp]) {
           STEP_UPDATE_EDHB(f[ec][cmp], ec, gv, gvs_eh[ft][i].little_owned_corner0(ec),
