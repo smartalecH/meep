@@ -24,6 +24,7 @@
 #include "meep/mympi.hpp"
 #include "meep_internals.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/halo_plan.hpp"
 
 #define UNUSED(x) (void)x // silence compiler warnings
 
@@ -158,6 +159,7 @@ vec fields::lattice_vector(direction d) const { return gv[ilattice_vector(d)]; }
 
 void fields::disconnect_chunks() {
   note_connections_invalidated(*this);
+  halos->clear();
   chunk_connections_valid = false;
   for (int i = 0; i < num_chunks; i++) {
     chunks[i]->connections_in.clear();
@@ -509,18 +511,55 @@ void fields::connect_the_chunks() {
               const bool j_is_mine = chunks[j]->is_mine();
               if (!i_is_mine && !j_is_mine) { continue; }
 
+              /* Every connection is recorded twice: once as the legacy host
+                 pointer, and once as a relocatable (ArrayId, index) reference.
+                 They are emitted from the *same* call so the two cannot drift
+                 apart; the byte-identity test in tests/halo_plan.cpp asserts
+                 that packing from the references reproduces the legacy comm
+                 block exactly. The legacy lists are deleted below this PR's
+                 switchover commit. */
               auto push_back_phase = [this, &thephase, &pair_j_to_i](field_type f) {
+                const std::complex<realnum> ph(thephase.real(), thephase.imag());
                 chunks[pair_j_to_i.second]
                     ->connection_phases[{f, CONNECT_PHASE, pair_j_to_i}]
-                    .push_back(std::complex<realnum>(thephase.real(), thephase.imag()));
+                    .push_back(ph);
+                halos->get_or_create({f, CONNECT_PHASE, pair_j_to_i}).phase_values.push_back(ph);
               };
-              auto push_back_incoming_pointer = [this, &pair_j_to_i](field_type f, connect_phase ip,
-                                                                     realnum *p) {
-                chunks[pair_j_to_i.second]->connections_in[{f, ip, pair_j_to_i}].push_back(p);
+              auto push_back_incoming = [this, &pair_j_to_i](field_type f, connect_phase ip,
+                                                             ArrayId id, ptrdiff_t idx) {
+                chunks[pair_j_to_i.second]->connections_in[{f, ip, pair_j_to_i}].push_back(
+                    halos->arrays.base(id) + idx);
+                halos->get_or_create({f, ip, pair_j_to_i}).scatter.push_back(ElementRef{id, idx});
               };
-              auto push_back_outgoing_pointer = [this, &pair_j_to_i](field_type f, connect_phase ip,
-                                                                     realnum *p) {
-                chunks[pair_j_to_i.first]->connections_out[{f, ip, pair_j_to_i}].push_back(p);
+              auto push_back_outgoing = [this, &pair_j_to_i](field_type f, connect_phase ip,
+                                                             ArrayId id, ptrdiff_t idx) {
+                chunks[pair_j_to_i.first]->connections_out[{f, ip, pair_j_to_i}].push_back(
+                    halos->arrays.base(id) + idx);
+                halos->get_or_create({f, ip, pair_j_to_i}).gather.push_back(ElementRef{id, idx});
+              };
+
+              /* Interning helpers. The f_w case deliberately falls back to the
+                 f key when f_w is absent, so the same storage never gets two
+                 identities -- that would silently break run coalescing. */
+              auto fld = [this](int ch, component cc, int cmp) {
+                return halos->arrays.intern({ch, int(array_role::field), int(cc), cmp, 0},
+                                            chunks[ch]->f[cc][cmp], size_t(chunks[ch]->gv.ntot()),
+                                            array_role::field);
+              };
+              auto wfld = [this, &fld](int ch, component cc, int cmp) {
+                realnum *w = chunks[ch]->f_w[cc][cmp];
+                if (!w) return fld(ch, cc, cmp);
+                return halos->arrays.intern({ch, int(array_role::field), int(cc), cmp, 1}, w,
+                                            size_t(chunks[ch]->gv.ntot()), array_role::field);
+              };
+              /* Polarization internals are an opaque void* blob today, so the
+                 best available identity is (blob, offset from the blob base).
+                 PR 6 makes each built-in susceptibility publish its layout and
+                 replaces this with a typed ArrayRef. */
+              auto polbase = [this](int ch, field_type ftp, int state_idx, void *data) {
+                return halos->arrays.intern(
+                    {ch, int(array_role::polarization), int(ftp), -1, state_idx},
+                    static_cast<realnum *>(data), 0, array_role::polarization);
               };
 
               if (chunks[j]->gv.owns(here) &&
@@ -533,10 +572,10 @@ void fields::connect_the_chunks() {
                   field_type f = type(c);
                   if (i_is_mine) {
                     if (ip == CONNECT_PHASE) { push_back_phase(f); }
-                    DOCMP { push_back_incoming_pointer(f, ip, chunks[i]->f[corig][cmp] + n); }
+                    DOCMP { push_back_incoming(f, ip, fld(i, corig, cmp), n); }
                   }
                   if (j_is_mine) {
-                    DOCMP { push_back_outgoing_pointer(f, ip, chunks[j]->f[c][cmp] + m); }
+                    DOCMP { push_back_outgoing(f, ip, fld(j, c, cmp), m); }
                   }
                 }
 
@@ -544,28 +583,21 @@ void fields::connect_the_chunks() {
                   field_type f = is_electric(corig) ? WE_stuff : WH_stuff;
                   if (i_is_mine) {
                     if (ip == CONNECT_PHASE) { push_back_phase(f); }
-                    DOCMP {
-                      push_back_incoming_pointer(f, ip,
-                                                 (chunks[i]->f_w[corig][cmp]
-                                                      ? chunks[i]->f_w[corig][cmp]
-                                                      : chunks[i]->f[corig][cmp]) +
-                                                     n);
-                    }
+                    DOCMP { push_back_incoming(f, ip, wfld(i, corig, cmp), n); }
                   }
                   if (j_is_mine) {
-                    DOCMP {
-                      push_back_outgoing_pointer(
-                          f, ip,
-                          (chunks[j]->f_w[c][cmp] ? chunks[j]->f_w[c][cmp] : chunks[j]->f[c][cmp]) +
-                              m);
-                    }
+                    DOCMP { push_back_outgoing(f, ip, wfld(j, c, cmp), m); }
                   }
                 }
 
                 if (is_electric(corig) || is_magnetic(corig)) {
                   field_type f = is_electric(corig) ? PE_stuff : PH_stuff;
-                  for (polarization_state *pi = chunks[i]->pol[type(corig)]; pi; pi = pi->next)
-                    for (polarization_state *pj = chunks[j]->pol[type(c)]; pj; pj = pj->next)
+                  int pi_idx = -1;
+                  for (polarization_state *pi = chunks[i]->pol[type(corig)]; pi; pi = pi->next) {
+                    ++pi_idx;
+                    int pj_idx = -1;
+                    for (polarization_state *pj = chunks[j]->pol[type(c)]; pj; pj = pj->next) {
+                      ++pj_idx;
                       if (*pi->s == *pj->s) {
                         polarization_state *po = NULL;
                         if (pi->data && chunks[i]->is_mine())
@@ -574,15 +606,24 @@ void fields::connect_the_chunks() {
                           po = pj;
                         if (po) {
                           const connect_phase iip = CONNECT_COPY;
+                          const ArrayId in_pol =
+                              i_is_mine ? polbase(i, type(corig), pi_idx, pi->data)
+                                        : invalid_array();
+                          const ArrayId out_pol =
+                              j_is_mine ? polbase(j, type(c), pj_idx, pj->data) : invalid_array();
+                          realnum *in_base = static_cast<realnum *>(pi->data);
+                          realnum *out_base = static_cast<realnum *>(pj->data);
                           const size_t ni = po->s->num_internal_notowned_needed(corig, po->data);
                           for (size_t k = 0; k < ni; ++k) {
                             if (i_is_mine) {
-                              push_back_incoming_pointer(
-                                  f, iip, po->s->internal_notowned_ptr(k, corig, n, pi->data));
+                              push_back_incoming(
+                                  f, iip, in_pol,
+                                  po->s->internal_notowned_ptr(k, corig, n, pi->data) - in_base);
                             }
                             if (j_is_mine) {
-                              push_back_outgoing_pointer(
-                                  f, iip, po->s->internal_notowned_ptr(k, c, m, pj->data));
+                              push_back_outgoing(
+                                  f, iip, out_pol,
+                                  po->s->internal_notowned_ptr(k, c, m, pj->data) - out_base);
                             }
                           }
                           const size_t cni = po->s->num_cinternal_notowned_needed(corig, po->data);
@@ -591,20 +632,25 @@ void fields::connect_the_chunks() {
                               if (ip == CONNECT_PHASE) { push_back_phase(f); }
 
                               DOCMP {
-                                push_back_incoming_pointer(
-                                    f, ip,
-                                    po->s->cinternal_notowned_ptr(k, corig, cmp, n, pi->data));
+                                push_back_incoming(
+                                    f, ip, in_pol,
+                                    po->s->cinternal_notowned_ptr(k, corig, cmp, n, pi->data) -
+                                        in_base);
                               }
                             }
                             if (j_is_mine) {
                               DOCMP {
-                                push_back_outgoing_pointer(
-                                    f, ip, po->s->cinternal_notowned_ptr(k, c, cmp, m, pj->data));
+                                push_back_outgoing(
+                                    f, ip, out_pol,
+                                    po->s->cinternal_notowned_ptr(k, c, cmp, m, pj->data) -
+                                        out_base);
                               }
                             }
                           }
                         }
                       }
+                    }
+                  }
                 } // is_electric(corig)
               }   // if is_mine and owns...
             }     // loop over j chunks
@@ -654,6 +700,69 @@ void fields::connect_the_chunks() {
     }
 
     comms_sequence_for_field[f] = optimize_comms_operations(operations);
+  }
+
+  finalize_halo_plans();
+}
+
+/* Fill in everything about a HaloPlan that is not known until every connection
+   has been pushed: its position in the communication block, its peer, and the
+   slab decomposition of its gather/scatter lists. */
+void fields::finalize_halo_plans() {
+  const int interleave = is_real ? 1 : 2;
+
+  FOR_FIELD_TYPES(ft) {
+    for (int i = 0; i < num_chunks; i++)
+      for (int j = 0; j < num_chunks; j++) {
+        const chunk_pair pair{j, i};
+        size_t offset = 0;
+        /* The block layout contract: phases in all_connect_phases declaration
+           order, which is exactly what step_boundaries packs and what
+           process_incoming_chunk_data unpacks. sequence_index records it so
+           the two can be checked against each other instead of merely
+           agreeing by convention. */
+        for (connect_phase ip : all_connect_phases) {
+          const comms_key key{ft, ip, pair};
+          const size_t sz = get_comm_size(key);
+          HaloPlan *p = halos->find(key);
+          if (!sz) {
+            if (p) {
+              p->block_offset = offset;
+              p->block_elements = 0;
+            }
+            continue;
+          }
+          if (!p) p = &halos->get_or_create(key);
+          p->block_offset = offset;
+          p->block_elements = sz;
+          p->peer_rank = chunks[j]->is_mine() ? chunks[i]->n_proc() : chunks[j]->n_proc();
+          p->same_rank = chunks[i]->n_proc() == chunks[j]->n_proc();
+          offset += sz;
+        }
+      }
+  }
+
+  /* Coalesce. The gather and scatter sides are folded independently: a run
+     that is contiguous on the sending chunk need not be contiguous on the
+     receiving one, and vice versa. */
+  for (HaloPlan &p : halos->plans) {
+    /* Polarization internal streams are pushed one real at a time
+       (num_internal_notowned_needed), not as complex pairs, so they must not
+       be de-interleaved as if they were. Fold them as a single stream. */
+    const int iv = (p.ft == PE_stuff || p.ft == PH_stuff) ? 1 : interleave;
+    std::vector<SlabRef> slabs;
+    std::vector<ElementRef> residue;
+    std::vector<HaloSegment> order;
+
+    coalesce_into_slabs(p.gather, iv, slabs, residue, order);
+    p.gather_slabs.swap(slabs);
+    p.gather.swap(residue);
+    p.gather_order.swap(order);
+
+    coalesce_into_slabs(p.scatter, iv, slabs, residue, order);
+    p.scatter_slabs.swap(slabs);
+    p.scatter.swap(residue);
+    p.scatter_order.swap(order);
   }
 }
 

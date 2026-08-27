@@ -12,7 +12,8 @@ $(BACKEND_HDRS)
 
 # Backend-private headers: NOT installed, and never included from meep.hpp
 # (global rule 5 -- meep.hpp is the SWIG surface).
-BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp
+BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp \
+backend/array_ref.hpp backend/halo_plan.hpp
 
 libmeep_la_SOURCES = array_slice.cpp anisotropic_averaging.cpp 		\
 bands.cpp boundaries.cpp bicgstab.cpp casimir.cpp 	\
@@ -23,7 +24,7 @@ multilevel-atom.cpp near2far.cpp output_directory.cpp random.cpp 	\
 sources.cpp step.cpp step_db.cpp stress.cpp structure.cpp structure_dump.cpp		\
 susceptibility.cpp time.cpp update_eh.cpp mpb.cpp update_pols.cpp 	\
 vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
-backend/lifecycle.cpp backend/diagnostics.cpp 	\
+backend/lifecycle.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
 $(HDRS) $(BUILT_SOURCES)
 
 SUBDIRS = support
