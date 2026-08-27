@@ -103,6 +103,25 @@ void fields::step_once() {
      to be selected here. Running the ordinary plan under solve_cw is the one
      failure mode in this stack that produces wrong physics silently rather than
      crashing. */
+  /* The three times the plan's evaluate_source_scalars operations use.
+   *
+   * Written this way on purpose. `time() + 0.5 * dt` expands to
+   * `(double)t * dt + 0.5 * dt`, and GCC may contract the t*dt multiply into
+   * the add; whether it does depends on the surrounding code, and the two
+   * forms differ in the last bit. That is not a stable value to build on -- it
+   * flipped merely from moving the expression, which the bitwise harness
+   * caught as a 1-ULP field difference at a custom source's location.
+   *
+   * Materializing time() into a local forces the product to round, and the
+   * remaining `0.5 * dt` is exact because 0.5 is a power of two, so no
+   * contraction can change the result. These values are now the same on every
+   * compiler and at every optimization level. See the exception note in
+   * ~/meep-phase1-pr5.md. */
+  const double tnow = time();
+  step_source_times[0] = tnow;
+  step_source_times[1] = tnow + 0.5 * dt;
+  step_source_times[2] = tnow + dt;
+
   const bool cw = num_chunks && chunks[0]->is_solving_cw();
   execute_step_plan(step_plan_for(cw ? StepProgram::solve_cw : StepProgram::ordinary),
                     save_synchronized_magnetic_fields);
@@ -352,6 +371,20 @@ void fields_chunk::step_source(field_type ft, bool including_integrated) {
         }
     }
   }
+}
+
+/* The source-scalar evaluation the plan schedules.
+ *
+ * This lives in step.cpp, textually where fields::step_once used to compute it,
+ * and that placement is load-bearing rather than sentimental. `time() + 0.5*dt`
+ * is `(double)t * dt + 0.5 * dt`, and GCC may contract the t*dt multiply into
+ * the add. Whether it does depends on the surrounding code, and the two forms
+ * differ by 1 ULP -- which reaches a custom source's Python callback and shows
+ * up as a 1-ULP field difference at the source point. The bitwise harness
+ * caught exactly that when this expression was evaluated inside the executor's
+ * dispatch loop instead. */
+void fields::evaluate_source_scalars(double offset_in_dt) {
+  calc_sources(step_source_times[offset_in_dt == 0.0 ? 0 : offset_in_dt == 0.5 ? 1 : 2]);
 }
 
 void fields::calc_sources(double tim) {
