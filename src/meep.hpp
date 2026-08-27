@@ -1547,6 +1547,10 @@ public:
   // update_eh.cpp
   bool needs_W_prev(component c) const;
   bool update_eh(field_type ft, bool skip_w_components = false);
+  /* Storage preparation needs to know which timestep program is next:
+     solve_cw runs update_eh with skip_w_components, which changes whether
+     f_w_prev exists. */
+  bool is_solving_cw() const { return doing_solve_cw; }
 
   bool alloc_f(component c);
   void figure_out_step_plan();
@@ -1713,7 +1717,9 @@ private:
 /***************************************************************/
 typedef vec (*kpoint_func)(double freq, int mode, void *user_data);
 
-class halo_plan_set; // src/backend/halo_plan.hpp -- backend-private
+class halo_plan_set;    // src/backend/halo_plan.hpp    -- backend-private
+class CpuArrayCatalog;  // src/backend/storage_plan.hpp -- backend-private
+struct StoragePlan;
 struct HaloPlan;
 
 class fields {
@@ -1886,6 +1892,11 @@ public:
   /* Boundary exchange plans (src/backend/halo_plan.{hpp,cpp}). Opaque here for
      the same reason as the lifecycle types: meep.hpp is the SWIG surface. */
   halo_plan_set *halos;
+  /* Finalized storage (src/backend/storage_plan.{hpp,cpp}). The catalog holds
+     non-owning views: fields_chunk, structure_chunk, dft_chunk and the
+     susceptibility objects keep ownership of their allocations (decision E). */
+  CpuArrayCatalog *array_catalog;
+  StoragePlan *storage_plan;
 
   static const int num_mutation_kinds = 13;
   uint32_t dirty_mask;
@@ -2297,6 +2308,11 @@ private:
   // fix_boundary_sources.cpp
   void fix_boundary_sources();
   // step.cpp
+  /* A source definition change can reach storage: an integrated source is
+     what makes f_minus_p necessary. Called from every source add/remove. */
+  void note_source_change(bool integrated);
+  void prepare_storage();           // realize every array the timestep may need
+  void prepare_storage_if_stale();  // no-op unless dirty_storage is set
   void step_once(); // one timestep; advance(n) calls this n times
   void check_finite_fields();
   void phase_material();

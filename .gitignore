@@ -104,6 +104,9 @@ tests/harmonics
 tests/integrate
 tests/known_results
 tests/halo_plan
+tests/storage_plan
+tests/storage_plan.log
+tests/storage_plan.trs
 tests/halo_plan.log
 tests/halo_plan.trs
 tests/lifecycle
