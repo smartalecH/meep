@@ -1,0 +1,121 @@
+# Bitwise-neutrality gate for the Phase 1 backend-neutral refactor.
+#
+# Phase 1 changes no arithmetic, so every PR in the stack must produce
+# bitwise-identical raw state to its merge base across the configuration
+# matrix in tests/bitwise/configs.py.
+#
+# This workflow is additive: build-ci.yml, build-ci-adjoint.yml, build-san.yml,
+# docs.yml and pre-commit.yml are left unchanged and unconditional, so an
+# outage here cannot mask an ordinary regression.
+#
+# No golden hashes are stored in the repo -- they are not stable across
+# compilers, libc, or HDF5 versions. Both sides are always built here, in the
+# same container, and compared against each other.
+
+name: bitwise-neutrality
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  neutrality:
+    name: bitwise (${{ matrix.precision }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both storage precisions: single-precision has its own rounding, and a
+        # refactor can be neutral in one and not the other.
+        precision: [double, single]
+
+    steps:
+      - name: Check out the PR head
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool gfortran pkg-config swig \
+            libopenmpi-dev openmpi-bin libhdf5-openmpi-dev libfftw3-dev \
+            libfftw3-mpi-dev libgsl-dev libblas-dev liblapack-dev \
+            python3-dev python3-pip python3-numpy python3-scipy
+          python3 -m pip install --upgrade h5py mpi4py
+
+      - name: Build libctl and MPB
+        run: tests/bitwise/ci_build_deps.sh
+
+      - name: Resolve merge base
+        id: base
+        run: echo "sha=$(git merge-base origin/${{ github.base_ref }} HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build both trees and compare
+        env:
+          # Determinism pins (plan section 4). Without these the harness is a
+          # random-failure generator.
+          OMP_NUM_THREADS: "1"
+          MEEP_FINITE_CHECK: step
+          EXTRA_CONFIGURE: >-
+            ${{ matrix.precision == 'single' && '--enable-single' || '' }}
+        run: |
+          set -euo pipefail
+          bash tests/bitwise/ci_compare.sh "${{ steps.base.outputs.sha }}" HEAD
+
+      - name: Upload manifests on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bitwise-manifests-${{ matrix.precision }}
+          path: |
+            /tmp/bitwise/*.json
+            /tmp/bitwise/*.log
+
+  assertions-on:
+    # PRs 3-5 add debug assertions that only have value if something runs with
+    # them enabled, and the PR 1 shadow assertions that hold the new generation
+    # counters against the legacy flags live behind the same switch.
+    name: assertions enabled (NDEBUG off)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool gfortran pkg-config swig \
+            libopenmpi-dev openmpi-bin libhdf5-openmpi-dev libfftw3-dev \
+            libfftw3-mpi-dev libgsl-dev libblas-dev liblapack-dev \
+            python3-dev python3-pip python3-numpy python3-scipy
+          python3 -m pip install --upgrade h5py mpi4py parameterized
+
+      - name: Build libctl and MPB
+        run: tests/bitwise/ci_build_deps.sh
+
+      - name: Configure with assertions on
+        run: |
+          sh autogen.sh --enable-maintainer-mode --enable-shared --with-mpi \
+            --without-scheme --with-python \
+            CXXFLAGS="-O1 -g -UNDEBUG" CFLAGS="-O1 -g -UNDEBUG"
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: C++ suite
+        run: make -C tests check
+
+      - name: Harness matrix (assertions live)
+        env:
+          OMP_NUM_THREADS: "1"
+        run: |
+          PYTHONPATH="$PWD/python:$PYTHONPATH" \
+          LD_LIBRARY_PATH="$PWD/src/.libs:$LD_LIBRARY_PATH" \
+            python3 tests/bitwise/run_matrix.py --out /tmp/assert-matrix.json \
+              --ranks 1 2 --python python3
