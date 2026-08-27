@@ -107,6 +107,9 @@ tests/classification
 tests/classification.log
 tests/classification.trs
 tests/halo_plan
+tests/step_plan
+tests/step_plan.log
+tests/step_plan.trs
 tests/storage_plan
 tests/storage_plan.log
 tests/storage_plan.trs
