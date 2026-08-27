@@ -26,6 +26,8 @@
 #include "backend/diagnostics.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/prepare.hpp"
+#include "backend/storage_plan.hpp"
 
 #include "config.h"
 
@@ -51,6 +53,9 @@ void fields::step() { advance(1); }
    a timestep. */
 void fields::advance(int n) {
   if (n <= 0) return;
+  /* Storage is realized before the loop, never inside it. From here the
+     timestep only executes. */
+  prepare_storage_if_stale();
   const FiniteCheckMode mode = finite_check_mode();
   for (int i = 0; i < n; ++i) {
     step_once();
