@@ -51,9 +51,12 @@ static int failures = 0;
 #define CHECK(cond, ...)                                                                           \
   do {                                                                                             \
     if (!(cond)) {                                                                                 \
-      master_printf("FAIL (%s:%d): ", __FILE__, __LINE__);                                         \
-      master_printf(__VA_ARGS__);                                                                  \
-      master_printf("\n");                                                                         \
+      /* printf, not master_printf: a failure on a non-master rank is exactly  \
+         the interesting kind, and master_printf would swallow it. */          \
+      printf("[rank %d] FAIL (%s:%d): ", my_rank(), __FILE__, __LINE__);                           \
+      printf(__VA_ARGS__);                                                                         \
+      printf("\n");                                                                                \
+      fflush(stdout);                                                                              \
       ++failures;                                                                                  \
     }                                                                                              \
   } while (0)
