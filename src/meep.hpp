@@ -1740,6 +1740,8 @@ class halo_plan_set;    // src/backend/halo_plan.hpp    -- backend-private
 class CpuArrayCatalog;  // src/backend/storage_plan.hpp -- backend-private
 struct StoragePlan;
 struct HaloPlan;
+struct StepPlan;                 // src/backend/step_plan.hpp -- backend-private
+enum class StepProgram;
 
 class fields {
 public:
@@ -1916,6 +1918,11 @@ public:
      susceptibility objects keep ownership of their allocations (decision E). */
   CpuArrayCatalog *array_catalog;
   StoragePlan *storage_plan;
+  /* [0] = ordinary, [1] = solve_cw. Both are rebuilt together: solve_cw is
+     entered and left by flipping doing_solve_cw, and a stale CW plan is the one
+     failure mode in this stack that produces wrong physics rather than a
+     crash. */
+  StepPlan *step_plans[2];
 
   static const int num_mutation_kinds = 12;
   uint32_t dirty_mask;
@@ -2344,6 +2351,9 @@ private:
   void prepare_storage_if_stale(field_type ft);  // no-op if already prepared
   void classify_and_finalize();                  // preparation pass 2
   void step_once(); // one timestep; advance(n) calls this n times
+  const StepPlan &step_plan_for(StepProgram program);
+  void execute_step_plan(const StepPlan &plan, int save_synchronized_magnetic_fields);
+  bool phase_material_mix();
   void check_finite_fields();
   void phase_material();
   void step_db(field_type ft);
