@@ -22,6 +22,7 @@
 #include "backend/lifecycle.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/classification.hpp"
+#include "backend/descriptors.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
@@ -266,6 +267,14 @@ void fields::prepare_storage_for(field_type ft) {
   /* Freeze: the catalog is rebuilt from whatever now exists, and from here the
      timestep is asserted not to allocate. */
   build_storage_catalog(*this, *array_catalog, *storage_plan);
+
+  /* Descriptors are built on the real path, not only in tests. Nothing on CPU
+     reads them, but a descriptor that cannot be built from the live objects is
+     a descriptor that is wrong, and this way the bitwise harness covers their
+     construction too. */
+  build_source_descriptors(*this, descriptors->sources);
+  build_dft_descriptors(*this, descriptors->dfts);
+  build_polarization_descriptors(*this, descriptors->polarizations);
 }
 
 void fields::prepare_storage() {
