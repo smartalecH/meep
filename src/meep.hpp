@@ -25,6 +25,7 @@
 
 #include <stdio.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <math.h>
 
 #include "meep/vec.hpp"
@@ -1870,6 +1871,33 @@ public:
   double last_step_output_wall_time;
   int last_step_output_t;
   void step();
+  /* Advance the simulation by n timesteps. advance(n) is numerically
+     equivalent to n consecutive step() calls; step() is advance(1). */
+  void advance(int n);
+
+  /* --- Lifecycle bookkeeping (src/backend/lifecycle.{hpp,cpp}) ------------
+     These are POD counters only. The MutationKind / DirtyMask types that give
+     them meaning live in the backend-private header src/backend/lifecycle.hpp,
+     which must not be included from meep.hpp (global rule 5: meep.hpp is the
+     SWIG surface). Treat these as internal; use meep::invalidate() rather than
+     writing them directly. */
+  static const int num_mutation_kinds = 11;
+  uint32_t dirty_mask;
+  uint64_t mutation_generation[num_mutation_kinds];
+  /* Shadows `chunk_connections_valid`: connectivity is current iff these two
+     agree. connect_chunks() catches the second up to the first. */
+  uint64_t connections_generation;
+  uint64_t connections_built_generation;
+  /* Shadows `changed_materials`, whose real meaning is "an invalidation that
+     may have happened on only some ranks is pending, so connect_chunks() needs
+     a collective and_to_all first". */
+  uint64_t local_invalidation_generation;
+  uint64_t local_invalidation_synced;
+  /* CPU realization of backend/diagnostics.hpp's DiagnosticBlock. Stored as
+     POD here so the struct itself stays out of the SWIG surface. */
+  uint32_t nonfinite_flag;
+  int32_t first_bad_step;
+  int32_t first_bad_component;
 
   // when comparing times, e.g. for source cutoffs, it
   // is useful to round to float to avoid gratuitous sensitivity
@@ -2257,6 +2285,8 @@ private:
   // fix_boundary_sources.cpp
   void fix_boundary_sources();
   // step.cpp
+  void step_once(); // one timestep; advance(n) calls this n times
+  void check_finite_fields();
   void phase_material();
   void step_db(field_type ft);
   void step_source(field_type ft, bool including_integrated = false);

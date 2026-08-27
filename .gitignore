@@ -103,6 +103,9 @@ tests/h5test
 tests/harmonics
 tests/integrate
 tests/known_results
+tests/lifecycle
+tests/lifecycle.log
+tests/lifecycle.trs
 tests/near2far
 tests/one_dimensional
 tests/physical

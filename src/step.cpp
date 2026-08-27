@@ -23,6 +23,8 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/diagnostics.hpp"
+#include "backend/lifecycle.hpp"
 
 #include "config.h"
 
@@ -32,7 +34,45 @@ using namespace std;
 
 namespace meep {
 
-void fields::step() {
+void fields::step() { advance(1); }
+
+/* advance(n) is numerically equivalent to n consecutive step() calls: the
+   per-step body below is untouched, and the only thing that moves is *when*
+   the non-finite check runs (see backend/diagnostics.hpp).
+
+   The plan also suggests hoisting the wall-time progress report and the
+   am_now_working_on(Stepping) scope out of the per-step body. We deliberately
+   do not: the Stepping scope currently closes *before* the magnetic re-synch
+   and the finite check, so hoisting it would re-attribute those to Stepping,
+   and hoisting the progress report would change its cadence for n > 1. Both
+   are ruled out by the stronger requirement that timing scopes and progress
+   output stay identical. The per-iteration cost of both is negligible next to
+   a timestep. */
+void fields::advance(int n) {
+  if (n <= 0) return;
+  const FiniteCheckMode mode = finite_check_mode();
+  for (int i = 0; i < n; ++i) {
+    step_once();
+    if (mode == FiniteCheckMode::step) check_finite_fields();
+  }
+  if (mode == FiniteCheckMode::batch) check_finite_fields();
+}
+
+/* The same center-point read fields::step has always performed. A per-voxel
+   diagnostic would mean touching STEP_* (global rule 6) and would regress CPU
+   performance; the device-native version is Phase 2 (decision D). */
+void fields::check_finite_fields() {
+  if (!std::isfinite(get_field(D_EnergyDensity, gv.center(), false))) {
+    if (!nonfinite_flag) {
+      nonfinite_flag = 1;
+      first_bad_step = t;
+      first_bad_component = int(D_EnergyDensity);
+    }
+    meep::abort("simulation fields are NaN or Inf");
+  }
+}
+
+void fields::step_once() {
   // however many times the fields have been synched, we want to restore now
   int save_synchronized_magnetic_fields = synchronized_magnetic_fields;
   if (synchronized_magnetic_fields) {
@@ -133,9 +173,8 @@ void fields::step() {
   }
 
   changed_materials = false; // any material changes were handled in connect_chunks()
-
-  if (!std::isfinite(get_field(D_EnergyDensity, gv.center(), false)))
-    meep::abort("simulation fields are NaN or Inf");
+  note_connection_sync_done(*this);
+  assert_local_invalidation_shadow(*this, changed_materials, "step_once end");
 }
 
 void fields::phase_material() {

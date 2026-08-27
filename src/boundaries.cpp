@@ -23,6 +23,7 @@
 #include "meep.hpp"
 #include "meep/mympi.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 
 #define UNUSED(x) (void)x // silence compiler warnings
 
@@ -83,6 +84,8 @@ void fields::set_boundary(boundary_side b, direction d, boundary_condition cond)
     if (cond == Periodic || boundaries[1 - b][d] == Periodic) boundaries[1 - b][d] = cond;
     // we don't need to call sync_chunk_connections() since set_boundary()
     // should always be called on every process
+    invalidate(*this, MutationKind::boundary_topology);
+    note_connections_invalidated(*this);
     chunk_connections_valid = false;
   }
 }
@@ -109,6 +112,8 @@ void fields::use_bloch(direction d, complex<double> kk) {
   sinkna[d] = imag(eikna[d]);
   if (is_real && kk != 0.0) // FIXME: allow real phases (c.f. CONNECT_PHASE)
     meep::abort("Can't use real fields with bloch boundary conditions!\n");
+  invalidate(*this, MutationKind::boundary_topology);
+  note_connections_invalidated(*this);
   chunk_connections_valid = false; // FIXME: we don't always need to invalidate
 }
 
@@ -152,6 +157,7 @@ ivec fields::ilattice_vector(direction d) const {
 vec fields::lattice_vector(direction d) const { return gv[ilattice_vector(d)]; }
 
 void fields::disconnect_chunks() {
+  note_connections_invalidated(*this);
   chunk_connections_valid = false;
   for (int i = 0; i < num_chunks; i++) {
     chunks[i]->connections_in.clear();
@@ -174,20 +180,30 @@ void fields::sync_chunk_connections() {
   /* make sure all processes agree on chunk_connections_valid to avoid deadlocks
      when we eventually call connect_chunks */
   am_now_working_on(MpiAllTime);
+  const bool was_valid = chunk_connections_valid;
   chunk_connections_valid = and_to_all(chunk_connections_valid);
   finished_working();
+  /* Another rank invalidated while we did not: mirror that into our own
+     connection generation so the shadow stays exact. */
+  if (was_valid && !chunk_connections_valid) note_connections_invalidated(*this);
+  /* Deliberately NOT note_connection_sync_done() here: the legacy
+     `changed_materials` flag stays set until the end of the timestep, so
+     clearing the shadow now would desynchronize it. step_once() clears both. */
 }
 
 void fields::connect_chunks() {
   // might have invalidated connections in step_db, update_eh, or update_pols:
+  assert_local_invalidation_shadow(*this, changed_materials, "connect_chunks");
   if (changed_materials) sync_chunk_connections();
 
+  assert_connections_shadow(*this, chunk_connections_valid, "connect_chunks");
   if (!chunk_connections_valid) {
     am_now_working_on(Connecting);
     disconnect_chunks();
     find_metals();
     connect_the_chunks();
     finished_working();
+    note_connections_built(*this);
     chunk_connections_valid = true;
   }
 }

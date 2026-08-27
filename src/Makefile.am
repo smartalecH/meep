@@ -7,7 +7,12 @@ AM_CPPFLAGS = -I$(top_srcdir)/src
 BUILT_SOURCES = sphere-quad.h step_generic_stride1.cpp meep/meep-config.h
 
 HDRS = meep.hpp meep_internals.hpp meep/mympi.hpp meep/vec.hpp	\
-bicgstab.hpp meepgeom.hpp material_data.hpp adjust_verbosity.hpp
+bicgstab.hpp meepgeom.hpp material_data.hpp adjust_verbosity.hpp	\
+$(BACKEND_HDRS)
+
+# Backend-private headers: NOT installed, and never included from meep.hpp
+# (global rule 5 -- meep.hpp is the SWIG surface).
+BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp
 
 libmeep_la_SOURCES = array_slice.cpp anisotropic_averaging.cpp 		\
 bands.cpp boundaries.cpp bicgstab.cpp casimir.cpp 	\
@@ -17,7 +22,9 @@ initialize.cpp integrate.cpp integrate2.cpp material_data.cpp monitor.cpp mympi.
 multilevel-atom.cpp near2far.cpp output_directory.cpp random.cpp 	\
 sources.cpp step.cpp step_db.cpp stress.cpp structure.cpp structure_dump.cpp		\
 susceptibility.cpp time.cpp update_eh.cpp mpb.cpp update_pols.cpp 	\
-vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp $(HDRS) $(BUILT_SOURCES)
+vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
+backend/lifecycle.cpp backend/diagnostics.cpp 	\
+$(HDRS) $(BUILT_SOURCES)
 
 SUBDIRS = support
 libmeep_la_LIBADD = support/libsupport.la

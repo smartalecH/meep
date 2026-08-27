@@ -22,6 +22,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 #include "config.h"
 
 using namespace std;
@@ -32,8 +33,11 @@ void fields::update_pols(field_type ft) {
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
       if (chunks[i]->update_pols(ft)) {
+        invalidate(*this, MutationKind::field_layout);
+        note_connections_invalidated(*this);
         chunk_connections_valid = false;
         assert(changed_materials);
+        assert(needs_connection_sync(*this));
       }
 }
 

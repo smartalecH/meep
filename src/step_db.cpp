@@ -23,6 +23,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 
 #define RESTRICT
 
@@ -36,8 +37,13 @@ void fields::step_db(field_type ft) {
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
       if (chunks[i]->step_db(ft)) {
+        /* Rank-local lazy allocation. changed_materials must already be set by
+           whoever caused it, so that connect_chunks() runs its and_to_all. */
+        invalidate(*this, MutationKind::field_layout);
+        note_connections_invalidated(*this);
         chunk_connections_valid = false;
         assert(changed_materials);
+        assert(needs_connection_sync(*this));
       }
 }
 

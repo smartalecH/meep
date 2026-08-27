@@ -20,6 +20,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 
 using namespace std;
 
@@ -29,8 +30,12 @@ void fields::update_eh(field_type ft, bool skip_w_components) {
   if (ft != E_stuff && ft != H_stuff) meep::abort("update_eh only works with E/H");
 
   // split the chunks' volume into subdomains for tiled execution of update_eh loop
+  /* This consumer has moved off `changed_materials` onto the generation
+     comparison; the shadow assertion holds them together until PR 2 deletes
+     the flag. (The re-tiling itself becomes a preparation output in PR 4.) */
+  assert_local_invalidation_shadow(*this, changed_materials, "update_eh retile");
   for (int i = 0; i < num_chunks; i++)
-    if (chunks[i]->is_mine() && changed_materials) {
+    if (chunks[i]->is_mine() && needs_connection_sync(*this)) {
       bool is_aniso = false;
       FOR_FT_COMPONENTS(ft, cc) {
         const direction d_c = component_direction(cc);
@@ -52,8 +57,11 @@ void fields::update_eh(field_type ft, bool skip_w_components) {
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
       if (chunks[i]->update_eh(ft, skip_w_components)) {
+        invalidate(*this, MutationKind::field_layout);
+        note_connections_invalidated(*this);
         chunk_connections_valid = false; // E/H allocated - reconnect chunks
         assert(changed_materials);
+        assert(needs_connection_sync(*this));
       }
 }
 
