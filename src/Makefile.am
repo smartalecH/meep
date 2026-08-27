@@ -15,7 +15,8 @@ $(BACKEND_HDRS)
 BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp \
 backend/random_state.hpp backend/array_ref.hpp backend/halo_plan.hpp \
 backend/prepare.hpp backend/storage_plan.hpp backend/classification.hpp \
-backend/step_plan.hpp
+backend/step_plan.hpp backend/region_plan.hpp \
+backend/descriptors.hpp
 
 libmeep_la_SOURCES = array_slice.cpp anisotropic_averaging.cpp 		\
 bands.cpp boundaries.cpp bicgstab.cpp casimir.cpp 	\
@@ -29,6 +30,7 @@ vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
 backend/lifecycle.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
 backend/prepare.cpp backend/storage_plan.cpp backend/classification.cpp 	\
 backend/step_plan.cpp backend/cpu/cpu_executor.cpp 	\
+backend/descriptors.cpp 	\
 $(HDRS) $(BUILT_SOURCES)
 
 SUBDIRS = support

@@ -22,6 +22,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/region_plan.hpp"
 
 /* This file contains a generic function for looping over all of the
    points in all of the chunks that intersect some given grid_volume.  This
@@ -336,8 +337,20 @@ void compute_boundary_weights(grid_volume gv, const volume &where, ivec &is, ive
    (min = max) dimensions of WHERE, instead of interpolating, we
    "snap" them to the nearest grid point.  */
 
-void fields::loop_in_chunks(field_chunkloop chunkloop, void *chunkloop_data, const volume &where,
-                            component cgrid, bool use_symmetry, bool snap_empty_dimensions) {
+/* The single implementation of the chunk-region rules.
+ *
+ * This used to be fields::loop_in_chunks, which computed all of this and then
+ * immediately invoked a callback. The geometry is untouched -- every line below
+ * is the original -- and the only change is that the region is handed to
+ * `emit` instead of to a field_chunkloop. Both the legacy callback path and
+ * prepare_loop_in_chunks() go through here, so there is exactly one copy of the
+ * rules.
+ *
+ * A template rather than a std::function so the legacy path pays nothing and
+ * does not have to materialize a temporary vector. */
+template <typename Emit>
+void fields::enumerate_chunk_regions(const volume &where, component cgrid, bool use_symmetry,
+                                     bool snap_empty_dimensions, Emit emit) {
   if (coordinate_mismatch(gv.dim, cgrid))
     meep::abort("Invalid fields::loop_in_chunks grid type %s for dimensions %s\n",
                 component_name(cgrid), dimension_name(gv.dim));
@@ -512,8 +525,18 @@ void fields::loop_in_chunks(field_chunkloop chunkloop, void *chunkloop_data, con
             dV0 *= 2 * pi * fabs((S.transform(chunks[i]->gv[isc], sn) + shift).in_direction(R));
           }
 
-          chunkloop(chunks[i], i, cS, isc, iec, s0c, s1c, e0c, e1c, dV0, dV1, shifti, ph, S, sn,
-                    chunkloop_data);
+          ChunkLoopRegion region;
+          region.chunk = i;
+          region.transformed_grid_component = cS;
+          region.begin = isc;
+          region.end = iec;
+          region.weights = BoundaryWeights(s0c, s1c, e0c, e1c);
+          region.dV0 = dV0;
+          region.dV1 = dV1;
+          region.lattice_shift = shifti;
+          region.phase = ph;
+          region.symmetry_index = sn;
+          emit(region);
           int loop_vol = 1;
           LOOP_OVER_DIRECTIONS(gv.dim, d) {
             loop_vol *= (iec.in_direction(d) - isc.in_direction(d)) / 2 + 1;
@@ -531,10 +554,36 @@ void fields::loop_in_chunks(field_chunkloop chunkloop, void *chunkloop_data, con
       }
     } while (ishift != min_ishift);
   }
+  /* Collective, and the only existing detector for symmetry/periodicity
+     planning bugs. prepare_loop_in_chunks() inherits it, which is why region
+     planning has to be entered on every rank. Do not drop it. */
   int vol_sum_all = sum_to_all(vol_sum);
   if (use_symmetry && vol_sum_all != original_vol)
     master_printf("WARNING vol mismatch:, original_vol %i, looped vol_sum %i \n", original_vol,
                   vol_sum_all);
+}
+
+/* Compatibility adapter: recovers the fields_chunk * and the symmetry from
+   `fields` and calls the legacy callback with the identical argument tuple, in
+   the identical order. tests/region_plan.cpp records that tuple and asserts the
+   sequence is unchanged. */
+void fields::loop_in_chunks(field_chunkloop chunkloop, void *chunkloop_data, const volume &where,
+                            component cgrid, bool use_symmetry, bool snap_empty_dimensions) {
+  enumerate_chunk_regions(where, cgrid, use_symmetry, snap_empty_dimensions,
+                          [&](const ChunkLoopRegion &r) {
+                            chunkloop(chunks[r.chunk], r.chunk, r.transformed_grid_component,
+                                      r.begin, r.end, r.weights.s0, r.weights.s1, r.weights.e0,
+                                      r.weights.e1, r.dV0, r.dV1, r.lattice_shift, r.phase, S,
+                                      r.symmetry_index, chunkloop_data);
+                          });
+}
+
+ChunkLoopPlan prepare_loop_in_chunks(fields &f, const volume &where, component cgrid,
+                                     bool use_symmetry, bool snap_empty_dimensions) {
+  ChunkLoopPlan plan;
+  f.enumerate_chunk_regions(where, cgrid, use_symmetry, snap_empty_dimensions,
+                            [&](const ChunkLoopRegion &r) { plan.regions.push_back(r); });
+  return plan;
 }
 
 } // namespace meep
