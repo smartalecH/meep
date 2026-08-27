@@ -119,6 +119,8 @@ void lifecycle_init(fields &f) {
   f.local_invalidation_generation = 0;
   f.local_invalidation_synced = 0;
   f.storage_prepared_mask = 0;
+  f.prepared_classification_hash = 0;
+  f.classification_reentries = 0;
   f.nonfinite_flag = 0;
   f.first_bad_step = -1;
   f.first_bad_component = -1;
