@@ -1714,6 +1714,8 @@ private:
 /***************************************************************/
 typedef vec (*kpoint_func)(double freq, int mode, void *user_data);
 
+class halo_plan_set; // src/backend/halo_plan.hpp -- backend-private
+
 class fields {
 public:
   int num_chunks;
@@ -1881,6 +1883,10 @@ public:
      which must not be included from meep.hpp (global rule 5: meep.hpp is the
      SWIG surface). Treat these as internal; use meep::invalidate() rather than
      writing them directly. */
+  /* Boundary exchange plans (src/backend/halo_plan.{hpp,cpp}). Opaque here for
+     the same reason as the lifecycle types: meep.hpp is the SWIG surface. */
+  halo_plan_set *halos;
+
   static const int num_mutation_kinds = 13;
   uint32_t dirty_mask;
   uint64_t mutation_generation[num_mutation_kinds];
@@ -2277,6 +2283,7 @@ private:
   void connect_chunks();
   void sync_chunk_connections();
   void connect_the_chunks(); // Intended to be ultra-private...
+  void finalize_halo_plans();
   bool on_metal_boundary(const ivec &);
   ivec ilattice_vector(direction) const;
   bool locate_point_in_user_volume(ivec *, std::complex<double> *phase) const;
