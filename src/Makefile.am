@@ -28,7 +28,7 @@ susceptibility.cpp time.cpp update_eh.cpp mpb.cpp update_pols.cpp 	\
 vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
 backend/lifecycle.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
 backend/prepare.cpp backend/storage_plan.cpp backend/classification.cpp 	\
-backend/step_plan.cpp 	\
+backend/step_plan.cpp backend/cpu/cpu_executor.cpp 	\
 $(HDRS) $(BUILT_SOURCES)
 
 SUBDIRS = support
