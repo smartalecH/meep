@@ -1912,6 +1912,10 @@ public:
   uint64_t local_invalidation_synced;
   /* CPU realization of backend/diagnostics.hpp's DiagnosticBlock. Stored as
      POD here so the struct itself stays out of the SWIG surface. */
+  /* Bit per field_type: which have been prepared since dirty_storage was last
+     set. Preparation is per field type because the lazy allocation it replaces
+     was -- see the note in backend/prepare.cpp. */
+  uint32_t storage_prepared_mask;
   uint32_t nonfinite_flag;
   int32_t first_bad_step;
   int32_t first_bad_component;
@@ -2311,8 +2315,9 @@ private:
   /* A source definition change can reach storage: an integrated source is
      what makes f_minus_p necessary. Called from every source add/remove. */
   void note_source_change(bool integrated);
-  void prepare_storage();           // realize every array the timestep may need
-  void prepare_storage_if_stale();  // no-op unless dirty_storage is set
+  void prepare_storage();                        // all four field types
+  void prepare_storage_for(field_type ft);       // one field type
+  void prepare_storage_if_stale(field_type ft);  // no-op if already prepared
   void step_once(); // one timestep; advance(n) calls this n times
   void check_finite_fields();
   void phase_material();
