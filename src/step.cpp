@@ -55,7 +55,6 @@ void fields::advance(int n) {
   if (n <= 0) return;
   /* Storage is realized before the loop, never inside it. From here the
      timestep only executes. */
-  prepare_storage_if_stale();
   const FiniteCheckMode mode = finite_check_mode();
   for (int i = 0; i < n; ++i) {
     step_once();
