@@ -1928,6 +1928,10 @@ public:
      every nontrivial array nontrivial reuses everything. */
   uint64_t prepared_classification_hash;
   uint32_t classification_reentries;
+  /* The three source-evaluation times for the current step, computed in
+     step_once. See the note there: moving these expressions changes their FP
+     contraction and therefore their last bit. */
+  double step_source_times[3];
   uint32_t nonfinite_flag;
   int32_t first_bad_step;
   int32_t first_bad_component;
@@ -2335,6 +2339,7 @@ private:
   const StepPlan &step_plan_for(StepProgram program);
   void execute_step_plan(const StepPlan &plan, int save_synchronized_magnetic_fields);
   bool phase_material_mix();
+  void evaluate_source_scalars(double offset_in_dt);
   void check_finite_fields();
   void phase_material();
   void step_db(field_type ft);
