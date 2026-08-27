@@ -3,7 +3,7 @@ convergence_cyl_waveguide.cpp cylindrical.cpp dump_load.cpp flux.cpp    \
 harmonics.cpp integrate.cpp known_results.cpp near2far.cpp              \
 one_dimensional.cpp physical.cpp stress_tensor.cpp symmetry.cpp 	\
 three_d.cpp two_dimensional.cpp 2D_convergence.cpp h5test.cpp pml.cpp \
-lifecycle.cpp random-state.cpp halo_plan.cpp
+lifecycle.cpp random-state.cpp halo_plan.cpp storage_plan.cpp
 
 # The bitwise-neutrality harness (plan section 4) is Python, and is driven by
 # CI rather than by `make check`: it needs two builds to compare.
@@ -19,7 +19,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/src -DDATADIR=\"$(srcdir)/\"
 
 .SUFFIXES = .dac .done
 
-check_PROGRAMS = lifecycle random-state-lazy-default random-state-initial-restore random-state-initial-set random-state-transitions halo_plan aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml pw-source-ll ring-ll cyl-ellipsoid-ll absorber-1d-ll array-slice-ll user-defined-material dft-fields bend-flux-ll array-metadata
+check_PROGRAMS = lifecycle random-state-lazy-default random-state-initial-restore random-state-initial-set random-state-transitions halo_plan storage_plan aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml pw-source-ll ring-ll cyl-ellipsoid-ll absorber-1d-ll array-slice-ll user-defined-material dft-fields bend-flux-ll array-metadata
 
 array_metadata_SOURCES = array-metadata.cpp
 array_metadata_LDADD   = $(MEEPLIBS)
@@ -45,6 +45,9 @@ random_state_transitions_LDADD = $(MEEPLIBS)
 
 halo_plan_SOURCES = halo_plan.cpp
 halo_plan_LDADD = $(MEEPLIBS)
+
+storage_plan_SOURCES = storage_plan.cpp
+storage_plan_LDADD = $(MEEPLIBS)
 
 aniso_disp_SOURCES = aniso_disp.cpp
 aniso_disp_LDADD = $(MEEPLIBS)
@@ -132,7 +135,7 @@ user_defined_material_LDADD   = $(MEEPLIBS)
 
 dist_noinst_DATA = cyl-ellipsoid-eps-ref.h5 array-slice-ll-ref.h5
 
-TESTS = lifecycle random-state-lazy-default random-state-initial-restore random-state-initial-set random-state-transitions halo_plan aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml
+TESTS = lifecycle random-state-lazy-default random-state-initial-restore random-state-initial-set random-state-transitions halo_plan storage_plan aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml
 
 if WITH_MPI
   LOG_COMPILER = $(RUNCODE)
