@@ -78,14 +78,9 @@ void fields::execute_step_plan(const StepPlan &plan, int save_synchronized_magne
         break;
 
       case OpKind::evaluate_source_scalars:
-        /* The offsets are written exactly as step_once wrote them; 0.5 * dt and
-           dt are not interchangeable expressions for a bitwise comparison. */
-        if (op.source_time_offset == 0.0)
-          calc_sources(time());
-        else if (op.source_time_offset == 0.5)
-          calc_sources(time() + 0.5 * dt);
-        else
-          calc_sources(time() + dt);
+        /* Deliberately a call into step.cpp rather than the expression inline
+           here -- see the comment on fields::evaluate_source_scalars. */
+        evaluate_source_scalars(op.source_time_offset);
         break;
 
       case OpKind::update_db: {
