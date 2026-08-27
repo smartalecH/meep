@@ -25,6 +25,7 @@
 #include "meep_internals.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/halo_plan.hpp"
 
 #include "config.h"
 
@@ -208,56 +209,100 @@ void fields_chunk::phase_material(int phasein_time) {
   }
 }
 
+/* Walks one side of a HaloPlan in communication-block order, yielding the
+   address of each real. Kept as an explicit cursor rather than materializing a
+   pointer vector: this runs every timestep, and the whole point of the plan is
+   that it does not carry addresses around. */
+namespace {
+class side_cursor {
+public:
+  side_cursor(const HaloArrayTable &tbl, const std::vector<SlabRef> &slabs,
+              const std::vector<ElementRef> &residue, const std::vector<HaloSegment> &order)
+      : tbl_(tbl), slabs_(slabs), residue_(residue), order_(order) {}
+
+  realnum *next() {
+    while (seg_ < order_.size()) {
+      const HaloSegment &g = order_[seg_];
+      if (g.nslabs) {
+        if (k_ < g.count) {
+          const SlabRef &sl = slabs_[g.first_slab + s_];
+          realnum *p = tbl_.base(sl.array) + sl.base + ptrdiff_t(k_) * sl.strides[0];
+          if (++s_ == g.nslabs) {
+            s_ = 0;
+            ++k_;
+          }
+          return p;
+        }
+      }
+      else if (rk_ < g.residue) {
+        const ElementRef &e = residue_[r_++];
+        ++rk_;
+        return tbl_.base(e.array) + e.index;
+      }
+      ++seg_;
+      k_ = 0;
+      s_ = 0;
+      rk_ = 0;
+    }
+    return NULL;
+  }
+
+private:
+  const HaloArrayTable &tbl_;
+  const std::vector<SlabRef> &slabs_;
+  const std::vector<ElementRef> &residue_;
+  const std::vector<HaloSegment> &order_;
+  size_t seg_ = 0, r_ = 0;
+  uint32_t k_ = 0, s_ = 0, rk_ = 0;
+};
+} // namespace
+
+void fields::unpack_halo(const HaloPlan &p, const realnum *block) {
+  if (!p.block_elements) return;
+  side_cursor cur(halos->arrays, p.scatter_slabs, p.scatter, p.scatter_order);
+  const realnum *in = block + p.block_offset;
+
+  switch (p.phase) {
+    case CONNECT_PHASE: {
+      const size_t num_transfers = p.block_elements / 2; // two realnums per complex
+      for (size_t n = 0; n < num_transfers; ++n) {
+        /* Reproduce the legacy expression exactly: phase * complex(re, im),
+           in that association. Any reassociation loses bit-identity. */
+        std::complex<realnum> temp =
+            p.phase_values[n] * std::complex<realnum>(in[2 * n], in[2 * n + 1]);
+        realnum *re = cur.next();
+        realnum *im = cur.next();
+        *re = temp.real();
+        *im = temp.imag();
+      }
+      break;
+    }
+    case CONNECT_NEGATE:
+      for (size_t n = 0; n < p.block_elements; ++n)
+        *cur.next() = -in[n];
+      break;
+    case CONNECT_COPY:
+      for (size_t n = 0; n < p.block_elements; ++n)
+        *cur.next() = in[n];
+      break;
+  }
+}
+
+void fields::pack_halo(const HaloPlan &p, realnum *block) {
+  if (!p.block_elements) return;
+  side_cursor cur(halos->arrays, p.gather_slabs, p.gather, p.gather_order);
+  realnum *out = block + p.block_offset;
+  for (size_t n = 0; n < p.block_elements; ++n)
+    out[n] = *cur.next();
+}
+
 void fields::process_incoming_chunk_data(field_type ft, const chunk_pair &comm_pair) {
   am_now_working_on(Boundaries);
-  int this_chunk_idx = comm_pair.second;
-  const int pair_idx = chunk_pair_to_index(comm_pair);
-  const realnum *pair_comm_block = static_cast<realnum *>(comm_blocks[ft][pair_idx]);
-
-  {
-    const comms_key key = {ft, CONNECT_PHASE, comm_pair};
-    size_t num_transfers = get_comm_size(key) / 2; // Two realnums per complex
-    if (num_transfers) {
-      const std::vector<realnum *> &incoming_connection =
-          chunks[this_chunk_idx]->connections_in.at(key);
-      const std::vector<std::complex<realnum> > &connection_phase_for_ft =
-          chunks[this_chunk_idx]->connection_phases[key];
-
-      for (size_t n = 0; n < num_transfers; ++n) {
-        std::complex<realnum> temp =
-            connection_phase_for_ft[n] *
-            std::complex<realnum>(pair_comm_block[2 * n], pair_comm_block[2 * n + 1]);
-        *(incoming_connection[2 * n]) = temp.real();
-        *(incoming_connection[2 * n + 1]) = temp.imag();
-      }
-      pair_comm_block += 2 * num_transfers;
-    }
-  }
-
-  {
-    const comms_key key = {ft, CONNECT_NEGATE, comm_pair};
-    const size_t num_transfers = get_comm_size(key);
-    if (num_transfers) {
-      const std::vector<realnum *> &incoming_connection =
-          chunks[this_chunk_idx]->connections_in.at(key);
-      for (size_t n = 0; n < num_transfers; ++n) {
-        *(incoming_connection[n]) = -pair_comm_block[n];
-      }
-      pair_comm_block += num_transfers;
-    }
-  }
-
-  {
-    const comms_key key = {ft, CONNECT_COPY, comm_pair};
-    const size_t num_transfers = get_comm_size(key);
-    if (num_transfers) {
-      const std::vector<realnum *> &incoming_connection =
-          chunks[this_chunk_idx]->connections_in.at(key);
-      for (size_t n = 0; n < num_transfers; ++n) {
-        *(incoming_connection[n]) = pair_comm_block[n];
-      }
-    }
-  }
+  const realnum *block = comm_blocks[ft][chunk_pair_to_index(comm_pair)];
+  /* Unpack in the order the sender packed. all_connect_phases is the contract;
+     HaloPlan::sequence_index records each plan's position in it. */
+  for (connect_phase ip : all_connect_phases)
+    if (const HaloPlan *p = halos->find({ft, ip, comm_pair})) unpack_halo(*p, block);
   finished_working();
 }
 
@@ -281,7 +326,7 @@ void fields::step_boundaries(field_type ft) {
 
     // Do the metals first!
     for (int i = 0; i < num_chunks; i++)
-      if (chunks[i]->is_mine()) chunks[i]->zero_metal(ft);
+      if (chunks[i]->is_mine()) zero_metal(ft, i);
 
     // Copy outgoing data into buffers while following the predefined sequence of comms operations.
     // Trigger the asynchronous send immediately once the outgoing comms buffer has been filled.
@@ -292,18 +337,8 @@ void fields::step_boundaries(field_type ft) {
       const int pair_idx = op.pair_idx;
 
       realnum *outgoing_comm_block = comm_blocks[ft][pair_idx];
-      for (connect_phase ip : all_connect_phases) {
-        const comms_key key = {ft, ip, comm_pair};
-        const size_t pair_comm_size = get_comm_size(key);
-        if (pair_comm_size) {
-          const std::vector<realnum *> &outgoing_connection =
-              chunks[op.my_chunk_idx]->connections_out.at(key);
-          for (size_t n = 0; n < pair_comm_size; ++n) {
-            outgoing_comm_block[n] = *(outgoing_connection[n]);
-          }
-          outgoing_comm_block += pair_comm_size;
-        }
-      }
+      for (connect_phase ip : all_connect_phases)
+        if (const HaloPlan *p = halos->find({ft, ip, comm_pair})) pack_halo(*p, outgoing_comm_block);
       if (chunks[op.other_chunk_idx]->is_mine()) { continue; }
       manager->send_real_async(comm_blocks[ft][pair_idx], static_cast<int>(op.transfer_size),
                                op.other_proc_id, op.tag);
