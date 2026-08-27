@@ -212,7 +212,6 @@ fields_chunk::~fields_chunk() {
       delete dft_chunks;
     dft_chunks = nxt;
   }
-  FOR_FIELD_TYPES(ft) { delete[] zeroes[ft]; }
   FOR_FIELD_TYPES(ft) {
     for (polarization_state *cur = pol[ft]; cur;) {
       polarization_state *p = cur;
@@ -314,8 +313,6 @@ fields_chunk::fields_chunk(structure_chunk *the_s, const char *od, double m, dou
   }
   f_rderiv_int = NULL;
   FOR_FIELD_TYPES(ft) {
-    zeroes[ft] = NULL;
-    num_zeroes[ft] = 0;
   }
   figure_out_step_plan();
 }
@@ -399,8 +396,6 @@ fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv)
     }
   }
   FOR_FIELD_TYPES(ft) {
-    zeroes[ft] = NULL;
-    num_zeroes[ft] = 0;
   }
   FOR_COMPONENTS(c) DOCMP2 {
     if (thef.f_minus_p[c][cmp]) {
