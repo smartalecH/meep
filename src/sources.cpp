@@ -25,6 +25,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 
 using namespace std;
 
@@ -335,6 +336,7 @@ void fields::add_srcdata(struct sourcedata cur_data, src_time *src, size_t n,
   // srcdata for the same components in the same order, which may not be true.
   // ... instead, the caller should call fields::require_source_components()
   //     after all add_srcdata calls are complete.
+  note_source_change(src->is_integrated);
 }
 
 static double *amp_func_data_re = NULL;
@@ -486,6 +488,7 @@ void fields::add_volume_source(component c, const src_time &src, const volume &w
   data.center = (where.get_min_corner() + where.get_max_corner()) * 0.5;
   loop_in_chunks(src_vol_chunkloop, (void *)&data, where, c, false);
   require_component(c);
+  note_source_change(src.is_integrated);
 }
 
 /***************************************************************/
