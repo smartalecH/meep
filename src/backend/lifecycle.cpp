@@ -115,6 +115,7 @@ void lifecycle_init(fields &f) {
   f.connections_built_generation = 0;
   f.local_invalidation_generation = 0;
   f.local_invalidation_synced = 0;
+  f.storage_prepared_mask = 0;
   f.nonfinite_flag = 0;
   f.first_bad_step = -1;
   f.first_bad_component = -1;
