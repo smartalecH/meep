@@ -34,6 +34,12 @@ namespace meep {
 
 void fields::step_db(field_type ft) {
   if (ft != B_stuff && ft != D_stuff) meep::abort("step_db only works with B/D");
+  /* advance() prepares before its loop, but step_db and update_eh are public
+     and are also driven directly by synchronize_magnetic_fields() and by
+     solve_cw's matrix-vector product, neither of which goes through advance().
+     One predictable branch here is cheaper than an invariant that holds only
+     on the common path. */
+  prepare_storage_if_stale();
 
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
