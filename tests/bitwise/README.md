@@ -63,6 +63,15 @@ The harness is worthless without these, and every one of them is a real source
 of run-to-run variation:
 
 * `OMP_NUM_THREADS` pinned by the driver (the matrix runs at 1 and at 4).
+* **`OPENBLAS_NUM_THREADS` (and the MKL/numexpr/veclib equivalents) pinned too.**
+  This is a separate knob from `OMP_NUM_THREADS` and is not in the plan's
+  section 4 list, but it matters: MPB's eigensolver runs BLAS dot products, and
+  a multithreaded OpenBLAS reduces them in nondeterministic order. Measured
+  here, four runs of `test_material_grid.test_symmetry` on one fixed binary
+  produced two distinct transmittances (29.4686628169574 three times,
+  29.46866280588633 once); pinning the BLAS threads made all four identical.
+  Note that this tree is built *without* OpenMP (`HAVE_OPENMP` is undefined in
+  `config.h`), so `OMP_NUM_THREADS` alone pins nothing at all here.
 * `split_chunks_evenly=True` with an explicit `num_chunks`, so
   `choose_chunkdivision` does not vary with the host core count.
 * `loop_tile_base_db` / `loop_tile_base_eh` fixed, so tiling does not vary.

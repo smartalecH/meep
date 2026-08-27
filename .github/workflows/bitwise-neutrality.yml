@@ -61,6 +61,10 @@ jobs:
           # Determinism pins (plan section 4). Without these the harness is a
           # random-failure generator.
           OMP_NUM_THREADS: "1"
+          # Separate knob from OMP_NUM_THREADS; a multithreaded OpenBLAS
+          # reduces MPB's dot products in nondeterministic order.
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
           MEEP_FINITE_CHECK: step
           EXTRA_CONFIGURE: >-
             ${{ matrix.precision == 'single' && '--enable-single' || '' }}
@@ -114,6 +118,8 @@ jobs:
       - name: Harness matrix (assertions live)
         env:
           OMP_NUM_THREADS: "1"
+          OPENBLAS_NUM_THREADS: "1"
+          MKL_NUM_THREADS: "1"
         run: |
           PYTHONPATH="$PWD/python:$PYTHONPATH" \
           LD_LIBRARY_PATH="$PWD/src/.libs:$LD_LIBRARY_PATH" \

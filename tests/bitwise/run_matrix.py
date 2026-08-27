@@ -43,6 +43,17 @@ def _run_one(name, ranks, threads, python, mpirun, keep_dir):
 
     env = dict(os.environ)
     env["OMP_NUM_THREADS"] = str(threads)
+    # The BLAS thread pool is a separate knob from OMP_NUM_THREADS and is a
+    # real source of run-to-run variation: MPB's eigensolver runs BLAS dot
+    # products, and a multithreaded OpenBLAS sums them in nondeterministic
+    # order. Measured on this tree, four identical runs of
+    # test_material_grid.test_symmetry produced two distinct transmittances
+    # (29.4686628169574 x3, 29.46866280588633 x1); pinning the BLAS threads
+    # made all four identical. Section 4 of the plan does not list this pin.
+    env["OPENBLAS_NUM_THREADS"] = str(threads)
+    env["MKL_NUM_THREADS"] = str(threads)
+    env["NUMEXPR_NUM_THREADS"] = str(threads)
+    env["VECLIB_MAXIMUM_THREADS"] = str(threads)
     # Keep the check in its historical position so the matrix measures the
     # default configuration; MEEP_FINITE_CHECK is exercised by its own test.
     env.setdefault("MEEP_FINITE_CHECK", "step")
