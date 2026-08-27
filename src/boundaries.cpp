@@ -161,11 +161,6 @@ void fields::disconnect_chunks() {
   note_connections_invalidated(*this);
   halos->clear();
   chunk_connections_valid = false;
-  for (int i = 0; i < num_chunks; i++) {
-    chunks[i]->connections_in.clear();
-    chunks[i]->connections_out.clear();
-    chunks[i]->connection_phases.clear();
-  }
   FOR_FIELD_TYPES(ft) {
     for (int i = 0; i < num_chunks * num_chunks; i++) {
       delete[] comm_blocks[ft][i];
@@ -329,39 +324,43 @@ bool fields::locate_component_point(component *c, ivec *there, complex<double> *
   return false;
 }
 
-void fields_chunk::zero_metal(field_type ft) {
-  for (size_t i = 0; i < num_zeroes[ft]; i++)
-    *(zeroes[ft][i]) = 0.0;
+void fields::zero_metal(field_type ft, int chunk_idx) {
+  const ZeroPlan &z = halos->zeros[ft][chunk_idx];
+  for (const SlabRef &sl : z.slabs) {
+    realnum *base = halos->arrays.base(sl.array) + sl.base;
+    const ptrdiff_t stride = sl.strides[0];
+    for (int k = 0; k < sl.counts[0]; ++k)
+      base[ptrdiff_t(k) * stride] = 0.0;
+  }
+  for (const ElementRef &e : z.residue)
+    halos->arrays.base(e.array)[e.index] = 0.0;
 }
 
 void fields::find_metals() {
+  FOR_FIELD_TYPES(ft) { halos->zeros[ft].assign(num_chunks, ZeroPlan()); }
+
+  std::vector<ElementRef> refs;
+  std::vector<HaloSegment> order; // unused: every write here is a zero
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) {
       const grid_volume vi = chunks[i]->gv;
       FOR_FIELD_TYPES(ft) {
-        delete[] chunks[i]->zeroes[ft];
-        // First electric components...
-        chunks[i]->num_zeroes[ft] = 0;
+        refs.clear();
         DOCMP FOR_COMPONENTS(c) {
-          if (type(c) == ft && chunks[i]->f[c][cmp]) LOOP_OVER_VOL_OWNED(vi, c, n) {
+          if (type(c) == ft && chunks[i]->f[c][cmp]) {
+            const ArrayId id =
+                halos->arrays.intern({i, int(array_role::field), int(c), cmp, 0},
+                                     chunks[i]->f[c][cmp], size_t(vi.ntot()), array_role::field);
+            LOOP_OVER_VOL_OWNED(vi, c, n) {
               if (IVEC_LOOP_AT_BOUNDARY) { // todo: just loop over boundaries
                 IVEC_LOOP_ILOC(vi, here);
-                if (on_metal_boundary(here)) chunks[i]->num_zeroes[ft]++;
+                if (on_metal_boundary(here)) refs.push_back(ElementRef{id, ptrdiff_t(n)});
               }
             }
+          }
         }
-        typedef realnum *realnum_ptr;
-        chunks[i]->zeroes[ft] = new realnum_ptr[chunks[i]->num_zeroes[ft]];
-        size_t num = 0;
-        DOCMP FOR_COMPONENTS(c) {
-          if (type(c) == ft && chunks[i]->f[c][cmp]) LOOP_OVER_VOL_OWNED(vi, c, n) {
-              if (IVEC_LOOP_AT_BOUNDARY) { // todo: just loop over boundaries
-                IVEC_LOOP_ILOC(vi, here);
-                if (on_metal_boundary(here))
-                  chunks[i]->zeroes[ft][num++] = chunks[i]->f[c][cmp] + n;
-              }
-            }
-        }
+        ZeroPlan &z = halos->zeros[ft][i];
+        coalesce_into_slabs(refs, 1, z.slabs, z.residue, order);
       }
     }
 }
@@ -481,17 +480,12 @@ void fields::connect_the_chunks() {
     }
   } // loop over i chunks
 
-  // Preallocate all connection vectors.
+  // Preallocate the plan element lists.
   for (const std::pair<const comms_key, size_t> &key_and_comm_size : comm_sizes) {
     const chunk_pair &pair_j_to_i = key_and_comm_size.first.pair;
-    if (chunks[pair_j_to_i.first]->is_mine()) {
-      chunks[pair_j_to_i.first]->connections_out[key_and_comm_size.first].reserve(
-          key_and_comm_size.second);
-    }
-    if (chunks[pair_j_to_i.second]->is_mine()) {
-      chunks[pair_j_to_i.second]->connections_in[key_and_comm_size.first].reserve(
-          key_and_comm_size.second);
-    }
+    HaloPlan &p = halos->get_or_create(key_and_comm_size.first);
+    if (chunks[pair_j_to_i.first]->is_mine()) p.gather.reserve(key_and_comm_size.second);
+    if (chunks[pair_j_to_i.second]->is_mine()) p.scatter.reserve(key_and_comm_size.second);
   }
 
   // Next start setting up the connections...
@@ -519,22 +513,16 @@ void fields::connect_the_chunks() {
                  block exactly. The legacy lists are deleted below this PR's
                  switchover commit. */
               auto push_back_phase = [this, &thephase, &pair_j_to_i](field_type f) {
-                const std::complex<realnum> ph(thephase.real(), thephase.imag());
-                chunks[pair_j_to_i.second]
-                    ->connection_phases[{f, CONNECT_PHASE, pair_j_to_i}]
-                    .push_back(ph);
-                halos->get_or_create({f, CONNECT_PHASE, pair_j_to_i}).phase_values.push_back(ph);
+                halos->get_or_create({f, CONNECT_PHASE, pair_j_to_i})
+                    .phase_values.push_back(
+                        std::complex<realnum>(thephase.real(), thephase.imag()));
               };
               auto push_back_incoming = [this, &pair_j_to_i](field_type f, connect_phase ip,
                                                              ArrayId id, ptrdiff_t idx) {
-                chunks[pair_j_to_i.second]->connections_in[{f, ip, pair_j_to_i}].push_back(
-                    halos->arrays.base(id) + idx);
                 halos->get_or_create({f, ip, pair_j_to_i}).scatter.push_back(ElementRef{id, idx});
               };
               auto push_back_outgoing = [this, &pair_j_to_i](field_type f, connect_phase ip,
                                                              ArrayId id, ptrdiff_t idx) {
-                chunks[pair_j_to_i.first]->connections_out[{f, ip, pair_j_to_i}].push_back(
-                    halos->arrays.base(id) + idx);
                 halos->get_or_create({f, ip, pair_j_to_i}).gather.push_back(ElementRef{id, idx});
               };
 
