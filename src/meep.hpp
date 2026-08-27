@@ -1472,12 +1472,12 @@ public:
 
   dft_chunk *dft_chunks;
 
-  realnum **zeroes[NUM_FIELD_TYPES]; // Holds pointers to metal points.
-  size_t num_zeroes[NUM_FIELD_TYPES];
-  std::unordered_map<comms_key, std::vector<realnum *>, comms_key_hash_fn> connections_in;
-  std::unordered_map<comms_key, std::vector<realnum *>, comms_key_hash_fn> connections_out;
-  std::unordered_map<comms_key, std::vector<std::complex<realnum> >, comms_key_hash_fn>
-      connection_phases;
+  /* connections_in / connections_out / connection_phases / zeroes used to
+     live here as raw host addresses. They are now HaloPlans and ZeroPlans in
+     fields::halos (src/backend/halo_plan.hpp), addressed by ArrayId + index.
+     These were public members, so C++ code reaching into fields_chunk
+     internals will need updating; SWIG %ignores fields_chunk, so there is no
+     Python or Scheme impact. */
 
   int npol[NUM_FIELD_TYPES];                // only E_stuff and H_stuff are used
   polarization_state *pol[NUM_FIELD_TYPES]; // array of npol[i] polarization_state structures
@@ -1537,7 +1537,6 @@ public:
   int n_proc() const { return s->n_proc(); };
   int is_mine() const { return s->is_mine(); };
   // boundaries.cpp
-  void zero_metal(field_type);
   bool needs_W_notowned(component c);
   // fields.cpp
   void remove_sources();
@@ -1715,6 +1714,7 @@ private:
 typedef vec (*kpoint_func)(double freq, int mode, void *user_data);
 
 class halo_plan_set; // src/backend/halo_plan.hpp -- backend-private
+struct HaloPlan;
 
 class fields {
 public:
@@ -2253,6 +2253,10 @@ public:
   double max_eps() const;
   // step.cpp
   void step_boundaries(field_type);
+  /* Halo exchange split into its three phases. Public so the descriptor tests
+     can drive a single plan without a timestep around it. */
+  void pack_halo(const HaloPlan &p, realnum *block);
+  void unpack_halo(const HaloPlan &p, const realnum *block);
   void process_incoming_chunk_data(field_type ft, const chunk_pair &comm_pair);
 
   bool nosize_direction(direction d) const;
@@ -2284,6 +2288,7 @@ private:
   void sync_chunk_connections();
   void connect_the_chunks(); // Intended to be ultra-private...
   void finalize_halo_plans();
+  void zero_metal(field_type, int chunk_idx);
   bool on_metal_boundary(const ivec &);
   ivec ilattice_vector(direction) const;
   bool locate_point_in_user_volume(ivec *, std::complex<double> *phase) const;
