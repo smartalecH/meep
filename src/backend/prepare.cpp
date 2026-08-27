@@ -24,6 +24,7 @@
 #include "backend/prepare.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/storage_plan.hpp"
+#include "backend/classification.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
@@ -372,7 +373,44 @@ void fields::prepare_storage_if_stale(field_type ft) {
   const uint32_t bit = uint32_t(1) << int(ft);
   if (storage_prepared_mask & bit) return;
   storage_prepared_mask |= bit;
+
+  /* Pass 1: storage superset, initialization, relocatable metadata. */
   prepare_storage_for(ft);
+
+  /* Pass 2: classify what initialization actually produced, then finalize.
+     Both is_aniso2d and has_nonlinearities are collective, so this has to be
+     entered on every rank -- which it is, because storage_prepared_mask is
+     driven by dirty_storage, and every cause that sets it is either collective
+     or routed through the and_to_all in connect_chunks. */
+  classify_and_finalize();
+}
+
+/* The two-pass boundary. Kept separate from prepare_storage_for() so the
+   re-entry bound below is explicit and assertable. */
+void fields::classify_and_finalize() {
+  MaterialClassification cls = classify(*this, *storage_plan);
+
+  if (cls.hash != prepared_classification_hash) {
+    const bool promoted = apply_classification(*this, cls);
+    prepared_classification_hash = cls.hash;
+
+    if (promoted) {
+      /* Discovering an anisotropic coupling in 2D adds field components, which
+         changes storage and halo topology and therefore re-enters pass 1. The
+         re-entry is bounded to a single iteration because classification
+         depends only on material values, which pass 1 does not modify. */
+      ++classification_reentries;
+      assert(classification_reentries <= 1 && "classification re-entered pass 1 more than once");
+      require_source_components();
+      prepare_storage();
+    }
+  }
+  else {
+    /* Unchanged hash: the common case after a material *value* change. Reuse
+       everything, including (from PR 5) the compiled executable. Still publish
+       the tiling, since a fresh chunk may have been prepared. */
+    apply_classification(*this, cls);
+  }
 }
 
 void prepare_dfts(fields &f, StoragePlan &) {
