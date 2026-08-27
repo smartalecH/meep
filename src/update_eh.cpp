@@ -29,7 +29,7 @@ namespace meep {
 
 void fields::update_eh(field_type ft, bool skip_w_components) {
   if (ft != E_stuff && ft != H_stuff) meep::abort("update_eh only works with E/H");
-  prepare_storage_if_stale(); // see the note in fields::step_db
+  prepare_storage_if_stale(ft); // see the note in fields::step_db
 
   // split the chunks' volume into subdomains for tiled execution of update_eh loop
   /* This consumer has moved off `changed_materials` onto the generation

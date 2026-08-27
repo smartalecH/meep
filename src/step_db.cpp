@@ -39,7 +39,7 @@ void fields::step_db(field_type ft) {
      solve_cw's matrix-vector product, neither of which goes through advance().
      One predictable branch here is cheaper than an invariant that holds only
      on the common path. */
-  prepare_storage_if_stale();
+  prepare_storage_if_stale(ft);
 
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())

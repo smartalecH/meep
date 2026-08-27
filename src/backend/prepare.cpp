@@ -215,21 +215,37 @@ bool prepare_polarizations(fields_chunk &fc, field_type ft, StoragePlan &) {
 
 /* --- the fields-level entry point --------------------------------------- */
 
-void fields::prepare_storage() {
+/* Preparation is per field type, not global.
+ *
+ * The obvious implementation -- prepare everything the moment anything is
+ * dirty -- is observably different from the lazy behavior it replaces, and the
+ * bitwise harness caught it: a simulation that calls
+ * synchronize_magnetic_fields() before its first step runs only step_db(B) and
+ * update_eh(H), so the lazy path had created f_u for the B components alone.
+ * Preparing all four field types at that point produces twice as many f_u
+ * arrays, and fields::dump serializes exactly which arrays exist, so a
+ * checkpoint taken there differs.
+ *
+ * Per-field-type granularity reproduces the old set exactly while still
+ * keeping allocation out of every loop body. It also matches the shape of the
+ * lazy code, which allocated per update call.
+ */
+void fields::prepare_storage_for(field_type ft) {
   bool reconnect = false;
-  /* Both timestep programs have to be prepared for: solve_cw runs update_eh
-     with skip_w_components, which changes whether f_w_prev exists. */
+  /* solve_cw runs update_eh with skip_w_components, which changes whether
+     f_w_prev exists, so preparation has to know which program is next. */
   const bool skip_w = num_chunks && chunks[0]->is_solving_cw();
 
   for (int i = 0; i < num_chunks; ++i) {
     if (!chunks[i]->is_mine()) continue;
     fields_chunk &fc = *chunks[i];
-    reconnect |= prepare_step_db(fc, B_stuff, *storage_plan);
-    reconnect |= prepare_step_db(fc, D_stuff, *storage_plan);
-    reconnect |= prepare_update_eh(fc, H_stuff, skip_w, *storage_plan);
-    reconnect |= prepare_update_eh(fc, E_stuff, skip_w, *storage_plan);
-    reconnect |= prepare_polarizations(fc, H_stuff, *storage_plan);
-    reconnect |= prepare_polarizations(fc, E_stuff, *storage_plan);
+    if (ft == B_stuff || ft == D_stuff) {
+      reconnect |= prepare_step_db(fc, ft, *storage_plan);
+    }
+    else if (ft == E_stuff || ft == H_stuff) {
+      reconnect |= prepare_update_eh(fc, ft, skip_w, *storage_plan);
+      reconnect |= prepare_polarizations(fc, ft, *storage_plan);
+    }
   }
   prepare_dfts(*this, *storage_plan);
 
@@ -241,6 +257,9 @@ void fields::prepare_storage() {
     mark_local_invalidation(*this);
     chunk_connections_valid = false;
     changed_materials = true;
+    /* field_layout re-dirties storage; we are mid-preparation, so absorb it
+       rather than looping. */
+    clear_dirty(*this, dirty_storage);
   }
 
   /* Freeze: the catalog is rebuilt from whatever now exists, and from here the
@@ -248,10 +267,22 @@ void fields::prepare_storage() {
   build_storage_catalog(*this, *array_catalog, *storage_plan);
 }
 
-void fields::prepare_storage_if_stale() {
-  if (!is_dirty(*this, dirty_storage)) return;
-  prepare_storage();
-  clear_dirty(*this, dirty_storage);
+void fields::prepare_storage() {
+  prepare_storage_if_stale(B_stuff);
+  prepare_storage_if_stale(D_stuff);
+  prepare_storage_if_stale(H_stuff);
+  prepare_storage_if_stale(E_stuff);
+}
+
+void fields::prepare_storage_if_stale(field_type ft) {
+  if (is_dirty(*this, dirty_storage)) {
+    storage_prepared_mask = 0; // everything has to be re-examined
+    clear_dirty(*this, dirty_storage);
+  }
+  const uint32_t bit = uint32_t(1) << int(ft);
+  if (storage_prepared_mask & bit) return;
+  storage_prepared_mask |= bit;
+  prepare_storage_for(ft);
 }
 
 void prepare_dfts(fields &f, StoragePlan &) {
