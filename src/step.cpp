@@ -27,6 +27,7 @@
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/prepare.hpp"
+#include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 
 #include "config.h"
@@ -80,10 +81,6 @@ void fields::check_finite_fields() {
 void fields::step_once() {
   // however many times the fields have been synched, we want to restore now
   int save_synchronized_magnetic_fields = synchronized_magnetic_fields;
-  if (synchronized_magnetic_fields) {
-    synchronized_magnetic_fields = 1; // reset synchronization count
-    restore_magnetic_fields();
-  }
 
   am_now_working_on(Stepping);
 
@@ -100,109 +97,188 @@ void fields::step_once() {
     last_step_output_t = t;
   }
 
-  phase_material();
-
-  // update cached conductivity-inverse array, if needed
-  for (int i = 0; i < num_chunks; i++)
-    chunks[i]->s->update_condinv();
-
-  calc_sources(time()); // for B sources
-  {
-    auto step_timer = with_timing_scope(FieldUpdateB);
-    step_db(B_stuff);
-  }
-  step_source(B_stuff);
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingB);
-    step_boundaries(B_stuff);
-  }
-  calc_sources(time() + 0.5 * dt); // for integrated H sources
-  {
-    auto step_timer = with_timing_scope(FieldUpdateH);
-    update_eh(H_stuff);
-  }
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingWH);
-    step_boundaries(WH_stuff);
-  }
-  update_pols(H_stuff);
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingPH);
-    step_boundaries(PH_stuff);
-  }
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingH);
-    step_boundaries(H_stuff);
-  }
-
-  if (fluxes) fluxes->update_half();
-
-  calc_sources(time() + 0.5 * dt); // for D sources
-  {
-    auto step_timer = with_timing_scope(FieldUpdateD);
-    step_db(D_stuff);
-  }
-  step_source(D_stuff);
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingD);
-    step_boundaries(D_stuff);
-  }
-  calc_sources(time() + dt); // for integrated E sources
-  {
-    auto step_timer = with_timing_scope(FieldUpdateE);
-    update_eh(E_stuff);
-  }
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingWE);
-    step_boundaries(WE_stuff);
-  }
-  update_pols(E_stuff);
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingPE);
-    step_boundaries(PE_stuff);
-  }
-  {
-    auto step_timer = with_timing_scope(BoundarySteppingE);
-    step_boundaries(E_stuff);
-  }
-
-  if (fluxes) fluxes->update();
-  t += 1;
-  update_dfts();
-  finished_working();
-
-  // re-synch magnetic fields if they were previously synchronized
-  if (save_synchronized_magnetic_fields) {
-    synchronize_magnetic_fields();
-    synchronized_magnetic_fields = save_synchronized_magnetic_fields;
-  }
+  /* solve_cw drives fields::step() with doing_solve_cw set (cw_fields.cpp:91,
+     151, 243). It is a genuinely different timestep program -- step_source
+     skips non-integrated sources, update_dfts is disabled -- so the program has
+     to be selected here. Running the ordinary plan under solve_cw is the one
+     failure mode in this stack that produces wrong physics silently rather than
+     crashing. */
+  const bool cw = num_chunks && chunks[0]->is_solving_cw();
+  execute_step_plan(step_plan_for(cw ? StepProgram::solve_cw : StepProgram::ordinary),
+                    save_synchronized_magnetic_fields);
 
   changed_materials = false; // any material changes were handled in connect_chunks()
   note_connection_sync_done(*this);
   assert_local_invalidation_shadow(*this, changed_materials, "step_once end");
 }
 
-void fields::phase_material() {
-  bool changed = false;
-  if (is_phasing()) {
-    CHUNK_OPENMP
-    for (int i = 0; i < num_chunks; i++)
-      if (chunks[i]->is_mine()) {
-        chunks[i]->phase_material(phasein_time);
-        changed = changed || chunks[i]->new_s;
+/* Build the plan for `program` if it is stale, and return it.
+ *
+ * A plan is rebuilt only when something it depends on changes -- dirty_executable
+ * is the trigger, and PR 4's classification hash is what decides whether a
+ * material change reaches it. */
+const StepPlan &fields::step_plan_for(StepProgram program) {
+  const int idx = program == StepProgram::solve_cw ? 1 : 0;
+  if (!step_plans[idx] || is_dirty(*this, dirty_executable)) {
+    if (!step_plans[idx]) step_plans[idx] = new StepPlan;
+    *step_plans[idx] = build_step_plan(*this, program);
+    /* Both programs are rebuilt together: solve_cw is entered and left by
+       flipping doing_solve_cw, and a stale CW plan is the one failure mode in
+       this stack that produces wrong physics rather than a crash. */
+    const int other = 1 - idx;
+    if (step_plans[other])
+      *step_plans[other] =
+          build_step_plan(*this, other ? StepProgram::solve_cw : StepProgram::ordinary);
+    clear_dirty(*this, dirty_executable);
+  }
+  return *step_plans[idx];
+}
+
+/* The timing sink each boundary step used to be wrapped in, preserved exactly
+   so timing output does not change. */
+static time_sink boundary_timing_scope(field_type ft) {
+  switch (ft) {
+    case B_stuff: return BoundarySteppingB;
+    case WH_stuff: return BoundarySteppingWH;
+    case PH_stuff: return BoundarySteppingPH;
+    case H_stuff: return BoundarySteppingH;
+    case D_stuff: return BoundarySteppingD;
+    case WE_stuff: return BoundarySteppingWE;
+    case PE_stuff: return BoundarySteppingPE;
+    default: return BoundarySteppingE;
+  }
+}
+
+/* The CPU executor. Each operation dispatches to the existing implementation at
+   the same granularity as today's chunk loops, so there is no dispatch
+   regression and no virtual call anywhere near a voxel loop. */
+void fields::execute_step_plan(const StepPlan &plan, int save_synchronized_magnetic_fields) {
+  bool segment_guard = false; // phase_material's collective E/H reconciliation
+
+  for (const Operation &op : plan.operations) {
+    if (op.guard.kind == GuardKind::segment_boundary && !segment_guard) continue;
+
+    switch (op.kind) {
+      case OpKind::restore_magnetic_fields:
+        if (synchronized_magnetic_fields) {
+          synchronized_magnetic_fields = 1; // reset synchronization count
+          restore_magnetic_fields();
+        }
+        break;
+
+      case OpKind::phase_material: segment_guard = phase_material_mix(); break;
+
+      case OpKind::update_material_coefficients:
+        // update cached conductivity-inverse array, if needed
+        for (int i = 0; i < num_chunks; i++)
+          chunks[i]->s->update_condinv();
+        break;
+
+      case OpKind::evaluate_source_scalars:
+        /* The offsets are written exactly as step_once wrote them; 0.5 * dt and
+           dt are not interchangeable expressions for a bitwise comparison. */
+        if (op.source_time_offset == 0.0)
+          calc_sources(time());
+        else if (op.source_time_offset == 0.5)
+          calc_sources(time() + 0.5 * dt);
+        else
+          calc_sources(time() + dt);
+        break;
+
+      case OpKind::update_db: {
+        auto step_timer =
+            with_timing_scope(op.ft == B_stuff ? FieldUpdateB : FieldUpdateD);
+        step_db(op.ft);
+        break;
       }
-    phasein_time--;
-    am_now_working_on(MpiAllTime);
-    bool changed_mpi = or_to_all(changed);
-    finished_working();
-    if (changed_mpi) {
-      calc_sources(time() + 0.5 * dt); // for integrated H sources
-      update_eh(H_stuff);              // ensure H = 1/mu * B
-      step_boundaries(H_stuff);
-      calc_sources(time() + dt); // for integrated E sources
-      update_eh(E_stuff);        // ensure E = 1/eps * D
-      step_boundaries(E_stuff);
+
+      case OpKind::apply_sources: step_source(op.ft); break;
+
+      case OpKind::update_eh: {
+        auto step_timer =
+            with_timing_scope(op.ft == H_stuff ? FieldUpdateH : FieldUpdateE);
+        update_eh(op.ft);
+        break;
+      }
+
+      case OpKind::update_polarization: update_pols(op.ft); break;
+
+      case OpKind::transfer_halo: {
+        auto step_timer = with_timing_scope(boundary_timing_scope(op.ft));
+        step_boundaries(op.ft);
+        break;
+      }
+
+      case OpKind::update_flux_half:
+        if (fluxes) fluxes->update_half();
+        break;
+
+      case OpKind::update_flux:
+        if (fluxes) fluxes->update();
+        break;
+
+      case OpKind::increment_time: t += 1; break;
+
+      case OpKind::update_dft: update_dfts(); break;
+
+      case OpKind::synchronize_magnetic_fields:
+        /* finished_working() closes the Stepping scope *before* the re-synch,
+           exactly as the procedural body did, so timing attribution does not
+           move. */
+        finished_working();
+        if (save_synchronized_magnetic_fields) {
+          synchronize_magnetic_fields();
+          synchronized_magnetic_fields = save_synchronized_magnetic_fields;
+        }
+        break;
+
+      case OpKind::finite_value_check:
+        /* Owned by advance(), which knows the MEEP_FINITE_CHECK mode. Present
+           in the plan so Phase 2 can lower it. */
+        break;
+
+      /* Not emitted by the CPU builder; the vocabulary exists for Phase 2. */
+      case OpKind::zero_boundary:
+      case OpKind::pack_halo:
+      case OpKind::unpack_halo:
+      case OpKind::exchange_local:
+      case OpKind::reduction:
+      case OpKind::host_callback:
+      case OpKind::pack_state:
+      case OpKind::unpack_state:
+      case OpKind::num_kinds: break;
     }
+  }
+}
+
+/* The mixing half of what used to be fields::phase_material. The conditional
+   E/H reconciliation that followed it is now a segment_boundary-guarded block
+   in the plan; the guard is this function's return value, and it is collective
+   (or_to_all over all chunks), so every rank has to reach it. */
+bool fields::phase_material_mix() {
+  bool changed = false;
+  if (!is_phasing()) return false;
+  CHUNK_OPENMP
+  for (int i = 0; i < num_chunks; i++)
+    if (chunks[i]->is_mine()) {
+      chunks[i]->phase_material(phasein_time);
+      changed = changed || chunks[i]->new_s;
+    }
+  phasein_time--;
+  am_now_working_on(MpiAllTime);
+  bool changed_mpi = or_to_all(changed);
+  finished_working();
+  return changed_mpi;
+}
+
+void fields::phase_material() {
+  if (phase_material_mix()) {
+    calc_sources(time() + 0.5 * dt); // for integrated H sources
+    update_eh(H_stuff);              // ensure H = 1/mu * B
+    step_boundaries(H_stuff);
+    calc_sources(time() + dt); // for integrated E sources
+    update_eh(E_stuff);        // ensure E = 1/eps * D
+    step_boundaries(E_stuff);
   }
 }
 
