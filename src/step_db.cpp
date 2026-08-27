@@ -24,6 +24,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/prepare.hpp"
 
 #define RESTRICT
 
@@ -49,6 +50,9 @@ void fields::step_db(field_type ft) {
 
 bool fields_chunk::step_db(field_type ft) {
   bool allocated_u = false;
+  /* Debug only, plus the assertions-on CI job: a missed preparation path must
+     not turn a working release build into a crashing one. */
+  assert_step_db_prepared(*this, ft);
 
   for (const auto &sub_gv : gvs_tiled) {
     DOCMP FOR_FT_COMPONENTS(ft, cc) {
@@ -70,19 +74,8 @@ bool fields_chunk::step_db(field_type ft) {
         realnum *the_f = f[cc][cmp];
         bool use_bfast = bfast_scaled_k[0] || bfast_scaled_k[1] || bfast_scaled_k[2];
 
-        if (dsig != NO_DIRECTION && s->conductivity[cc][d_c] && !f_cond[cc][cmp]) {
-          f_cond[cc][cmp] = new realnum[gv.ntot()];
-          memset(f_cond[cc][cmp], 0, sizeof(realnum) * gv.ntot());
-        }
-        if (dsigu != NO_DIRECTION && !f_u[cc][cmp]) {
-          f_u[cc][cmp] = new realnum[gv.ntot()];
-          memcpy(f_u[cc][cmp], the_f, gv.ntot() * sizeof(realnum));
-          allocated_u = true;
-        }
-        if (use_bfast && !f_bfast[cc][cmp]) {
-          f_bfast[cc][cmp] = new realnum[gv.ntot()];
-          memset(f_bfast[cc][cmp], 0, sizeof(realnum) * gv.ntot());
-        }
+        /* f_cond, f_u and f_bfast used to be allocated right here. They are
+           realized by prepare_step_db() now; see backend/prepare.cpp. */
 
         if (ft == D_stuff) { // strides are opposite sign for H curl
           stride_p = -stride_p;
@@ -107,7 +100,7 @@ bool fields_chunk::step_db(field_type ft) {
                  and get the correct derivative.  (More precisely,
                  the derivative and integral are replaced by differences
                  and sums, but you get the idea). */
-              if (!f_rderiv_int) f_rderiv_int = new realnum[gv.ntot()];
+              assert(f_rderiv_int); // allocated by prepare_step_db()
               realnum ir0 = gv.origin_r() * gv.a + 0.5 * gv.iyee_shift(c_p).in_direction(R);
               memset(f_rderiv_int, 0, sizeof(realnum) * (gv.nz() + 1));
               int sr = gv.nz() + 1;

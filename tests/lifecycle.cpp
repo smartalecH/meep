@@ -299,8 +299,10 @@ static void test_mutation_lifecycle() {
   const uint64_t before = generation(f, MutationKind::source_definition);
   gaussian_src_time src2(0.25, 0.1, 0.0, 6.0);
   f.add_point_source(Hz, src2, vec(-0.3, 0.2));
-  invalidate(f, MutationKind::source_definition);
-  CHECK(generation(f, MutationKind::source_definition) == before + 1,
+  /* add_volume_source drives the invalidation itself as of PR 3 -- storage
+     preparation depends on it, and a missed promotion silently drops an
+     integrated source. */
+  CHECK(generation(f, MutationKind::source_definition) > before,
         "source_definition generation did not advance");
   f.advance(3);
   CHECK(f.t == 6, "expected t=6 after two 3-step batches, got %d", f.t);

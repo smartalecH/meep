@@ -26,6 +26,7 @@
 #include "meep_internals.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/storage_plan.hpp"
 
 using namespace std;
 
@@ -77,6 +78,8 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
         boundaries[b][d] = None;
     }
   halos = new halo_plan_set;
+  array_catalog = new CpuArrayCatalog;
+  storage_plan = new StoragePlan;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -134,6 +137,8 @@ fields::fields(const fields &thef)
   for (int b = 0; b < 2; b++)
     FOR_DIRECTIONS(d) { boundaries[b][d] = thef.boundaries[b][d]; }
   halos = new halo_plan_set;
+  array_catalog = new CpuArrayCatalog;
+  storage_plan = new StoragePlan;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -147,6 +152,8 @@ fields::fields(const fields &thef)
 
 fields::~fields() {
   delete halos;
+  delete array_catalog;
+  delete storage_plan;
   for (int i = 0; i < num_chunks; i++)
     delete chunks[i];
   delete[] chunks;
@@ -615,6 +622,20 @@ void fields::remove_sources() {
   sources = NULL;
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->remove_sources();
+  /* Conservative: we no longer know whether an integrated source was among
+     them, and leaving a stale f_minus_p behind changes dumped state. */
+  note_source_change(true);
+}
+
+/* A source add or remove always changes the source plan. It reaches *storage*
+   only when the source is integrated, because that is what makes f_minus_p
+   necessary -- and f_minus_p used to be allocated lazily by update_eh, which
+   is why adding an integrated source mid-run worked at all. Now that the lazy
+   path is gone, the promotion below is what keeps it working; without it the
+   source would be silently ignored. */
+void fields::note_source_change(bool integrated) {
+  invalidate(*this, MutationKind::source_definition);
+  if (integrated) invalidate(*this, MutationKind::field_layout);
 }
 
 void fields_chunk::remove_susceptibilities(bool shared_chunks) {
@@ -764,11 +785,16 @@ bool fields::nosize_direction(direction d) const {
 void fields::set_solve_cw_omega(complex<double> omega) {
   for (int i = 0; i < num_chunks; ++i)
     chunks[i]->set_solve_cw_omega(omega);
+  /* Entering solve_cw deletes f_minus_p (have_int_sources reads false) and
+     changes whether f_w_prev exists; leaving it restores both. Storage has to
+     be re-prepared either way. */
+  invalidate(*this, MutationKind::field_layout);
 }
 
 void fields::unset_solve_cw_omega() {
   for (int i = 0; i < num_chunks; ++i)
     chunks[i]->unset_solve_cw_omega();
+  invalidate(*this, MutationKind::field_layout);
 }
 
 void fields::log(const char *prefix) {
