@@ -77,8 +77,18 @@ double pml_quadratic_profile(double, void *);
 
 /* generic base class, only used by subclassing: represents susceptibility
    polarizability vector P = chi(omega) W  (where W = E or H). */
+/* Where one array inside a susceptibility's internal-data blob lives.
+ *
+ * Offsets are in realnum units from `(realnum *)P_internal_data`, i.e. from the
+ * start of the blob, which is the same convention the boundary plans use for
+ * polarization internals. That keeps one notion of "where is this value" across
+ * the backend.
+ *
+ * Deliberately POD, and deliberately not using the backend's ElementType: this
+ * has to live in meep.hpp because it appears in a virtual on a public,
+ * user-subclassable class, and meep.hpp is the SWIG surface. */
 struct InternalArrayLayout {
-  const char *name;
+  const char *name; // "P", "P_prev", "N", ...
   enum value_type { realnum_value, complex_realnum } element_type;
   size_t offset_elements;
   size_t elements;
@@ -207,6 +217,17 @@ public:
      internal fields that need to be multiplied by the same phase
      factor as the fields at boundaries.  Note: we assume internal fields
      are complex if and only if !is_real (i.e. if EM fields are complex) */
+  /* Publish the layout of the internal-data blob, so a backend can address it
+     as (ArrayId, offset) instead of through interior pointers handed out by
+     internal_notowned_ptr / cinternal_notowned_ptr.
+
+     Returning false -- the default -- means "opaque", and the caller classifies
+     this susceptibility as host_custom. That is what lets an unknown
+     third-party subclass keep working unchanged.
+
+     NOTE: adding this virtual changes the vtable of a public, user-subclassable
+     class. Source-compatible, but a compiled subclass must be rebuilt; see the
+     shared-library version bump. */
   virtual bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &gv,
                                void *P_internal_data) const {
     (void)out;
@@ -1743,6 +1764,7 @@ class CpuArrayCatalog;  // src/backend/storage_plan.hpp -- backend-private
 struct StoragePlan;
 struct HaloPlan;
 struct StepPlan;                 // src/backend/step_plan.hpp -- backend-private
+struct DescriptorSet;            // src/backend/descriptors.hpp -- backend-private
 enum class StepProgram;
 
 class fields {
@@ -1925,6 +1947,13 @@ public:
      failure mode in this stack that produces wrong physics rather than a
      crash. */
   StepPlan *step_plans[2];
+  /* Source, DFT and susceptibility descriptors (src/backend/descriptors.hpp).
+     Rebuilt with the storage plan. The CPU path does not read them -- it still
+     runs the same code it always did -- but building them on the real path is
+     what keeps them honest: the bitwise harness covers their construction, and
+     a descriptor that cannot be built from the live objects is a descriptor
+     that is wrong. */
+  DescriptorSet *descriptors;
 
   static const int num_mutation_kinds = 14;
   uint32_t dirty_mask;
@@ -2042,6 +2071,13 @@ public:
   // loop_in_chunks.cpp
   static ivec vec2diel_floor(const vec &pt, double a, const ivec &equal_shift);
   static ivec vec2diel_ceil(const vec &pt, double a, const ivec &equal_shift);
+  /* The one implementation of the chunk-region rules; defined in
+     loop_in_chunks.cpp. A template so the legacy callback path pays nothing,
+     and so that no backend type appears in this declaration. */
+  template <typename Emit>
+  void enumerate_chunk_regions(const volume &where, component cgrid, bool use_symmetry,
+                               bool snap_empty_dimensions, Emit emit);
+
   void loop_in_chunks(field_chunkloop chunkloop, void *chunkloop_data, const volume &where,
                       component cgrid = Centered, bool use_symmetry = true,
                       bool snap_unit_dims = false);
