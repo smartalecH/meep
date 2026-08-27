@@ -107,6 +107,12 @@ tests/classification
 tests/classification.log
 tests/classification.trs
 tests/halo_plan
+tests/descriptors
+tests/descriptors.log
+tests/descriptors.trs
+tests/region_plan
+tests/region_plan.log
+tests/region_plan.trs
 tests/step_plan
 tests/step_plan.log
 tests/step_plan.trs

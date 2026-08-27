@@ -1,0 +1,264 @@
+/* Copyright (C) 2005-2026 Massachusetts Institute of Technology
+%
+%  This program is free software; you can redistribute it and/or modify
+%  it under the terms of the GNU General Public License as published by
+%  the Free Software Foundation; either version 2, or (at your option)
+%  any later version.
+%
+%  This program is distributed in the hope that it will be useful,
+%  but WITHOUT ANY WARRANTY; without even the implied warranty of
+%  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+%  GNU General Public License for more details.
+%
+%  You should have received a copy of the GNU General Public License
+%  along with this program; if not, write to the Free Software Foundation,
+%  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
+*/
+
+/* PR 6 acceptance tests: source, DFT and susceptibility descriptors. */
+
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#include <vector>
+
+#include <meep.hpp>
+
+#include "backend/descriptors.hpp"
+#include "backend/storage_plan.hpp"
+#include "meep_internals.hpp"
+
+using namespace meep;
+using std::complex;
+
+static int failures = 0;
+
+#define CHECK(cond, ...)                                                                           \
+  do {                                                                                             \
+    if (!(cond)) {                                                                                 \
+      printf("[rank %d] FAIL (%s:%d): ", my_rank(), __FILE__, __LINE__);                           \
+      printf(__VA_ARGS__);                                                                         \
+      printf("\n");                                                                                \
+      fflush(stdout);                                                                              \
+      ++failures;                                                                                  \
+    }                                                                                              \
+  } while (0)
+
+static double one(const vec &) { return 1.0; }
+static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+
+/* A susceptibility that publishes no layout: it must classify as host_custom
+   and still run. This stands in for an unknown third-party subclass. */
+class opaque_susceptibility : public lorentzian_susceptibility {
+public:
+  opaque_susceptibility(realnum w, realnum g) : lorentzian_susceptibility(w, g) {}
+  virtual susceptibility *clone() const { return new opaque_susceptibility(*this); }
+  virtual bool internal_layout(std::vector<InternalArrayLayout> &, const grid_volume &,
+                               void *) const {
+    return false;
+  }
+};
+
+static void test_sources() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  fields f(&s);
+  gaussian_src_time g(0.3, 0.1);
+  continuous_src_time c(0.25);
+  f.add_point_source(Ez, g, vec(0.13, 0.11));
+  f.add_point_source(Ez, c, vec(-0.3, 0.2));
+  f.advance(2);
+
+  SourcePlan plan;
+  build_source_descriptors(f, plan);
+
+  CHECK(plan.source_times.size() == 2, "expected 2 source-time descriptors, got %zu",
+        plan.source_times.size());
+  CHECK(plan.scalars.size() == plan.source_times.size(), "scalar block is the wrong size");
+
+  bool saw_gaussian = false, saw_continuous = false;
+  for (const SourceTimeDescriptor &d : plan.source_times) {
+    if (d.kind == SourceTimeKind::gaussian) saw_gaussian = true;
+    if (d.kind == SourceTimeKind::continuous) saw_continuous = true;
+    CHECK(d.scalar_slot < plan.scalars.size(), "scalar_slot %u out of range", d.scalar_slot);
+    if (d.kind != SourceTimeKind::host_custom)
+      CHECK(!d.parameters.empty(), "%s descriptor has no closed parameters",
+            source_time_kind_name(d.kind));
+  }
+  CHECK(saw_gaussian && saw_continuous, "built-in source kinds were not both classified");
+
+  /* Every spatial table must match the src_vol it came from, point for point,
+     and must resolve to a registered destination array. */
+  size_t bad = 0, checked = 0;
+  size_t src_vols = 0;
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine()) FOR_FIELD_TYPES(ft) { src_vols += f.chunks[i]->get_sources(ft).size(); }
+  CHECK(plan.sources.size() == src_vols, "%zu source descriptors for %zu src_vols",
+        plan.sources.size(), src_vols);
+  for (const SourceDescriptor &d : plan.sources) {
+    CHECK(is_valid(d.destination), "source descriptor has no destination array");
+    CHECK(d.source_time_id < plan.source_times.size(), "source has no src_time descriptor");
+    const std::vector<src_vol> &sv = f.chunks[d.chunk]->get_sources(d.ft);
+    bool matched = false;
+    for (const src_vol &v : sv) {
+      if (v.num_points() != d.indices.size()) continue;
+      bool same = true;
+      for (size_t j = 0; j < d.indices.size() && same; ++j)
+        same = v.index_at(j) == d.indices[j] && v.amplitude_at(j) == d.complex_amplitudes[j];
+      if (same) matched = true;
+    }
+    if (!matched) ++bad;
+    ++checked;
+  }
+  CHECK(bad == 0, "%zu of %zu source spatial tables do not match their src_vol", bad, checked);
+  master_printf("sources: %zu descriptors, %zu source times\n", plan.sources.size(),
+                plan.source_times.size());
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine()) FOR_FIELD_TYPES(ft) {
+        if (!f.chunks[i]->get_sources(ft).empty())
+          master_printf("  chunk %d ft %d: %zu src_vol\n", i, int(ft),
+                        f.chunks[i]->get_sources(ft).size());
+      }
+}
+
+static void test_dfts() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  fields f(&s);
+  gaussian_src_time g(0.3, 0.1);
+  f.add_point_source(Ez, g, vec(0.13, 0.11));
+  volume fv(vec(0.8, -1.0), vec(0.8, 1.0));
+  f.add_dft_flux(Z, fv, 0.25, 0.35, 3);
+  /* A persistent (adjoint-style) monitor: its extent is padded by one pixel per
+     direction, and the unpadded extent has to survive into the descriptor. */
+  volume dv(vec(-0.6, -0.6), vec(0.6, 0.6));
+  f.add_dft(Ez, dv, 0.25, 0.35, 3, /*include_dV*/ true, /*stored_weight*/ 1.0,
+            /*chunk_next*/ 0, /*sqrt_dV*/ false, /*extra_weight*/ 1.0,
+            /*use_centered_grid*/ true, /*vc*/ 0, /*decimation_factor*/ 0, /*persist*/ true);
+  f.advance(4);
+
+  std::vector<DftDescriptor> dfts;
+  build_dft_descriptors(f, dfts);
+  CHECK(!dfts.empty() || f.num_chunks > 1, "no DFT descriptors were built");
+
+  size_t persistent = 0, padded = 0;
+  for (const DftDescriptor &d : dfts) {
+    CHECK(is_valid(d.accumulator), "DFT descriptor has no accumulator array");
+    CHECK(d.Nomega == 3, "expected 3 frequencies, got %zu", d.Nomega);
+    CHECK(d.decimation_factor >= 1, "decimation factor %d is not positive", d.decimation_factor);
+    if (d.persist) {
+      ++persistent;
+      /* The load-bearing distinction: dft_chunk::norm2 and the design-region
+         gradient iterate is_old/ie_old while indexing the is/ie array. If a
+         lowering collapses the two, dft_norm() is wrong in every adjoint run. */
+      bool differs = false;
+      LOOP_OVER_DIRECTIONS(d.is.dim, dd) {
+        if (d.is.in_direction(dd) != d.is_old.in_direction(dd) ||
+            d.ie.in_direction(dd) != d.ie_old.in_direction(dd))
+          differs = true;
+      }
+      if (differs) ++padded;
+    }
+    else {
+      LOOP_OVER_DIRECTIONS(d.is.dim, dd) {
+        CHECK(d.is.in_direction(dd) == d.is_old.in_direction(dd) &&
+                  d.ie.in_direction(dd) == d.ie_old.in_direction(dd),
+              "a non-persistent monitor has a padded extent");
+      }
+    }
+  }
+  CHECK(or_to_all(persistent > 0), "the persistent monitor produced no descriptor");
+  CHECK(or_to_all(padded > 0), "no persistent descriptor recorded a padded extent");
+  master_printf("dfts: %zu descriptors, %zu persistent\n", dfts.size(), persistent);
+}
+
+static void test_polarizations(const char *name, susceptibility *sus,
+                               SusceptibilityKind expect_kind, bool expect_layout) {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5));
+  s.add_susceptibility(one, E_stuff, *sus);
+  fields f(&s);
+  gaussian_src_time g(0.3, 0.1);
+  f.add_point_source(Ez, g, vec(0.11, 0.13));
+  f.advance(4);
+
+  std::vector<PolarizationDescriptor> pols;
+  build_polarization_descriptors(f, pols);
+  CHECK(or_to_all(!pols.empty()), "%s: no polarization descriptors", name);
+
+  for (const PolarizationDescriptor &d : pols) {
+    CHECK(d.kind == expect_kind, "%s: classified as %s, expected %s", name,
+          susceptibility_kind_name(d.kind), susceptibility_kind_name(expect_kind));
+    if (expect_layout) {
+      CHECK(!d.internal_arrays.empty(), "%s: published an empty layout", name);
+      /* The published offsets must address the same memory the object's own
+         interior pointers do. If they ever disagree, the object is right. */
+      for (const InternalArrayLayout &l : d.internal_arrays)
+        CHECK(l.elements > 0, "%s: layout entry '%s' has zero elements", name, l.name);
+    }
+    else {
+      CHECK(d.internal_arrays.empty(), "%s: host_custom must publish no layout", name);
+    }
+  }
+  if (!pols.empty())
+    master_printf("%s: %zu descriptors, %zu layout entries\n", name, pols.size(),
+                  pols[0].internal_arrays.size());
+  delete sus;
+}
+
+/* The published offsets must resolve to exactly the pointers
+   cinternal_notowned_ptr hands out. */
+static void test_layout_matches_pointers() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5));
+  lorentzian_susceptibility lor(1.1, 1e-5);
+  s.add_susceptibility(one, E_stuff, lor);
+  fields f(&s);
+  gaussian_src_time g(0.3, 0.1);
+  f.add_point_source(Ez, g, vec(0.11, 0.13));
+  f.advance(4);
+
+  size_t compared = 0, bad = 0;
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    for (polarization_state *p = f.chunks[i]->pol[E_stuff]; p; p = p->next) {
+      if (!p->data) continue;
+      std::vector<InternalArrayLayout> layout;
+      if (!p->s->internal_layout(layout, f.chunks[i]->gv, p->data)) continue;
+      const realnum *base = (const realnum *)p->data;
+      for (const InternalArrayLayout &l : layout) {
+        if (strcmp(l.name, "P") != 0) continue;
+        const realnum *want = p->s->cinternal_notowned_ptr(0, l.c, l.cmp, 0, p->data);
+        if (!want) continue;
+        ++compared;
+        if (base + l.offset_elements != want) ++bad;
+      }
+    }
+  }
+  CHECK(bad == 0, "%zu of %zu published P offsets disagree with cinternal_notowned_ptr", bad,
+        compared);
+  CHECK(or_to_all(compared > 0), "no published offsets were compared");
+  master_printf("layout: %zu offsets checked against the object's own pointers\n", compared);
+}
+
+int main(int argc, char **argv) {
+  initialize mpi(argc, argv);
+  verbosity = 0;
+
+  test_sources();
+  test_dfts();
+  test_polarizations("lorentzian", new lorentzian_susceptibility(1.1, 1e-5),
+                     SusceptibilityKind::lorentzian, true);
+  test_polarizations("noisy", new noisy_lorentzian_susceptibility(0.01, 1.1, 0.05),
+                     SusceptibilityKind::noisy_lorentzian, true);
+  test_polarizations("third-party opaque", new opaque_susceptibility(1.1, 1e-5),
+                     SusceptibilityKind::host_custom, false);
+  test_layout_matches_pointers();
+
+  if (failures) {
+    master_printf("descriptors: %d FAILURE(S)\n", failures);
+    return 1;
+  }
+  master_printf("descriptors: all checks passed\n");
+  return 0;
+}
