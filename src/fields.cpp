@@ -25,6 +25,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/halo_plan.hpp"
 
 using namespace std;
 
@@ -75,6 +76,7 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
       else
         boundaries[b][d] = None;
     }
+  halos = new halo_plan_set;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -131,6 +133,7 @@ fields::fields(const fields &thef)
   }
   for (int b = 0; b < 2; b++)
     FOR_DIRECTIONS(d) { boundaries[b][d] = thef.boundaries[b][d]; }
+  halos = new halo_plan_set;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -143,6 +146,7 @@ fields::fields(const fields &thef)
 }
 
 fields::~fields() {
+  delete halos;
   for (int i = 0; i < num_chunks; i++)
     delete chunks[i];
   delete[] chunks;
