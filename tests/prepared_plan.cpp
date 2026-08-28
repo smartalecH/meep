@@ -164,11 +164,14 @@ static void check_prepared_updates() {
   gaussian_src_time src(0.3, 0.1);
   src.is_integrated = false;
   f.add_point_source(Ez, src, vec(0.13, 0.11));
+  f.add_dft(Ez, volume(vec(-0.7, -0.6), vec(0.7, 0.6)), 0.23, 0.37, 3,
+            /*include_dV_and_interp_weights=*/true);
   f.advance(2);
 
   StepPlan plan = build_step_plan(f, StepProgram::ordinary);
   size_t update_ops = 0;
   size_t source_evaluations = 0, source_applications = 0;
+  size_t dft_operations = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
     if (op.kind == OpKind::evaluate_source_scalars) {
@@ -192,6 +195,29 @@ static void check_prepared_updates() {
                   has_access(op, d.destination_imag, AccessMode::read_write) &&
                   has_access(op, d.condinv, AccessMode::read),
               "ordinary source access set is incomplete");
+      }
+    }
+    if (op.kind == OpKind::update_dft) {
+      ++dft_operations;
+      CHECK(size_t(op.descriptor_index) + op.descriptor_count <= plan.dft_updates.size(),
+            "update_dft descriptor span is out of range");
+      CHECK(op.descriptor_count > 0 || f.num_chunks > 1,
+            "owned DFT chunks produced an empty descriptor span");
+      for (size_t i = op.descriptor_index;
+           i < size_t(op.descriptor_index) + op.descriptor_count; ++i) {
+        const DftDescriptor &d = plan.dft_updates[i];
+        CHECK(d.omega.size() == d.Nomega, "DFT descriptor omega table is incomplete");
+        CHECK(is_valid(d.accumulator) && is_valid(d.phase_scratch) &&
+                  is_valid(d.source_field.id),
+              "DFT descriptor lacks a required array");
+        CHECK(has_access(op, d.accumulator, AccessMode::read_write),
+              "DFT accumulator is not read-write");
+        CHECK(has_access(op, d.phase_scratch, AccessMode::write),
+              "DFT phase scratch is not write-only");
+        CHECK(has_access(op, d.source_field.id, AccessMode::read),
+              "DFT real source is not read-only");
+        CHECK(has_access(op, d.source_field_imag.id, AccessMode::read),
+              "DFT imaginary source is not read-only");
       }
     }
     if (op.kind != OpKind::update_db && op.kind != OpKind::update_eh) continue;
@@ -255,6 +281,7 @@ static void check_prepared_updates() {
     }
   }
   CHECK(update_ops == 4, "expected four Maxwell update operations, got %zu", update_ops);
+  CHECK(dft_operations == 1, "expected one DFT update operation, got %zu", dft_operations);
   check_finite_value_accesses(f, plan);
   CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",
         source_evaluations);
@@ -270,6 +297,16 @@ static void check_prepared_updates() {
     ++plan.db_updates[0].plus_stride;
     CHECK(compute_step_plan_signature(plan) != original,
           "signature ignored a structural curl descriptor change");
+  }
+  if (!plan.dft_updates.empty()) {
+    StepPlan changed = plan;
+    changed.dft_updates[0].omega[0] += 1e-6;
+    CHECK(compute_step_plan_signature(changed) != plan.signature,
+          "signature ignored a DFT frequency change");
+    changed = plan;
+    changed.dft_updates[0].scale += std::complex<double>(0.0, 1e-6);
+    CHECK(compute_step_plan_signature(changed) != plan.signature,
+          "signature ignored a DFT complex-scale change");
   }
 }
 

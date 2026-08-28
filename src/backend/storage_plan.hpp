@@ -58,6 +58,7 @@ enum class array_kind {
   pml_kap,
   pml_siginv,
   dft,
+  dft_phase,
   polarization_internal,
   num_kinds
 };

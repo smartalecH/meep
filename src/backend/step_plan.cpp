@@ -1020,6 +1020,7 @@ public:
   void add_eh(field_type ft, Guard guard = guard_always());
   void add_source_evaluation(Guard guard, double src_offset);
   void add_sources(field_type ft);
+  void add_dfts();
 
   Operation &add_material_refresh(OpKind op_kind) {
     Operation &op = add(op_kind, field_type(NUM_FIELD_TYPES),
@@ -1291,6 +1292,7 @@ public:
       mix(sig, cw_layout_signature(plan.cw_state_layout));
     hash_magnetic_half_step(sig, plan.magnetic_half_step);
     mix(sig, plan.material_phase_target_signature);
+    for (const DftDescriptor &d : plan.dft_updates) hash_dft(sig, d);
     return sig;
   }
 
@@ -1319,6 +1321,19 @@ private:
     mix(sig, uint64_t(r.variant_key));
   }
   static void hash_id(uint64_t &sig, ArrayId id) { mix(sig, uint64_t(id.value)); }
+  static void hash_ref(uint64_t &sig, const ArrayRef &ref) {
+    hash_id(sig, ref.id);
+    mix(sig, uint64_t(ref.offset));
+    mix(sig, uint64_t(ref.elements));
+  }
+  static void hash_ivec(uint64_t &sig, const ivec &v) {
+    mix(sig, uint64_t(v.dim));
+    LOOP_OVER_DIRECTIONS(v.dim, d) { mix(sig, uint64_t(v.in_direction(d))); }
+  }
+  static void hash_vec(uint64_t &sig, const vec &v) {
+    mix(sig, uint64_t(v.dim));
+    LOOP_OVER_DIRECTIONS(v.dim, d) { mix_double(sig, v.in_direction(d)); }
+  }
   static void hash_pml(uint64_t &sig, const PmlProfile &p) {
     hash_id(sig, p.sig);
     hash_id(sig, p.kap);
@@ -1549,6 +1564,37 @@ private:
     hash_id(sig, d.p);
     mix(sig, uint64_t(d.elements));
   }
+  static void hash_dft(uint64_t &sig, const DftDescriptor &d) {
+    hash_id(sig, d.accumulator);
+    hash_id(sig, d.phase_scratch);
+    hash_ref(sig, d.source_field);
+    hash_ref(sig, d.source_field_imag);
+    mix(sig, uint64_t(d.omega.size()));
+    for (size_t i = 0; i < d.omega.size(); ++i) mix_double(sig, d.omega[i]);
+    mix_double(sig, d.scale.real());
+    mix_double(sig, d.scale.imag());
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.c));
+    mix(sig, uint64_t(d.avg1));
+    mix(sig, uint64_t(d.avg2));
+    hash_ivec(sig, d.is);
+    hash_ivec(sig, d.ie);
+    hash_ivec(sig, d.is_old);
+    hash_ivec(sig, d.ie_old);
+    mix(sig, uint64_t(d.persist));
+    mix(sig, uint64_t(d.decimation_factor));
+    mix(sig, uint64_t(d.due_scalar_slot));
+    hash_vec(sig, d.weights.s0);
+    hash_vec(sig, d.weights.s1);
+    hash_vec(sig, d.weights.e0);
+    hash_vec(sig, d.weights.e1);
+    mix_double(sig, d.dV0);
+    mix_double(sig, d.dV1);
+    mix(sig, uint64_t(d.include_dV_and_interp_weights));
+    mix(sig, uint64_t(d.sqrt_dV_and_interp_weights));
+    mix(sig, uint64_t(d.N));
+    mix(sig, uint64_t(d.Nomega));
+  }
 
   static void hash_legacy_flux_update(uint64_t &sig, const LegacyFluxUpdate &d) {
     mix(sig, uint64_t(d.flux_ordinal));
@@ -1695,6 +1741,22 @@ void StepPlanBuilder::add_source_evaluation(Guard guard, double src_offset) {
 void StepPlanBuilder::add_sources(field_type ft) {
   Operation &op = add(OpKind::apply_sources, ft);
   attach_source_span(op, ft, false);
+}
+
+void StepPlanBuilder::add_dfts() {
+  Operation &op = add(OpKind::update_dft, field_type(NUM_FIELD_TYPES), guard_device(0));
+  op.descriptor_index = uint32_t(plan_.dft_updates.size());
+  if (f_.descriptors) {
+    for (size_t i = 0; i < f_.descriptors->dfts.size(); ++i) {
+      const DftDescriptor &d = f_.descriptors->dfts[i];
+      plan_.dft_updates.push_back(d);
+      add_access(f_, op, d.accumulator, AccessMode::read_write);
+      add_access(f_, op, d.phase_scratch, AccessMode::write);
+      add_access(f_, op, d.source_field.id, AccessMode::read);
+      add_access(f_, op, d.source_field_imag.id, AccessMode::read);
+    }
+  }
+  op.descriptor_count = uint32_t(plan_.dft_updates.size()) - op.descriptor_index;
 }
 
 void StepPlanBuilder::add_db(field_type ft) {
@@ -2845,7 +2907,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   p.add(OpKind::increment_time);
   /* The decimation predicate is a device_predicate: the node stays in the
      graph and the kernel returns early when the step is not due. */
-  if (has_dfts && !cw) p.add(OpKind::update_dft, field_type(NUM_FIELD_TYPES), guard_device(0));
+  if (has_dfts && !cw) p.add_dfts();
   p.set_magnetic_half_step(magnetic_evaluate_b, magnetic_update_b, magnetic_apply_b,
                            magnetic_transfer_b, magnetic_evaluate_h, magnetic_update_h,
                            magnetic_transfer_h);
