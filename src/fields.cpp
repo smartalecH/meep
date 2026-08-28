@@ -24,6 +24,8 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
+#include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/storage_plan.hpp"
@@ -177,16 +179,18 @@ fields::fields(const fields &thef)
 }
 
 fields::~fields() {
+  /* Backend objects may refer to every prepared artifact below, and device
+     state needs a complete type-erased destructor to release its resources. */
+  delete executable;
+  delete backend_state;
+  delete backend;
+  delete initialization_plan;
   delete halos;
   delete array_catalog;
   delete storage_plan;
   delete step_plans[0];
   delete step_plans[1];
   delete descriptors;
-  delete executable;
-  delete backend_state;
-  delete backend;
-  delete initialization_plan;
   for (int i = 0; i < num_chunks; i++)
     delete chunks[i];
   delete[] chunks;
