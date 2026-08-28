@@ -301,6 +301,7 @@ void fields::classify_and_finalize() {
   MaterialClassification cls = classify(*this, *storage_plan);
 
   if (cls.hash != prepared_classification_hash) {
+    if (prepared_classification_hash) dirty_mask |= dirty_executable;
     const bool promoted = apply_classification(*this, cls);
     prepared_classification_hash = cls.hash;
 
