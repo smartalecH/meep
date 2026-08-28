@@ -46,8 +46,33 @@ struct dft_launch {
   scalar_precision monitor_precision;
 };
 
+enum class dft_reduction_operation { norm2, real_weighted_product, complex_weighted_product };
+
+struct dft_reduction_launch {
+  const void *left;  // interleaved complex monitor scalars
+  const void *right; // null for norm2
+  void *partials;    // bounded per-lane block partials
+  void *result;      // double2-compatible compact output
+  size_t storage_points;
+  size_t frequencies;
+  size_t base;
+  size_t counts[3];
+  size_t strides[3];
+  size_t result_count;
+  size_t blocks_per_lane;
+  double weight_real;
+  double weight_imag;
+  dft_reduction_operation operation;
+  scalar_precision monitor_precision;
+  scalar_precision accumulation_precision;
+};
+
 /* Launches phase generation followed by accumulation on the same stream. */
 void launch_dft(const dft_launch &launch, double sample_time, const stream &stream);
+
+/* Two-stage, bounded reduction. Terms are launched sequentially and this adds
+   the term's contribution to the existing compact result buffer. */
+void launch_dft_reduction(const dft_reduction_launch &launch, const stream &stream);
 
 } // namespace nvidia
 } // namespace meep
