@@ -301,6 +301,13 @@ static meep::vec my_kpoint_func(double freq, int mode, void *user_data) {
 %ignore meep::fields::backend_state;
 %ignore meep::fields::executable;
 %ignore meep::fields::initialization_plan;
+%ignore meep::fields::dft_monitor_lifetime_;
+%ignore meep::dft_chunk::monitor_lifetime;
+%ignore meep::dft_flux::monitor_lifetime;
+%ignore meep::dft_energy::monitor_lifetime;
+%ignore meep::dft_force::monitor_lifetime;
+%ignore meep::dft_near2far::monitor_lifetime;
+%ignore meep::dft_fields::monitor_lifetime;
 %ignore meep::fields::dirty_mask;
 %ignore meep::fields::mutation_generation;
 %ignore meep::fields::connections_generation;

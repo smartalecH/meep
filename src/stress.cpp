@@ -60,10 +60,15 @@ dft_force::dft_force(const dft_force &f) : where(f.where) {
   offdiag1 = f.offdiag1;
   offdiag2 = f.offdiag2;
   diag = f.diag;
+  monitor_lifetime = f.monitor_lifetime;
   // where = new volume(f.where->get_min_corner(), f.where->get_max_corner());
 }
 
 void dft_force::remove() {
+  const bool attached = (offdiag1 && offdiag1->attached_to_fields) ||
+                        (offdiag2 && offdiag2->attached_to_fields) ||
+                        (diag && diag->attached_to_fields);
+  begin_dft_monitor_removal(monitor_lifetime, attached, "dft_force::remove");
   while (offdiag1) {
     dft_chunk *nxt = offdiag1->next_in_dft;
     delete offdiag1;
@@ -90,6 +95,8 @@ void dft_force::operator-=(const dft_force &st) {
 static void stress_sum(size_t Nfreq, double *F, const dft_chunk *F1, const dft_chunk *F2) {
   for (const dft_chunk *curF1 = F1, *curF2 = F2; curF1 && curF2;
        curF1 = curF1->next_in_dft, curF2 = curF2->next_in_dft) {
+    curF1->sync_dft_to_host();
+    if (curF2 != curF1) curF2->sync_dft_to_host();
     complex<double> extra_weight(real(curF1->extra_weight), imag(curF1->extra_weight));
     for (size_t k = 0; k < curF1->N; ++k)
       for (size_t i = 0; i < Nfreq; ++i)
@@ -163,8 +170,11 @@ dft_force fields::add_dft_force(const volume_list *where, const double *freq, si
   }
 
   volume_list *where_reduced = S.reduce(&where_copy);
-  if (!where_reduced) // empty list
-    return dft_force(offdiag1, offdiag2, diag, freq, Nfreq, volume(v.center()));
+  if (!where_reduced) { // empty list
+    dft_force result(offdiag1, offdiag2, diag, freq, Nfreq, volume(v.center()));
+    result.monitor_lifetime = dft_monitor_lifetime_;
+    return result;
+  }
 
   volume everywhere = where_reduced->v;
 
@@ -196,7 +206,9 @@ dft_force fields::add_dft_force(const volume_list *where, const double *freq, si
   }
 
   delete where_reduced;
-  return dft_force(offdiag1, offdiag2, diag, freq, Nfreq, everywhere);
+  dft_force result(offdiag1, offdiag2, diag, freq, Nfreq, everywhere);
+  result.monitor_lifetime = dft_monitor_lifetime_;
+  return result;
 }
 
 } // namespace meep

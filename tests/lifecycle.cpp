@@ -29,6 +29,7 @@
 #include "backend/diagnostics.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/storage_plan.hpp"
 
 using namespace meep;
 using std::complex;
@@ -327,6 +328,69 @@ static void test_source_descriptor_refresh() {
           scalar.dipole.real(), scalar.dipole.imag(), live->dipole().real(), live->dipole().imag());
   }
 }
+static void test_dft_monitor_lifecycle() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  fields f(&s);
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(-1.25, 0.0));
+  f.require_component(Ez);
+
+  const uint64_t before_add = generation(f, MutationKind::monitor_definition);
+  component c = Ez;
+  dft_fields monitor = f.add_dft_fields(&c, 1, f.v, 0.3, 0.3, 1);
+  CHECK(generation(f, MutationKind::monitor_definition) > before_add,
+        "adding a DFT monitor did not advance monitor_definition");
+  CHECK(is_dirty(f, dirty_monitor_plan) && is_dirty(f, dirty_storage) &&
+            is_dirty(f, dirty_executable),
+        "adding a DFT monitor did not invalidate its dependent artifacts");
+  CHECK(max_to_all(int(f.dirty_mask)) == -max_to_all(-int(f.dirty_mask)),
+        "DFT-add dirty state diverged across ranks");
+
+  f.advance(1);
+  CHECK(!is_dirty(f, dirty_monitor_plan) && !is_dirty(f, dirty_storage),
+        "DFT monitor preparation left monitor/storage dirty");
+  CHECK(or_to_all(monitor.chunks != NULL), "localized DFT monitor produced no chunks");
+
+  const uint64_t before_remove = generation(f, MutationKind::monitor_definition);
+  monitor.remove();
+  CHECK(generation(f, MutationKind::monitor_definition) > before_remove,
+        "removing a DFT monitor did not advance monitor_definition");
+  CHECK(is_dirty(f, dirty_monitor_plan) && is_dirty(f, dirty_storage) &&
+            is_dirty(f, dirty_executable),
+        "removing a DFT monitor did not invalidate its dependent artifacts");
+  CHECK(max_to_all(int(f.dirty_mask)) == -max_to_all(-int(f.dirty_mask)),
+        "DFT-remove dirty state diverged across ranks");
+
+  f.advance(1);
+  CHECK(f.descriptors->dfts.empty(), "removed DFT monitor survived descriptor refresh");
+  for (size_t i = 0; i < f.storage_plan->keys.size(); ++i)
+    CHECK(f.storage_plan->keys[i].kind != int(array_kind::dft) &&
+              f.storage_plan->keys[i].kind != int(array_kind::dft_phase),
+          "removed DFT monitor survived storage rebuild");
+}
+
+static void test_persistent_dft_outlives_fields() {
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure *s = new structure(gv, one, no_pml());
+  fields *f = new fields(s);
+  gaussian_src_time src(0.3, 0.1);
+  f->add_point_source(Ez, src, vec(0.0, 0.0));
+  f->require_component(Ez);
+  component c = Ez;
+  dft_fields monitor = f->add_dft_fields(&c, 1, f->v, 0.3, 0.3, 1,
+                                         /*use_centered_grid=*/true,
+                                         /*decimation_factor=*/1,
+                                         /*persist=*/true);
+  f->advance(1);
+  delete f;
+  delete s;
+  /* The shared liveness token suppresses invalidation through a dead fields
+     pointer, and dft_chunk destruction accepts the intentional fc=NULL detach. */
+  monitor.remove();
+  CHECK(monitor.chunks == NULL, "persistent DFT monitor was not removable after fields teardown");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -337,6 +401,8 @@ int main(int argc, char **argv) {
   test_finite_check_modes();
   test_mutation_lifecycle();
   test_source_descriptor_refresh();
+  test_dft_monitor_lifecycle();
+  test_persistent_dft_outlives_fields();
 
   if (failures) {
     master_printf("lifecycle: %d FAILURE(S)\n", failures);
