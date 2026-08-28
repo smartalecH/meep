@@ -28,11 +28,13 @@
 #ifndef MEEP_BACKEND_BACKEND_HPP
 #define MEEP_BACKEND_BACKEND_HPP
 
+#include <stdexcept>
 #include <string>
 
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
 #include "backend/classification.hpp"
+#include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
@@ -74,6 +76,15 @@ public:
   /* Device-resident backends need one collective, complete storage snapshot
      before create_state; the CPU backend must preserve its lazy preparation. */
   virtual bool requires_full_storage_preparation() const = 0;
+
+  /* Called while the old state and executable are still alive, before a
+     storage-layout rebuild or backend replacement can destroy authoritative
+     resident values. Host-authoritative backends may override this as a no-op;
+     the default refuses the rebuild so a future device backend cannot silently
+     discard data merely because it forgot to implement migration. */
+  virtual void prepare_state_rebuild(BackendState &, DirtyMask) {
+    throw std::logic_error("backend does not support authority-safe state rebuild");
+  }
 
   /* Reject an unsupported request clearly and *collectively*: every rank has to
      reach the same verdict, or the ones that accept will wait forever on the
