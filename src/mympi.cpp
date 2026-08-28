@@ -144,6 +144,30 @@ std::unique_ptr<comms_manager> create_comms_manager() {
   return std::unique_ptr<comms_manager>(new mpi_comms_manager());
 }
 
+void node_local_process_info(int *rank, int *size) {
+  if (!rank || !size) abort("node_local_process_info requires non-null outputs");
+#ifdef HAVE_MPI
+#if MPI_VERSION >= 3
+  MPI_Comm local_comm = MPI_COMM_NULL;
+  if (MPI_Comm_split_type(mycomm, MPI_COMM_TYPE_SHARED, my_rank(), MPI_INFO_NULL, &local_comm) !=
+      MPI_SUCCESS)
+    abort("MPI_Comm_split_type failed while selecting an accelerator");
+  if (MPI_Comm_rank(local_comm, rank) != MPI_SUCCESS ||
+      MPI_Comm_size(local_comm, size) != MPI_SUCCESS) {
+    MPI_Comm_free(&local_comm);
+    abort("MPI could not query the node-local accelerator rank");
+  }
+  MPI_Comm_free(&local_comm);
+#else
+  *rank = my_rank();
+  *size = count_processors();
+#endif
+#else
+  *rank = 0;
+  *size = 1;
+#endif
+}
+
 int verbosity = 1; // defined in meep.h
 
 /* Set CPU to flush subnormal values to zero (if iszero == true).  This slightly
