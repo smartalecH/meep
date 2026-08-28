@@ -46,7 +46,7 @@ void fields::step_db(field_type ft) {
       if (chunks[i]->step_db(ft)) {
         /* Rank-local lazy allocation. changed_materials must already be set by
            whoever caused it, so that connect_chunks() runs its and_to_all. */
-        invalidate(*this, MutationKind::field_layout);
+        invalidate(*this, MutationKind::field_layout, "step_db.cpp:49");
         note_connections_invalidated(*this);
         chunk_connections_valid = false;
         assert(changed_materials);

@@ -107,6 +107,29 @@ const char *dirty_bit_name(DirtyBit bit) {
   return "?";
 }
 
+bool invalidate_collectively(fields &f, MutationKind cause, bool locally_observed,
+                             const char *site) {
+  const bool anywhere = or_to_all(locally_observed);
+  if (anywhere) invalidate(f, cause, site);
+  return anywhere;
+}
+
+#ifndef NDEBUG
+void assert_dirty_state_synced(const fields &f, const char *where) {
+  const int mine = int(f.dirty_mask);
+  const int hi = max_to_all(mine);
+  const int lo = -max_to_all(-mine);
+  if (lo != hi)
+    meep::abort("dirty mask diverged across ranks at %s: this rank has 0x%02x, the ranks span "
+                "0x%02x..0x%02x. Some invalidation was applied on a subset of ranks. Every bit "
+                "that gates collective work must be set everywhere, or the next reduction "
+                "deadlocks -- use invalidate_collectively().",
+                where, unsigned(mine), unsigned(lo), unsigned(hi));
+}
+#else
+void assert_dirty_state_synced(const fields &, const char *) {}
+#endif
+
 void lifecycle_init(fields &f) {
   f.dirty_mask = dirty_none;
   for (int i = 0; i < fields::num_mutation_kinds; ++i)
@@ -123,17 +146,10 @@ void lifecycle_init(fields &f) {
   f.first_bad_component = -1;
 }
 
-bool invalidate_collectively(fields &f, MutationKind cause, bool locally_observed,
-                             const char *site) {
-  const bool anywhere = or_to_all(locally_observed);
-  if (anywhere) invalidate(f, cause, site);
-  return anywhere;
-}
-
 void invalidate(fields &f, MutationKind cause, const char *site) {
   f.dirty_mask |= invalidation_closure(cause);
   ++f.mutation_generation[static_cast<int>(cause)];
-  (void)site;
+  (void)site; // retained for the assert_dirty_state_synced diagnostic
 }
 
 uint64_t generation(const fields &f, MutationKind cause) {

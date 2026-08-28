@@ -391,6 +391,74 @@ static void test_persistent_dft_outlives_fields() {
   CHECK(monitor.chunks == NULL, "persistent DFT monitor was not removable after fields teardown");
 }
 
+
+/* ------------------------------------------------------------------ */
+/* 6. The dirty mask must be identical on every rank.                  */
+/* ------------------------------------------------------------------ */
+/*
+ * This is the invariant whose violation deadlocks rather than failing. The
+ * dirty bits gate collective work -- classify() reduces, build_step_plan()
+ * reduces, preparation can reconnect -- so a bit set on a subset of ranks means
+ * one rank enters a reduction alone.
+ *
+ * Measured before the fix: tests/flux at np=2 hung, with prepare_storage_for()'s
+ * reconnect branch firing twice on rank 0 and once on rank 1.
+ *
+ * Trivially true at np=1; the check only bites under MPI, which is exactly why
+ * it has to be in the suite rather than left to inspection.
+ */
+
+static bool mask_agrees_across_ranks(const fields &f) {
+  const int mine = int(f.dirty_mask);
+  return max_to_all(mine) == -max_to_all(-mine);
+}
+
+static void test_dirty_state_is_collective() {
+  const double a = 10.0;
+  grid_volume gv = vol2d(4.0, 4.0, a);
+  /* PML on ONE side only, with the cell split across that axis. A chunk with
+     no PML allocates no f_u, so preparation's `reconnect` is true on some ranks
+     and false on others -- which is precisely the asymmetry that used to
+     deadlock. A symmetric configuration (PML all round, every chunk allocating)
+     does not reproduce it, which is why this one is spelled out.
+     
+     Dispersive as well, so update_pols() also allocates polarization internals
+     lazily and per chunk. */
+  structure s(gv, eps_slab, pml(1.0, X, High), identity(), 2);
+  lorentzian_susceptibility lor(1.1, 1e-5);
+  s.add_susceptibility(one, E_stuff, lor);
+  fields f(&s);
+
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged after construction (0x%02x here)",
+        unsigned(f.dirty_mask));
+
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.13, 0.11));
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged after adding a source");
+
+  /* The step that used to diverge: preparation reconnects on some ranks. */
+  f.advance(1);
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged after the first step");
+
+  f.advance(5);
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged during stepping");
+
+  /* require_component's need_to_reconnect is rank-local by construction. */
+  f.require_component(Hz);
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged after require_component");
+
+  /* A source added mid-run, which promotes to field_layout. */
+  gaussian_src_time src2(0.25, 0.1, 0.0, 6.0);
+  src2.is_integrated = true;
+  f.add_point_source(Ez, src2, vec(-0.4, 0.3));
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged after a mid-run integrated source");
+
+  f.advance(5);
+  CHECK(mask_agrees_across_ranks(f), "dirty mask diverged after resuming");
+
+  /* And the whole thing has to still run: this is the case that hung. */
+  CHECK(f.t == 11, "expected t=11, got %d", f.t);
+}
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -403,6 +471,7 @@ int main(int argc, char **argv) {
   test_source_descriptor_refresh();
   test_dft_monitor_lifecycle();
   test_persistent_dft_outlives_fields();
+  test_dirty_state_is_collective();
 
   if (failures) {
     master_printf("lifecycle: %d FAILURE(S)\n", failures);
