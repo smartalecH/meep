@@ -84,6 +84,10 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
   storage_plan = new StoragePlan;
   step_plans[0] = step_plans[1] = NULL;
   descriptors = new DescriptorSet;
+  backend = NULL;
+  backend_state = NULL;
+  executable = NULL;
+  initialization_plan = NULL;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -100,6 +104,18 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
         s->user_volume.num_direction(d) == 1)
       use_bloch(d, 0.0);
   }
+}
+
+/* Backend-selecting overload. Delegates to the original constructor -- which
+   keeps its symbol and behavior -- and then selects, so an unavailable backend
+   or unsupported precision fails at construction rather than at the first
+   step. */
+fields::fields(structure *s, const execution_options &opts, double m, double beta,
+               bool zero_fields_near_cylorigin, int loop_tile_base_db, int loop_tile_base_eh,
+               std::vector<double> bfast_scaled_k)
+    : fields(s, m, beta, zero_fields_near_cylorigin, loop_tile_base_db, loop_tile_base_eh,
+             bfast_scaled_k) {
+  select_backend(opts);
 }
 
 fields::fields(const fields &thef)
@@ -145,6 +161,10 @@ fields::fields(const fields &thef)
   storage_plan = new StoragePlan;
   step_plans[0] = step_plans[1] = NULL;
   descriptors = new DescriptorSet;
+  backend = NULL;
+  backend_state = NULL;
+  executable = NULL;
+  initialization_plan = NULL;
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
@@ -163,6 +183,10 @@ fields::~fields() {
   delete step_plans[0];
   delete step_plans[1];
   delete descriptors;
+  delete executable;
+  delete backend_state;
+  delete backend;
+  delete initialization_plan;
   for (int i = 0; i < num_chunks; i++)
     delete chunks[i];
   delete[] chunks;
