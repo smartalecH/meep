@@ -1247,6 +1247,10 @@ class Simulation:
         subpixel_tol: float = 1e-4,
         subpixel_maxeval: int = 100000,
         allow_3d_subpixel: bool = True,
+        backend: str = "cpu",
+        device_id: Optional[int] = None,
+        precision: str = "native",
+        accelerator_strict: bool = True,
         loop_tile_base_db: int = 0,
         loop_tile_base_eh: int = 0,
         ensure_periodicity: bool = True,
@@ -1511,6 +1515,10 @@ class Simulation:
         self.subpixel_tol = subpixel_tol
         self.subpixel_maxeval = subpixel_maxeval
         self.allow_3d_subpixel = allow_3d_subpixel
+        self.backend = backend
+        self.device_id = device_id
+        self.precision = precision
+        self.accelerator_strict = accelerator_strict
         self.loop_tile_base_db = loop_tile_base_db
         self.loop_tile_base_eh = loop_tile_base_eh
         self.ensure_periodicity = ensure_periodicity
@@ -2044,6 +2052,43 @@ class Simulation:
                 "MaterialGrid(s)"
             )
 
+    _BACKEND_KINDS = {
+        "cpu": mp.backend_kind_cpu,
+        "nvidia": mp.backend_kind_nvidia,
+        "auto": mp.backend_kind_automatic,
+    }
+    _PRECISION_KINDS = {
+        "native": mp.precision_policy_kind_native,
+        "mixed": mp.precision_policy_kind_mixed,
+        "f32": mp.precision_policy_kind_f32,
+    }
+
+    def _execution_options(self):
+        """Build the `execution_options` the fields constructor takes.
+
+        Environment overrides (MEEP_BACKEND, MEEP_DEVICE_ID, MEEP_PRECISION,
+        MEEP_ACCELERATOR_STRICT) are applied on the C++ side, on top of
+        whatever is set here, so the two entry points cannot disagree.
+        """
+        if self.backend not in self._BACKEND_KINDS:
+            raise ValueError(
+                f"backend must be one of {sorted(self._BACKEND_KINDS)}, got {self.backend!r}"
+            )
+        if self.precision not in self._PRECISION_KINDS:
+            raise ValueError(
+                f"precision must be one of {sorted(self._PRECISION_KINDS)}, "
+                f"got {self.precision!r}"
+            )
+        opts = mp.execution_options()
+        opts.backend = self._BACKEND_KINDS[self.backend]
+        opts.precision = self._PRECISION_KINDS[self.precision]
+        opts.device_id = mp.automatic_device if self.device_id is None else int(self.device_id)
+        opts.strict = bool(self.accelerator_strict)
+        opts.fallback = (
+            mp.fallback_policy_error if self.accelerator_strict else mp.fallback_policy_warn
+        )
+        return opts
+
     def _init_structure(self, k=False):
         if verbosity.meep > 0:
             print("-" * 11)
@@ -2526,6 +2571,7 @@ class Simulation:
 
         self.fields = mp.fields(
             self.structure,
+            self._execution_options(),
             self.m if self.is_cylindrical else 0,
             self.k_point.z if self.special_kz and self.k_point else 0,
             not self.accurate_fields_near_cylorigin,
