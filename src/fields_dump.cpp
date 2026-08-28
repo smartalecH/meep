@@ -27,6 +27,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 #include "backend/lifecycle.hpp"
 
 namespace meep {
@@ -49,6 +50,7 @@ void fields::dump_fields_chunk_field(h5file *h5f, bool single_parallel_file,
   size_t num_f_size = my_num_chunks * NUM_FIELD_COMPONENTS * 2;
   std::vector<size_t> num_f_(num_f_size);
   size_t my_ntot = 0;
+  std::string local_error;
   for (int i = 0, chunk_i = 0; i < num_chunks; i++) {
     if (chunks[i]->is_mine()) {
       FOR_FIELD_TYPES(ft) {
@@ -59,12 +61,17 @@ void fields::dump_fields_chunk_field(h5file *h5f, bool single_parallel_file,
       for (int c = 0; c < NUM_FIELD_COMPONENTS; ++c) {
         for (int d = 0; d < 2; ++d) {
           realnum **f = field_ptr_getter(chunks[i], c, d);
-          if (*f) { my_ntot += (num_f_[(chunk_i * NUM_FIELD_COMPONENTS + c) * 2 + d] = ntot); }
+          if (*f) {
+            my_ntot += (num_f_[(chunk_i * NUM_FIELD_COMPONENTS + c) * 2 + d] = ntot);
+            backend_read_host_range(*this, *f, ntot, local_error);
+          }
         }
       }
     }
     chunk_i += (chunks[i]->is_mine() || single_parallel_file);
   }
+  if (backend_host_refresh_required(*this))
+    backend_reconcile_host_access(local_error, "fields::dump field storage");
 
   std::vector<size_t> num_f;
   if (single_parallel_file) {
@@ -134,6 +141,15 @@ void fields::dump(const char *filename, bool single_parallel_file) {
   dump_fields_chunk_field(
       &file, single_parallel_file, "f_w_prev",
       [](fields_chunk *chunk, int c, int d) { return &(chunk->f_w_prev[c][d]); });
+
+  std::string local_error;
+  if (backend_host_refresh_required(*this)) {
+    for (int i = 0; i < num_chunks; ++i)
+      if (chunks[i]->is_mine())
+        for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
+          backend_read_host_range(*this, cur->dft, cur->N * cur->omega.size(), local_error);
+    backend_reconcile_host_access(local_error, "fields::dump DFT storage");
+  }
 
   // Dump DFT chunks.
   for (int i = 0; i < num_chunks; i++) {
@@ -234,6 +250,11 @@ void fields::load(const char *filename, bool single_parallel_file) {
   if (verbosity > 0)
     printf("reading fields from file \"%s\" (%d)...\n", filename, single_parallel_file);
 
+  /* The reader below may create/delete field allocations and writes directly
+     through their host pointers. Retire resident state before either happens;
+     the next advance rebuilds from the checkpoint's host values. */
+  backend_prepare_checkpoint_load(*this);
+
   h5file file(filename, h5file::READONLY, single_parallel_file, !single_parallel_file);
 
   // Read in the current time 't'
@@ -276,7 +297,6 @@ void fields::load(const char *filename, bool single_parallel_file) {
       load_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file);
     }
   }
-  invalidate(*this, MutationKind::field_values);
 }
 
 } // namespace meep
