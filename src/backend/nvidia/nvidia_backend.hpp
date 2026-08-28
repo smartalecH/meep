@@ -38,6 +38,9 @@ public:
 
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override;
   void write(ArrayRef ref, const void *host_buffer, size_t bytes) override;
+  bool supports_compact_dft_reductions() const override { return true; }
+  void reduce_dft(const DftReductionRequest &request, std::complex<double> *local_result,
+                  size_t result_count) override;
   void synchronize() override;
   backend_capabilities capabilities() const override;
   bool requires_full_storage_preparation() const override { return true; }
