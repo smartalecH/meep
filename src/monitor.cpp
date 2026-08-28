@@ -21,6 +21,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 
 /* Below are the field point routines. */
 
@@ -103,8 +104,23 @@ complex<double> fields::get_field(component c, const vec &loc, bool parallel) co
       double w[8];
       complex<double> res = 0.0;
       gv.interpolate(c, loc, ilocs, w);
-      for (int argh = 0; argh < 8 && w[argh]; argh++)
-        res += w[argh] * get_field(c, ilocs[argh], false);
+      if (parallel && backend_host_refresh_required(*this)) {
+        std::string local_error;
+        try {
+          for (int argh = 0; argh < 8 && w[argh]; argh++)
+            res += w[argh] * get_field(c, ilocs[argh], false);
+        }
+        catch (const std::exception &e) {
+          local_error = e.what();
+        }
+        catch (...) {
+          local_error = "unknown backend host-access failure";
+        }
+        backend_reconcile_host_access(local_error, "fields::get_field interpolation");
+      }
+      else
+        for (int argh = 0; argh < 8 && w[argh]; argh++)
+          res += w[argh] * get_field(c, ilocs[argh], false);
       if (gv.dim == D2 && loc.in_direction(Z) != 0) // special_kz handling
         res *= std::polar(1.0, 2 * pi * beta * loc.in_direction(Z));
       return parallel ? sum_to_all(res) : res;
@@ -115,11 +131,29 @@ complex<double> fields::get_field(component c, const ivec &origloc, bool paralle
   ivec iloc = origloc;
   complex<double> kphase = 1.0;
   locate_point_in_user_volume(&iloc, &kphase);
+  const bool refresh_host = backend_host_refresh_required(*this);
   for (int sn = 0; sn < S.multiplicity(); sn++)
     for (int i = 0; i < num_chunks; i++)
       if (chunks[i]->gv.owns(S.transform(iloc, sn))) {
+        const component transformed_component = S.transform(c, sn);
+        const ivec transformed_location = S.transform(iloc, sn);
+        fields_chunk *chunk = chunks[i];
+        if (refresh_host) {
+          std::string local_error;
+          const ptrdiff_t index = chunk->gv.index(transformed_component, transformed_location);
+          if (chunk->f[transformed_component][0])
+            backend_read_host_range(*this, chunk->f[transformed_component][0] + index, 1,
+                                    local_error);
+          if (chunk->f[transformed_component][1])
+            backend_read_host_range(*this, chunk->f[transformed_component][1] + index, 1,
+                                    local_error);
+          if (parallel)
+            backend_reconcile_host_access(local_error, "fields::get_field");
+          else if (!local_error.empty())
+            throw std::runtime_error(std::string("fields::get_field: ") + local_error);
+        }
         complex<double> val = S.phase_shift(c, sn) * kphase *
-                              chunks[i]->get_field(S.transform(c, sn), S.transform(iloc, sn));
+                              chunk->get_field(transformed_component, transformed_location);
         return parallel ? sum_to_all(val) : val;
       }
   return 0.0;
