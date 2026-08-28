@@ -45,22 +45,28 @@ template <typename T> static void check_device(int device) {
   const size_t elements = 96;
   const size_t bytes = elements * sizeof(T);
   std::vector<T> target(elements), plus(elements), minus(elements), primary(elements),
-      diagonal(elements), output(elements, T(-17.25)), observed(elements);
+      diagonal(elements), offdiagonal1(elements), offdiagonal2(elements),
+      output(elements, T(-17.25)), observed(elements);
   for (size_t i = 0; i < elements; ++i) {
     target[i] = T(0.01 * double(i + 1));
     plus[i] = T(std::sin(0.13 * double(i)));
     minus[i] = T(std::cos(0.07 * double(i)));
     primary[i] = T(0.25 + 0.005 * double(i));
     diagonal[i] = T(0.5 + 0.002 * double(i));
+    offdiagonal1[i] = T(0.03 - 0.0001 * double(i));
+    offdiagonal2[i] = T(-0.02 + 0.00015 * double(i));
   }
 
   device_buffer d_target(bytes, device), d_plus(bytes, device), d_minus(bytes, device),
-      d_primary(bytes, device), d_diagonal(bytes, device), d_output(bytes, device);
+      d_primary(bytes, device), d_diagonal(bytes, device), d_offdiagonal1(bytes, device),
+      d_offdiagonal2(bytes, device), d_output(bytes, device);
   copy_host_to_device_async(d_target, 0, target.data(), bytes, execution);
   copy_host_to_device_async(d_plus, 0, plus.data(), bytes, execution);
   copy_host_to_device_async(d_minus, 0, minus.data(), bytes, execution);
   copy_host_to_device_async(d_primary, 0, primary.data(), bytes, execution);
   copy_host_to_device_async(d_diagonal, 0, diagonal.data(), bytes, execution);
+  copy_host_to_device_async(d_offdiagonal1, 0, offdiagonal1.data(), bytes, execution);
+  copy_host_to_device_async(d_offdiagonal2, 0, offdiagonal2.data(), bytes, execution);
   copy_host_to_device_async(d_output, 0, output.data(), bytes, execution);
 
   flat_region region;
@@ -337,6 +343,92 @@ template <typename T> static void check_device(int device) {
                 constitutive_tolerance * (1.0 + std::fabs(double(expected_w[i]))),
             "constitutive PML auxiliary or sentinel differs");
   }
+
+  flat_region anisotropic_region = {};
+  anisotropic_region.base = 16;
+  anisotropic_region.counts[0] = 1;
+  anisotropic_region.counts[1] = 1;
+  anisotropic_region.counts[2] = 8;
+  anisotropic_region.strides[0] = 0;
+  anisotropic_region.strides[1] = 0;
+  anisotropic_region.strides[2] = 1;
+  const ptrdiff_t primary_stride = 9;
+  const ptrdiff_t cross1_stride = 2;
+  const ptrdiff_t cross2_stride = 3;
+  for (unsigned int offdiagonals = 1; offdiagonals <= 2; ++offdiagonals)
+    for (unsigned int pml_enabled = 0; pml_enabled <= 1; ++pml_enabled) {
+      copy_host_to_device_async(d_output, 0, output.data(), bytes, execution);
+      copy_host_to_device_async(d_pml_u, 0, pml_u.data(), bytes, execution);
+
+      constitutive_launch anisotropic = {};
+      anisotropic.region = anisotropic_region;
+      anisotropic.target = d_output.opaque_handle();
+      anisotropic.primary = d_primary.opaque_handle();
+      anisotropic.cross1 = d_plus.opaque_handle();
+      anisotropic.diagonal = d_diagonal.opaque_handle();
+      anisotropic.offdiagonal1 = d_offdiagonal1.opaque_handle();
+      anisotropic.primary_stride = primary_stride;
+      anisotropic.cross1_stride = cross1_stride;
+      if (offdiagonals == 2) {
+        anisotropic.cross2 = d_minus.opaque_handle();
+        anisotropic.offdiagonal2 = d_offdiagonal2.opaque_handle();
+        anisotropic.cross2_stride = cross2_stride;
+      }
+      if (pml_enabled) {
+        anisotropic.target_w = d_pml_u.opaque_handle();
+        anisotropic.pml.sigma = d_sigma.opaque_handle();
+        anisotropic.pml.kappa = d_kappa.opaque_handle();
+        anisotropic.pml.inverse = d_inverse.opaque_handle();
+        anisotropic.pml.base = 3;
+        anisotropic.pml.strides[2] = 1;
+      }
+      anisotropic.precision = precision;
+      launch_constitutive(anisotropic, execution);
+
+      std::vector<T> expected_anisotropic = output;
+      std::vector<T> expected_anisotropic_w = pml_u;
+      for (size_t n = 0; n < anisotropic_region.counts[2]; ++n) {
+        const ptrdiff_t i = ptrdiff_t(anisotropic_region.base + n);
+        T value = primary[i] * diagonal[i];
+        const T first =
+            T(0.25) * ((plus[i] + plus[i - cross1_stride]) * offdiagonal1[i] +
+                       (plus[i + primary_stride] + plus[(i + primary_stride) - cross1_stride]) *
+                           offdiagonal1[i + primary_stride]);
+        value += first;
+        if (offdiagonals == 2) {
+          const T second =
+              T(0.25) *
+              ((minus[i] + minus[i - cross2_stride]) * offdiagonal2[i] +
+               (minus[i + primary_stride] + minus[(i + primary_stride) - cross2_stride]) *
+                   offdiagonal2[i + primary_stride]);
+          value += second;
+        }
+        if (pml_enabled) {
+          const ptrdiff_t k = 3 + ptrdiff_t(n);
+          const T previous = expected_anisotropic_w[i];
+          expected_anisotropic_w[i] = value;
+          expected_anisotropic[i] +=
+              (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * previous;
+        }
+        else
+          expected_anisotropic[i] = value;
+      }
+
+      copy_device_to_host_async(observed.data(), d_output, 0, bytes, execution);
+      copy_device_to_host_async(observed_w.data(), d_pml_u, 0, bytes, execution);
+      execution.synchronize();
+      const double anisotropic_tolerance = 20.0 * std::numeric_limits<T>::epsilon();
+      for (size_t i = 0; i < elements; ++i) {
+        require(std::fabs(double(observed[i] - expected_anisotropic[i])) <=
+                    anisotropic_tolerance *
+                        (1.0 + std::fabs(double(expected_anisotropic[i]))),
+                "anisotropic constitutive target or sentinel differs");
+        require(std::fabs(double(observed_w[i] - expected_anisotropic_w[i])) <=
+                    anisotropic_tolerance *
+                        (1.0 + std::fabs(double(expected_anisotropic_w[i]))),
+                "anisotropic constitutive PML auxiliary or sentinel differs");
+      }
+    }
 
   std::vector<T> halo_values(8), halo_observed(8);
   for (size_t i = 0; i < halo_values.size(); ++i) halo_values[i] = T(i + 1);
