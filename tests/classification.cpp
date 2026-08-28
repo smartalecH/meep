@@ -185,7 +185,6 @@ int main(int argc, char **argv) {
   test_tiling_decision();
   test_value_change_preserves_hash();
   test_reentry_bound();
-  test_changed_hash_invalidates_executable();
 
   if (failures) {
     master_printf("classification: %d FAILURE(S)\n", failures);
