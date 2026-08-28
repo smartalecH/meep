@@ -1771,12 +1771,58 @@ private:
 /***************************************************************/
 typedef vec (*kpoint_func)(double freq, int mode, void *user_data);
 
+/* --- Execution options ----------------------------------------------------
+   Public because they are the user-facing selection surface, and because SWIG
+   exposes exactly these. The machinery behind them is backend-private. */
+
+enum class backend_kind { cpu, nvidia, automatic };
+
+/* The selector; src/backend/precision.hpp expands it into the four-way
+   PrecisionPolicy (field / material / monitor / reduction). */
+enum class precision_policy_kind { native, mixed, f32 };
+
+enum class fallback_policy { error, warn };
+
+const int automatic_device = -1;
+
+struct execution_options {
+  backend_kind backend;
+  int device_id;
+  precision_policy_kind precision;
+  fallback_policy fallback;
+  bool strict;
+
+  execution_options()
+      : backend(backend_kind::cpu), device_id(automatic_device),
+        precision(precision_policy_kind::native), fallback(fallback_policy::error), strict(true) {}
+};
+
+/* What a backend can actually do. Reported before any allocation, so a
+   preflight or a strict-mode rejection happens early. */
+struct backend_capabilities {
+  bool supports_native;
+  bool supports_mixed;
+  bool supports_f32;
+  size_t memory_budget_bytes; // 0 == unknown / unbounded
+  const char *name;
+};
+
+/* Reads MEEP_BACKEND, MEEP_DEVICE_ID, MEEP_PRECISION and
+   MEEP_ACCELERATOR_STRICT over the top of `opts`. An unrecognized value warns
+   and leaves the field alone. */
+void apply_execution_environment(execution_options &opts);
+const char *backend_kind_name(backend_kind k);
+
 class halo_plan_set;    // src/backend/halo_plan.hpp    -- backend-private
 class CpuArrayCatalog;  // src/backend/storage_plan.hpp -- backend-private
 struct StoragePlan;
 struct HaloPlan;
 struct StepPlan;                 // src/backend/step_plan.hpp -- backend-private
 struct DescriptorSet;            // src/backend/descriptors.hpp -- backend-private
+class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
+struct BackendState;
+struct Executable;
+struct InitializationPlan;
 enum class StepProgram;
 
 class fields {
@@ -1806,6 +1852,12 @@ public:
   fields(structure *, double m = 0, double beta = 0, bool zero_fields_near_cylorigin = true,
          int loop_tile_base_db = 0, int loop_tile_base_eh = 0,
          std::vector<double> bfast_scaled_k = {0, 0, 0});
+  /* Backend-selecting overload. The constructor above keeps its symbol and its
+     behavior; this is added, not substituted (global rule 3). An unavailable
+     backend or unsupported precision fails here, clearly and on every rank. */
+  fields(structure *, const execution_options &opts, double m = 0, double beta = 0,
+         bool zero_fields_near_cylorigin = true, int loop_tile_base_db = 0,
+         int loop_tile_base_eh = 0, std::vector<double> bfast_scaled_k = {0, 0, 0});
   fields(const fields &);
   ~fields();
   bool equal_layout(const fields &f) const;
@@ -1939,6 +1991,23 @@ public:
   /* Advance the simulation by n timesteps. advance(n) is numerically
      equivalent to n consecutive step() calls; step() is advance(1). */
   void advance(int n);
+  /* The CPU implementation advance() dispatches to through the backend. Public
+     so the backend can call it; not part of the user-facing surface. */
+  void advance_cpu(int n);
+
+  /* --- Backend-safe access -------------------------------------------------
+     Each array has one authoritative location. Host output and query is an
+     explicit point, slice, reduction, DFT or checkpoint read; host mutation is
+     an explicit write. No implicitly coherent host mirrors, and no unified
+     memory. On CPU the authoritative location is the host allocation, so these
+     are cheap; they exist so a device backend has a defined boundary. */
+  enum class reduction_kind { field_energy, flux, norm };
+  uint32_t register_point_sampler(component c, const vec &loc, int interval);
+  uint32_t register_reduction(reduction_kind kind, const volume &where, int interval);
+  void read_samples(uint32_t id, std::vector<std::complex<double> > &out);
+  void collect_samples(); // called once per step by the executor
+  void select_backend(const execution_options &opts);
+  void init_backend();
 
   /* --- Lifecycle bookkeeping (src/backend/lifecycle.{hpp,cpp}) ------------
      These are POD counters only. The MutationKind / DirtyMask types that give
@@ -1966,6 +2035,14 @@ public:
      a descriptor that cannot be built from the live objects is a descriptor
      that is wrong. */
   DescriptorSet *descriptors;
+  /* The selected backend, its state and the compiled executable. On CPU these
+     are thin wrappers over the objects `fields` already owns. */
+  ExecutionBackend *backend;
+  BackendState *backend_state;
+  Executable *executable;
+  InitializationPlan *initialization_plan;
+  execution_options options;
+  backend_capabilities backend_caps() const;
 
   static const int num_mutation_kinds = 14;
   uint32_t dirty_mask;
