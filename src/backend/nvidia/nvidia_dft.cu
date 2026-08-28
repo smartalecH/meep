@@ -20,6 +20,11 @@ namespace nvidia {
 
 namespace {
 
+template <typename T> struct reduction_pair {
+  T real;
+  T imag;
+};
+
 void check_cuda(cudaError_t result, const char *operation) {
   if (result == cudaSuccess) return;
   throw runtime_error(operation, static_cast<int>(result), cudaGetErrorName(result),
@@ -131,6 +136,94 @@ __global__ void dft_accumulate_kernel(dft_launch launch, size_t outputs) {
   accumulator[2 * output + 1] += phase_real * value_imag + phase_imag * value_real;
 }
 
+template <typename AccumT>
+__device__ reduction_pair<AccumT> add_pair(reduction_pair<AccumT> a,
+                                           reduction_pair<AccumT> b) {
+  return reduction_pair<AccumT>{a.real + b.real, a.imag + b.imag};
+}
+
+template <typename MonitorT, typename AccumT>
+__global__ void dft_reduction_partials_kernel(dft_reduction_launch launch) {
+  const size_t lane = size_t(blockIdx.x) / launch.blocks_per_lane;
+  const size_t lane_block = size_t(blockIdx.x) % launch.blocks_per_lane;
+  const size_t selected_points = launch.counts[0] * launch.counts[1] * launch.counts[2];
+  const size_t lane_work = launch.operation == dft_reduction_operation::norm2
+                               ? selected_points * launch.frequencies
+                               : selected_points;
+  reduction_pair<AccumT> sum = {AccumT(0), AccumT(0)};
+  const MonitorT *left = static_cast<const MonitorT *>(launch.left);
+  const MonitorT *right = static_cast<const MonitorT *>(launch.right);
+
+  for (size_t linear = lane_block * blockDim.x + threadIdx.x; linear < lane_work;
+       linear += launch.blocks_per_lane * blockDim.x) {
+    size_t point = linear;
+    size_t frequency = lane;
+    if (launch.operation == dft_reduction_operation::norm2) {
+      frequency = linear % launch.frequencies;
+      point = linear / launch.frequencies;
+    }
+    size_t rest = point;
+    const size_t i2 = rest % launch.counts[2];
+    rest /= launch.counts[2];
+    const size_t i1 = rest % launch.counts[1];
+    const size_t i0 = rest / launch.counts[1];
+    const size_t voxel = launch.base + i0 * launch.strides[0] + i1 * launch.strides[1] +
+                         i2 * launch.strides[2];
+    const size_t element = voxel * launch.frequencies + frequency;
+    const AccumT ar = AccumT(left[2 * element]);
+    const AccumT ai = AccumT(left[2 * element + 1]);
+    if (launch.operation == dft_reduction_operation::norm2) {
+      sum.real += ar * ar + ai * ai;
+      continue;
+    }
+    const AccumT br = AccumT(right[2 * element]);
+    const AccumT bi = AccumT(right[2 * element + 1]);
+    const AccumT wr = AccumT(launch.weight_real);
+    const AccumT wi = AccumT(launch.weight_imag);
+    const AccumT weighted_real = wr * ar - wi * ai;
+    const AccumT weighted_imag = wr * ai + wi * ar;
+    sum.real += weighted_real * br + weighted_imag * bi;
+    if (launch.operation == dft_reduction_operation::complex_weighted_product)
+      sum.imag += weighted_imag * br - weighted_real * bi;
+  }
+
+  __shared__ reduction_pair<AccumT> shared[256];
+  shared[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned int offset = blockDim.x / 2; offset; offset >>= 1) {
+    if (threadIdx.x < offset)
+      shared[threadIdx.x] = add_pair(shared[threadIdx.x], shared[threadIdx.x + offset]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    reduction_pair<AccumT> *partials = static_cast<reduction_pair<AccumT> *>(launch.partials);
+    partials[lane * launch.blocks_per_lane + lane_block] = shared[0];
+  }
+}
+
+template <typename AccumT>
+__global__ void dft_reduction_final_kernel(dft_reduction_launch launch) {
+  const size_t lane = blockIdx.x;
+  reduction_pair<AccumT> sum = {AccumT(0), AccumT(0)};
+  const reduction_pair<AccumT> *partials =
+      static_cast<const reduction_pair<AccumT> *>(launch.partials);
+  for (size_t block = threadIdx.x; block < launch.blocks_per_lane; block += blockDim.x)
+    sum = add_pair(sum, partials[lane * launch.blocks_per_lane + block]);
+  __shared__ reduction_pair<AccumT> shared[256];
+  shared[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned int offset = blockDim.x / 2; offset; offset >>= 1) {
+    if (threadIdx.x < offset)
+      shared[threadIdx.x] = add_pair(shared[threadIdx.x], shared[threadIdx.x + offset]);
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    double2 *result = static_cast<double2 *>(launch.result);
+    result[lane].x += double(shared[0].real);
+    result[lane].y += double(shared[0].imag);
+  }
+}
+
 template <typename MonitorT>
 void launch_phase(const dft_launch &launch, double sample_time, const stream &execution_stream) {
   unsigned int blocks = 0, threads = 0;
@@ -174,6 +267,44 @@ void launch_dft(const dft_launch &launch, double sample_time, const stream &exec
       launch_accumulation<float, double>(launch, execution_stream);
     else
       launch_accumulation<double, double>(launch, execution_stream);
+  }
+}
+
+template <typename MonitorT, typename AccumT>
+void launch_reduction_typed(const dft_reduction_launch &launch,
+                            const stream &execution_stream) {
+  const unsigned int threads = 256;
+  const size_t total_blocks = launch.result_count * launch.blocks_per_lane;
+  if (total_blocks > std::numeric_limits<unsigned int>::max())
+    throw std::overflow_error("NVIDIA DFT reduction grid overflow");
+  cudaStream_t cuda_stream = static_cast<cudaStream_t>(execution_stream.opaque_handle());
+  dft_reduction_partials_kernel<MonitorT, AccumT>
+      <<<static_cast<unsigned int>(total_blocks), threads, 0, cuda_stream>>>(launch);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA DFT reduction partials");
+  if (launch.result_count > std::numeric_limits<unsigned int>::max())
+    throw std::overflow_error("NVIDIA DFT reduction result grid overflow");
+  dft_reduction_final_kernel<AccumT>
+      <<<static_cast<unsigned int>(launch.result_count), threads, 0, cuda_stream>>>(launch);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA DFT reduction final");
+}
+
+void launch_dft_reduction(const dft_reduction_launch &launch,
+                          const stream &execution_stream) {
+  if (!launch.left || !launch.partials || !launch.result || !launch.storage_points ||
+      !launch.frequencies || !launch.result_count || !launch.blocks_per_lane)
+    throw std::invalid_argument("NVIDIA DFT reduction launch is incomplete");
+  if (launch.operation != dft_reduction_operation::norm2 && !launch.right)
+    throw std::invalid_argument("NVIDIA DFT product reduction has no right operand");
+  if (launch.accumulation_precision == scalar_precision::f64) {
+    if (launch.monitor_precision == scalar_precision::f32)
+      launch_reduction_typed<float, double>(launch, execution_stream);
+    else
+      launch_reduction_typed<double, double>(launch, execution_stream);
+  }
+  else {
+    if (launch.monitor_precision != scalar_precision::f32)
+      throw std::invalid_argument("NVIDIA DFT does not reduce f64 monitor storage in f32");
+    launch_reduction_typed<float, float>(launch, execution_stream);
   }
 }
 
