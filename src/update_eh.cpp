@@ -36,15 +36,16 @@ void fields::update_eh(field_type ft, bool skip_w_components) {
      now: apply_classification() publishes it from the same
      chi1inv[cc][d_1] && chi1inv[cc][d_2] test. */
 
+  /* As in step_db: the E/H split, f_w and f_w_prev all moved into
+     prepare_update_eh() in PR 3, so allocated_eh is now always false. A dead
+     rank-local invalidation path is a trap waiting for someone to reintroduce
+     an allocation, so assert instead of branching. */
   for (int i = 0; i < num_chunks; i++)
-    if (chunks[i]->is_mine())
-      if (chunks[i]->update_eh(ft, skip_w_components)) {
-        invalidate(*this, MutationKind::field_layout);
-        note_connections_invalidated(*this);
-        chunk_connections_valid = false; // E/H allocated - reconnect chunks
-        assert(changed_materials);
-        assert(needs_connection_sync(*this));
-      }
+    if (chunks[i]->is_mine()) {
+      const bool allocated = chunks[i]->update_eh(ft, skip_w_components);
+      assert(!allocated && "update_eh allocated; preparation missed something");
+      (void)allocated;
+    }
 }
 
 bool fields_chunk::needs_W_prev(component c) const {

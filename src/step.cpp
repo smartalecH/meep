@@ -148,6 +148,10 @@ void fields::step_once() {
   changed_materials = false; // any material changes were handled in connect_chunks()
   note_connection_sync_done(*this);
   assert_local_invalidation_shadow(*this, changed_materials, "step_once end");
+  /* Every rank reaches this, every step. Debug-only, and itself collective, so
+     a divergence aborts everywhere with a diagnosis instead of hanging
+     somewhere else later. */
+  assert_dirty_state_synced(*this, "step_once end");
 }
 
 /* Build the plan for `program` if it is stale, and return it.

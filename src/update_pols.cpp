@@ -30,15 +30,20 @@ using namespace std;
 namespace meep {
 
 void fields::update_pols(field_type ft) {
+  /* Polarization internal data is still allocated lazily here -- PR 3 hoisted
+     the field arrays, not this -- and only for owned chunks, so the result is
+     rank-local. Collect it, then reduce once. */
+  bool allocated = false;
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
-      if (chunks[i]->update_pols(ft)) {
-        invalidate(*this, MutationKind::field_layout);
-        note_connections_invalidated(*this);
-        chunk_connections_valid = false;
-        assert(changed_materials);
-        assert(needs_connection_sync(*this));
-      }
+      if (chunks[i]->update_pols(ft)) allocated = true;
+
+  if (invalidate_collectively(*this, MutationKind::field_layout, allocated, "update_pols")) {
+    note_connections_invalidated(*this);
+    chunk_connections_valid = false;
+    assert(changed_materials);
+    assert(needs_connection_sync(*this));
+  }
 }
 
 bool fields_chunk::update_pols(field_type ft) {
