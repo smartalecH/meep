@@ -132,6 +132,19 @@ struct rebuild_trace {
   rebuild_trace() : reasons(dirty_none) {}
 };
 
+struct access_trace {
+  size_t reads;
+  size_t field_reads;
+  size_t dft_reads;
+  size_t max_elements;
+  int prepare_rebuilds;
+  int fail_read_rank;
+
+  access_trace()
+      : reads(0), field_reads(0), dft_reads(0), max_elements(0), prepare_rebuilds(0),
+        fail_read_rank(-1) {}
+};
+
 struct rebuild_state : BackendState {
   explicit rebuild_state(rebuild_trace &trace_) : trace(trace_) {}
   ~rebuild_state() override { trace.events.push_back("destroy-state"); }
@@ -188,6 +201,45 @@ public:
     trace.events.push_back("prepare-rebuild");
     trace.reasons = reasons;
   }
+};
+
+class access_tracking_backend : public rebuild_backend_base {
+public:
+  access_tracking_backend(fields &f, rebuild_trace &rebuilds, access_trace &accesses_)
+      : rebuild_backend_base(f, rebuilds), accesses(accesses_) {}
+
+  void advance(Executable &, BackendState &, int num_steps) override { f.t += num_steps; }
+
+  void read(ArrayRef ref, void *host_buffer, size_t bytes) override {
+    if (my_rank() == accesses.fail_read_rank)
+      throw std::runtime_error("injected rank-local backend read failure");
+    const ArraySpec &spec = f.array_catalog->spec(ref.id);
+    CHECK(bytes == ref.elements * host_element_bytes(spec.element_type),
+          "backend host-range read byte count is inconsistent");
+    ++accesses.reads;
+    accesses.field_reads += spec.role == array_role::field;
+    accesses.dft_reads += spec.role == array_role::dft;
+    if (ref.elements > accesses.max_elements) accesses.max_elements = ref.elements;
+    if (spec.element_type == ElementType::realnum_value) {
+      realnum *values = static_cast<realnum *>(host_buffer);
+      for (size_t i = 0; i < ref.elements; ++i)
+        values[i] = realnum(2.5);
+    }
+    else if (spec.element_type == ElementType::complex_realnum) {
+      std::complex<realnum> *values = static_cast<std::complex<realnum> *>(host_buffer);
+      for (size_t i = 0; i < ref.elements; ++i)
+        values[i] = std::complex<realnum>(realnum(1.25), realnum(-0.75));
+    }
+  }
+
+  void prepare_state_rebuild(BackendState &, DirtyMask reasons) override {
+    CHECK((reasons & dirty_storage) != 0,
+          "checkpoint replacement did not request storage-safe teardown");
+    ++accesses.prepare_rebuilds;
+  }
+
+private:
+  access_trace &accesses;
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL) {
@@ -638,6 +690,90 @@ static void test_cpu_state_rebuild_is_safe_noop() {
   delete s;
 }
 
+static void test_backend_safe_host_access() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  component components[1] = {Ez};
+  const double frequencies[2] = {0.2, 0.3};
+  dft_fields monitor =
+      f->add_dft_fields(components, 1, volume(vec(0.4, 0.4), vec(1.2, 1.2)), frequencies, 2);
+
+  rebuild_trace rebuilds;
+  access_trace accesses;
+  f->backend = new access_tracking_backend(*f, rebuilds, accesses);
+  f->advance(1);
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  const std::complex<double> point = f->get_field(Ez, vec(0.7, 0.8), true);
+  CHECK(fabs(point.real() - 2.5) < 1e-12 && fabs(point.imag() - 2.5) < 1e-12,
+        "point query did not consume backend-refreshed real/imaginary values");
+  CHECK(sum_to_all(int(accesses.field_reads)) > 0 && max_to_all(int(accesses.max_elements)) == 1,
+        "point query did not issue exact one-element backend reads");
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  std::unique_ptr<std::complex<realnum>[]> slice(
+      f->get_complex_array_slice(volume(vec(0.5, 0.5), vec(1.0, 1.0)), Ez));
+  CHECK(slice.get() != NULL && sum_to_all(int(accesses.field_reads)) > 0,
+        "array slice did not issue explicit backend field reads");
+  size_t largest_field_allocation = 0;
+  for (size_t i = 0; i < f->array_catalog->size(); ++i) {
+    const ArraySpec &spec = f->array_catalog->spec(ArrayId{uint32_t(i)});
+    if (spec.role == array_role::field && spec.elements > largest_field_allocation)
+      largest_field_allocation = spec.elements;
+  }
+  CHECK(!accesses.field_reads || accesses.max_elements < largest_field_allocation,
+        "small array slice refreshed a complete unrelated field allocation");
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  int rank = 0;
+  size_t dims[3] = {0, 0, 0};
+  std::unique_ptr<std::complex<realnum>[]> dft(f->get_dft_array(monitor, Ez, 0, &rank, dims));
+  CHECK(dft.get() != NULL && sum_to_all(int(accesses.dft_reads)) > 0,
+        "DFT array query did not refresh its accumulator storage");
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  dft_chunk *chunklists[1] = {monitor.chunks};
+  std::unique_ptr<std::complex<realnum>[]> encoded_dft;
+  std::complex<realnum> *encoded_array = NULL;
+  direction dirs[3];
+  f->process_dft_component(chunklists, 1, 0, NO_COMPONENT, NULL, &encoded_array, &rank, dims, dirs);
+  encoded_dft.reset(encoded_array);
+  CHECK(encoded_dft.get() != NULL && sum_to_all(int(accesses.dft_reads)) > 0,
+        "encoded DFT component did not refresh its normalized accumulator storage");
+
+  accesses.fail_read_rank = 0;
+  bool symmetric_failure = false;
+  try {
+    (void)f->get_field(Ez, vec(0.7, 0.8), true);
+  }
+  catch (const std::runtime_error &) {
+    symmetric_failure = true;
+  }
+  CHECK(symmetric_failure, "rank-local backend read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
+
+  char filename[128];
+  snprintf(filename, sizeof(filename), "/tmp/meep-backend-access-%d.h5", my_rank());
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  f->dump(filename, false);
+  CHECK(sum_to_all(int(accesses.field_reads)) > 0 && sum_to_all(int(accesses.dft_reads)) > 0,
+        "checkpoint dump did not explicitly read field and DFT storage");
+  CHECK(f->backend_state != NULL && f->executable != NULL,
+        "checkpoint dump retired resident execution state");
+
+  f->load(filename, false);
+  CHECK(accesses.prepare_rebuilds == 1,
+        "checkpoint load did not prepare resident authority for replacement");
+  CHECK(f->backend_state == NULL && f->executable == NULL,
+        "checkpoint load retained artifacts referring to the old catalog");
+  CHECK(is_dirty(*f, dirty_storage), "checkpoint load did not invalidate storage layout");
+  std::remove(filename);
+
+  delete f;
+  delete s;
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -652,6 +788,7 @@ int main(int argc, char **argv) {
   test_initialization_plan();
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();
+  test_backend_safe_host_access();
 
   if (failures) {
     master_printf("backend_api: %d FAILURE(S)\n", failures);
