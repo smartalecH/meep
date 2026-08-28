@@ -37,6 +37,7 @@
 
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
+#include "backend/descriptors.hpp"
 
 namespace meep {
 
@@ -255,6 +256,7 @@ struct StepPlan {
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
+  std::vector<DftDescriptor> dft_updates;
   uint64_t source_signature;
   uint64_t signature;
 
@@ -265,6 +267,7 @@ struct StepPlan {
     eh_updates.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
+    dft_updates.clear();
     source_signature = 0;
     signature = 0;
   }
