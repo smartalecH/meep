@@ -131,9 +131,17 @@ void lifecycle_init(fields &f) {
   f.first_bad_component = -1;
 }
 
-void invalidate(fields &f, MutationKind cause) {
+bool invalidate_collectively(fields &f, MutationKind cause, bool locally_observed,
+                             const char *site) {
+  const bool anywhere = or_to_all(locally_observed);
+  if (anywhere) invalidate(f, cause, site);
+  return anywhere;
+}
+
+void invalidate(fields &f, MutationKind cause, const char *site) {
   f.dirty_mask |= invalidation_closure(cause);
   ++f.mutation_generation[static_cast<int>(cause)];
+  (void)site;
 }
 
 uint64_t generation(const fields &f, MutationKind cause) {
