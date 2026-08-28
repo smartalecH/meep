@@ -12,6 +12,7 @@
 #define MEEP_BACKEND_NVIDIA_NVIDIA_STEP_HPP
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "backend/nvidia/runtime.hpp"
 
@@ -101,6 +102,13 @@ struct halo_launch {
   scalar_precision precision;
 };
 
+struct finite_check_launch {
+  const void *values;
+  size_t elements;
+  uint64_t ordinal_base;
+  scalar_precision precision;
+};
+
 /* All launches are asynchronous on `stream`. Invalid geometry or a CUDA launch
    failure throws before returning. */
 void launch_curl(const curl_launch &update, const stream &stream);
@@ -110,6 +118,8 @@ void launch_halo_gather(const halo_launch &launch, const void *device_entries, v
                         const stream &stream);
 void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
                          const void *device_buffer, const stream &stream);
+void launch_finite_check(const finite_check_launch &launch, void *device_first_bad,
+                         const stream &stream);
 
 } // namespace nvidia
 } // namespace meep
