@@ -1162,9 +1162,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA source-time descriptors are not canonical");
         switch (time.kind) {
           case SourceTimeKind::gaussian:
-          case SourceTimeKind::continuous: break;
-          case SourceTimeKind::host_custom:
-            throw std::invalid_argument("NVIDIA PR3 does not support custom source times");
+          case SourceTimeKind::continuous:
+          case SourceTimeKind::host_custom: break;
           default: throw std::invalid_argument("NVIDIA source-time kind is invalid");
         }
       }
