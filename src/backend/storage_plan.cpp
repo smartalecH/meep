@@ -16,10 +16,12 @@
 */
 
 #include "backend/storage_plan.hpp"
+#include "backend/halo_plan.hpp"
 #include "meep_internals.hpp"
 
 #include <limits>
 #include <stdexcept>
+#include <stdint.h>
 
 namespace meep {
 
@@ -120,6 +122,27 @@ ArrayId CpuArrayCatalog::register_array(const StorageKey &key, void *address, si
   index_[key] = id;
   by_address_[address] = id;
   return ArrayId{id};
+}
+
+bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offset) const {
+  id = invalid_array();
+  element_offset = 0;
+  if (!p) return false;
+  const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+  for (size_t i = 0; i < specs_.size(); ++i) {
+    const ArraySpec &spec = specs_[i];
+    if (!bases_[i]) continue;
+    const size_t bytes_per_element = element_bytes(spec.element_type);
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(bases_[i]);
+    const size_t bytes = spec.elements * bytes_per_element;
+    if (address < begin || address - begin >= bytes) continue;
+    const uintptr_t delta = address - begin;
+    if (delta % bytes_per_element) continue;
+    id = is_valid(spec.alias_of) ? spec.alias_of : spec.id;
+    element_offset = ptrdiff_t(delta / bytes_per_element);
+    return true;
+  }
+  return false;
 }
 
 size_t CpuArrayCatalog::total_bytes() const {
@@ -238,6 +261,29 @@ size_t build_storage_catalog(fields &f, CpuArrayCatalog &cat, StoragePlan &plan)
         }
     }
 
+    /* Register each published internal array separately. The blob header
+       contains host pointers and is not device data; only the typed arrays are
+       portable. The layout ordinal distinguishes P/P_prev entries belonging
+       to the same susceptibility/component/cmp tuple. */
+    FOR_FIELD_TYPES(ft) {
+      int si = 0;
+      for (polarization_state *p = fc.pol[ft]; p; p = p->next, ++si) {
+        if (!p->data) continue;
+        std::vector<InternalArrayLayout> layout;
+        if (!p->s->internal_layout(layout, fc.gv, p->data)) continue;
+        realnum *base = static_cast<realnum *>(p->data);
+        for (size_t li = 0; li < layout.size(); ++li) {
+          const InternalArrayLayout &entry = layout[li];
+          const ElementType type = entry.element_type == InternalArrayLayout::complex_realnum
+                                       ? ElementType::complex_realnum
+                                       : ElementType::realnum_value;
+          const int aux = si * 1024 + int(li);
+          r.add(i, array_kind::polarization_internal, int(entry.c), entry.cmp, aux,
+                base + entry.offset_elements, entry.elements, array_role::polarization, type);
+        }
+      }
+    }
+
     // ---- dft_chunk ------------------------------------------------------
     int di = 0;
     for (dft_chunk *cur = fc.dft_chunks; cur; cur = cur->next_in_chunk, ++di)
@@ -302,6 +348,17 @@ size_t audit_storage_catalog(fields &f, const CpuArrayCatalog &cat, bool report)
     }
     for (dft_chunk *cur = fc.dft_chunks; cur; cur = cur->next_in_chunk)
       check(cur->dft, "dft", i);
+
+    FOR_FIELD_TYPES(ft) {
+      for (polarization_state *p = fc.pol[ft]; p; p = p->next) {
+        if (!p->data) continue;
+        std::vector<InternalArrayLayout> layout;
+        if (!p->s->internal_layout(layout, fc.gv, p->data)) continue;
+        realnum *base = static_cast<realnum *>(p->data);
+        for (size_t li = 0; li < layout.size(); ++li)
+          check(base + layout[li].offset_elements, "polarization internal", i);
+      }
+    }
   }
   return problems;
 }
