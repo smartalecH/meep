@@ -463,6 +463,11 @@ static void check_prepared_updates() {
         "prepared plan contains no custom host callback delta");
   CHECK(or_to_all(host_halos > 0),
         "prepared custom polarization segment contains no logical host halos");
+  const size_t global_dft_operations = sum_to_all(dft_operations);
+  CHECK(max_to_all(int(dft_operations)) <= 1 && global_dft_operations >= 1,
+        "expected at most one local and at least one global DFT update operation, got %zu local "
+        "and %zu global",
+        dft_operations, global_dft_operations);
   check_finite_value_accesses(f, plan);
   CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",
         source_evaluations);
