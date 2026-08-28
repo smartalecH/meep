@@ -74,7 +74,7 @@ template <typename T> static void check_device(int device) {
   const scalar_precision precision =
       sizeof(T) == sizeof(float) ? scalar_precision::f32 : scalar_precision::f64;
 
-  curl_launch curl;
+  curl_launch curl = {};
   curl.region = region;
   curl.target = d_target.opaque_handle();
   curl.plus_source = d_plus.opaque_handle();
@@ -101,7 +101,7 @@ template <typename T> static void check_device(int device) {
                 4.0 * std::numeric_limits<T>::epsilon() * (1.0 + std::fabs(double(expected[i]))),
             "curl result differs from host reference");
 
-  constitutive_launch constitutive;
+  constitutive_launch constitutive = {};
   constitutive.region = region;
   constitutive.target = d_output.opaque_handle();
   constitutive.primary = d_primary.opaque_handle();
@@ -124,7 +124,7 @@ template <typename T> static void check_device(int device) {
                     (1.0 + std::fabs(double(expected_output[i]))),
             "constitutive result or out-of-region sentinel differs");
 
-  zero_launch zero;
+  zero_launch zero = {};
   zero.region = region;
   zero.target = d_target.opaque_handle();
   zero.precision = precision;
@@ -141,6 +141,202 @@ template <typename T> static void check_device(int device) {
       }
   for (size_t i = 0; i < elements; ++i)
     require(observed[i] == expected_zero[i], "zero result or out-of-region sentinel differs");
+
+  const double pml_dt = 0.075;
+  flat_region pml_region = {};
+  pml_region.base = 2;
+  pml_region.counts[0] = 1;
+  pml_region.counts[1] = 1;
+  pml_region.counts[2] = 6;
+  pml_region.strides[0] = 0;
+  pml_region.strides[1] = 0;
+  pml_region.strides[2] = 1;
+  const size_t profile_elements = 20;
+  std::vector<T> pml_target(elements), pml_u(elements), pml_cond_target(elements),
+      conductivity(elements), conductivity_inverse(elements), sigma(profile_elements),
+      kappa(profile_elements), inverse(profile_elements), sigma_u(profile_elements),
+      kappa_u(profile_elements), inverse_u(profile_elements);
+  for (size_t i = 0; i < elements; ++i) {
+    pml_target[i] = T(0.4 + 0.003 * double(i));
+    pml_u[i] = T(-0.2 + 0.002 * double(i));
+    pml_cond_target[i] = T(0.1 - 0.001 * double(i));
+    conductivity[i] = T(0.03 + 0.0004 * double(i));
+    conductivity_inverse[i] = T(1) / (T(1) + T(0.5 * pml_dt) * conductivity[i]);
+  }
+  for (size_t i = 0; i < profile_elements; ++i) {
+    sigma[i] = T(0.004 * double(i + 1));
+    kappa[i] = T(1.0 + 0.003 * double(i));
+    inverse[i] = T(1) / (kappa[i] + sigma[i]);
+    sigma_u[i] = T(0.003 * double(i + 1));
+    kappa_u[i] = T(1.0 + 0.002 * double(i));
+    inverse_u[i] = T(1) / (kappa_u[i] + sigma_u[i]);
+  }
+
+  device_buffer d_pml_target(bytes, device), d_pml_u(bytes, device),
+      d_pml_cond_target(bytes, device), d_conductivity(bytes, device),
+      d_conductivity_inverse(bytes, device), d_sigma(profile_elements * sizeof(T), device),
+      d_kappa(profile_elements * sizeof(T), device), d_inverse(profile_elements * sizeof(T), device),
+      d_sigma_u(profile_elements * sizeof(T), device),
+      d_kappa_u(profile_elements * sizeof(T), device),
+      d_inverse_u(profile_elements * sizeof(T), device);
+  copy_host_to_device_async(d_conductivity, 0, conductivity.data(), bytes, execution);
+  copy_host_to_device_async(d_conductivity_inverse, 0, conductivity_inverse.data(), bytes,
+                            execution);
+  copy_host_to_device_async(d_sigma, 0, sigma.data(), profile_elements * sizeof(T), execution);
+  copy_host_to_device_async(d_kappa, 0, kappa.data(), profile_elements * sizeof(T), execution);
+  copy_host_to_device_async(d_inverse, 0, inverse.data(), profile_elements * sizeof(T), execution);
+  copy_host_to_device_async(d_sigma_u, 0, sigma_u.data(), profile_elements * sizeof(T), execution);
+  copy_host_to_device_async(d_kappa_u, 0, kappa_u.data(), profile_elements * sizeof(T), execution);
+  copy_host_to_device_async(d_inverse_u, 0, inverse_u.data(), profile_elements * sizeof(T),
+                            execution);
+
+  for (unsigned int variant = 0; variant < 8; ++variant) {
+    const bool main_pml = (variant & 1) != 0;
+    const bool auxiliary_pml = (variant & 2) != 0;
+    const bool conductive = (variant & 4) != 0;
+    copy_host_to_device_async(d_pml_target, 0, pml_target.data(), bytes, execution);
+    copy_host_to_device_async(d_pml_u, 0, pml_u.data(), bytes, execution);
+    copy_host_to_device_async(d_pml_cond_target, 0, pml_cond_target.data(), bytes, execution);
+
+    curl_launch pml_curl = {};
+    pml_curl.region = pml_region;
+    pml_curl.target = d_pml_target.opaque_handle();
+    pml_curl.plus_source = d_plus.opaque_handle();
+    pml_curl.minus_source = d_minus.opaque_handle();
+    pml_curl.plus_stride = 1;
+    pml_curl.minus_stride = 1;
+    pml_curl.dtdx = 0.125;
+    pml_curl.dt = pml_dt;
+    pml_curl.precision = precision;
+    if (main_pml) {
+      pml_curl.pml.sigma = d_sigma.opaque_handle();
+      pml_curl.pml.kappa = d_kappa.opaque_handle();
+      pml_curl.pml.inverse = d_inverse.opaque_handle();
+      pml_curl.pml.base = 3;
+      pml_curl.pml.strides[2] = 2;
+    }
+    if (auxiliary_pml) {
+      pml_curl.target_u = d_pml_u.opaque_handle();
+      pml_curl.pml_u.sigma = d_sigma_u.opaque_handle();
+      pml_curl.pml_u.kappa = d_kappa_u.opaque_handle();
+      pml_curl.pml_u.inverse = d_inverse_u.opaque_handle();
+      pml_curl.pml_u.base = 2;
+      pml_curl.pml_u.strides[2] = 2;
+    }
+    if (conductive) {
+      pml_curl.conductivity = d_conductivity.opaque_handle();
+      pml_curl.conductivity_inverse = d_conductivity_inverse.opaque_handle();
+      if (main_pml) pml_curl.target_conductivity = d_pml_cond_target.opaque_handle();
+    }
+    launch_curl(pml_curl, execution);
+
+    std::vector<T> expected_target = pml_target;
+    std::vector<T> expected_u = pml_u;
+    std::vector<T> expected_cond_target = pml_cond_target;
+    for (size_t n = 0; n < pml_region.counts[2]; ++n) {
+      const size_t i = pml_region.base + n;
+      const size_t k = 3 + 2 * n;
+      const size_t ku = 2 + 2 * n;
+      const T curl_value = plus[i + 1] - plus[i] + minus[i] - minus[i + 1];
+      const T delta = T(pml_curl.dtdx) * curl_value;
+      const T damping = T(1) - T(0.5 * pml_dt) * conductivity[i];
+      if (!main_pml && !auxiliary_pml) {
+        expected_target[i] = conductive
+                                 ? (damping * expected_target[i] - delta) *
+                                       conductivity_inverse[i]
+                                 : expected_target[i] - delta;
+        continue;
+      }
+      T intermediate;
+      T previous_u = T(0);
+      if (main_pml) {
+        if (conductive) {
+          const T previous = expected_cond_target[i];
+          expected_cond_target[i] =
+              (damping * previous - delta) * conductivity_inverse[i];
+          intermediate = expected_cond_target[i] - previous;
+        }
+        else
+          intermediate = -delta;
+        if (auxiliary_pml) {
+          previous_u = expected_u[i];
+          expected_u[i] =
+              ((kappa[k] - sigma[k]) * expected_u[i] + intermediate) * inverse[k];
+        }
+        else {
+          expected_target[i] =
+              ((kappa[k] - sigma[k]) * expected_target[i] + intermediate) * inverse[k];
+          continue;
+        }
+      }
+      else {
+        previous_u = expected_u[i];
+        expected_u[i] = conductive
+                            ? (damping * previous_u - delta) * conductivity_inverse[i]
+                            : previous_u - delta;
+      }
+      expected_target[i] =
+          inverse_u[ku] * (((kappa_u[ku] - sigma_u[ku]) * expected_target[i] + expected_u[i]) -
+                           previous_u);
+    }
+
+    copy_device_to_host_async(observed.data(), d_pml_target, 0, bytes, execution);
+    std::vector<T> observed_u(elements), observed_cond_target(elements);
+    copy_device_to_host_async(observed_u.data(), d_pml_u, 0, bytes, execution);
+    copy_device_to_host_async(observed_cond_target.data(), d_pml_cond_target, 0, bytes, execution);
+    execution.synchronize();
+    const double variant_tolerance = 16.0 * std::numeric_limits<T>::epsilon();
+    for (size_t i = 0; i < elements; ++i) {
+      require(std::fabs(double(observed[i] - expected_target[i])) <=
+                  variant_tolerance * (1.0 + std::fabs(double(expected_target[i]))),
+              "curl PML/conductivity target differs");
+      require(std::fabs(double(observed_u[i] - expected_u[i])) <=
+                  variant_tolerance * (1.0 + std::fabs(double(expected_u[i]))),
+              "curl PML auxiliary or sentinel differs");
+      require(std::fabs(double(observed_cond_target[i] - expected_cond_target[i])) <=
+                  variant_tolerance * (1.0 + std::fabs(double(expected_cond_target[i]))),
+              "curl conductivity auxiliary or sentinel differs");
+    }
+  }
+
+  copy_host_to_device_async(d_pml_target, 0, pml_target.data(), bytes, execution);
+  copy_host_to_device_async(d_pml_u, 0, pml_u.data(), bytes, execution);
+  constitutive_launch pml_constitutive = {};
+  pml_constitutive.region = pml_region;
+  pml_constitutive.target = d_pml_target.opaque_handle();
+  pml_constitutive.primary = d_primary.opaque_handle();
+  pml_constitutive.diagonal = d_diagonal.opaque_handle();
+  pml_constitutive.target_w = d_pml_u.opaque_handle();
+  pml_constitutive.pml.sigma = d_sigma.opaque_handle();
+  pml_constitutive.pml.kappa = d_kappa.opaque_handle();
+  pml_constitutive.pml.inverse = d_inverse.opaque_handle();
+  pml_constitutive.pml.base = 3;
+  pml_constitutive.pml.strides[2] = 2;
+  pml_constitutive.precision = precision;
+  launch_constitutive(pml_constitutive, execution);
+  copy_device_to_host_async(observed.data(), d_pml_target, 0, bytes, execution);
+  std::vector<T> observed_w(elements);
+  copy_device_to_host_async(observed_w.data(), d_pml_u, 0, bytes, execution);
+  execution.synchronize();
+  std::vector<T> expected_pml_target = pml_target;
+  std::vector<T> expected_w = pml_u;
+  for (size_t n = 0; n < pml_region.counts[2]; ++n) {
+    const size_t i = pml_region.base + n;
+    const size_t k = 3 + 2 * n;
+    const T value = primary[i] * diagonal[i];
+    expected_pml_target[i] +=
+        (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * expected_w[i];
+    expected_w[i] = value;
+  }
+  const double constitutive_tolerance = 12.0 * std::numeric_limits<T>::epsilon();
+  for (size_t i = 0; i < elements; ++i) {
+    require(std::fabs(double(observed[i] - expected_pml_target[i])) <=
+                constitutive_tolerance * (1.0 + std::fabs(double(expected_pml_target[i]))),
+            "constitutive PML target or sentinel differs");
+    require(std::fabs(double(observed_w[i] - expected_w[i])) <=
+                constitutive_tolerance * (1.0 + std::fabs(double(expected_w[i]))),
+            "constitutive PML auxiliary or sentinel differs");
+  }
 
   std::vector<T> halo_values(8), halo_observed(8);
   for (size_t i = 0; i < halo_values.size(); ++i) halo_values[i] = T(i + 1);
