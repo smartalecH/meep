@@ -1,0 +1,212 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meep.readthedocs.io/schemas/nvidia-paper-benchmark-result-v1.json",
+  "title": "Meep NVIDIA paper benchmark result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_manifest", "physics_reference", "status", "provenance", "simulation", "timing", "performance", "memory", "counters", "physics_observables"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonnegativeNumber": {"type": "number", "minimum": 0},
+    "nonnegativeInteger": {"type": "integer", "minimum": 0},
+    "execution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "backend", "precision", "ranks", "mpi_transport"],
+      "properties": {
+        "mode": {"enum": ["smoke", "fixed-step", "end-to-end"]},
+        "backend": {"enum": ["auto", "cpu", "nvidia"]},
+        "precision": {"enum": ["native", "f32", "mixed"]},
+        "ranks": {"type": "integer", "minimum": 1},
+        "mpi_transport": {"enum": ["none", "host", "staged", "direct", "auto"]}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "run_manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "case_id"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "case_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "physics_reference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {"type": "string"},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "status": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["exit_code", "succeeded", "errors"],
+      "properties": {
+        "exit_code": {"type": "integer"},
+        "succeeded": {"type": "boolean"},
+        "errors": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["meep", "invocation", "requested_execution", "resolved_execution", "cuda", "mpi", "rank_devices"],
+      "properties": {
+        "meep": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commit", "dirty", "configure_flags", "build_flags"],
+          "properties": {
+            "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+            "dirty": {"type": "boolean"},
+            "configure_flags": {"type": "array", "items": {"type": "string"}},
+            "build_flags": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "invocation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argv", "cwd", "environment"],
+          "properties": {
+            "argv": {"type": "array", "items": {"type": "string"}},
+            "cwd": {"type": "string"},
+            "environment": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        },
+        "requested_execution": {"$ref": "#/$defs/execution"},
+        "resolved_execution": {"$ref": "#/$defs/execution"},
+        "cuda": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["driver_version", "runtime_version", "toolkit_version"],
+          "properties": {
+            "driver_version": {"type": ["string", "null"]},
+            "runtime_version": {"type": ["string", "null"]},
+            "toolkit_version": {"type": ["string", "null"]}
+          }
+        },
+        "mpi": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "version", "cuda_aware_query", "mca"],
+          "properties": {
+            "provider": {"type": ["string", "null"]},
+            "version": {"type": ["string", "null"]},
+            "cuda_aware_query": {"type": ["boolean", "null"]},
+            "mca": {"type": "object", "additionalProperties": {"type": "string"}}
+          }
+        },
+        "rank_devices": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["rank", "visible_device", "uuid", "name", "memory_bytes", "sm_clock_hz", "memory_clock_hz"],
+            "properties": {
+              "rank": {"$ref": "#/$defs/nonnegativeInteger"},
+              "visible_device": {"$ref": "#/$defs/nonnegativeInteger"},
+              "uuid": {"type": "string", "minLength": 1},
+              "name": {"type": "string", "minLength": 1},
+              "memory_bytes": {"type": "integer", "minimum": 1},
+              "sm_clock_hz": {"type": "number", "exclusiveMinimum": 0},
+              "memory_clock_hz": {"type": "number", "exclusiveMinimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "simulation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grid_shape", "grid_points_exact", "courant_factor", "dt_meep", "steps", "physical_time_meep"],
+      "properties": {
+        "grid_shape": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 1}},
+        "grid_points_exact": {"type": "integer", "minimum": 1},
+        "courant_factor": {"type": "number", "exclusiveMinimum": 0},
+        "dt_meep": {"type": "number", "exclusiveMinimum": 0},
+        "steps": {"$ref": "#/$defs/nonnegativeInteger"},
+        "physical_time_meep": {"$ref": "#/$defs/nonnegativeNumber"}
+      }
+    },
+    "timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["initialization_seconds", "graph_build_seconds", "warmup_steps", "steady_state_repetitions_seconds", "steady_state_min_seconds", "steady_state_median_seconds", "steady_state_max_seconds", "kernel_seconds", "pack_seconds", "unpack_seconds", "staging_d2h_seconds", "staging_h2d_seconds", "mpi_progress_seconds", "mpi_wait_seconds"],
+      "properties": {
+        "initialization_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "graph_build_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "warmup_steps": {"$ref": "#/$defs/nonnegativeInteger"},
+        "steady_state_repetitions_seconds": {"type": "array", "items": {"$ref": "#/$defs/nonnegativeNumber"}},
+        "steady_state_min_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "steady_state_median_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "steady_state_max_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "kernel_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "pack_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "unpack_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "staging_d2h_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "staging_h2d_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "mpi_progress_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "mpi_wait_seconds": {"$ref": "#/$defs/nonnegativeNumber"}
+      }
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["grid_timesteps_per_second", "component_updates_per_second", "component_updates_per_grid_timestep", "rate_basis"],
+      "properties": {
+        "grid_timesteps_per_second": {"$ref": "#/$defs/nonnegativeNumber"},
+        "component_updates_per_second": {"$ref": "#/$defs/nonnegativeNumber"},
+        "component_updates_per_grid_timestep": {"$ref": "#/$defs/nonnegativeNumber"},
+        "rate_basis": {"const": "steady_state_median_seconds"}
+      }
+    },
+    "memory": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["peak_host_bytes", "peak_device_bytes", "device_allocation_count"],
+      "properties": {
+        "peak_host_bytes": {"$ref": "#/$defs/nonnegativeInteger"},
+        "peak_device_bytes": {"$ref": "#/$defs/nonnegativeInteger"},
+        "device_allocation_count": {"$ref": "#/$defs/nonnegativeInteger"}
+      }
+    },
+    "counters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["h2d_bytes", "d2h_bytes", "halo_bytes", "full_field_copy_count", "fallback_count", "graph_launches", "graph_launches_per_step"],
+      "properties": {
+        "h2d_bytes": {"$ref": "#/$defs/nonnegativeInteger"},
+        "d2h_bytes": {"$ref": "#/$defs/nonnegativeInteger"},
+        "halo_bytes": {"$ref": "#/$defs/nonnegativeInteger"},
+        "full_field_copy_count": {"$ref": "#/$defs/nonnegativeInteger"},
+        "fallback_count": {"$ref": "#/$defs/nonnegativeInteger"},
+        "graph_launches": {"$ref": "#/$defs/nonnegativeInteger"},
+        "graph_launches_per_step": {"$ref": "#/$defs/nonnegativeNumber"}
+      }
+    },
+    "physics_observables": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value", "unit", "reference_value", "absolute_tolerance", "relative_tolerance", "passed", "monitor"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "value": {"type": "number"},
+          "unit": {"type": "string", "minLength": 1},
+          "reference_value": {"type": "number"},
+          "absolute_tolerance": {"$ref": "#/$defs/nonnegativeNumber"},
+          "relative_tolerance": {"$ref": "#/$defs/nonnegativeNumber"},
+          "passed": {"type": "boolean"},
+          "monitor": {"type": "object"}
+        }
+      }
+    }
+  }
+}
