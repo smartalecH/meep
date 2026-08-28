@@ -297,6 +297,15 @@ void fields::init_backend() {
     return;
   }
 
+  /* Resident lifecycle decisions guard collective preparation. Reconcile the
+     relevant causes before any rank branches into classification or rebuild. */
+  const DirtyMask relevant = dirty_storage | dirty_initialization | dirty_classification |
+                             dirty_executable;
+  const size_t local_dirty = size_t(dirty_mask & relevant);
+  size_t global_dirty = 0;
+  bw_or_to_all(&local_dirty, &global_dirty, 1);
+  dirty_mask |= DirtyMask(global_dirty);
+
   /* A value-only material update can change classification without changing
      the existing storage layout. Reconcile the host representation first; any
      promotion it discovers will set dirty_storage for the rebuild below. */
