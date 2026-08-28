@@ -8,6 +8,8 @@
 
 /* Backend selection, lifecycle, and the backend-safe access points. */
 
+#include <limits>
+#include <stdexcept>
 #include <string>
 
 #include "meep.hpp"
@@ -58,6 +60,74 @@ backend_capabilities fields::backend_caps() const {
   c.memory_budget_bytes = 0;
   c.name = "none";
   return c;
+}
+
+bool backend_host_refresh_required(const fields &f) {
+  return f.backend && f.backend_state && f.backend->requires_full_storage_preparation();
+}
+
+bool backend_read_host_range(const fields &f, const void *host_address, size_t elements,
+                             std::string &local_error) {
+  if (!local_error.empty()) return false;
+  try {
+    if (!host_address || !elements || !backend_host_refresh_required(f)) return true;
+    if (!f.array_catalog)
+      throw std::logic_error("resident backend access requires a storage catalog");
+
+    ArrayId id;
+    ptrdiff_t offset;
+    if (!f.array_catalog->locate(host_address, id, offset) || offset < 0)
+      throw std::out_of_range("host access does not name catalogued backend storage");
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (size_t(offset) > spec.elements || elements > spec.elements - size_t(offset))
+      throw std::out_of_range("host access exceeds catalogued backend storage");
+    const size_t element_bytes = host_element_bytes(spec.element_type);
+    if (elements > std::numeric_limits<size_t>::max() / element_bytes)
+      throw std::overflow_error("backend host-access byte count overflow");
+    f.backend->read(ArrayRef{id, size_t(offset), elements}, const_cast<void *>(host_address),
+                    elements * element_bytes);
+    return true;
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown backend host-access failure";
+  }
+  return false;
+}
+
+void backend_reconcile_host_access(const std::string &local_error, const char *site) {
+  if (!or_to_all(!local_error.empty())) return;
+  if (local_error.empty())
+    throw std::runtime_error(std::string(site) + ": backend host access failed on another MPI rank");
+  throw std::runtime_error(std::string(site) + ": " + local_error);
+}
+
+void backend_prepare_checkpoint_load(fields &f) {
+  std::string local_error;
+  if (f.backend_state)
+    try {
+      f.backend->prepare_state_rebuild(
+          *f.backend_state, DirtyMask(dirty_storage | dirty_initialization | dirty_executable));
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown backend checkpoint-preparation failure";
+    }
+  backend_reconcile_host_access(local_error, "fields::load");
+  if (f.backend_state) {
+    delete f.executable;
+    f.executable = NULL;
+    delete f.backend_state;
+    f.backend_state = NULL;
+  }
+  /* A load can create or remove lazily allocated arrays. Always rebuild the
+     catalog before the next resident execution rather than trying to infer
+     whether this particular checkpoint happened to retain its old shape. */
+  invalidate(f, MutationKind::field_layout, "fields::load checkpoint replacement");
 }
 
 /* Select the backend for `opts`, or abort with a clear message.
