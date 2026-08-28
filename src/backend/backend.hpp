@@ -110,6 +110,13 @@ bool backend_read_host_range(const fields &f, const void *host_address, size_t e
    of backend reads and before entering the next MPI/HDF5 collective. */
 void backend_reconcile_host_access(const std::string &local_error, const char *site);
 
+/* Refresh the exact contiguous field envelopes touched by a legacy
+   loop_in_chunks consumer, then reconcile any rank-local read failure before
+   the consumer reaches an MPI or HDF5 collective. */
+void backend_refresh_host_fields(fields &owner, int count, const component *components,
+                                 const volume &where, component cgrid, bool use_symmetry,
+                                 bool snap_empty_dimensions, const char *site);
+
 /* A checkpoint load may replace array allocations. Preserve authoritative
    resident state before those host pointers change, then retire the stale
    state/catalog consumers. */
