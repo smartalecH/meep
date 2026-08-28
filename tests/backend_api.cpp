@@ -63,13 +63,17 @@ struct lifetime_counts {
   int classified;
   int finalized;
   int advanced;
+  int reads;
+  int writes;
+  int rebuilds;
   size_t arrays_at_create;
   bool connections_current_at_create;
 
   lifetime_counts()
       : states_created(0), states_destroyed(0), executables_created(0),
         executables_destroyed(0), initialized(0), classified(0), finalized(0), advanced(0),
-        arrays_at_create(0), connections_current_at_create(false) {}
+        reads(0), writes(0), rebuilds(0), arrays_at_create(0),
+        connections_current_at_create(false) {}
 };
 
 struct tracking_state : BackendState {
@@ -105,15 +109,15 @@ public:
     return new tracking_executable(counts);
   }
   void advance(Executable &, BackendState &, int) override { ++counts.advanced; }
-  void read(ArrayRef, void *, size_t) override {}
-  void write(ArrayRef, const void *, size_t) override {}
+  void read(ArrayRef, void *, size_t) override { ++counts.reads; }
+  void write(ArrayRef, const void *, size_t) override { ++counts.writes; }
   void synchronize() override {}
   backend_capabilities capabilities() const override {
     backend_capabilities c = {true, true, true, 0, "tracking"};
     return c;
   }
   bool requires_full_storage_preparation() const override { return true; }
-  void prepare_state_rebuild(BackendState &, DirtyMask) override {}
+  void prepare_state_rebuild(BackendState &, DirtyMask) override { ++counts.rebuilds; }
   bool accepts(const execution_options &, std::string &) const override { return true; }
 
 private:
@@ -408,6 +412,66 @@ static void test_precision_policy() {
   CHECK(overflow_rejected, "overflowing storage byte count was accepted");
 }
 
+static void test_dft_access_boundaries() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->require_component(Ez);
+  component c = Ez;
+  dft_fields monitor = f->add_dft_fields(&c, 1, f->v, 0.3, 0.3, 1);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+
+  const int reads_before = counts.reads;
+  const int writes_before = counts.writes;
+  if (monitor.chunks) monitor.scale_dfts(2.0);
+  CHECK(or_to_all(counts.reads > reads_before),
+        "DFT host mutation did not read resident accumulator data");
+  CHECK(or_to_all(counts.writes > writes_before),
+        "DFT host mutation did not publish the accumulator back to the backend");
+
+  monitor.remove();
+  CHECK(!f->backend_state, "DFT removal left resident state referencing freed storage");
+  CHECK(counts.rebuilds == 1, "DFT removal did not migrate resident state before deletion");
+  delete f;
+  delete s;
+}
+
+static void test_detached_dft_access() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->require_component(Ez);
+  component c = Ez;
+  dft_fields monitor = f->add_dft_fields(&c, 1, f->v, 0.3, 0.3, 1,
+                                         /*use_centered_grid=*/true,
+                                         /*decimation_factor=*/1,
+                                         /*persist=*/true);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+
+  f->clear_dft_monitors();
+  CHECK(!f->backend_state, "clearing DFT monitors left resident state alive");
+  CHECK(counts.rebuilds == 1, "clearing DFT monitors did not migrate resident state");
+  f->advance(1);
+  BackendState *rebuilt = f->backend_state;
+
+  /* Detached persistent accumulators are now host-authoritative and absent
+     from the rebuilt catalog. Queries/mutations must not try to resolve them. */
+  if (monitor.chunks) {
+    monitor.chunks->sync_dft_to_host();
+    monitor.scale_dfts(2.0);
+  }
+  monitor.remove();
+  CHECK(f->backend_state == rebuilt,
+        "removing an already detached DFT monitor retired unrelated backend state");
+
+  delete f;
+  delete s;
+}
+
 static void test_backend_lifecycle_epoch() {
   structure *s;
   fields *f;
@@ -582,6 +646,8 @@ int main(int argc, char **argv) {
   test_construction_equivalence();
   test_read_write_roundtrip();
   test_precision_policy();
+  test_dft_access_boundaries();
+  test_detached_dft_access();
   test_backend_lifecycle_epoch();
   test_initialization_plan();
   test_authority_safe_state_rebuild();
