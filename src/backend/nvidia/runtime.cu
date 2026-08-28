@@ -29,6 +29,9 @@ std::atomic<size_t> device_current(0);
 std::atomic<size_t> device_peak(0);
 std::atomic<size_t> pinned_current(0);
 std::atomic<size_t> pinned_peak(0);
+std::atomic<size_t> host_to_device_calls(0), host_to_device_bytes(0);
+std::atomic<size_t> device_to_host_calls(0), device_to_host_bytes(0);
+std::atomic<size_t> device_to_device_calls(0), device_to_device_bytes(0);
 std::atomic<int> injected_failure(static_cast<int>(testing::failure_point::none));
 
 void update_peak(std::atomic<size_t> &peak, size_t value) {
@@ -570,6 +573,8 @@ void copy_host_to_device_async(device_buffer &destination, size_t destination_of
   check(cudaMemcpyAsync(destination_address, source, bytes, cudaMemcpyHostToDevice,
                         reinterpret_cast<cudaStream_t>(on_stream.opaque_handle())),
         "cudaMemcpyAsync(host-to-device)");
+  host_to_device_calls.fetch_add(1, std::memory_order_relaxed);
+  host_to_device_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void copy_device_to_host_async(void *destination, const device_buffer &source,
@@ -583,6 +588,8 @@ void copy_device_to_host_async(void *destination, const device_buffer &source,
   check(cudaMemcpyAsync(destination, source_address, bytes, cudaMemcpyDeviceToHost,
                         reinterpret_cast<cudaStream_t>(on_stream.opaque_handle())),
         "cudaMemcpyAsync(device-to-host)");
+  device_to_host_calls.fetch_add(1, std::memory_order_relaxed);
+  device_to_host_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void copy_device_to_device_async(device_buffer &destination, size_t destination_offset,
@@ -599,6 +606,8 @@ void copy_device_to_device_async(device_buffer &destination, size_t destination_
   check(cudaMemcpyAsync(destination_address, source_address, bytes, cudaMemcpyDeviceToDevice,
                         reinterpret_cast<cudaStream_t>(on_stream.opaque_handle())),
         "cudaMemcpyAsync(device-to-device)");
+  device_to_device_calls.fetch_add(1, std::memory_order_relaxed);
+  device_to_device_bytes.fetch_add(bytes, std::memory_order_relaxed);
 }
 
 void fill_byte_async(device_buffer &destination, size_t destination_offset, int value, size_t bytes,
@@ -631,6 +640,26 @@ void fail_next(failure_point point) {
 
 void clear_failure() {
   injected_failure.store(static_cast<int>(failure_point::none), std::memory_order_relaxed);
+}
+
+transfer_accounting current_transfer_accounting() {
+  transfer_accounting result;
+  result.host_to_device_calls = host_to_device_calls.load(std::memory_order_relaxed);
+  result.host_to_device_bytes = host_to_device_bytes.load(std::memory_order_relaxed);
+  result.device_to_host_calls = device_to_host_calls.load(std::memory_order_relaxed);
+  result.device_to_host_bytes = device_to_host_bytes.load(std::memory_order_relaxed);
+  result.device_to_device_calls = device_to_device_calls.load(std::memory_order_relaxed);
+  result.device_to_device_bytes = device_to_device_bytes.load(std::memory_order_relaxed);
+  return result;
+}
+
+void reset_transfer_accounting() {
+  host_to_device_calls.store(0, std::memory_order_relaxed);
+  host_to_device_bytes.store(0, std::memory_order_relaxed);
+  device_to_host_calls.store(0, std::memory_order_relaxed);
+  device_to_host_bytes.store(0, std::memory_order_relaxed);
+  device_to_device_calls.store(0, std::memory_order_relaxed);
+  device_to_device_bytes.store(0, std::memory_order_relaxed);
 }
 
 } // namespace testing
