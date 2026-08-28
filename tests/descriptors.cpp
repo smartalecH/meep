@@ -20,6 +20,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
 
 #include <meep.hpp>
@@ -46,6 +47,9 @@ static int failures = 0;
 
 static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+static bool close(complex<double> a, complex<double> b) {
+  return abs(a - b) <= 1e-13 * std::max(1.0, std::max(abs(a), abs(b)));
+}
 
 /* A susceptibility that publishes no layout: it must classify as host_custom
    and still run. This stands in for an unknown third-party subclass. */
@@ -59,12 +63,32 @@ public:
   }
 };
 
+class derived_gaussian_source : public gaussian_src_time {
+public:
+  derived_gaussian_source() : gaussian_src_time(0.31, 0.08) {}
+  virtual src_time *clone() const { return new derived_gaussian_source(*this); }
+  virtual complex<double> dipole(double time) const {
+    return gaussian_src_time::dipole(time) + complex<double>(0.125, -0.25);
+  }
+};
+
+class derived_continuous_source : public continuous_src_time {
+public:
+  derived_continuous_source() : continuous_src_time(0.27) {}
+  virtual src_time *clone() const { return new derived_continuous_source(*this); }
+  virtual complex<double> current(double time, double dt) const {
+    (void)time;
+    (void)dt;
+    return complex<double>(0.375, 0.5);
+  }
+};
+
 static void test_sources() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
   fields f(&s);
   gaussian_src_time g(0.3, 0.1);
-  continuous_src_time c(0.25);
+  continuous_src_time c(complex<double>(0.25, 0.02), 0.4, 0.2, 2.5, 3.0);
   f.add_point_source(Ez, g, vec(0.13, 0.11));
   f.add_point_source(Ez, c, vec(-0.3, 0.2));
   f.advance(2);
@@ -81,11 +105,39 @@ static void test_sources() {
     if (d.kind == SourceTimeKind::gaussian) saw_gaussian = true;
     if (d.kind == SourceTimeKind::continuous) saw_continuous = true;
     CHECK(d.scalar_slot < plan.scalars.size(), "scalar_slot %u out of range", d.scalar_slot);
-    if (d.kind != SourceTimeKind::host_custom)
-      CHECK(!d.parameters.empty(), "%s descriptor has no closed parameters",
-            source_time_kind_name(d.kind));
+    if (d.kind == SourceTimeKind::gaussian)
+      CHECK(d.parameters.size() == 4, "gaussian descriptor has %zu parameters, expected 4",
+            d.parameters.size());
+    if (d.kind == SourceTimeKind::continuous)
+      CHECK(d.parameters.size() == 6, "continuous descriptor has %zu parameters, expected 6",
+            d.parameters.size());
   }
   CHECK(saw_gaussian && saw_continuous, "built-in source kinds were not both classified");
+
+  /* Closed descriptors reproduce the live built-ins, including cutoff and
+     finite-difference current semantics. */
+  const src_time *live = f.sources;
+  for (size_t i = 0; i < plan.source_times.size(); ++i, live = live->next) {
+    const SourceTimeDescriptor &d = plan.source_times[i];
+    const double sample_times[] = {0.0, 0.5 * f.dt, f.dt, live->last_time()};
+    for (size_t ti = 0; ti < sizeof(sample_times) / sizeof(sample_times[0]); ++ti) {
+      const double time = sample_times[ti];
+      const SourceStepScalar got = evaluate_source_time_descriptor(d, time, f.dt);
+      CHECK(close(got.dipole, live->dipole(time)), "%s dipole differs at %.17g",
+            source_time_kind_name(d.kind), time);
+      CHECK(close(got.current, live->current(time, f.dt)), "%s current differs at %.17g",
+            source_time_kind_name(d.kind), time);
+    }
+  }
+
+  /* The production scalar block follows the same linked-list/slot order. */
+  populate_source_scalars(f, plan);
+  live = f.sources;
+  for (size_t i = 0; i < plan.source_times.size(); ++i, live = live->next) {
+    const SourceStepScalar &got = plan.scalars[plan.source_times[i].scalar_slot];
+    CHECK(got.current == live->current(), "source scalar current slot %zu is stale", i);
+    CHECK(got.dipole == live->dipole(), "source scalar dipole slot %zu is stale", i);
+  }
 
   /* Every spatial table must match the src_vol it came from, point for point,
      and must resolve to a registered destination array. */
@@ -97,6 +149,11 @@ static void test_sources() {
         plan.sources.size(), src_vols);
   for (const SourceDescriptor &d : plan.sources) {
     CHECK(is_valid(d.destination), "source descriptor has no destination array");
+    if (!f.chunks[d.chunk]->is_real)
+      CHECK(is_valid(d.destination_imag), "complex source descriptor has no imaginary target");
+    if (d.integrated)
+      CHECK(is_valid(d.integrated_destination),
+            "integrated source descriptor has no f_minus_p destination");
     CHECK(d.source_time_id < plan.source_times.size(), "source has no src_time descriptor");
     const std::vector<src_vol> &sv = f.chunks[d.chunk]->get_sources(d.ft);
     bool matched = false;
@@ -119,6 +176,30 @@ static void test_sources() {
           master_printf("  chunk %d ft %d: %zu src_vol\n", i, int(ft),
                         f.chunks[i]->get_sources(ft).size());
       }
+}
+
+static void test_derived_source_times_remain_host_custom() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+  derived_gaussian_source gaussian;
+  derived_continuous_source continuous;
+  gaussian.is_integrated = false;
+  continuous.is_integrated = false;
+  f.add_point_source(Ez, gaussian, vec(0.11, 0.13));
+  f.add_point_source(Hz, continuous, vec(-0.17, 0.19));
+  f.advance(1);
+
+  SourcePlan plan;
+  build_source_descriptors(f, plan);
+  CHECK(plan.source_times.size() == 2, "derived sources produced %zu source times",
+        plan.source_times.size());
+  for (const SourceTimeDescriptor &d : plan.source_times) {
+    CHECK(d.kind == SourceTimeKind::host_custom,
+          "derived built-in source was classified as %s", source_time_kind_name(d.kind));
+    CHECK(d.parameters.empty(), "host-custom source unexpectedly exported closed parameters");
+    CHECK(d.host_callback_id != 0xffffffffu, "host-custom source has no callback id");
+  }
 }
 
 static void test_dfts() {
@@ -246,6 +327,7 @@ int main(int argc, char **argv) {
   verbosity = 0;
 
   test_sources();
+  test_derived_source_times_remain_host_custom();
   test_dfts();
   test_polarizations("lorentzian", new lorentzian_susceptibility(1.1, 1e-5),
                      SusceptibilityKind::lorentzian, true);
