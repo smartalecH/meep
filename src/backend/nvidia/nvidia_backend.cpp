@@ -303,6 +303,14 @@ public:
     if (staging_.size() < bytes) staging_.allocate(bytes);
   }
 
+  void ensure_dft_reduction_buffers(size_t result_bytes, size_t partial_bytes) {
+    if (dft_reduction_result_.size() < result_bytes)
+      dft_reduction_result_.allocate(result_bytes, device_);
+    if (dft_reduction_partials_.size() < partial_bytes)
+      dft_reduction_partials_.allocate(partial_bytes, device_);
+    ensure_staging(result_bytes);
+  }
+
   NvidiaBackend *owner_;
   StoragePlan plan_;
   nvidia::arena_plan layout_;
@@ -315,6 +323,8 @@ public:
   std::unique_ptr<nvidia::device_arenas> arenas_;
   std::unique_ptr<nvidia::stream> transfer_;
   nvidia::pinned_buffer staging_;
+  nvidia::device_buffer dft_reduction_result_;
+  nvidia::device_buffer dft_reduction_partials_;
 };
 
 struct NvidiaCompiledOperation {
@@ -463,6 +473,47 @@ nvidia::scalar_precision complex_precision_for(const StoragePlan &plan, ArrayId 
     throw std::invalid_argument(std::string(what) + " is not a complex-realnum array");
   return spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
                                         : nvidia::scalar_precision::f64;
+}
+
+nvidia::scalar_precision scalar_precision_for(Precision precision) {
+  return precision == Precision::f32 ? nvidia::scalar_precision::f32
+                                     : nvidia::scalar_precision::f64;
+}
+
+const ArraySpec &validate_dft_reduction_array(const StoragePlan &plan, ArrayId id,
+                                              size_t storage_points, size_t frequencies,
+                                              const char *what) {
+  if (!is_valid(id) || id.value >= plan.arrays.size())
+    throw std::out_of_range(std::string(what) + " uses an invalid ArrayId");
+  const ArraySpec &spec = plan.arrays[id.value];
+  if (spec.role != array_role::dft || spec.element_type != ElementType::complex_realnum)
+    throw std::invalid_argument(std::string(what) + " is not a DFT complex-realnum array");
+  if (is_valid(spec.alias_of))
+    throw std::invalid_argument(std::string(what) + " must not be an alias");
+  const size_t elements =
+      checked_product(storage_points, frequencies, "validating DFT reduction array shape");
+  if (!storage_points || !frequencies || elements != spec.elements)
+    throw std::out_of_range(std::string(what) + " has an incompatible logical shape");
+  return spec;
+}
+
+size_t validate_dft_reduction_region(const DftReductionTerm &term) {
+  size_t selected = 1;
+  size_t maximum = term.region.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!term.region.counts[axis])
+      throw std::invalid_argument("NVIDIA DFT reduction region has a zero count");
+    selected = checked_product(selected, term.region.counts[axis],
+                               "validating DFT reduction region size");
+    const size_t extent = term.region.counts[axis] - 1;
+    if (term.region.strides[axis] &&
+        extent > (std::numeric_limits<size_t>::max() - maximum) / term.region.strides[axis])
+      throw std::overflow_error("NVIDIA DFT reduction region index overflow");
+    maximum += extent * term.region.strides[axis];
+  }
+  if (maximum >= term.storage_points)
+    throw std::out_of_range("NVIDIA DFT reduction region exceeds monitor storage");
+  return selected;
 }
 
 void require_same_precision(const StoragePlan &plan, ArrayId id, nvidia::scalar_precision precision,
@@ -1837,6 +1888,114 @@ void NvidiaBackend::write(ArrayRef ref, const void *host_buffer, size_t bytes) {
     state.transfer_failed_ = true;
     throw;
   }
+}
+
+void NvidiaBackend::reduce_dft(const DftReductionRequest &request,
+                               std::complex<double> *local_result, size_t result_count) {
+  if (!active_state_) throw std::logic_error("NVIDIA backend has no active state");
+  NvidiaBackendState &state = *active_state_;
+  if (!state.initialized_) throw std::logic_error("NVIDIA backend storage is not initialized");
+  if (state.transfer_failed_)
+    throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
+  if (!local_result && result_count)
+    throw std::invalid_argument("NVIDIA DFT reduction has no result buffer");
+  if (request.result_count != result_count || !result_count)
+    throw std::invalid_argument("NVIDIA DFT reduction result-count mismatch");
+  if ((request.kind == DftReductionKind::norm2 && result_count != 1) ||
+      (request.kind != DftReductionKind::norm2 && !result_count))
+    throw std::invalid_argument("NVIDIA DFT reduction kind/result-count mismatch");
+  switch (request.kind) {
+    case DftReductionKind::norm2:
+    case DftReductionKind::real_weighted_product:
+    case DftReductionKind::complex_weighted_product: break;
+    default: throw std::invalid_argument("NVIDIA DFT reduction kind is invalid");
+  }
+  if (request.accumulation_precision != policy_for(options_.precision).reduction)
+    throw std::invalid_argument("NVIDIA DFT reduction precision violates backend policy");
+
+  std::vector<size_t> selected_points(request.terms.size());
+  std::vector<size_t> blocks_per_lane(request.terms.size());
+  size_t maximum_blocks = 1;
+  for (size_t i = 0; i < request.terms.size(); ++i) {
+    const DftReductionTerm &term = request.terms[i];
+    const ArraySpec &left = validate_dft_reduction_array(
+        state.plan_, term.left, term.storage_points, term.frequencies, "DFT reduction left array");
+    selected_points[i] = validate_dft_reduction_region(term);
+    if (request.kind == DftReductionKind::norm2) {
+      if (is_valid(term.right))
+        throw std::invalid_argument("NVIDIA DFT norm reduction has a right operand");
+    }
+    else {
+      if (term.frequencies != result_count)
+        throw std::invalid_argument("NVIDIA DFT product frequency/result mismatch");
+      const ArraySpec &right = validate_dft_reduction_array(state.plan_, term.right,
+                                                            term.storage_points, term.frequencies,
+                                                            "DFT reduction right array");
+      if (right.storage != left.storage)
+        throw std::invalid_argument("NVIDIA DFT pair has different monitor precision");
+    }
+    if (request.accumulation_precision == Precision::f32 && left.storage != Precision::f32)
+      throw std::invalid_argument("NVIDIA DFT f64 monitor storage cannot reduce in f32");
+    size_t work = selected_points[i];
+    if (request.kind == DftReductionKind::norm2)
+      work = checked_product(work, term.frequencies, "sizing NVIDIA DFT norm reduction");
+    const size_t needed = (work + 255) / 256;
+    blocks_per_lane[i] = std::min<size_t>(128, std::max<size_t>(1, needed));
+    maximum_blocks = std::max(maximum_blocks, blocks_per_lane[i]);
+  }
+
+  const size_t result_bytes =
+      checked_product(result_count, sizeof(double) * 2, "sizing NVIDIA DFT reduction result");
+  const size_t partial_values = checked_product(result_count, maximum_blocks,
+                                                "sizing NVIDIA DFT reduction partial count");
+  const size_t partial_bytes = checked_product(
+      partial_values, sizeof(double) * 2, "sizing NVIDIA DFT reduction partial storage");
+  state.ensure_dft_reduction_buffers(result_bytes, partial_bytes);
+
+  try {
+    nvidia::fill_byte_async(state.dft_reduction_result_, 0, 0, result_bytes, *state.transfer_);
+    for (size_t i = 0; i < request.terms.size(); ++i) {
+      const DftReductionTerm &term = request.terms[i];
+      nvidia::dft_reduction_launch launch;
+      launch.left = complex_device_address(state, term.left, "DFT reduction left array");
+      launch.right = request.kind == DftReductionKind::norm2
+                         ? NULL
+                         : complex_device_address(state, term.right, "DFT reduction right array");
+      launch.partials = state.dft_reduction_partials_.opaque_handle();
+      launch.result = state.dft_reduction_result_.opaque_handle();
+      launch.storage_points = term.storage_points;
+      launch.frequencies = term.frequencies;
+      launch.base = term.region.base;
+      for (int axis = 0; axis < 3; ++axis) {
+        launch.counts[axis] = term.region.counts[axis];
+        launch.strides[axis] = term.region.strides[axis];
+      }
+      launch.result_count = result_count;
+      launch.blocks_per_lane = blocks_per_lane[i];
+      launch.weight_real = term.weight.real();
+      launch.weight_imag = term.weight.imag();
+      launch.operation = request.kind == DftReductionKind::norm2
+                             ? nvidia::dft_reduction_operation::norm2
+                             : request.kind == DftReductionKind::real_weighted_product
+                                   ? nvidia::dft_reduction_operation::real_weighted_product
+                                   : nvidia::dft_reduction_operation::complex_weighted_product;
+      launch.monitor_precision = complex_precision_for(state.plan_, term.left,
+                                                       "DFT reduction monitor");
+      launch.accumulation_precision = scalar_precision_for(request.accumulation_precision);
+      nvidia::launch_dft_reduction(launch, *state.transfer_);
+    }
+    nvidia::copy_device_to_host_async(state.staging_.data(), state.dft_reduction_result_, 0,
+                                      result_bytes, *state.transfer_);
+    state.transfer_->synchronize();
+  }
+  catch (...) {
+    state.transfer_failed_ = true;
+    throw;
+  }
+
+  const double *values = static_cast<const double *>(state.staging_.data());
+  for (size_t i = 0; i < result_count; ++i)
+    local_result[i] = std::complex<double>(values[2 * i], values[2 * i + 1]);
 }
 
 void NvidiaBackend::synchronize() {
