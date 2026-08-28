@@ -399,6 +399,16 @@ void fields::init_backend() {
   if (!and_to_all(coordinates_match))
     meep::abort("meep: fields beta/BFAST coordinates changed after construction; recreate fields "
                 "so the per-chunk coordinate state and resident executable agree");
+
+  /* update_condinv() is normally the first operation in the CPU step plan.
+     A resident backend has to freeze and upload the complete storage catalog
+     before executing that plan, so realize the same cached material arrays
+     here. The call is cheap when the cache is current and preserves the CPU
+     backend's lazy path because this branch is resident-only. */
+  if (!backend_state || is_dirty(*this, dirty_storage) ||
+      is_dirty(*this, dirty_initialization) || is_dirty(*this, dirty_classification))
+    for (int i = 0; i < num_chunks; ++i)
+      if (chunks[i]->is_mine()) chunks[i]->s->update_condinv();
   /* A value-only material update can change classification without changing
      the existing storage layout. Reconcile the host representation first; any
      promotion it discovers will set dirty_storage for the rebuild below. */
