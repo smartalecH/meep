@@ -271,7 +271,7 @@ static void compare_source_scalars(const fields &cpu, const fields &gpu) {
 static void run_source_case(const char *name, precision_policy_kind policy, bool real_fields,
                             bool conductivity, bool integrated = false,
                             material_function *material = NULL,
-                            const boundary_region *boundaries = NULL) {
+                            const boundary_region *boundaries = NULL, bool continuous = false) {
   const bool anisotropic = material != NULL;
   const grid_volume gv = anisotropic ? vol3d(2.0, 2.0, 2.0, 5.0) : vol2d(2.0, 2.0, 8.0);
   const boundary_region no_boundaries = no_pml();
@@ -299,14 +299,22 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
     cpu.use_real_fields();
     gpu.use_real_fields();
   }
-  gaussian_src_time cpu_time(0.31, 0.14), gpu_time(0.31, 0.14);
-  cpu_time.is_integrated = integrated;
-  gpu_time.is_integrated = integrated;
+  std::unique_ptr<src_time> cpu_time, gpu_time;
+  if (continuous) {
+    cpu_time.reset(new continuous_src_time(std::complex<double>(0.31, -0.02), 0.2, 0.0, 4.0));
+    gpu_time.reset(new continuous_src_time(std::complex<double>(0.31, -0.02), 0.2, 0.0, 4.0));
+  }
+  else {
+    cpu_time.reset(new gaussian_src_time(0.31, 0.14));
+    gpu_time.reset(new gaussian_src_time(0.31, 0.14));
+  }
+  cpu_time->is_integrated = integrated;
+  gpu_time->is_integrated = integrated;
   const std::complex<double> amplitude =
       real_fields ? std::complex<double>(0.37, 0.0) : std::complex<double>(0.37, -0.23);
   const vec location = anisotropic ? vec(0.73, 0.83, 0.41) : vec(0.73, 0.83);
-  cpu.add_point_source(Ez, cpu_time, location, amplitude);
-  gpu.add_point_source(Ez, gpu_time, location, amplitude);
+  cpu.add_point_source(Ez, *cpu_time, location, amplitude);
+  gpu.add_point_source(Ez, *gpu_time, location, amplitude);
 
   /* Prepare the CPU catalog without retaining the preparation step's fields. */
   cpu.advance(1);
@@ -333,8 +341,66 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
   master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
 }
 
-static std::complex<double> custom_source_value(double time, void *) {
-  return std::complex<double>(time, -0.5 * time);
+struct custom_source_trace {
+  std::vector<double> times;
+};
+
+static std::complex<double> custom_source_value(double time, void *data) {
+  custom_source_trace *trace = static_cast<custom_source_trace *>(data);
+  if (trace) trace->times.push_back(time);
+  return std::complex<double>(std::sin(0.7 * time), -0.5 * std::cos(0.3 * time));
+}
+
+static void run_custom_source_case(const char *name, precision_policy_kind policy,
+                                   bool integrated) {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+
+  custom_source_trace cpu_trace, gpu_trace;
+  custom_src_time cpu_time(custom_source_value, &cpu_trace);
+  custom_src_time gpu_time(custom_source_value, &gpu_trace);
+  cpu_time.is_integrated = integrated;
+  gpu_time.is_integrated = integrated;
+  const vec location(0.73, 0.83);
+  cpu.add_point_source(Ez, cpu_time, location, std::complex<double>(0.37, 0.0));
+  gpu.add_point_source(Ez, gpu_time, location, std::complex<double>(0.37, 0.0));
+
+  /* Prepare both live source objects through the same first step, then reset
+     field/time state so callback ordering can be compared from an equal cache. */
+  cpu.advance(1);
+  gpu.advance(1);
+  cpu.t = gpu.t = 0;
+  cpu_trace.times.clear();
+  gpu_trace.times.clear();
+  require_source_plan(cpu, false, integrated, false);
+  require_source_plan(gpu, false, integrated, false);
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
+  const double tolerance = narrowed ? 2e-5 : 2e-13;
+  const int checkpoints[] = {1, 2, 8};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    compare_fields(cpu, gpu, tolerance);
+    compare_source_scalars(cpu, gpu);
+    require(cpu_trace.times == gpu_trace.times,
+            "NVIDIA custom-source callback count/order/time differs");
+    previous = checkpoints[i];
+  }
+  require(!cpu_trace.times.empty(), "custom-source callback was not evaluated");
+  master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
 }
 
 static void run_case(const char *name, const grid_volume &gv, precision_policy_kind policy,
@@ -502,15 +568,6 @@ static void test_rejections() {
 
   {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    fields f(&s, options);
-    f.use_real_fields();
-    custom_src_time src(custom_source_value, NULL);
-    src.is_integrated = false;
-    f.add_point_source(Ez, src, vec(0.1, 0.1));
-    require_advance_rejected(f, "does not support custom source times");
-  }
-  {
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
     s.set_chi3(unit_value);
     fields f(&s, options);
     f.use_real_fields();
@@ -589,9 +646,13 @@ int main(int argc, char **argv) {
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
     run_source_case("real-point-source", policies[p], true, false);
     run_source_case("complex-conductive-point-source", policies[p], false, true);
+    run_source_case("complex-continuous-point-source", policies[p], false, false, false, NULL,
+                    NULL, true);
     run_source_case("real-integrated-point-source", policies[p], true, false, true);
     run_source_case("complex-integrated-anisotropic-pml", policies[p], false, false, true,
                     &two_offdiagonals, &xy_pml);
+    run_custom_source_case("custom-point-source", policies[p], false);
+    run_custom_source_case("custom-integrated-point-source", policies[p], true);
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
              1u << 0, 1u << 0, false, true);
     run_case("complex-phase", gv2, policies[p], false, no_pml(), identity(), 4, &bloch2,
