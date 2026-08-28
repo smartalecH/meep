@@ -34,6 +34,7 @@
 #include <meep.hpp>
 
 #include "backend/lifecycle.hpp"
+#include "backend/halo_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -78,10 +79,77 @@ static void test_coverage(const char *name, structure &s, bool with_flux, const 
     CHECK(f.storage_plan->arrays[i].alias_of == f.array_catalog->spec(ArrayId{uint32_t(i)}).alias_of,
           "%s: storage plan lost alias metadata at ArrayId %zu", name, i);
 
+  /* Halo construction has its own temporary pointer table because it can run
+     before storage preparation. A backend consumes only the remapped copy. */
+  for (const HaloPlan &source : f.halos->plans) {
+    HaloPlan canonical;
+    std::string why;
+    CHECK(remap_halo_plan(source, f.halos->arrays, *f.array_catalog, f.is_real ? 1 : 2,
+                          canonical, why),
+          "%s: halo plan did not map to canonical storage: %s", name, why.c_str());
+    std::vector<ElementRef> source_refs, canonical_refs;
+    expand_gather(source, source_refs);
+    expand_gather(canonical, canonical_refs);
+    CHECK(source_refs.size() == canonical_refs.size(), "%s: canonical gather size differs", name);
+    for (size_t j = 0; j < source_refs.size() && j < canonical_refs.size(); ++j) {
+      const ElementRef &from = source_refs[j], &to = canonical_refs[j];
+      CHECK(to.array.value < f.array_catalog->size(), "%s: canonical gather id is invalid", name);
+      CHECK(f.halos->arrays.base(from.array) + from.index ==
+                f.array_catalog->resolve<realnum>(to.array) + to.index,
+            "%s: canonical gather address differs at %zu", name, j);
+    }
+    expand_scatter(source, source_refs);
+    expand_scatter(canonical, canonical_refs);
+    CHECK(source_refs.size() == canonical_refs.size(), "%s: canonical scatter size differs", name);
+    for (size_t j = 0; j < source_refs.size() && j < canonical_refs.size(); ++j) {
+      const ElementRef &from = source_refs[j], &to = canonical_refs[j];
+      CHECK(to.array.value < f.array_catalog->size(), "%s: canonical scatter id is invalid", name);
+      CHECK(f.halos->arrays.base(from.array) + from.index ==
+                f.array_catalog->resolve<realnum>(to.array) + to.index,
+            "%s: canonical scatter address differs at %zu", name, j);
+    }
+  }
+  FOR_FIELD_TYPES(ft) for (size_t i = 0; i < f.halos->zeros[ft].size(); ++i) {
+    ZeroPlan canonical;
+    std::string why;
+    CHECK(remap_zero_plan(f.halos->zeros[ft][i], f.halos->arrays, *f.array_catalog, canonical,
+                          why),
+          "%s: zero plan did not map to canonical storage: %s", name, why.c_str());
+  }
+
   master_printf("%s: %zu arrays catalogued, provisional %.2f MB, steady %.2f MB\n", name,
                 f.array_catalog->size(),
                 f.storage_plan->provisional_peak_bytes() / 1048576.0,
                 f.storage_plan->steady_state_bytes() / 1048576.0);
+}
+
+static double unit_sigma(const vec &) { return 1.0; }
+
+static void test_polarization_halo_remap() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  lorentzian_susceptibility susceptibility(1.1, 0.05);
+  s.add_susceptibility(unit_sigma, E_stuff, susceptibility);
+  fields f(&s);
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.13, 0.11));
+  f.advance(3);
+
+  size_t polarization_refs = 0;
+  for (const HaloPlan &source : f.halos->plans) {
+    if (source.ft != PE_stuff && source.ft != PH_stuff) continue;
+    HaloPlan canonical;
+    std::string why;
+    CHECK(remap_halo_plan(source, f.halos->arrays, *f.array_catalog, f.is_real ? 1 : 2,
+                          canonical, why),
+          "polarization halo plan did not map to canonical storage: %s", why.c_str());
+    std::vector<ElementRef> refs;
+    expand_gather(canonical, refs);
+    polarization_refs += refs.size();
+    expand_scatter(canonical, refs);
+    polarization_refs += refs.size();
+  }
+  CHECK(or_to_all(polarization_refs > 0), "no polarization halo references were remapped");
 }
 
 /* ------------------------------------------------------------------ */
@@ -201,6 +269,7 @@ int main(int argc, char **argv) {
 
   test_mid_run_source();
   test_mid_run_susceptibility();
+  test_polarization_halo_remap();
 
   if (failures) {
     master_printf("storage_plan: %d FAILURE(S)\n", failures);

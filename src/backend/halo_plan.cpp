@@ -16,6 +16,7 @@
 */
 
 #include "backend/halo_plan.hpp"
+#include "backend/storage_plan.hpp"
 #include "meep/mympi.hpp"
 
 #include <limits>
@@ -210,10 +211,11 @@ static void expand_addresses(const std::vector<SlabRef> &slabs,
                              const std::vector<ElementRef> &residue,
                              const std::vector<HaloSegment> &order,
                              const std::vector<HostElementRef> &host,
+                             HaloStorageDisposition storage,
                              const HaloArrayTable &arrays, const HostHaloArrayTable &host_arrays,
                              std::vector<realnum *> &out) {
   out.clear();
-  if (!host.empty()) {
+  if (storage == HaloStorageDisposition::host_owned) {
     out.reserve(host.size());
     for (const HostElementRef &ref : host)
       out.push_back(host_arrays.address(ref.id));
@@ -230,21 +232,21 @@ static void expand_addresses(const std::vector<SlabRef> &slabs,
 void expand_gather_addresses(const HaloPlan &p, const HaloArrayTable &arrays,
                              const HostHaloArrayTable &host_arrays,
                              std::vector<realnum *> &out) {
-  expand_addresses(p.gather_slabs, p.gather, p.gather_order, p.host_gather, arrays, host_arrays,
-                   out);
+  expand_addresses(p.gather_slabs, p.gather, p.gather_order, p.host_gather, p.storage, arrays,
+                   host_arrays, out);
 }
 
 void expand_scatter_addresses(const HaloPlan &p, const HaloArrayTable &arrays,
                               const HostHaloArrayTable &host_arrays,
                               std::vector<realnum *> &out) {
-  expand_addresses(p.scatter_slabs, p.scatter, p.scatter_order, p.host_scatter, arrays,
+  expand_addresses(p.scatter_slabs, p.scatter, p.scatter_order, p.host_scatter, p.storage, arrays,
                    host_arrays, out);
 }
 
 CoalesceStats coalesce_stats(const std::vector<HaloPlan> &plans) {
   CoalesceStats st{0, 0, 0, 0};
   for (const HaloPlan &p : plans) {
-    if (!p.host_gather.empty()) {
+    if (p.storage == HaloStorageDisposition::host_owned) {
       st.residue_elements += p.host_gather.size();
     }
     else {
@@ -312,6 +314,107 @@ bool reconcile_host_halo_comm_size(int sender_rank, size_t sender_local,
     return false;
   }
   why.clear();
+  return true;
+}
+
+namespace {
+
+bool remap_elements(const std::vector<ElementRef> &source, const HaloArrayTable &source_arrays,
+                    const CpuArrayCatalog &catalog, std::vector<ElementRef> &destination,
+                    std::string &why) {
+  destination.clear();
+  destination.reserve(source.size());
+  for (size_t i = 0; i < source.size(); ++i) {
+    const ElementRef &ref = source[i];
+    const realnum *address = source_arrays.base(ref.array) + ref.index;
+    ArrayId id = invalid_array();
+    ptrdiff_t offset = 0;
+    if (!catalog.locate(address, id, offset)) {
+      why = "halo element is not represented in the canonical storage catalog";
+      destination.clear();
+      return false;
+    }
+    destination.push_back(ElementRef{id, offset});
+  }
+  return true;
+}
+
+void expand_zero(const ZeroPlan &source, std::vector<ElementRef> &out) {
+  out.clear();
+  for (size_t i = 0; i < source.slabs.size(); ++i) {
+    const SlabRef &slab = source.slabs[i];
+    for (int i0 = 0; i0 < slab.counts[0]; ++i0)
+      for (int i1 = 0; i1 < slab.counts[1]; ++i1)
+        for (int i2 = 0; i2 < slab.counts[2]; ++i2)
+          out.push_back(ElementRef{
+              slab.array, slab.base + ptrdiff_t(i0) * slab.strides[0] +
+                              ptrdiff_t(i1) * slab.strides[1] +
+                              ptrdiff_t(i2) * slab.strides[2]});
+  }
+  out.insert(out.end(), source.residue.begin(), source.residue.end());
+}
+
+} // namespace
+
+bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, int field_interleave, HaloPlan &destination,
+                     std::string &why) {
+  why.clear();
+  HaloPlan staged = source;
+  std::vector<ElementRef> source_gather, source_scatter, gather, scatter;
+  expand_gather(source, source_gather);
+  expand_scatter(source, source_scatter);
+
+  std::string gather_why, scatter_why;
+  const bool gather_mapped =
+      remap_elements(source_gather, source_arrays, catalog, gather, gather_why);
+  const bool scatter_mapped =
+      remap_elements(source_scatter, source_arrays, catalog, scatter, scatter_why);
+  const bool polarization = source.ft == PE_stuff || source.ft == PH_stuff;
+
+  if (!gather_mapped || !scatter_mapped) {
+    if (!polarization) {
+      why = !gather_mapped ? gather_why : scatter_why;
+      return false;
+    }
+    if ((!source_gather.empty() && source.host_gather.size() != source_gather.size()) ||
+        (!source_scatter.empty() && source.host_scatter.size() != source_scatter.size())) {
+      why = "polarization halo lacks a complete ordered host mirror";
+      return false;
+    }
+
+    staged.storage = HaloStorageDisposition::host_owned;
+    staged.gather_slabs.clear();
+    staged.scatter_slabs.clear();
+    staged.gather.clear();
+    staged.scatter.clear();
+    staged.gather_order.clear();
+    staged.scatter_order.clear();
+    destination = staged;
+    why.clear();
+    return true;
+  }
+
+  const int interleave = polarization ? 1 : field_interleave;
+  coalesce_into_slabs(gather, interleave, staged.gather_slabs, staged.gather,
+                      staged.gather_order);
+  coalesce_into_slabs(scatter, interleave, staged.scatter_slabs, staged.scatter,
+                      staged.scatter_order);
+  staged.host_gather.clear();
+  staged.host_scatter.clear();
+  staged.storage = HaloStorageDisposition::canonical;
+  destination = staged;
+  return true;
+}
+
+bool remap_zero_plan(const ZeroPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, ZeroPlan &destination, std::string &why) {
+  why.clear();
+  std::vector<ElementRef> expanded, remapped, unused_residue;
+  std::vector<HaloSegment> unused_order;
+  expand_zero(source, expanded);
+  if (!remap_elements(expanded, source_arrays, catalog, remapped, why)) return false;
+  coalesce_into_slabs(remapped, 1, destination.slabs, destination.residue, unused_order);
   return true;
 }
 

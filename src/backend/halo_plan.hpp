@@ -40,6 +40,8 @@
 
 namespace meep {
 
+class CpuArrayCatalog;
+
 /* --- CPU array table -------------------------------------------------------
    The single place that knows what address an ArrayId currently resolves to.
    Plans hold IDs; this holds pointers. Rebuilt whenever connectivity is, so a
@@ -193,6 +195,8 @@ struct HostElementRef {
   HostHaloId id;
 };
 
+enum class HaloStorageDisposition { canonical, host_owned };
+
 /* --- The plan --------------------------------------------------------------
    One HaloPlan per (field_type, connect_phase, chunk_pair) -- the same key the
    legacy comms_key used. */
@@ -215,6 +219,7 @@ struct HaloPlan {
   int peer_rank;
   int tag;
   bool same_rank; // populated now; exchange_local lowering is deferred
+  HaloStorageDisposition storage;
 
   /* Position within the (field_type, chunk_pair) communication block. The send
      side used to iterate all_connect_phases in declaration order while the
@@ -307,6 +312,15 @@ bool reconcile_host_halo_comm_size(int sender_rank, size_t sender_local,
                                    int receiver_rank, size_t receiver_local,
                                    std::string &why);
 
+/* Translate a CPU halo plan's private array IDs into the canonical storage
+   catalog namespace. PE/PH is all-or-nothing: if any element is absent from
+   the catalog, the destination retains the complete ordered host mirror. The
+   source plan remains unchanged and continues to serve the legacy CPU
+   executor. */
+bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, int field_interleave, HaloPlan &destination,
+                     std::string &why);
+
 /* Metal-zero lists get the same treatment: they were one realnum* per zeroed
    point in fields_chunk::zeroes. Order is irrelevant here since every write is
    a zero, so no HaloSegment list is needed. */
@@ -314,6 +328,9 @@ struct ZeroPlan {
   std::vector<SlabRef> slabs;
   std::vector<ElementRef> residue;
 };
+
+bool remap_zero_plan(const ZeroPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, ZeroPlan &destination, std::string &why);
 
 /* Everything the boundary exchange needs that used to be host addresses.
    Owned by `fields` through an opaque pointer so that none of these types
@@ -346,6 +363,8 @@ public:
     p.peer_rank = -1;
     p.tag = 0;
     p.same_rank = false;
+    p.storage = (k.ft == PE_stuff || k.ft == PH_stuff) ? HaloStorageDisposition::host_owned
+                                                       : HaloStorageDisposition::canonical;
     p.sequence_index = uint32_t(k.phase);
     p.block_offset = 0;
     p.block_elements = 0;
