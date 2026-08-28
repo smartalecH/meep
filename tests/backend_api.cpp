@@ -160,15 +160,15 @@ struct rebuild_executable : Executable {
 
 class rebuild_backend_base : public ExecutionBackend {
 public:
-  explicit rebuild_backend_base(rebuild_trace &trace_) : trace(trace_) {}
+  rebuild_backend_base(fields &f_, rebuild_trace &trace_) : f(f_), trace(trace_) {}
 
   BackendState *create_state(const StoragePlan &) override {
     trace.events.push_back("create-state");
     return new rebuild_state(trace);
   }
   void initialize(const InitializationPlan &, BackendState &) override {}
-  MaterialClassification classify_state(const StoragePlan &, BackendState &) override {
-    return MaterialClassification();
+  MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
+    return classify(f, plan);
   }
   void finalize_storage(const StoragePlan &, BackendState &) override {}
   Executable *compile(const StepPlan &, BackendState &) override {
@@ -191,12 +191,13 @@ public:
   bool accepts(const execution_options &, std::string &) const override { return true; }
 
 protected:
+  fields &f;
   rebuild_trace &trace;
 };
 
 class rebuild_tracking_backend : public rebuild_backend_base {
 public:
-  explicit rebuild_tracking_backend(rebuild_trace &trace_) : rebuild_backend_base(trace_) {}
+  rebuild_tracking_backend(fields &f, rebuild_trace &trace_) : rebuild_backend_base(f, trace_) {}
 
   void prepare_state_rebuild(BackendState &, DirtyMask reasons) override {
     trace.events.push_back("prepare-rebuild");
@@ -207,11 +208,7 @@ public:
 class access_tracking_backend : public rebuild_backend_base {
 public:
   access_tracking_backend(fields &f, rebuild_trace &rebuilds, access_trace &accesses_)
-      : rebuild_backend_base(rebuilds), f(f), accesses(accesses_) {}
-
-  MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
-    return classify(f, plan);
-  }
+      : rebuild_backend_base(f, rebuilds), accesses(accesses_) {}
   void advance(Executable &, BackendState &, int num_steps) override { f.t += num_steps; }
 
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override {
@@ -243,7 +240,6 @@ public:
   }
 
 private:
-  fields &f;
   access_trace &accesses;
 };
 
@@ -630,7 +626,7 @@ static void test_authority_safe_state_rebuild() {
   build(&s, &f);
 
   rebuild_trace trace;
-  rebuild_backend_base *tracking = new rebuild_tracking_backend(trace);
+  rebuild_backend_base *tracking = new rebuild_tracking_backend(*f, trace);
   f->backend = tracking;
   f->backend_state = tracking->create_state(*f->storage_plan);
   StepPlan plan;
@@ -658,7 +654,7 @@ static void test_authority_safe_state_rebuild() {
 
   build(&s, &f);
   rebuild_trace refused;
-  tracking = new rebuild_backend_base(refused);
+  tracking = new rebuild_backend_base(*f, refused);
   f->backend = tracking;
   f->backend_state = tracking->create_state(*f->storage_plan);
   BackendState *live_state = f->backend_state;
@@ -686,10 +682,11 @@ static void test_cpu_state_rebuild_is_safe_noop() {
   CHECK(f->backend_state != NULL && f->executable != NULL,
         "CPU advance did not create backend artifacts");
 
-  invalidate(*f, MutationKind::field_layout);
-  f->init_backend();
-  CHECK(f->backend_state != NULL, "CPU state rebuild did not create a replacement state");
-  CHECK(f->executable == NULL, "CPU state rebuild retained a stale executable");
+  BackendState *state = f->backend_state;
+  Executable *executable = f->executable;
+  f->backend->prepare_state_rebuild(*state, dirty_storage);
+  CHECK(f->backend_state == state && f->executable == executable,
+        "CPU authority-safe rebuild hook modified host-authoritative state");
 
   delete f;
   delete s;
