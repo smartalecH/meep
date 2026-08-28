@@ -95,6 +95,154 @@ if test "x$enable_ccache" != "xno"; then
 fi
 
 ##############################################################################
+# optional NVIDIA accelerator backend
+
+AC_ARG_WITH([accelerator],
+            [AS_HELP_STRING([--with-accelerator=no|nvidia],
+                            [build an accelerator backend (default: no)])],
+            [with_accelerator=$withval], [with_accelerator=no])
+AC_ARG_WITH([cuda],
+            [AS_HELP_STRING([--with-cuda=DIR],
+                            [CUDA toolkit prefix for the NVIDIA backend])],
+            [cuda_prefix=$withval], [cuda_prefix=])
+AC_ARG_WITH([cuda-architectures],
+            [AS_HELP_STRING([--with-cuda-architectures=LIST],
+                            [comma-separated CUDA targets, e.g. sm_90,sm_100])],
+            [cuda_architectures=$withval], [cuda_architectures=])
+AC_ARG_WITH([cuda-host-compiler],
+            [AS_HELP_STRING([--with-cuda-host-compiler=PATH],
+                            [host compiler used only by nvcc])],
+            [cuda_host_compiler=$withval], [cuda_host_compiler=])
+AC_ARG_VAR([NVCC], [NVIDIA CUDA compiler])
+AC_ARG_VAR([NVCCFLAGS], [additional NVIDIA CUDA compiler flags])
+
+case "$with_accelerator" in
+  no) have_nvidia_backend=no ;;
+  nvidia) have_nvidia_backend=yes ;;
+  *) AC_MSG_ERROR([--with-accelerator must be no or nvidia]) ;;
+esac
+
+CUDA_CPPFLAGS=
+CUDA_LDFLAGS=
+CUDA_NVCC_LDFLAGS=
+CUDA_LIBS=
+CUDA_ARCH_FLAGS=
+CUDA_PIC_FLAGS=
+CUDA_HOST_FLAGS=
+
+if test "x$have_nvidia_backend" = "xyes"; then
+  if test "x$cuda_prefix" = "xyes" -o "x$cuda_prefix" = "xno"; then
+    AC_MSG_ERROR([--with-cuda requires an explicit toolkit directory])
+  fi
+
+  if test -n "$cuda_prefix"; then
+    cuda_prefix=`cd "$cuda_prefix" 2>/dev/null && pwd -P`
+    if test -z "$cuda_prefix"; then
+      AC_MSG_ERROR([CUDA toolkit directory does not exist])
+    fi
+    if test -z "$NVCC"; then
+      AC_PATH_PROG([NVCC], [nvcc], [], [$cuda_prefix/bin:$PATH])
+    fi
+  else
+    AC_PATH_PROG([NVCC], [nvcc])
+    if test -n "$NVCC"; then
+      cuda_prefix=`cd "`dirname "$NVCC"`/.." 2>/dev/null && pwd -P`
+    fi
+  fi
+
+  if test -z "$NVCC"; then
+    AC_MSG_ERROR([nvcc is required for --with-accelerator=nvidia])
+  fi
+  case "$NVCC" in
+    */*) ;;
+    *) NVCC=`command -v "$NVCC" 2>/dev/null` ;;
+  esac
+  if test ! -x "$NVCC"; then
+    AC_MSG_ERROR([NVCC is not executable: $NVCC])
+  fi
+  if test -z "$cuda_architectures"; then
+    AC_MSG_ERROR([--with-cuda-architectures is required for the NVIDIA backend])
+  fi
+  if test -n "$cuda_host_compiler"; then
+    case "$cuda_host_compiler" in
+      */*) ;;
+      *) cuda_host_compiler=`command -v "$cuda_host_compiler" 2>/dev/null` ;;
+    esac
+    if test ! -x "$cuda_host_compiler"; then
+      AC_MSG_ERROR([CUDA host compiler is not executable: $cuda_host_compiler])
+    fi
+    CUDA_HOST_FLAGS="-ccbin=$cuda_host_compiler"
+  fi
+
+  cuda_arch_list=`echo "$cuda_architectures" | sed 's/,/ /g'`
+  CUDA_ARCHITECTURES=
+  for cuda_arch in $cuda_arch_list; do
+    case "$cuda_arch" in
+      sm_*) cuda_digits=`echo "$cuda_arch" | sed 's/^sm_//'` ;;
+      *) cuda_digits=$cuda_arch ; cuda_arch=sm_$cuda_arch ;;
+    esac
+    case "$cuda_digits" in
+      ''|*@<:@!0123456789@:>@*)
+        AC_MSG_ERROR([invalid CUDA architecture in --with-cuda-architectures: $cuda_arch])
+        ;;
+    esac
+    cuda_compute=compute_$cuda_digits
+    CUDA_ARCH_FLAGS="$CUDA_ARCH_FLAGS -gencode=arch=$cuda_compute,code=$cuda_arch"
+    if test -z "$CUDA_ARCHITECTURES"; then
+      CUDA_ARCHITECTURES=$cuda_arch
+    else
+      CUDA_ARCHITECTURES="$CUDA_ARCHITECTURES,$cuda_arch"
+    fi
+  done
+
+  if test ! -f "$cuda_prefix/include/cuda_runtime_api.h"; then
+    AC_MSG_ERROR([CUDA runtime headers not found below $cuda_prefix])
+  fi
+  CUDA_CPPFLAGS="-I$cuda_prefix/include"
+  if test -d "$cuda_prefix/lib64"; then
+    cuda_libdir=$cuda_prefix/lib64
+  elif test -d "$cuda_prefix/lib"; then
+    cuda_libdir=$cuda_prefix/lib
+  else
+    AC_MSG_ERROR([CUDA runtime library directory not found below $cuda_prefix])
+  fi
+  CUDA_LDFLAGS="-L$cuda_libdir -Wl,-rpath,$cuda_libdir"
+  CUDA_NVCC_LDFLAGS="-L$cuda_libdir -Xlinker=-rpath -Xlinker=$cuda_libdir"
+  CUDA_LIBS="-lcudart"
+  CUDA_PIC_FLAGS="-Xcompiler=-fPIC"
+
+  AC_MSG_CHECKING([whether nvcc can compile and link the CUDA runtime])
+  cat > conftest.cu <<'_ACEOF'
+#include <cuda_runtime_api.h>
+int main() { return cudaFree(0) == cudaSuccess ? 0 : 1; }
+_ACEOF
+  if $NVCC $CUDA_HOST_FLAGS -std=c++11 $NVCCFLAGS $CUDA_ARCH_FLAGS \
+       $CUDA_CPPFLAGS conftest.cu \
+       $CUDA_NVCC_LDFLAGS $CUDA_LIBS -o conftest-cuda \
+       >&AS_MESSAGE_LOG_FD; then
+    AC_MSG_RESULT([yes])
+  else
+    rm -f conftest.cu conftest-cuda
+    AC_MSG_ERROR([nvcc could not compile and link a CUDA runtime program])
+  fi
+  rm -f conftest.cu conftest-cuda
+
+  AC_DEFINE([HAVE_NVIDIA_BACKEND], [1],
+            [Define if the private NVIDIA accelerator backend is enabled])
+fi
+
+AC_SUBST([CUDA_ARCHITECTURES])
+AC_SUBST([CUDA_ARCH_FLAGS])
+AC_SUBST([CUDA_CPPFLAGS])
+AC_SUBST([CUDA_LDFLAGS])
+AC_SUBST([CUDA_NVCC_LDFLAGS])
+AC_SUBST([CUDA_LIBS])
+AC_SUBST([CUDA_PIC_FLAGS])
+AC_SUBST([CUDA_HOST_FLAGS])
+AM_CONDITIONAL([HAVE_NVIDIA_BACKEND],
+               [test "x$have_nvidia_backend" = "xyes"])
+
+##############################################################################
 # Compiler flags
 
 # Pick "good" compiler flags(?)
