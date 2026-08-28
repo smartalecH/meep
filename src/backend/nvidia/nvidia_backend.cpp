@@ -414,6 +414,52 @@ const void *optional_device_address(NvidiaBackendState &state, ArrayId id,
   return state.arenas_->resolve(id.value).address;
 }
 
+void *optional_mutable_device_address(NvidiaBackendState &state, ArrayId id,
+                                      nvidia::scalar_precision precision, const char *what) {
+  if (!is_valid(id)) return NULL;
+  require_same_precision(state.plan_, id, precision, what);
+  return state.arenas_->resolve(id.value).address;
+}
+
+void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum, ptrdiff_t maximum,
+                          const char *what);
+
+nvidia::pml_profile_launch compile_pml_profile(const PmlProfile &source,
+                                               const nvidia::flat_region &region,
+                                               nvidia::scalar_precision precision,
+                                               NvidiaBackendState &state, const char *what) {
+  nvidia::pml_profile_launch result = {};
+  const bool have_sigma = is_valid(source.sig);
+  if (!have_sigma) {
+    if (is_valid(source.kap) || is_valid(source.siginv))
+      throw std::invalid_argument(std::string(what) + " has an incomplete disabled profile");
+    return result;
+  }
+  if (!is_valid(source.kap) || !is_valid(source.siginv))
+    throw std::invalid_argument(std::string(what) + " has an incomplete profile");
+  if (source.base < 0) throw std::out_of_range(std::string(what) + " has a negative base index");
+
+  result.sigma = optional_device_address(state, source.sig, precision, what);
+  result.kappa = optional_device_address(state, source.kap, precision, what);
+  result.inverse = optional_device_address(state, source.siginv, precision, what);
+  result.base = source.base;
+  ptrdiff_t maximum = source.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (source.strides[axis] < 0)
+      throw std::invalid_argument(std::string(what) + " has a negative stride");
+    result.strides[axis] = source.strides[axis];
+    const size_t steps = region.counts[axis] - 1;
+    if (steps && size_t(source.strides[axis]) >
+                     size_t(std::numeric_limits<ptrdiff_t>::max() - maximum) / steps)
+      throw std::overflow_error(std::string(what) + " index range overflow");
+    maximum += ptrdiff_t(steps) * source.strides[axis];
+  }
+  validate_index_range(state.plan_, source.sig, source.base, maximum, what);
+  validate_index_range(state.plan_, source.kap, source.base, maximum, what);
+  validate_index_range(state.plan_, source.siginv, source.base, maximum, what);
+  return result;
+}
+
 nvidia::flat_region flat_region_for(const UpdateRegion &source) {
   nvidia::flat_region result;
   result.base = source.base;
@@ -450,16 +496,22 @@ void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum
 }
 
 nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &state) {
-  const uint32_t supported_variants = curl_has_second_derivative;
+  const uint32_t supported_variants =
+      curl_has_second_derivative | curl_has_pml | curl_has_pml_aux | curl_has_conductivity;
   if (source.region.variant_key & ~supported_variants)
-    throw std::invalid_argument("curl descriptor requires PML, conductivity, or BFAST");
-  if (is_valid(source.target_u) || is_valid(source.conductivity) || is_valid(source.condinv) ||
-      is_valid(source.target_cond) || is_valid(source.pml.sig) || is_valid(source.pml.kap) ||
-      is_valid(source.pml.siginv) || is_valid(source.pml_u.sig) || is_valid(source.pml_u.kap) ||
-      is_valid(source.pml_u.siginv))
-    throw std::invalid_argument("curl descriptor contains unsupported auxiliary arrays");
+    throw std::invalid_argument("curl descriptor requires BFAST");
 
-  nvidia::curl_launch result;
+  const bool have_pml = (source.region.variant_key & curl_has_pml) != 0;
+  const bool have_pml_u = (source.region.variant_key & curl_has_pml_aux) != 0;
+  const bool have_conductivity = (source.region.variant_key & curl_has_conductivity) != 0;
+  if (have_pml != is_valid(source.pml.sig) || have_pml_u != is_valid(source.pml_u.sig) ||
+      have_pml_u != is_valid(source.target_u) ||
+      have_conductivity != is_valid(source.conductivity) ||
+      have_conductivity != is_valid(source.condinv) ||
+      (have_pml && have_conductivity) != is_valid(source.target_cond))
+    throw std::invalid_argument("curl descriptor variant bits and auxiliary arrays disagree");
+
+  nvidia::curl_launch result = {};
   result.region = flat_region_for(source.region);
   result.precision = scalar_precision_for(state.plan_, source.target, "curl target");
   result.target = device_address(state, source.target, "curl target");
@@ -471,7 +523,20 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
     throw std::invalid_argument("curl descriptor has no source field");
   result.plus_stride = source.plus_stride;
   result.minus_stride = source.minus_stride;
+  result.target_u = optional_mutable_device_address(state, source.target_u, result.precision,
+                                                    "curl auxiliary target");
+  result.conductivity =
+      optional_device_address(state, source.conductivity, result.precision, "curl conductivity");
+  result.conductivity_inverse =
+      optional_device_address(state, source.condinv, result.precision, "curl conductivity inverse");
+  result.target_conductivity = optional_mutable_device_address(
+      state, source.target_cond, result.precision, "curl conductivity target");
+  result.pml =
+      compile_pml_profile(source.pml, result.region, result.precision, state, "curl main PML");
+  result.pml_u = compile_pml_profile(source.pml_u, result.region, result.precision, state,
+                                     "curl auxiliary PML");
   result.dtdx = source.dtdx;
+  result.dt = source.dt;
 
   const ptrdiff_t region_max = checked_region_max(result.region);
   validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
@@ -486,20 +551,38 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
         state.plan_, source.minus_source,
         ptrdiff_t(result.region.base) + std::min<ptrdiff_t>(0, source.minus_stride),
         region_max + std::max<ptrdiff_t>(0, source.minus_stride), "curl minus source");
+  if (is_valid(source.target_u))
+    validate_index_range(state.plan_, source.target_u, ptrdiff_t(result.region.base), region_max,
+                         "curl auxiliary target");
+  if (is_valid(source.conductivity))
+    validate_index_range(state.plan_, source.conductivity, ptrdiff_t(result.region.base),
+                         region_max, "curl conductivity");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, ptrdiff_t(result.region.base), region_max,
+                         "curl conductivity inverse");
+  if (is_valid(source.target_cond))
+    validate_index_range(state.plan_, source.target_cond, ptrdiff_t(result.region.base), region_max,
+                         "curl conductivity target");
   return result;
 }
 
 nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &source,
                                                  NvidiaBackendState &state) {
-  if (source.region.variant_key)
+  const uint32_t supported_variants = constitutive_has_pml;
+  if (source.region.variant_key & ~supported_variants)
     throw std::invalid_argument(
-        "constitutive descriptor requires anisotropy, PML, nonlinearity, or polarization");
+        "constitutive descriptor requires anisotropy, nonlinearity, or polarization");
   if (is_valid(source.offdiagonal1) || is_valid(source.offdiagonal2) || is_valid(source.chi2) ||
-      is_valid(source.chi3) || is_valid(source.target_w) || is_valid(source.previous_w) ||
-      is_valid(source.pml.sig) || is_valid(source.pml.kap) || is_valid(source.pml.siginv))
+      is_valid(source.chi3) || is_valid(source.previous_w))
     throw std::invalid_argument("constitutive descriptor contains unsupported auxiliary arrays");
 
-  nvidia::constitutive_launch result;
+  const bool have_pml = (source.region.variant_key & constitutive_has_pml) != 0;
+  if (have_pml != is_valid(source.pml.sig) || have_pml != is_valid(source.target_w))
+    throw std::invalid_argument("constitutive descriptor PML bit and auxiliary arrays disagree");
+  if (!have_pml && (is_valid(source.pml.kap) || is_valid(source.pml.siginv)))
+    throw std::invalid_argument("constitutive descriptor has a partial disabled PML profile");
+
+  nvidia::constitutive_launch result = {};
   result.region = flat_region_for(source.region);
   result.precision = scalar_precision_for(state.plan_, source.target, "constitutive target");
   result.target = device_address(state, source.target, "constitutive target");
@@ -507,6 +590,10 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
       optional_device_address(state, source.primary, result.precision, "constitutive primary");
   result.diagonal =
       optional_device_address(state, source.diagonal, result.precision, "constitutive diagonal");
+  result.target_w = optional_mutable_device_address(state, source.target_w, result.precision,
+                                                    "constitutive PML target");
+  result.pml =
+      compile_pml_profile(source.pml, result.region, result.precision, state, "constitutive PML");
   if (!result.primary) throw std::invalid_argument("constitutive descriptor has no primary field");
 
   const ptrdiff_t region_max = checked_region_max(result.region);
@@ -517,11 +604,14 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
   if (is_valid(source.diagonal))
     validate_index_range(state.plan_, source.diagonal, ptrdiff_t(result.region.base), region_max,
                          "constitutive diagonal");
+  if (is_valid(source.target_w))
+    validate_index_range(state.plan_, source.target_w, ptrdiff_t(result.region.base), region_max,
+                         "constitutive PML target");
   return result;
 }
 
 nvidia::zero_launch compile_zero(const SlabRef &source, NvidiaBackendState &state) {
-  nvidia::zero_launch result;
+  nvidia::zero_launch result = {};
   result.precision = scalar_precision_for(state.plan_, source.array, "metal-zero target");
   result.target = device_address(state, source.array, "metal-zero target");
   if (source.base < 0) throw std::out_of_range("metal-zero descriptor has a negative base");

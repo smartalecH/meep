@@ -35,42 +35,129 @@ size_t checked_points(const flat_region &region) {
   return points;
 }
 
-__device__ ptrdiff_t region_index(const flat_region &region, size_t linear) {
-  const size_t i2 = linear % region.counts[2];
+__device__ void region_coordinates(const flat_region &region, size_t linear, size_t &i0, size_t &i1,
+                                   size_t &i2) {
+  i2 = linear % region.counts[2];
   linear /= region.counts[2];
-  const size_t i1 = linear % region.counts[1];
-  const size_t i0 = linear / region.counts[1];
+  i1 = linear % region.counts[1];
+  i0 = linear / region.counts[1];
+}
+
+__device__ ptrdiff_t region_index(const flat_region &region, size_t i0, size_t i1, size_t i2) {
   return ptrdiff_t(region.base) + ptrdiff_t(i0) * region.strides[0] +
          ptrdiff_t(i1) * region.strides[1] + ptrdiff_t(i2) * region.strides[2];
 }
 
-template <typename T> __global__ void curl_kernel(curl_launch update, size_t points) {
+__device__ ptrdiff_t profile_index(const pml_profile_launch &profile, size_t i0, size_t i1,
+                                   size_t i2) {
+  return profile.base + ptrdiff_t(i0) * profile.strides[0] +
+         ptrdiff_t(i1) * profile.strides[1] + ptrdiff_t(i2) * profile.strides[2];
+}
+
+template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
+__global__ void curl_kernel(curl_launch update, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
-  const ptrdiff_t i = region_index(update.region, linear);
+  size_t i0, i1, i2;
+  region_coordinates(update.region, linear, i0, i1, i2);
+  const ptrdiff_t i = region_index(update.region, i0, i1, i2);
   T *target = static_cast<T *>(update.target);
   const T *plus_source = static_cast<const T *>(update.plus_source);
   const T *minus_source = static_cast<const T *>(update.minus_source);
   T curl = T(0);
   if (plus_source) curl += plus_source[i + update.plus_stride] - plus_source[i];
   if (minus_source) curl += minus_source[i] - minus_source[i + update.minus_stride];
-  target[i] -= T(update.dtdx) * curl;
+  const T delta = T(update.dtdx) * curl;
+
+  const T *conductivity = static_cast<const T *>(update.conductivity);
+  const T *conductivity_inverse = static_cast<const T *>(update.conductivity_inverse);
+  T *target_conductivity = static_cast<T *>(update.target_conductivity);
+  T *target_u = static_cast<T *>(update.target_u);
+
+  if (!MainPml && !AuxiliaryPml) {
+    if (Conductivity)
+      target[i] =
+          ((T(1) - T(0.5 * update.dt) * conductivity[i]) * target[i] - delta) *
+          conductivity_inverse[i];
+    else
+      target[i] -= delta;
+    return;
+  }
+
+  T intermediate_delta;
+  T previous_u = T(0);
+  if (MainPml) {
+    const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
+    const T *sigma = static_cast<const T *>(update.pml.sigma);
+    const T *kappa = static_cast<const T *>(update.pml.kappa);
+    const T *inverse = static_cast<const T *>(update.pml.inverse);
+    if (Conductivity) {
+      const T previous = target_conductivity[i];
+      target_conductivity[i] =
+          ((T(1) - T(0.5 * update.dt) * conductivity[i]) * previous - delta) *
+          conductivity_inverse[i];
+      intermediate_delta = target_conductivity[i] - previous;
+    }
+    else
+      intermediate_delta = -delta;
+
+    if (AuxiliaryPml) {
+      previous_u = target_u[i];
+      target_u[i] =
+          ((kappa[k] - sigma[k]) * target_u[i] + intermediate_delta) * inverse[k];
+    }
+    else {
+      target[i] = ((kappa[k] - sigma[k]) * target[i] + intermediate_delta) * inverse[k];
+      return;
+    }
+  }
+  else {
+    previous_u = target_u[i];
+    if (Conductivity)
+      target_u[i] =
+          ((T(1) - T(0.5 * update.dt) * conductivity[i]) * previous_u - delta) *
+          conductivity_inverse[i];
+    else
+      target_u[i] -= delta;
+  }
+
+  const ptrdiff_t ku = profile_index(update.pml_u, i0, i1, i2);
+  const T *sigma_u = static_cast<const T *>(update.pml_u.sigma);
+  const T *kappa_u = static_cast<const T *>(update.pml_u.kappa);
+  const T *inverse_u = static_cast<const T *>(update.pml_u.inverse);
+  target[i] = inverse_u[ku] *
+              (((kappa_u[ku] - sigma_u[ku]) * target[i] + target_u[i]) - previous_u);
 }
 
-template <typename T>
+template <typename T, bool Pml>
 __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
-  const ptrdiff_t i = region_index(update.region, linear);
+  size_t i0, i1, i2;
+  region_coordinates(update.region, linear, i0, i1, i2);
+  const ptrdiff_t i = region_index(update.region, i0, i1, i2);
   T value = static_cast<const T *>(update.primary)[i];
   if (update.diagonal) value *= static_cast<const T *>(update.diagonal)[i];
-  static_cast<T *>(update.target)[i] = value;
+  T *target = static_cast<T *>(update.target);
+  if (!Pml) {
+    target[i] = value;
+    return;
+  }
+  T *target_w = static_cast<T *>(update.target_w);
+  const T previous = target_w[i];
+  target_w[i] = value;
+  const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
+  const T *sigma = static_cast<const T *>(update.pml.sigma);
+  const T *kappa = static_cast<const T *>(update.pml.kappa);
+  target[i] += (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * previous;
 }
 
 template <typename T> __global__ void zero_kernel(zero_launch update, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
-  static_cast<T *>(update.target)[region_index(update.region, linear)] = T(0);
+  size_t i0, i1, i2;
+  region_coordinates(update.region, linear, i0, i1, i2);
+  static_cast<T *>(update.target)[region_index(update.region, i0, i1, i2)] = T(0);
 }
 
 template <typename T>
@@ -111,24 +198,25 @@ void launch_geometry(const flat_region &region, unsigned int &blocks, unsigned i
   blocks = static_cast<unsigned int>(block_count);
 }
 
-template <typename T>
+template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
 void launch_curl_t(const curl_launch &update, const stream &execution_stream) {
   const size_t points = checked_points(update.region);
   unsigned int blocks = 0, threads = 0;
   launch_geometry(update.region, blocks, threads);
-  curl_kernel<T><<<blocks, threads, 0,
-                   static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(update, points);
+  curl_kernel<T, MainPml, AuxiliaryPml, Conductivity>
+      <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+          update, points);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA curl");
 }
 
-template <typename T>
+template <typename T, bool Pml>
 void launch_constitutive_t(const constitutive_launch &update, const stream &execution_stream) {
   const size_t points = checked_points(update.region);
   unsigned int blocks = 0, threads = 0;
   launch_geometry(update.region, blocks, threads);
-  constitutive_kernel<T><<<blocks, threads, 0,
-                           static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(update,
-                                                                                          points);
+  constitutive_kernel<T, Pml>
+      <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+          update, points);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA constitutive update");
 }
 
@@ -180,19 +268,62 @@ void launch_halo_scatter_t(const halo_launch &launch, const void *device_entries
 void launch_curl(const curl_launch &update, const stream &execution_stream) {
   if (!update.target || (!update.plus_source && !update.minus_source))
     throw std::invalid_argument("NVIDIA curl launch has incomplete operands");
-  if (update.precision == scalar_precision::f32)
-    launch_curl_t<float>(update, execution_stream);
-  else
-    launch_curl_t<double>(update, execution_stream);
+  const bool main_pml = update.pml.sigma != NULL;
+  const bool auxiliary_pml = update.pml_u.sigma != NULL;
+  const bool conductivity = update.conductivity != NULL;
+  if (main_pml && (!update.pml.kappa || !update.pml.inverse))
+    throw std::invalid_argument("NVIDIA curl main PML profile is incomplete");
+  if (auxiliary_pml &&
+      (!update.target_u || !update.pml_u.kappa || !update.pml_u.inverse))
+    throw std::invalid_argument("NVIDIA curl auxiliary PML profile is incomplete");
+  if (conductivity &&
+      (!update.conductivity_inverse || (main_pml && !update.target_conductivity)))
+    throw std::invalid_argument("NVIDIA curl conductivity state is incomplete");
+
+#define LAUNCH_CURL_VARIANT(T, MP, AP, C) launch_curl_t<T, MP, AP, C>(update, execution_stream)
+#define DISPATCH_CURL(T)                                                                            \
+  do {                                                                                              \
+    const unsigned int key = unsigned(main_pml) | (unsigned(auxiliary_pml) << 1) |                  \
+                             (unsigned(conductivity) << 2);                                         \
+    switch (key) {                                                                                  \
+      case 0: LAUNCH_CURL_VARIANT(T, false, false, false); break;                                   \
+      case 1: LAUNCH_CURL_VARIANT(T, true, false, false); break;                                    \
+      case 2: LAUNCH_CURL_VARIANT(T, false, true, false); break;                                    \
+      case 3: LAUNCH_CURL_VARIANT(T, true, true, false); break;                                     \
+      case 4: LAUNCH_CURL_VARIANT(T, false, false, true); break;                                    \
+      case 5: LAUNCH_CURL_VARIANT(T, true, false, true); break;                                     \
+      case 6: LAUNCH_CURL_VARIANT(T, false, true, true); break;                                     \
+      case 7: LAUNCH_CURL_VARIANT(T, true, true, true); break;                                      \
+    }                                                                                               \
+  } while (0)
+  if (update.precision == scalar_precision::f32) {
+    DISPATCH_CURL(float);
+  }
+  else {
+    DISPATCH_CURL(double);
+  }
+#undef DISPATCH_CURL
+#undef LAUNCH_CURL_VARIANT
 }
 
 void launch_constitutive(const constitutive_launch &update, const stream &execution_stream) {
   if (!update.target || !update.primary)
     throw std::invalid_argument("NVIDIA constitutive launch has incomplete operands");
-  if (update.precision == scalar_precision::f32)
-    launch_constitutive_t<float>(update, execution_stream);
-  else
-    launch_constitutive_t<double>(update, execution_stream);
+  const bool pml = update.pml.sigma != NULL;
+  if (pml && (!update.target_w || !update.pml.kappa))
+    throw std::invalid_argument("NVIDIA constitutive PML state is incomplete");
+  if (update.precision == scalar_precision::f32) {
+    if (pml)
+      launch_constitutive_t<float, true>(update, execution_stream);
+    else
+      launch_constitutive_t<float, false>(update, execution_stream);
+  }
+  else {
+    if (pml)
+      launch_constitutive_t<double, true>(update, execution_stream);
+    else
+      launch_constitutive_t<double, false>(update, execution_stream);
+  }
 }
 
 void launch_zero(const zero_launch &update, const stream &execution_stream) {
