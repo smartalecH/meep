@@ -20,9 +20,17 @@
 
 #include <stdexcept>
 
+#include "config.h"
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/initialization_plan.hpp"
 #include "meep_internals.hpp"
+
+#ifdef HAVE_NVIDIA_BACKEND
+#include <unistd.h>
+
+#include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/runtime.hpp"
+#endif
 
 namespace meep {
 
@@ -139,6 +147,79 @@ bool CpuBackend::accepts(const execution_options &opts, std::string &why) const 
 
 ExecutionBackend *make_backend(fields &f, const execution_options &opts, std::string &why) {
   why.clear();
+
+#ifdef HAVE_NVIDIA_BACKEND
+  if (opts.backend == backend_kind::nvidia || opts.backend == backend_kind::automatic) {
+    std::string local_error;
+    ExecutionBackend *nvidia_backend = NULL;
+    nvidia::device_selection selection;
+    nvidia::device_properties properties;
+    char local_host[256] = {0};
+    bool allow_sharing = false;
+    try {
+      int local_rank = 0;
+      int local_size = 1;
+      node_local_process_info(&local_rank, &local_size);
+      if (const char *sharing = getenv("MEEP_ALLOW_GPU_SHARING")) {
+        if (!strcmp(sharing, "1") || !strcmp(sharing, "true") || !strcmp(sharing, "yes"))
+          allow_sharing = true;
+        else if (strcmp(sharing, "0") && strcmp(sharing, "false") && strcmp(sharing, "no"))
+          throw std::invalid_argument(
+              "MEEP_ALLOW_GPU_SHARING must be one of 0|false|no|1|true|yes");
+      }
+      selection = nvidia::select_device(opts.device_id, local_rank, local_size, allow_sharing);
+      properties = nvidia::properties_for_device(selection.device);
+      if (gethostname(local_host, sizeof(local_host) - 1) != 0)
+        throw std::runtime_error("could not determine the local hostname for GPU selection");
+    }
+    catch (const std::exception &error) { local_error = error.what(); }
+    catch (...) { local_error = "unknown NVIDIA backend selection failure"; }
+
+    /* Never enter rank-matching collectives until every rank completed its
+       local CUDA probe. Otherwise one bad visibility/device setting can strand
+       its peers inside broadcast. */
+    if (or_to_all(!local_error.empty())) {
+      if (opts.backend == backend_kind::nvidia) {
+        why = local_error.empty() ? "another rank failed NVIDIA backend selection" : local_error;
+        return NULL;
+      }
+    }
+    else {
+      try {
+        bool collision = false;
+        for (int root = 0; root < count_processors(); ++root) {
+          char peer_host[256] = {0};
+          char peer_uuid[128] = {0};
+          if (my_rank() == root) {
+            strncpy(peer_host, local_host, sizeof(local_host) - 1);
+            strncpy(peer_uuid, properties.uuid.c_str(), sizeof(peer_uuid) - 1);
+          }
+          broadcast(root, peer_host, int(sizeof(peer_host)));
+          broadcast(root, peer_uuid, int(sizeof(peer_uuid)));
+          if (!allow_sharing && root != my_rank() && !strcmp(peer_host, local_host) &&
+              properties.uuid == peer_uuid)
+            collision = true;
+        }
+        if (or_to_all(collision))
+          throw std::runtime_error(
+              "multiple ranks selected the same GPU; set MEEP_ALLOW_GPU_SHARING only if intentional");
+        nvidia_backend = make_nvidia_backend(f, opts, selection.device, local_error);
+        if (!nvidia_backend && local_error.empty())
+          local_error = "the NVIDIA backend could not be constructed";
+      }
+      catch (const std::exception &error) { local_error = error.what(); }
+      catch (...) { local_error = "unknown NVIDIA backend construction failure"; }
+
+      if (!or_to_all(!local_error.empty())) return nvidia_backend;
+      delete nvidia_backend;
+      if (opts.backend == backend_kind::nvidia) {
+        why = local_error.empty() ? "another rank failed NVIDIA backend construction" : local_error;
+        return NULL;
+      }
+    }
+  }
+#endif
+
   CpuBackend *cpu = new CpuBackend(f);
 
   if (opts.backend == backend_kind::automatic) {

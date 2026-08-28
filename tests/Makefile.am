@@ -7,7 +7,8 @@ lifecycle.cpp halo_plan.cpp storage_plan.cpp classification.cpp step_plan.cpp re
 
 # The bitwise-neutrality harness (plan section 4) is Python, and is driven by
 # CI rather than by `make check`: it needs two builds to compare.
-EXTRA_DIST = $(SRC) bitwise
+EXTRA_DIST = $(SRC) bitwise nvidia_runtime_smoke.cu nvidia_arena_smoke.cu \
+nvidia_mpi_runtime_smoke.cu nvidia_backend_state.cpp
 
 OBJ = $(SRC:.cpp=.o)
 DAC = $(SRC:.cpp=.dac)
@@ -137,11 +138,62 @@ user_defined_material_LDADD   = $(MEEPLIBS)
 dist_noinst_DATA = cyl-ellipsoid-eps-ref.h5 array-slice-ll-ref.h5
 
 TESTS = lifecycle halo_plan storage_plan classification step_plan prepared_plan region_plan descriptors backend_api aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml
+check_SCRIPTS =
+CLEANFILES =
 
 if WITH_MPI
   LOG_COMPILER = $(RUNCODE)
 else
   TESTS += cyl-ellipsoid-ll array-slice-ll ring-ll
+endif
+
+if HAVE_NVIDIA_BACKEND
+NVIDIA_CUDA_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
+NVIDIA_CUDA_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
+NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke
+if WITH_MPI
+NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
+endif
+check_SCRIPTS += $(NVIDIA_RUNTIME_TESTS)
+check_PROGRAMS += nvidia_backend_state
+TESTS += nvidia_backend_state
+CLEANFILES += $(NVIDIA_RUNTIME_TESTS)
+nvidia_backend_state_SOURCES = nvidia_backend_state.cpp
+nvidia_backend_state_LDADD = $(MEEPLIBS)
+
+check-local: check-TESTS
+	$(MAKE) nvidia-runtime-check
+
+.PHONY: nvidia-runtime-check
+nvidia-runtime-check: $(NVIDIA_RUNTIME_TESTS)
+	./nvidia_runtime_smoke
+	./nvidia_arena_smoke
+if WITH_MPI
+	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=staged
+	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=auto
+endif
+
+$(NVIDIA_CUDA_LIBRARY):
+	$(MAKE) -C $(top_builddir)/src libmeep_nvidia_runtime.la
+
+$(NVIDIA_CUDA_ARCHIVE): $(NVIDIA_CUDA_LIBRARY)
+	$(AM_V_at)test -f $@
+
+nvidia_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
+	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
+	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+
+nvidia_arena_smoke: $(srcdir)/nvidia_arena_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
+	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
+	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+
+if WITH_MPI
+nvidia_mpi_runtime_smoke: $(srcdir)/nvidia_mpi_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+	$(AM_V_GEN)$(CXX) $(CPPFLAGS) $(AM_CPPFLAGS) $(CXXFLAGS) -x c++ $< -x none \
+	  $(NVIDIA_CUDA_ARCHIVE) $(CUDA_LDFLAGS) $(CUDA_LIBS) $(LIBS) -o $@
+endif
 endif
 
 # Note: this requires GNU make
