@@ -25,6 +25,7 @@
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/nvidia/arena.hpp"
+#include "backend/nvidia/nvidia_dft.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
@@ -354,6 +355,8 @@ public:
                    size_t halo_scratch_bytes, const std::vector<NvidiaFiniteCheck> &finite_checks,
                    const std::vector<nvidia::point_source_launch> &point_sources,
                    const std::vector<nvidia::array_copy_launch> &source_copies,
+                   const std::vector<nvidia::dft_launch> &dft_updates,
+                   const std::vector<double> &dft_omega,
                    size_t source_scalar_count, size_t source_staging_elements,
                    NvidiaBackendState &state)
       : owner_(owner), state_token_(state_token), signature_(signature),
@@ -361,7 +364,7 @@ public:
         operations_(operations), curl_updates_(curl_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), point_sources_(point_sources),
-        source_copies_(source_copies),
+        source_copies_(source_copies), dft_updates_(dft_updates),
         source_scalar_count_(source_scalar_count) {
     try {
       nvidia::device_scope scope(state.device_);
@@ -393,7 +396,18 @@ public:
                                                  sizeof(nvidia::source_scalar),
                                                  "allocating NVIDIA source-scalar staging"));
       }
-      if (!halo_gathers.empty() || !halo_scatters.empty()) state.transfer_->synchronize();
+      if (!dft_omega.empty()) {
+        dft_omega_.allocate(checked_product(dft_omega.size(), sizeof(double),
+                                            "allocating NVIDIA DFT frequencies"),
+                            state.device_);
+        nvidia::copy_host_to_device_async(dft_omega_, 0, dft_omega.data(), dft_omega_.size(),
+                                          *state.transfer_);
+        const double *omega_base = static_cast<const double *>(dft_omega_.opaque_handle());
+        for (size_t i = 0; i < dft_updates_.size(); ++i)
+          dft_updates_[i].omega = omega_base;
+      }
+      if (!halo_gathers.empty() || !halo_scatters.empty() || !dft_omega.empty())
+        state.transfer_->synchronize();
     }
     catch (...) {
       /* Every destination above belongs to this unpublished executable.
@@ -415,6 +429,7 @@ public:
   std::vector<NvidiaFiniteCheck> finite_checks_;
   std::vector<nvidia::point_source_launch> point_sources_;
   std::vector<nvidia::array_copy_launch> source_copies_;
+  std::vector<nvidia::dft_launch> dft_updates_;
   size_t source_scalar_count_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
@@ -423,6 +438,7 @@ public:
   nvidia::pinned_buffer finite_result_host_;
   nvidia::device_buffer source_scalars_;
   nvidia::pinned_buffer source_staging_;
+  nvidia::device_buffer dft_omega_;
 };
 
 namespace {
@@ -438,6 +454,17 @@ nvidia::scalar_precision scalar_precision_for(const StoragePlan &plan, ArrayId i
                                         : nvidia::scalar_precision::f64;
 }
 
+nvidia::scalar_precision complex_precision_for(const StoragePlan &plan, ArrayId id,
+                                               const char *what) {
+  if (!is_valid(id) || id.value >= plan.arrays.size())
+    throw std::invalid_argument(std::string(what) + " uses an invalid ArrayId");
+  const ArraySpec &spec = plan.arrays[id.value];
+  if (spec.element_type != ElementType::complex_realnum)
+    throw std::invalid_argument(std::string(what) + " is not a complex-realnum array");
+  return spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
+                                        : nvidia::scalar_precision::f64;
+}
+
 void require_same_precision(const StoragePlan &plan, ArrayId id, nvidia::scalar_precision precision,
                             const char *what) {
   if (!is_valid(id)) return;
@@ -447,6 +474,11 @@ void require_same_precision(const StoragePlan &plan, ArrayId id, nvidia::scalar_
 
 void *device_address(NvidiaBackendState &state, ArrayId id, const char *what) {
   (void)scalar_precision_for(state.plan_, id, what);
+  return state.arenas_->resolve(id.value).address;
+}
+
+void *complex_device_address(NvidiaBackendState &state, ArrayId id, const char *what) {
+  (void)complex_precision_for(state.plan_, id, what);
   return state.arenas_->resolve(id.value).address;
 }
 
@@ -466,6 +498,18 @@ void *optional_mutable_device_address(NvidiaBackendState &state, ArrayId id,
 
 void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum, ptrdiff_t maximum,
                           const char *what);
+
+void validate_ref_index_range(const StoragePlan &plan, const ArrayRef &ref, ptrdiff_t minimum,
+                              ptrdiff_t maximum, const char *what) {
+  if (!is_valid(ref.id) || ref.id.value >= plan.arrays.size())
+    throw std::invalid_argument(std::string(what) + " uses an invalid ArrayId");
+  const ArraySpec &spec = plan.arrays[ref.id.value];
+  if (ref.offset > spec.elements || ref.elements > spec.elements - ref.offset)
+    throw std::out_of_range(std::string(what) + " declares an invalid source span");
+  if (minimum < 0 || maximum < minimum || size_t(minimum) < ref.offset ||
+      size_t(maximum) >= ref.offset + ref.elements)
+    throw std::out_of_range(std::string(what) + " index range exceeds its declared span");
+}
 
 nvidia::point_source_launch compile_point_source(const SourceDescriptor &source,
                                                  const SourcePlan &source_plan, size_t point,
@@ -633,6 +677,178 @@ void validate_shifted_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t
   const ptrdiff_t maximum_offset = std::max(std::max(offset0, offset1), std::max(offset2, offset3));
   validate_index_range(plan, id, checked_shift(region_min, minimum_offset, what),
                        checked_shift(region_max, maximum_offset, what), what);
+}
+
+nvidia::dft_launch compile_dft(const DftDescriptor &source, const fields &f,
+                               NvidiaBackendState &state, std::vector<double> &packed_omega) {
+  if (source.chunk < 0 || source.chunk >= f.num_chunks || !f.chunks[source.chunk] ||
+      !f.chunks[source.chunk]->is_mine())
+    throw std::invalid_argument("DFT descriptor has an invalid local chunk");
+  if (!source.N || !source.Nomega || source.omega.size() != source.Nomega)
+    throw std::invalid_argument("DFT descriptor has invalid dimensions");
+  if (source.decimation_factor <= 0)
+    throw std::invalid_argument("DFT descriptor has a nonpositive decimation factor");
+
+  const ArrayId accumulator = source.accumulator;
+  const ArrayId phase = source.phase_scratch;
+  if (!is_valid(accumulator) || accumulator.value >= state.plan_.arrays.size() ||
+      !is_valid(phase) || phase.value >= state.plan_.arrays.size())
+    throw std::invalid_argument("DFT descriptor has invalid monitor storage");
+  const ArraySpec &accumulator_spec = state.plan_.arrays[accumulator.value];
+  const ArraySpec &phase_spec = state.plan_.arrays[phase.value];
+  const StorageKey &accumulator_key = state.plan_.keys[accumulator.value];
+  const StorageKey &phase_key = state.plan_.keys[phase.value];
+  if (accumulator_spec.role != array_role::dft || phase_spec.role != array_role::dft ||
+      accumulator_key.kind != int(array_kind::dft) ||
+      phase_key.kind != int(array_kind::dft_phase) || accumulator_key.chunk != source.chunk ||
+      phase_key.chunk != source.chunk || accumulator_key.component_ != int(source.c) ||
+      phase_key.component_ != int(source.c) || accumulator_key.aux != phase_key.aux ||
+      is_valid(accumulator_spec.alias_of) || is_valid(phase_spec.alias_of))
+    throw std::invalid_argument("DFT descriptor storage has the wrong role");
+  const nvidia::scalar_precision monitor_precision =
+      complex_precision_for(state.plan_, accumulator, "DFT accumulator");
+  if (complex_precision_for(state.plan_, phase, "DFT phase scratch") != monitor_precision)
+    throw std::invalid_argument("DFT accumulator and phase scratch precisions differ");
+
+  if (!is_valid(source.source_field.id) ||
+      source.source_field.id.value >= state.plan_.arrays.size())
+    throw std::invalid_argument("DFT descriptor has no real source field");
+  const ArraySpec &real_spec = state.plan_.arrays[source.source_field.id.value];
+  const StorageKey &real_key = state.plan_.keys[source.source_field.id.value];
+  if (real_spec.role != array_role::field || real_spec.element_type != ElementType::realnum_value)
+    throw std::invalid_argument("DFT real source has the wrong storage type");
+  if (real_key.kind != int(array_kind::f) || real_key.chunk != source.chunk ||
+      real_key.component_ != int(source.c) || real_key.cmp != 0)
+    throw std::invalid_argument("DFT real source has the wrong storage identity");
+  const nvidia::scalar_precision field_precision =
+      scalar_precision_for(state.plan_, source.source_field.id, "DFT real source");
+  if (f.is_real && is_valid(source.source_field_imag.id))
+    throw std::invalid_argument("real NVIDIA fields have an imaginary DFT source");
+  if (!f.is_real && !is_valid(source.source_field_imag.id))
+    throw std::invalid_argument("complex NVIDIA fields have no imaginary DFT source");
+  if (is_valid(source.source_field_imag.id)) {
+    if (source.source_field_imag.id.value >= state.plan_.arrays.size())
+      throw std::out_of_range("DFT imaginary source ArrayId is out of range");
+    const ArraySpec &imag_spec = state.plan_.arrays[source.source_field_imag.id.value];
+    const StorageKey &imag_key = state.plan_.keys[source.source_field_imag.id.value];
+    if (imag_spec.role != array_role::field ||
+        imag_spec.element_type != ElementType::realnum_value)
+      throw std::invalid_argument("DFT imaginary source has the wrong storage type");
+    if (imag_key.kind != int(array_kind::f) || imag_key.chunk != source.chunk ||
+        imag_key.component_ != int(source.c) || imag_key.cmp != 1)
+      throw std::invalid_argument("DFT imaginary source has the wrong storage identity");
+    require_same_precision(state.plan_, source.source_field_imag.id, field_precision,
+                           "DFT imaginary source");
+  }
+  if (field_precision == nvidia::scalar_precision::f64 &&
+      monitor_precision == nvidia::scalar_precision::f32)
+    throw std::invalid_argument("NVIDIA DFT does not support f64 fields with f32 monitors");
+
+  nvidia::dft_launch result = {};
+  result.field_precision = field_precision;
+  result.monitor_precision = monitor_precision;
+  result.source_real = device_address(state, source.source_field.id, "DFT real source");
+  result.source_imag = is_valid(source.source_field_imag.id)
+                           ? device_address(state, source.source_field_imag.id,
+                                            "DFT imaginary source")
+                           : NULL;
+  result.accumulator = complex_device_address(state, accumulator, "DFT accumulator");
+  result.phase_scratch = complex_device_address(state, phase, "DFT phase scratch");
+  result.points = source.N;
+  result.frequencies = source.Nomega;
+  result.avg1 = source.avg1;
+  result.avg2 = source.avg2;
+  result.dV0 = source.dV0;
+  result.dV1 = source.dV1;
+  result.scale_real = source.scale.real();
+  result.scale_imag = source.scale.imag();
+  result.decimation_factor = source.decimation_factor;
+  result.include_weights = source.include_dV_and_interp_weights;
+  result.sqrt_weights = source.sqrt_dV_and_interp_weights;
+  result.magnetic = is_H_or_B(source.c);
+
+  const grid_volume &gv = f.chunks[source.chunk]->gv;
+  ptrdiff_t base = 0;
+  size_t points = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    const ptrdiff_t begin = source.is.yucky_val(axis);
+    const ptrdiff_t end = source.ie.yucky_val(axis);
+    const ptrdiff_t extent = end - begin;
+    if (extent < 0) {
+      std::ostringstream message;
+      message << "DFT descriptor has a reversed extent (chunk=" << source.chunk
+              << ", component=" << int(source.c) << ", axis=" << axis << ", begin=" << begin
+              << ", end=" << end << ")";
+      throw std::invalid_argument(message.str());
+    }
+    const size_t count = size_t(extent / 2) + 1;
+    points = checked_product(points, count, "sizing NVIDIA DFT region");
+    const direction d = gv.yucky_direction(axis);
+    const ptrdiff_t stride = gv.stride(d);
+    if (stride < 0) throw std::invalid_argument("DFT descriptor has a negative field stride");
+    const ptrdiff_t relative = begin - gv.little_corner().yucky_val(axis);
+    /* Match PLOOP_OVER_IVECS exactly: component Yee shifts can make this
+       difference odd (including -1), and C++ integer division truncates it
+       toward zero. */
+    const ptrdiff_t coordinate = relative / 2;
+    if (coordinate > 0 && stride > std::numeric_limits<ptrdiff_t>::max() / coordinate)
+      throw std::overflow_error("DFT descriptor base index overflow");
+    if (coordinate < 0) {
+      if (coordinate == std::numeric_limits<ptrdiff_t>::min() ||
+          stride > std::numeric_limits<ptrdiff_t>::max() / -coordinate)
+        throw std::overflow_error("DFT descriptor base index overflow");
+    }
+    base = checked_shift(base, coordinate * stride, "building DFT descriptor base");
+    result.region.counts[axis] = count;
+    result.region.strides[axis] = stride;
+    result.start0[axis] = source.weights.s0.in_direction(d);
+    result.start1[axis] = source.weights.s1.in_direction(d);
+    result.end0[axis] = source.weights.e0.in_direction(d);
+    result.end1[axis] = source.weights.e1.in_direction(d);
+  }
+  if (points != source.N)
+    throw std::invalid_argument("DFT descriptor region size does not match N");
+  if (base < 0) throw std::out_of_range("DFT descriptor has a negative source base");
+  result.region.base = size_t(base);
+
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  const ptrdiff_t offsets[4] = {0, source.avg1, source.avg2,
+                                checked_shift(source.avg1, source.avg2,
+                                              "validating DFT interpolation")};
+  const ptrdiff_t minimum_offset = *std::min_element(offsets, offsets + 4);
+  const ptrdiff_t maximum_offset = *std::max_element(offsets, offsets + 4);
+  validate_ref_index_range(state.plan_, source.source_field,
+                           checked_shift(base, minimum_offset, "validating DFT real source"),
+                           checked_shift(region_max, maximum_offset,
+                                         "validating DFT real source"),
+                           "DFT real source");
+  if (is_valid(source.source_field_imag.id))
+    validate_ref_index_range(state.plan_, source.source_field_imag,
+                             checked_shift(base, minimum_offset,
+                                           "validating DFT imaginary source"),
+                             checked_shift(region_max, maximum_offset,
+                                           "validating DFT imaginary source"),
+                             "DFT imaginary source");
+
+  const size_t outputs = checked_product(source.N, source.Nomega,
+                                         "sizing NVIDIA DFT accumulator");
+  if (accumulator_spec.elements < outputs || phase_spec.elements < source.Nomega)
+    throw std::out_of_range("DFT monitor storage is smaller than its descriptor");
+  const size_t monitor_bytes = monitor_precision == nvidia::scalar_precision::f32
+                                   ? sizeof(float)
+                                   : sizeof(double);
+  (void)checked_product(checked_product(outputs, size_t(2),
+                                        "sizing NVIDIA DFT scalar output"),
+                        monitor_bytes, "sizing NVIDIA DFT output bytes");
+  (void)checked_product(checked_product(source.Nomega, size_t(2),
+                                        "sizing NVIDIA DFT phase scalars"),
+                        monitor_bytes, "sizing NVIDIA DFT phase bytes");
+
+  result.omega_offset = packed_omega.size();
+  if (source.omega.size() > std::numeric_limits<size_t>::max() - packed_omega.size())
+    throw std::overflow_error("NVIDIA DFT frequency table size overflow");
+  packed_omega.insert(packed_omega.end(), source.omega.begin(), source.omega.end());
+  return result;
 }
 
 nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &state) {
@@ -963,12 +1179,6 @@ bool has_polarization(const fields &f) {
   return false;
 }
 
-bool has_dfts(const fields &f) {
-  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
-    if (f.chunks[chunk]->is_mine() && f.chunks[chunk]->dft_chunks) return true;
-  return false;
-}
-
 bool has_magnetic_backups(const StoragePlan &plan) {
   for (size_t i = 0; i < plan.keys.size(); ++i) {
     const int kind = plan.keys[i].kind;
@@ -1138,8 +1348,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 supports Cartesian fields with m=beta=0 only");
     if (f_.is_phasing())
       throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
-    if (f_.fluxes || has_dfts(f_))
-      throw std::invalid_argument("NVIDIA PR2 source-free slice does not support monitors");
+    if (f_.fluxes)
+      throw std::invalid_argument("NVIDIA PR3 does not support legacy time-domain flux monitors");
     if (has_polarization(f_))
       throw std::invalid_argument("NVIDIA PR2 source-free slice does not support dispersion");
     if (has_magnetic_backups(state.plan_))
@@ -1181,6 +1391,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     uint64_t finite_elements = 0;
     std::vector<nvidia::point_source_launch> point_sources;
     std::vector<nvidia::array_copy_launch> source_copies;
+    std::vector<nvidia::dft_launch> dft_updates;
+    std::vector<double> dft_omega;
     size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
 
@@ -1371,6 +1583,18 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           source_staging_elements += compiled.count;
           break;
         }
+        case OpKind::update_dft: {
+          if (size_t(op.descriptor_index) + op.descriptor_count > plan.dft_updates.size()) {
+            set_reason(local_error, oi, "DFT descriptor span is out of range");
+            break;
+          }
+          compiled.first = dft_updates.size();
+          for (size_t i = op.descriptor_index;
+               i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
+            dft_updates.push_back(compile_dft(plan.dft_updates[i], f_, state, dft_omega));
+          compiled.count = dft_updates.size() - compiled.first;
+          break;
+        }
         case OpKind::restore_magnetic_fields:
         case OpKind::update_material_coefficients:
         case OpKind::update_polarization:
@@ -1384,7 +1608,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         case OpKind::unpack_halo:
         case OpKind::update_flux_half:
         case OpKind::update_flux:
-        case OpKind::update_dft:
         case OpKind::reduction:
         case OpKind::host_callback:
         case OpKind::pack_state:
@@ -1399,7 +1622,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       executable.reset(new NvidiaExecutable(
           this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
           constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
-          halo_scratch_bytes, finite_checks, point_sources, source_copies,
+          halo_scratch_bytes, finite_checks, point_sources, source_copies, dft_updates, dft_omega,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, state));
   }
@@ -1497,6 +1720,15 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                                           *state.transfer_);
             break;
           case OpKind::increment_time: ++f_.t; break;
+          case OpKind::update_dft:
+            for (size_t i = op.first; i < op.first + op.count; ++i) {
+              const nvidia::dft_launch &dft = executable.dft_updates_[i];
+              if ((f_.t % dft.decimation_factor) != 0) continue;
+              const double sample_time =
+                  dft.magnetic ? f_.time() - 0.5 * f_.dt : f_.time();
+              nvidia::launch_dft(dft, sample_time, *state.transfer_);
+            }
+            break;
           case OpKind::finite_value_check: {
             const bool due = finite_mode == FiniteCheckMode::step ||
                              (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps);
