@@ -96,6 +96,25 @@ public:
    Returns NULL and fills `why` when the request cannot be satisfied. */
 ExecutionBackend *make_backend(fields &f, const execution_options &opts, std::string &why);
 
+/* True only while a device/resident backend has authoritative storage. This
+   also lets CPU callers skip range-discovery work entirely. */
+bool backend_host_refresh_required(const fields &f);
+
+/* Refresh exactly one catalogued host range before legacy host-side query or
+   output code reads it. Returns false and records the first local error rather
+   than unwinding one rank ahead of a later collective. */
+bool backend_read_host_range(const fields &f, const void *host_address, size_t elements,
+                             std::string &local_error);
+
+/* Every participating rank must call this at the boundary following a batch
+   of backend reads and before entering the next MPI/HDF5 collective. */
+void backend_reconcile_host_access(const std::string &local_error, const char *site);
+
+/* A checkpoint load may replace array allocations. Preserve authoritative
+   resident state before those host pointers change, then retire the stale
+   state/catalog consumers. */
+void backend_prepare_checkpoint_load(fields &f);
+
 } // namespace meep
 
 #endif // MEEP_BACKEND_BACKEND_HPP
