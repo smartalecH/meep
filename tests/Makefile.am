@@ -8,7 +8,8 @@ lifecycle.cpp halo_plan.cpp storage_plan.cpp classification.cpp step_plan.cpp re
 # The bitwise-neutrality harness (plan section 4) is Python, and is driven by
 # CI rather than by `make check`: it needs two builds to compare.
 EXTRA_DIST = $(SRC) bitwise nvidia_runtime_smoke.cu nvidia_arena_smoke.cu \
-nvidia_mpi_runtime_smoke.cu nvidia_step_smoke.cu nvidia_backend_state.cpp
+nvidia_mpi_runtime_smoke.cu nvidia_step_smoke.cu nvidia_backend_state.cpp \
+nvidia_timestep.cpp
 
 OBJ = $(SRC:.cpp=.o)
 DAC = $(SRC:.cpp=.dac)
@@ -155,11 +156,13 @@ if WITH_MPI
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
 endif
 check_SCRIPTS += $(NVIDIA_RUNTIME_TESTS)
-check_PROGRAMS += nvidia_backend_state
-TESTS += nvidia_backend_state
+check_PROGRAMS += nvidia_backend_state nvidia_timestep
+TESTS += nvidia_backend_state nvidia_timestep
 CLEANFILES += $(NVIDIA_RUNTIME_TESTS)
 nvidia_backend_state_SOURCES = nvidia_backend_state.cpp
 nvidia_backend_state_LDADD = $(MEEPLIBS)
+nvidia_timestep_SOURCES = nvidia_timestep.cpp
+nvidia_timestep_LDADD = $(MEEPLIBS)
 
 check-local: check-TESTS
 	$(MAKE) nvidia-runtime-check
