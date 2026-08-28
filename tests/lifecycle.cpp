@@ -27,6 +27,7 @@
 #include <meep.hpp>
 
 #include "backend/diagnostics.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
 
 using namespace meep;
@@ -279,6 +280,53 @@ static void test_mutation_lifecycle() {
   CHECK(is_dirty(f, dirty_halos), "boundary_topology must dirty the halos");
 }
 
+static void test_source_descriptor_refresh() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+
+  gaussian_src_time first(0.3, 0.1);
+  first.is_integrated = false;
+  f.add_point_source(Ez, first, vec(0.1, 0.1));
+  f.advance(2);
+  CHECK(!is_dirty(f, dirty_storage), "initial preparation left storage dirty");
+  CHECK(!is_dirty(f, dirty_source_plan), "initial preparation left source plan dirty");
+  const size_t old_times = f.descriptors->sources.source_times.size();
+  CHECK(old_times == 1, "expected one prepared source time, got %zu", old_times);
+
+  /* Simulate a cached query region. Source-definition invalidation includes
+     dirty_regions, and the descriptor refresh epoch must discard it. */
+  f.descriptors->regions.push_back(ChunkLoopRegion());
+
+  continuous_src_time second(0.25);
+  second.is_integrated = false;
+  f.add_point_source(Ez, second, vec(-0.3, 0.2));
+  CHECK(is_dirty(f, dirty_source_plan), "source addition did not dirty its descriptor plan");
+  CHECK(is_dirty(f, dirty_regions), "source addition did not dirty cached regions");
+  CHECK(!is_dirty(f, dirty_storage), "non-integrated source addition dirtied storage");
+
+  f.advance(1);
+  CHECK(f.descriptors->sources.source_times.size() == old_times + 1,
+        "mid-run source descriptor was not refreshed");
+  CHECK(f.descriptors->regions.empty(), "dirty region cache survived descriptor refresh");
+  CHECK(!is_dirty(f, dirty_source_plan), "source plan remained dirty after refresh");
+  CHECK(!is_dirty(f, dirty_regions), "regions remained dirty after refresh");
+  CHECK(f.descriptors->sources.scalars.size() == old_times + 1,
+        "refreshed source scalar block has the wrong size");
+
+  const src_time *live = f.sources;
+  for (size_t i = 0; i < f.descriptors->sources.source_times.size(); ++i, live = live->next) {
+    const SourceTimeDescriptor &d = f.descriptors->sources.source_times[i];
+    const SourceStepScalar &scalar = f.descriptors->sources.scalars[d.scalar_slot];
+    CHECK(scalar.current == live->current(),
+          "refreshed source scalar %zu is stale: (%g,%g) != (%g,%g)", i,
+          scalar.current.real(), scalar.current.imag(), live->current().real(),
+          live->current().imag());
+    CHECK(scalar.dipole == live->dipole(),
+          "refreshed source dipole %zu is stale: (%g,%g) != (%g,%g)", i,
+          scalar.dipole.real(), scalar.dipole.imag(), live->dipole().real(), live->dipole().imag());
+  }
+}
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -288,6 +336,7 @@ int main(int argc, char **argv) {
   test_advance_equivalence();
   test_finite_check_modes();
   test_mutation_lifecycle();
+  test_source_descriptor_refresh();
 
   if (failures) {
     master_printf("lifecycle: %d FAILURE(S)\n", failures);
