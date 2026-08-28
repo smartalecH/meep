@@ -167,6 +167,9 @@ SourceStepScalar evaluate_source_time_descriptor(const SourceTimeDescriptor &d, 
    block. A stale/unprepared plan is left untouched; lifecycle refreshes it
    before a resident backend compiles or executes. */
 void populate_source_scalars(fields &f, SourcePlan &out);
+/* Structural identity of source recipes/spatial tables. Runtime scalar values
+   are deliberately excluded so ordinary timesteps do not invalidate code. */
+uint64_t source_plan_signature(const SourcePlan &plan);
 void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
 
