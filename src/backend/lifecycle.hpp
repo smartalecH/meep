@@ -89,7 +89,12 @@ const char *dirty_bit_name(DirtyBit bit);
    the legacy flags exactly, 1:1 with the assignment sites they replace, while
    the dirty mask and generations describe the forward-looking model that
    PRs 3-7 consume. PR 2 makes the counters authoritative. */
-void invalidate(fields &f, MutationKind cause);
+void invalidate(fields &f, MutationKind cause, const char *site = "?");
+
+/* Rank-local observations must be reduced before dirty bits that gate
+   collective preparation are changed. */
+bool invalidate_collectively(fields &f, MutationKind cause, bool locally_observed,
+                             const char *site = "?");
 
 void lifecycle_init(fields &f);
 
