@@ -94,8 +94,8 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
-  invalidate(*this, MutationKind::chunk_topology);
-  invalidate(*this, MutationKind::material_definition);
+  invalidate(*this, MutationKind::chunk_topology, "fields.cpp:94");
+  invalidate(*this, MutationKind::material_definition, "fields.cpp:95");
   note_connections_invalidated(*this);
   mark_local_invalidation(*this);
   chunk_connections_valid = false;
@@ -172,8 +172,8 @@ fields::fields(const fields &thef)
   lifecycle_init(*this);
   /* A freshly built decomposition has no connectivity yet, and the material
      coefficients have never been reconciled with the chunk layout. */
-  invalidate(*this, MutationKind::chunk_topology);
-  invalidate(*this, MutationKind::material_definition);
+  invalidate(*this, MutationKind::chunk_topology, "fields.cpp:171");
+  invalidate(*this, MutationKind::material_definition, "fields.cpp:172");
   note_connections_invalidated(*this);
   mark_local_invalidation(*this);
   chunk_connections_valid = false;
@@ -230,7 +230,7 @@ void fields::use_real_fields() {
 
   // don't need to call sync_chunk_connections() since use_real_fields()
   // should always be called on every process
-  invalidate(*this, MutationKind::field_layout);
+  invalidate(*this, MutationKind::field_layout, "fields.cpp:214");
   note_connections_invalidated(*this);
   chunk_connections_valid = false;
 }
@@ -639,10 +639,12 @@ void fields::_require_component(component c, bool aniso2d) {
         if (chunks[i]->alloc_f(c_alloc)) need_to_reconnect++;
   }
 
-  if (need_to_reconnect) {
-    figure_out_step_plan();
-    // we will eventually call sync_chunk_connections() to synchronize this across processes:
-    invalidate(*this, MutationKind::field_layout);
+  /* need_to_reconnect counts allocations on *owned* chunks, so it is
+     rank-local by construction even though the component set above was already
+     synced. Reduce before invalidating: see invalidate_collectively(). */
+  if (need_to_reconnect) figure_out_step_plan();
+  if (invalidate_collectively(*this, MutationKind::field_layout, need_to_reconnect != 0,
+                              "require_component")) {
     note_connections_invalidated(*this);
     chunk_connections_valid = false;
   }
@@ -686,8 +688,8 @@ void fields::remove_sources() {
    path is gone, the promotion below is what keeps it working; without it the
    source would be silently ignored. */
 void fields::note_source_change(bool integrated) {
-  invalidate(*this, MutationKind::source_definition);
-  if (integrated) invalidate(*this, MutationKind::field_layout);
+  invalidate(*this, MutationKind::source_definition, "fields.cpp:670");
+  if (integrated) invalidate(*this, MutationKind::field_layout, "fields.cpp:671");
 }
 
 void fields_chunk::remove_susceptibilities(bool shared_chunks) {
@@ -706,7 +708,7 @@ void fields_chunk::remove_susceptibilities(bool shared_chunks) {
 }
 
 void fields::remove_susceptibilities() {
-  invalidate(*this, MutationKind::material_definition);
+  invalidate(*this, MutationKind::material_definition, "fields.cpp:690");
   mark_local_invalidation(*this);
   changed_materials = true;
   for (int i = 0; i < num_chunks; i++)
@@ -790,7 +792,7 @@ int fields::phase_in_material(const structure *snew, double time) {
     if (chunks[i]->is_mine()) chunks[i]->phase_in_material(snew->chunks[i]);
   phasein_time = (int)(time / dt);
   /* Only owned chunks were touched above, so this is rank-local. */
-  invalidate(*this, MutationKind::material_phase);
+  invalidate(*this, MutationKind::material_phase, "fields.cpp:phase_in_material");
   mark_local_invalidation(*this);
   changed_materials = true;
   // FIXME: how to handle changes in susceptibilities?
@@ -838,13 +840,13 @@ void fields::set_solve_cw_omega(complex<double> omega) {
   /* Entering solve_cw deletes f_minus_p (have_int_sources reads false) and
      changes whether f_w_prev exists; leaving it restores both. Storage has to
      be re-prepared either way. */
-  invalidate(*this, MutationKind::field_layout);
+  invalidate(*this, MutationKind::field_layout, "fields.cpp:821");
 }
 
 void fields::unset_solve_cw_omega() {
   for (int i = 0; i < num_chunks; ++i)
     chunks[i]->unset_solve_cw_omega();
-  invalidate(*this, MutationKind::field_layout);
+  invalidate(*this, MutationKind::field_layout, "fields.cpp:827");
 }
 
 void fields::log(const char *prefix) {

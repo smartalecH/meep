@@ -1464,27 +1464,18 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
      statically absent rather than guarded.
 
      dft_chunks are per-chunk, so a rank owning no chunk that intersects a
-     monitor builds a program of a different shape from its peers. On CPU that
-     is harmless -- update_dfts() is a no-op with no chunks -- and it is
-     deliberately left alone.
+     monitor would otherwise build a program of a different shape from its
+     peers. Harmless on CPU -- update_dfts() is a no-op with no chunks -- but a
+     compiled device graph cannot tolerate a per-rank shape, so it is reduced.
 
-     Reducing it with or_to_all here DEADLOCKS, and it is worth being precise
-     about why, because it is the plan's section 6.4 hazard showing up for
-     real. build_step_plan runs from step_plan_for(), which rebuilds when
-     dirty_executable is set -- and dirty_executable can be set on a *subset*
-     of ranks, because the lazy-allocation sites in step_db, update_eh and
-     update_pols are rank-local by design (each returns a flag saying "I
-     allocated, reconnect"). One rank rebuilds, enters the reduction, and waits
-     for peers that never arrive. Observed: tests/flux hung indefinitely at
-     np=2 with the reduction in place.
-
-     The real fix is to make the *rebuild decision* collective, the way
-     connect_chunks() gates on sync_chunk_connections(). That is follow-up
-     work, recorded in ~/meep-phase1-pr5.md -- and it applies equally to the
-     collectives PR 4 put inside classify(). */
-  bool has_dfts = false;
-  for (int i = 0; i < f.num_chunks && !has_dfts; ++i)
-    if (f.chunks[i]->is_mine() && f.chunks[i]->dft_chunks) has_dfts = true;
+     Reducing here used to deadlock, and the reason is worth remembering: the
+     plan is rebuilt when dirty_executable is set, and preparation could set
+     that bit on a subset of ranks. invalidate_collectively() fixes that at the
+     source; see ~/meep-phase1-pr8.md. */
+  bool has_dfts_local = false;
+  for (int i = 0; i < f.num_chunks && !has_dfts_local; ++i)
+    if (f.chunks[i]->is_mine() && f.chunks[i]->dft_chunks) has_dfts_local = true;
+  const bool has_dfts = or_to_all(has_dfts_local);
 
   /* Magnetic re-synchronization is a graph_variant: the whole program differs
      when synchronized fields are active. */

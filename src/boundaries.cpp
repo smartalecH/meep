@@ -85,7 +85,7 @@ void fields::set_boundary(boundary_side b, direction d, boundary_condition cond)
     if (cond == Periodic || boundaries[1 - b][d] == Periodic) boundaries[1 - b][d] = cond;
     // we don't need to call sync_chunk_connections() since set_boundary()
     // should always be called on every process
-    invalidate(*this, MutationKind::boundary_topology);
+    invalidate(*this, MutationKind::boundary_topology, "boundaries.cpp:88");
     note_connections_invalidated(*this);
     chunk_connections_valid = false;
   }
@@ -113,7 +113,7 @@ void fields::use_bloch(direction d, complex<double> kk) {
   sinkna[d] = imag(eikna[d]);
   if (is_real && kk != 0.0) // FIXME: allow real phases (c.f. CONNECT_PHASE)
     meep::abort("Can't use real fields with bloch boundary conditions!\n");
-  invalidate(*this, MutationKind::boundary_topology);
+  invalidate(*this, MutationKind::boundary_topology, "boundaries.cpp:116");
   note_connections_invalidated(*this);
   chunk_connections_valid = false; // FIXME: we don't always need to invalidate
 }

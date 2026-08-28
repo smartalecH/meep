@@ -91,10 +91,28 @@ const char *dirty_bit_name(DirtyBit bit);
    PRs 3-7 consume. PR 2 makes the counters authoritative. */
 void invalidate(fields &f, MutationKind cause, const char *site = "?");
 
-/* Rank-local observations must be reduced before dirty bits that gate
-   collective preparation are changed. */
+/* Record a mutation that may have been *observed on only some ranks*.
+ *
+ * This is the one primitive that makes the whole preparation lifecycle safe
+ * under MPI. The dirty bits gate collective work -- classify() reduces,
+ * build_step_plan() reduces, preparation itself can reconnect -- so if one rank
+ * sets a bit and its peers do not, the rank that decides to rebuild enters a
+ * reduction alone and the job hangs. It is not a wrong answer; it is a hang,
+ * which is why nothing catches it until it does.
+ *
+ * Every rank must call this, with its own local observation. The reduction
+ * happens first, so either everyone invalidates or nobody does.
+ *
+ * Returns the reduced verdict, so callers can gate the rest of their
+ * bookkeeping on the same answer. */
 bool invalidate_collectively(fields &f, MutationKind cause, bool locally_observed,
                              const char *site = "?");
+
+/* Debug-only, and itself collective: assert the dirty mask is identical on
+   every rank. Must be called from a point every rank reaches unconditionally
+   (step_once does), so a divergence aborts everywhere instead of hanging.
+   This is the regression guard for the class of bug above. */
+void assert_dirty_state_synced(const fields &f, const char *where);
 
 void lifecycle_init(fields &f);
 
