@@ -54,6 +54,7 @@ void abort(const char *fmt, ...) PRINTF_ATTR(1, 2);
 void all_wait();
 int count_processors();
 int my_rank();
+void node_local_process_info(int *rank, int *size);
 bool am_really_master();
 inline int am_master() { return my_rank() == 0; }
 bool with_mpi();
