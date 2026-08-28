@@ -253,14 +253,14 @@ void fields::prepare_storage_for(field_type ft) {
 
   /* Allocating up front without triggering the equivalent reconnect leaves
      boundaries wrong -- the lazy paths returned a flag for exactly this.
-     
+
      Collectively, and this is load-bearing rather than defensive. `reconnect`
      is the OR over *owned* chunks, so different ranks reach different answers,
      and field_layout's closure includes dirty_executable. A rank that
      reconnected then finds the step plan stale while its peers do not, rebuilds
      alone, and hangs on the first reduction inside build_step_plan. Measured:
      tests/flux at np=2, rank 0 taking this branch twice and rank 1 once.
-     
+
      Reducing here is also the same end state the old code reached, just
      earlier: connect_chunks() would have propagated it through
      sync_chunk_connections()'s and_to_all anyway. */
