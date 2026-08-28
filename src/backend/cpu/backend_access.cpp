@@ -54,6 +54,9 @@ backend_capabilities fields::backend_caps() const {
  * options against the same capabilities. A rank that accepted while its peers
  * rejected would hang at the next reduction rather than fail. */
 void fields::select_backend(const execution_options &opts) {
+  if (backend_state)
+    meep::abort("meep: cannot change backend after backend state has been initialized");
+
   options = opts;
   apply_execution_environment(options);
 
@@ -77,6 +80,8 @@ void fields::select_backend(const execution_options &opts) {
   backend_state = NULL;
   delete backend;
   backend = b;
+  delete initialization_plan;
+  initialization_plan = NULL;
 }
 
 void fields::init_backend() {
@@ -84,7 +89,49 @@ void fields::init_backend() {
     execution_options opts;
     select_backend(opts);
   }
-  if (!backend_state) backend_state = backend->create_state(*storage_plan);
+  if (!backend->requires_full_storage_preparation()) {
+    if (!backend_state) backend_state = backend->create_state(*storage_plan);
+    /* CPU storage is the host storage, so value mutations require no transfer. */
+    clear_dirty(*this, dirty_initialization);
+    return;
+  }
+
+  /* A value-only material update can change classification without changing
+     the existing storage layout. Reconcile the host representation first; any
+     promotion it discovers will set dirty_storage for the rebuild below. */
+  if (backend_state && is_dirty(*this, dirty_classification) &&
+      !is_dirty(*this, dirty_storage))
+    classify_and_finalize();
+
+  const bool rebuild_state = !backend_state || is_dirty(*this, dirty_storage);
+  if (rebuild_state) {
+    delete executable;
+    executable = NULL;
+    delete backend_state;
+    backend_state = NULL;
+
+    /* Unlike the CPU path, a resident backend needs the complete catalog before
+       it allocates. This is intentionally gated by the backend capability so
+       default CPU preparation remains lazy and checkpoint-bitwise identical. */
+    prepare_storage();
+    backend_state = backend->create_state(*storage_plan);
+    dirty_mask |= dirty_initialization | dirty_classification;
+  }
+
+  if (is_dirty(*this, dirty_initialization)) {
+    delete initialization_plan;
+    initialization_plan = new InitializationPlan(build_initialization_plan(*this));
+    backend->initialize(*initialization_plan, *backend_state);
+    clear_dirty(*this, dirty_initialization);
+  }
+
+  if (is_dirty(*this, dirty_classification)) {
+    const MaterialClassification cls = backend->classify_state(*storage_plan, *backend_state);
+    if (prepared_classification_hash && cls.hash != prepared_classification_hash)
+      meep::abort("meep: backend classification disagrees with the prepared host state");
+    backend->finalize_storage(*storage_plan, *backend_state);
+    clear_dirty(*this, dirty_classification);
+  }
 }
 
 /* --- Backend-safe access -------------------------------------------------- */

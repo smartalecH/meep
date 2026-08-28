@@ -17,6 +17,7 @@
 
 #include "backend/storage_plan.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/precision.hpp"
 #include "meep_internals.hpp"
 
 #include <limits>
@@ -69,7 +70,6 @@ uint64_t polarization_storage_aux(field_type ft, int state_index, size_t layout_
       uint32_t(uint64_t(state_index) * uint64_t(NUM_FIELD_TYPES) + uint64_t(field));
   return (uint64_t(identity) << 32) | uint64_t(uint32_t(layout_ordinal));
 }
-
 field_type polarization_storage_field_type(uint64_t aux) {
   const uint32_t identity = uint32_t(aux >> 32);
   const field_type ft = field_type(identity % uint32_t(NUM_FIELD_TYPES));
@@ -99,14 +99,10 @@ static size_t element_bytes(ElementType t) {
   }
   return 0;
 }
-
 static void add_array_bytes(size_t &total, const ArraySpec &spec) {
-  const size_t element_size = element_bytes(spec.element_type);
-  if (element_size && spec.elements > std::numeric_limits<size_t>::max() / element_size)
-    throw std::overflow_error("backend storage plan array byte count overflow");
-  const size_t bytes = spec.elements * element_size;
+  const size_t bytes = storage_bytes(spec);
   if (bytes > std::numeric_limits<size_t>::max() - total)
-    throw std::overflow_error("backend storage plan total byte count overflow");
+    throw std::overflow_error("backend storage plan byte count overflow");
   total += bytes;
 }
 

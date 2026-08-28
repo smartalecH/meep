@@ -21,6 +21,8 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -29,6 +31,7 @@
 #include "backend/backend.hpp"
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/initialization_plan.hpp"
+#include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
@@ -49,6 +52,71 @@ static int failures = 0;
   } while (0)
 
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
+
+struct lifetime_counts {
+  int states_created;
+  int states_destroyed;
+  int executables_created;
+  int executables_destroyed;
+  int initialized;
+  int classified;
+  int finalized;
+  int advanced;
+  size_t arrays_at_create;
+
+  lifetime_counts()
+      : states_created(0), states_destroyed(0), executables_created(0),
+        executables_destroyed(0), initialized(0), classified(0), finalized(0), advanced(0),
+        arrays_at_create(0) {}
+};
+
+struct tracking_state : BackendState {
+  explicit tracking_state(lifetime_counts &counts_) : counts(counts_) { ++counts.states_created; }
+  ~tracking_state() override { ++counts.states_destroyed; }
+  lifetime_counts &counts;
+};
+
+struct tracking_executable : Executable {
+  explicit tracking_executable(lifetime_counts &counts_) : counts(counts_) {
+    ++counts.executables_created;
+  }
+  ~tracking_executable() override { ++counts.executables_destroyed; }
+  lifetime_counts &counts;
+};
+
+class tracking_backend : public ExecutionBackend {
+public:
+  tracking_backend(fields &f_, lifetime_counts &counts_) : f(f_), counts(counts_) {}
+
+  BackendState *create_state(const StoragePlan &plan) override {
+    counts.arrays_at_create = plan.arrays.size();
+    return new tracking_state(counts);
+  }
+  void initialize(const InitializationPlan &, BackendState &) override { ++counts.initialized; }
+  MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
+    ++counts.classified;
+    return classify(f, plan);
+  }
+  void finalize_storage(const StoragePlan &, BackendState &) override { ++counts.finalized; }
+  Executable *compile(const StepPlan &, BackendState &) override {
+    return new tracking_executable(counts);
+  }
+  void advance(Executable &, BackendState &, int) override { ++counts.advanced; }
+  void read(ArrayRef, void *, size_t) override {}
+  void write(ArrayRef, const void *, size_t) override {}
+  void synchronize() override {}
+  backend_capabilities capabilities() const override {
+    backend_capabilities c = {true, true, true, 0, "tracking"};
+    return c;
+  }
+  bool requires_full_storage_preparation() const override { return true; }
+  bool accepts(const execution_options &, std::string &) const override { return true; }
+
+private:
+  fields &f;
+  lifetime_counts &counts;
+};
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL) {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
@@ -157,6 +225,59 @@ static void test_read_write_roundtrip() {
   }
   CHECK(bad == 0, "%zu of %zu arrays did not round-trip through read/write", bad, checked);
   CHECK(or_to_all(checked > 0), "no arrays were round-tripped");
+
+  /* The backend API is typed by ArraySpec, not implicitly by realnum. Register
+     one array of every representation and exercise a nonzero element offset. */
+  realnum r[4] = {1, 2, 3, 4};
+  std::complex<realnum> cr[4] = {{1, 2}, {3, 4}, {5, 6}, {7, 8}};
+  double d[4] = {1, 2, 3, 4};
+  std::complex<double> cd[4] = {{1, 2}, {3, 4}, {5, 6}, {7, 8}};
+  int32_t i32[4] = {1, 2, 3, 4};
+  size_t iz[4] = {1, 2, 3, 4};
+  void *arrays[] = {r, cr, d, cd, i32, iz};
+  const ElementType types[] = {ElementType::realnum_value, ElementType::complex_realnum,
+                               ElementType::float64, ElementType::complex_float64,
+                               ElementType::int32, ElementType::index};
+  for (size_t k = 0; k < sizeof(types) / sizeof(types[0]); ++k) {
+    const StorageKey key{-1, int(array_kind::num_kinds), -1, -1, int(k)};
+    const ArrayId id =
+        f->array_catalog->register_array(key, arrays[k], 4, array_role::scratch, types[k]);
+    const size_t element_size = host_element_bytes(types[k]);
+    std::vector<unsigned char> got(2 * element_size, 0);
+    cpu.read(ArrayRef{id, 1, 2}, got.data(), got.size());
+    CHECK(memcmp(got.data(), static_cast<unsigned char *>(arrays[k]) + element_size, got.size()) == 0,
+          "typed access failed for ElementType %zu", k);
+    std::vector<unsigned char> replacement(got.size(), 0x5a);
+    cpu.write(ArrayRef{id, 1, 2}, replacement.data(), replacement.size());
+    CHECK(memcmp(replacement.data(), static_cast<unsigned char *>(arrays[k]) + element_size,
+                 replacement.size()) == 0,
+          "typed write failed for ElementType %zu", k);
+  }
+
+  bool rejected = false;
+  try {
+    realnum one = 0;
+    cpu.read(ArrayRef{invalid_array(), 0, 1}, &one, sizeof(one));
+  }
+  catch (const std::out_of_range &) { rejected = true; }
+  CHECK(rejected, "an invalid ArrayId was not rejected");
+
+  rejected = false;
+  try {
+    realnum one = 0;
+    cpu.read(ArrayRef{ArrayId{0}, f->array_catalog->spec(ArrayId{0}).elements, 1}, &one,
+             sizeof(one));
+  }
+  catch (const std::out_of_range &) { rejected = true; }
+  CHECK(rejected, "an out-of-bounds ArrayRef was not rejected");
+
+  rejected = false;
+  try {
+    realnum one = 0;
+    cpu.read(ArrayRef{ArrayId{0}, 0, 1}, &one, sizeof(one) + 1);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "a mismatched host byte count was not rejected");
   delete f;
   delete s;
 }
@@ -180,6 +301,93 @@ static void test_precision_policy() {
   CHECK(validate_alias_precisions(*f->array_catalog, why), "alias precision validation failed: %s",
         why.c_str());
   delete f;
+  delete s;
+
+  StoragePlan plan;
+  plan.arrays.push_back(ArraySpec{ArrayId{0}, array_role::field, ElementType::realnum_value,
+                                  native_precision, 10, alignof(realnum), invalid_array(), false});
+  plan.arrays.push_back(ArraySpec{ArrayId{1}, array_role::field, ElementType::realnum_value,
+                                  native_precision, 10, alignof(realnum), ArrayId{0}, false});
+  plan.arrays.push_back(ArraySpec{ArrayId{2}, array_role::material, ElementType::realnum_value,
+                                  native_precision, 5, alignof(realnum), invalid_array(), true});
+  plan.arrays.push_back(ArraySpec{ArrayId{3}, array_role::dft, ElementType::complex_realnum,
+                                  native_precision, 2, alignof(realnum), invalid_array(), false});
+  plan.arrays.push_back(ArraySpec{ArrayId{4}, array_role::field, ElementType::float64,
+                                  native_precision, 3, alignof(double), invalid_array(), false});
+  plan.arrays.push_back(ArraySpec{ArrayId{5}, array_role::scratch, ElementType::int32,
+                                  native_precision, 4, alignof(int32_t), invalid_array(), false});
+  apply_precision_policy(plan, precision_mixed());
+  CHECK(plan.arrays[0].storage == Precision::f32 && plan.arrays[1].storage == Precision::f32,
+        "mixed policy did not apply to field/alias storage");
+  CHECK(plan.arrays[2].storage == Precision::f32, "mixed policy did not apply to material storage");
+  CHECK(plan.arrays[3].storage == Precision::f64, "mixed policy did not preserve monitor precision");
+  CHECK(plan.arrays[4].storage == Precision::f64, "fixed float64 storage was narrowed");
+  CHECK(plan.provisional_peak_bytes() == 132,
+        "precision-aware peak bytes are %zu, expected 132", plan.provisional_peak_bytes());
+  CHECK(plan.steady_state_bytes() == 112,
+        "precision-aware steady bytes are %zu, expected 112", plan.steady_state_bytes());
+  CHECK(validate_alias_precisions(plan, why), "valid plan aliases were rejected: %s", why.c_str());
+  plan.arrays[1].storage = Precision::f64;
+  CHECK(!validate_alias_precisions(plan, why), "mismatched plan alias precision was accepted");
+
+  ArraySpec huge = {ArrayId{0}, array_role::dft, ElementType::complex_float64, Precision::f64,
+                    std::numeric_limits<size_t>::max(), alignof(double), invalid_array(), false};
+  bool overflow_rejected = false;
+  try {
+    (void)storage_bytes(huge);
+  }
+  catch (const std::overflow_error &) { overflow_rejected = true; }
+  CHECK(overflow_rejected, "overflowing storage byte count was accepted");
+}
+
+static void test_backend_lifecycle_epoch() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+
+  f->advance(1);
+  BackendState *first_state = f->backend_state;
+  CHECK(counts.arrays_at_create > 0, "resident backend state was created from an empty plan");
+  CHECK(counts.states_created == 1 && counts.initialized == 1 && counts.classified == 1 &&
+            counts.finalized == 1 && counts.executables_created == 1 && counts.advanced == 1,
+        "initial resident lifecycle counts are wrong");
+  CHECK(!is_dirty(*f, dirty_initialization) && !is_dirty(*f, dirty_classification) &&
+            !is_dirty(*f, dirty_executable),
+        "resident lifecycle left consumed dirty bits set");
+
+  invalidate(*f, MutationKind::material_values);
+  f->advance(1);
+  CHECK(f->backend_state == first_state, "value-only refresh reallocated resident state");
+  CHECK(counts.states_created == 1 && counts.initialized == 2 && counts.classified == 2 &&
+            counts.finalized == 2 && counts.executables_created == 1,
+        "value-only refresh rebuilt the wrong backend artifacts");
+
+  f->zero_fields();
+  f->advance(1);
+  CHECK(f->backend_state == first_state && counts.states_created == 1 && counts.initialized == 3,
+        "field-value refresh did not preserve and reinitialize resident state");
+  CHECK(counts.classified == 2 && counts.finalized == 2 && counts.executables_created == 1,
+        "field-value refresh rebuilt unrelated backend artifacts");
+
+  f->initialize_field(Ez, initial_ez);
+  CHECK(is_dirty(*f, dirty_initialization),
+        "initialize_field did not invalidate resident values");
+  f->advance(1);
+  CHECK(f->backend_state == first_state && counts.states_created == 1 && counts.initialized == 4,
+        "initialize_field refresh did not preserve and reinitialize resident state");
+
+  invalidate(*f, MutationKind::field_layout);
+  f->advance(1);
+  CHECK(counts.states_created == 2 && counts.states_destroyed == 1,
+        "storage invalidation did not replace resident state");
+  CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
+        "executable invalidation did not replace the compiled artifact");
+
+  delete f;
+  CHECK(counts.states_destroyed == 2 && counts.executables_destroyed == 2,
+        "polymorphic backend artifacts were not destroyed exactly once");
   delete s;
 }
 
@@ -230,6 +438,7 @@ int main(int argc, char **argv) {
   test_construction_equivalence();
   test_read_write_roundtrip();
   test_precision_policy();
+  test_backend_lifecycle_epoch();
   test_initialization_plan();
 
   if (failures) {

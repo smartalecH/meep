@@ -60,8 +60,14 @@ void fields::step() { advance(1); }
 void fields::advance(int n) {
   if (n <= 0) return;
   init_backend();
-  if (!executable) executable = backend->compile(step_plan_for(StepProgram::ordinary),
-                                                 *backend_state);
+  /* step_plan_for clears dirty_executable, so remember whether the compiled
+     backend artifact was stale before asking it to rebuild the data plan. */
+  const bool recompile = !executable || is_dirty(*this, dirty_executable);
+  const StepPlan &plan = step_plan_for(StepProgram::ordinary);
+  if (recompile) {
+    delete executable;
+    executable = backend->compile(plan, *backend_state);
+  }
   backend->advance(*executable, *backend_state, n);
 }
 
