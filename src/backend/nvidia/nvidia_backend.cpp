@@ -11,6 +11,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <algorithm>
 #include <complex>
 #include <limits>
 #include <memory>
@@ -316,6 +317,13 @@ struct NvidiaCompiledOperation {
   OpKind kind;
   size_t first;
   size_t count;
+  size_t halo_first;
+  size_t halo_count;
+};
+
+struct NvidiaCompiledHalo {
+  nvidia::halo_launch gather;
+  nvidia::halo_launch scatter;
 };
 
 class NvidiaExecutable : public Executable {
@@ -325,11 +333,40 @@ public:
                    const std::vector<NvidiaCompiledOperation> &operations,
                    const std::vector<nvidia::curl_launch> &curl_updates,
                    const std::vector<nvidia::constitutive_launch> &constitutive_updates,
-                   const std::vector<nvidia::zero_launch> &zero_updates)
+                   const std::vector<nvidia::zero_launch> &zero_updates,
+                   const std::vector<NvidiaCompiledHalo> &halo_plans,
+                   const std::vector<nvidia::halo_gather_entry> &halo_gathers,
+                   const std::vector<nvidia::halo_scatter_entry> &halo_scatters,
+                   size_t halo_scratch_bytes, NvidiaBackendState &state)
       : owner_(owner), state_token_(state_token), signature_(signature),
         storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
-        constitutive_updates_(constitutive_updates), zero_updates_(zero_updates) {}
+        constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
+        halo_plans_(halo_plans) {
+    try {
+      nvidia::device_scope scope(state.device_);
+      if (!halo_gathers.empty()) {
+        halo_gathers_.allocate(checked_product(halo_gathers.size(), sizeof(halo_gathers[0]),
+                                               "allocating NVIDIA halo gather descriptors"),
+                               state.device_);
+        nvidia::copy_host_to_device_async(halo_gathers_, 0, halo_gathers.data(),
+                                          halo_gathers_.size(), *state.transfer_);
+      }
+      if (!halo_scatters.empty()) {
+        halo_scatters_.allocate(checked_product(halo_scatters.size(), sizeof(halo_scatters[0]),
+                                                "allocating NVIDIA halo scatter descriptors"),
+                                state.device_);
+        nvidia::copy_host_to_device_async(halo_scatters_, 0, halo_scatters.data(),
+                                          halo_scatters_.size(), *state.transfer_);
+      }
+      if (halo_scratch_bytes) halo_scratch_.allocate(halo_scratch_bytes, state.device_);
+      if (!halo_gathers.empty() || !halo_scatters.empty()) state.transfer_->synchronize();
+    }
+    catch (...) {
+      state.transfer_failed_ = true;
+      throw;
+    }
+  }
 
   const NvidiaBackend *owner_;
   uint64_t state_token_;
@@ -339,6 +376,10 @@ public:
   std::vector<nvidia::curl_launch> curl_updates_;
   std::vector<nvidia::constitutive_launch> constitutive_updates_;
   std::vector<nvidia::zero_launch> zero_updates_;
+  std::vector<NvidiaCompiledHalo> halo_plans_;
+  nvidia::device_buffer halo_gathers_;
+  nvidia::device_buffer halo_scatters_;
+  nvidia::device_buffer halo_scratch_;
 };
 
 namespace {
@@ -505,6 +546,105 @@ nvidia::zero_launch compile_zero(const ElementRef &source, NvidiaBackendState &s
     slab.strides[axis] = 0;
   }
   return compile_zero(slab, state);
+}
+
+struct CompiledHaloRef {
+  void *address;
+  ptrdiff_t index;
+  nvidia::scalar_precision precision;
+};
+
+CompiledHaloRef compile_halo_ref(const ElementRef &source, NvidiaBackendState &state,
+                                 const char *what) {
+  if (source.index < 0)
+    throw std::out_of_range(std::string(what) + " has a negative element index");
+  const nvidia::scalar_precision precision = scalar_precision_for(state.plan_, source.array, what);
+  validate_index_range(state.plan_, source.array, source.index, source.index, what);
+  return CompiledHaloRef{device_address(state, source.array, what), source.index, precision};
+}
+
+size_t scalar_bytes(nvidia::scalar_precision precision) {
+  return precision == nvidia::scalar_precision::f32 ? sizeof(float) : sizeof(double);
+}
+
+NvidiaCompiledHalo compile_halo(const HaloPlan &source, const fields &f, NvidiaBackendState &state,
+                                size_t buffer_base, std::vector<nvidia::halo_gather_entry> &gathers,
+                                std::vector<nvidia::halo_scatter_entry> &scatters) {
+  if (!source.same_rank)
+    throw std::invalid_argument("NVIDIA PR2 does not support remote halo exchange");
+
+  HaloPlan canonical;
+  std::string why;
+  if (!remap_halo_plan(source, f.halos->arrays, *f.array_catalog, f.is_real ? 1 : 2, canonical,
+                       why))
+    throw std::logic_error(std::string("cannot remap local halo plan: ") + why);
+
+  std::vector<ElementRef> gather_refs, scatter_refs;
+  expand_gather(canonical, gather_refs);
+  expand_scatter(canonical, scatter_refs);
+  if (gather_refs.size() != source.block_elements || scatter_refs.size() != source.block_elements)
+    throw std::logic_error("local halo plan expansion does not match its communication block");
+  if (!source.block_elements)
+    throw std::invalid_argument("cannot compile an empty local halo plan");
+  if (buffer_base > std::numeric_limits<size_t>::max() - source.block_elements)
+    throw std::overflow_error("NVIDIA local halo scratch index overflow");
+
+  NvidiaCompiledHalo result;
+  result.gather.first = gathers.size();
+  result.gather.count = gather_refs.size();
+  result.scatter.first = scatters.size();
+  result.scatter.count = 0;
+
+  bool have_precision = false;
+  nvidia::scalar_precision precision = nvidia::scalar_precision::f64;
+  for (size_t i = 0; i < gather_refs.size(); ++i) {
+    const CompiledHaloRef ref = compile_halo_ref(gather_refs[i], state, "halo gather source");
+    if (have_precision && ref.precision != precision)
+      throw std::invalid_argument("local halo gather mixes storage precisions");
+    precision = ref.precision;
+    have_precision = true;
+    gathers.push_back(nvidia::halo_gather_entry{ref.address, ref.index, buffer_base + i});
+  }
+
+  switch (source.phase) {
+    case CONNECT_COPY:
+    case CONNECT_NEGATE: {
+      const double sign = source.phase == CONNECT_NEGATE ? -1.0 : 1.0;
+      for (size_t i = 0; i < scatter_refs.size(); ++i) {
+        const CompiledHaloRef ref = compile_halo_ref(scatter_refs[i], state, "halo scatter target");
+        if (ref.precision != precision)
+          throw std::invalid_argument("local halo scatter mixes storage precisions");
+        scatters.push_back(nvidia::halo_scatter_entry{ref.address, ref.index, NULL, 0,
+                                                      buffer_base + i, sign, 0.0});
+      }
+      break;
+    }
+    case CONNECT_PHASE: {
+      if (f.is_real) throw std::invalid_argument("phase halo requires complex field storage");
+      if (source.block_elements % 2)
+        throw std::invalid_argument("phase halo block does not contain complex pairs");
+      if (source.phase_values.size() != source.block_elements / 2)
+        throw std::invalid_argument("phase halo values do not match the transfer count");
+      for (size_t i = 0; i < source.phase_values.size(); ++i) {
+        const CompiledHaloRef real_ref =
+            compile_halo_ref(scatter_refs[2 * i], state, "phase halo real target");
+        const CompiledHaloRef imag_ref =
+            compile_halo_ref(scatter_refs[2 * i + 1], state, "phase halo imaginary target");
+        if (real_ref.precision != precision || imag_ref.precision != precision)
+          throw std::invalid_argument("phase halo mixes storage precisions");
+        scatters.push_back(nvidia::halo_scatter_entry{
+            real_ref.address, real_ref.index, imag_ref.address, imag_ref.index, buffer_base + 2 * i,
+            double(source.phase_values[i].real()), double(source.phase_values[i].imag())});
+      }
+      break;
+    }
+    default: throw std::invalid_argument("local halo plan has an invalid transform");
+  }
+
+  result.gather.precision = precision;
+  result.scatter.count = scatters.size() - result.scatter.first;
+  result.scatter.precision = precision;
+  return result;
 }
 
 bool has_polarization(const fields &f) {
@@ -713,11 +853,18 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::curl_launch> curl_updates;
     std::vector<nvidia::constitutive_launch> constitutive_updates;
     std::vector<nvidia::zero_launch> zero_updates;
+    std::vector<NvidiaCompiledHalo> halo_plans;
+    std::vector<nvidia::halo_gather_entry> halo_gathers;
+    std::vector<nvidia::halo_scatter_entry> halo_scatters;
+    size_t halo_scratch_bytes = 0;
     operations.reserve(plan.operations.size());
 
+    /* Capability validation is deliberately fail-fast. The first local reason
+       is stable and actionable; the collective below only establishes that no
+       rank can enter execution after any rank rejected its plan. */
     for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
       const Operation &op = plan.operations[oi];
-      NvidiaCompiledOperation compiled{op.kind, 0, 0};
+      NvidiaCompiledOperation compiled{op.kind, 0, 0, 0, 0};
       switch (op.kind) {
         case OpKind::update_db: {
           if (size_t(op.descriptor_index) + op.descriptor_count > plan.db_updates.size()) {
@@ -746,13 +893,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           break;
         }
         case OpKind::transfer_halo: {
-          for (size_t i = 0; i < f_.halos->plans.size(); ++i)
-            if (f_.halos->plans[i].ft == op.ft && f_.halos->plans[i].block_elements) {
-              set_reason(local_error, oi,
-                         "same-rank and remote halo exchange is deferred beyond this slice");
-              break;
-            }
-          if (!local_error.empty()) break;
           if (op.ft < 0 || op.ft >= NUM_FIELD_TYPES) {
             set_reason(local_error, oi, "boundary operation has an invalid field type");
             break;
@@ -770,6 +910,29 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
               zero_updates.push_back(compile_zero(canonical.residue[i], state));
           }
           compiled.count = zero_updates.size() - compiled.first;
+
+          compiled.halo_first = halo_plans.size();
+          size_t buffer_elements = 0;
+          size_t operation_scratch_bytes = 0;
+          bool have_halo_precision = false;
+          nvidia::scalar_precision halo_precision = nvidia::scalar_precision::f64;
+          for (size_t i = 0; i < f_.halos->plans.size(); ++i) {
+            const HaloPlan &halo = f_.halos->plans[i];
+            if (halo.ft != op.ft || !halo.block_elements) continue;
+            const NvidiaCompiledHalo lowered =
+                compile_halo(halo, f_, state, buffer_elements, halo_gathers, halo_scatters);
+            if (have_halo_precision && lowered.gather.precision != halo_precision)
+              throw std::invalid_argument(
+                  "one NVIDIA boundary operation mixes halo storage precisions");
+            halo_precision = lowered.gather.precision;
+            have_halo_precision = true;
+            halo_plans.push_back(lowered);
+            buffer_elements += halo.block_elements;
+            operation_scratch_bytes = checked_product(buffer_elements, scalar_bytes(halo_precision),
+                                                      "sizing NVIDIA local halo scratch");
+          }
+          compiled.halo_count = halo_plans.size() - compiled.halo_first;
+          halo_scratch_bytes = std::max(halo_scratch_bytes, operation_scratch_bytes);
           break;
         }
         case OpKind::restore_magnetic_fields:
@@ -800,9 +963,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     }
 
     if (local_error.empty())
-      executable.reset(new NvidiaExecutable(this, plan.signature, state.fingerprint_,
-                                            state.state_token_, operations, curl_updates,
-                                            constitutive_updates, zero_updates));
+      executable.reset(new NvidiaExecutable(
+          this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
+          constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
+          halo_scratch_bytes, state));
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -846,6 +1010,18 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
           case OpKind::transfer_halo:
             for (size_t i = op.first; i < op.first + op.count; ++i)
               nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
+            /* All source values must be captured before any destination is
+               overwritten: local chunk boundaries can alias another plan's
+               gather side. Stream ordering supplies the gather/scatter
+               barrier without a host synchronization. */
+            for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i)
+              nvidia::launch_halo_gather(
+                  executable.halo_plans_[i].gather, executable.halo_gathers_.opaque_handle(),
+                  executable.halo_scratch_.opaque_handle(), *state.transfer_);
+            for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i)
+              nvidia::launch_halo_scatter(
+                  executable.halo_plans_[i].scatter, executable.halo_scatters_.opaque_handle(),
+                  executable.halo_scratch_.opaque_handle(), *state.transfer_);
             break;
           case OpKind::increment_time: ++f_.t; break;
           default: break; // capability validation proved these operations are no-ops
@@ -901,10 +1077,9 @@ void NvidiaBackend::write(ArrayRef ref, const void *host_buffer, size_t bytes) {
        of the single pinned staging allocation unambiguous. */
     state.transfer_->synchronize();
 
-    /* PR1 has no device timestep kernels, so explicit writes are the only way
-       device values can diverge from the compatibility host catalog. Mirror
-       them until PR2 introduces an explicit device-authority/migration epoch;
-       this makes initialization refresh and storage rebuild lossless today. */
+    /* Keep the explicitly written host range coherent. Other host arrays may
+       remain stale after stepping; prepare_state_rebuild migrates the complete
+       device-authoritative state before a storage rebuild. */
     char *host = static_cast<char *>(f_.array_catalog->resolve_untyped(ref.id));
     if (!host) throw std::logic_error("NVIDIA backend host mirror is null");
     const size_t host_offset =
