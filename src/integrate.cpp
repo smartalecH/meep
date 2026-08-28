@@ -17,6 +17,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 
 /* generic integration and related routines, based fields::loop_in_chunk */
 
@@ -187,6 +188,8 @@ complex<double> fields::integrate(int num_fvals, const component *components,
   for (int i = 0; i < 2 * num_fvals; ++i)
     data.offsets[i] = 0;
 
+  backend_refresh_host_fields(*this, num_fvals, components, where, cgrid, true, false,
+                              "fields::integrate");
   loop_in_chunks(integrate_chunkloop, (void *)&data, where, cgrid);
 
   delete[] data.offsets;
