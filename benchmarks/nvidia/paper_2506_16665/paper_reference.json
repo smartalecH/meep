@@ -1,0 +1,221 @@
+{
+  "schema_version": 1,
+  "paper": {
+    "title": "Comparison of Lumerical FDTD and Tidy3D for three-dimensional FDTD simulations of passive silicon photonic components",
+    "arxiv_id": "2506.16665",
+    "url": "https://arxiv.org/html/2506.16665",
+    "code_url": "https://github.com/JPPhotonics/fdtd-pipeline",
+    "code_commit": "622e0a9b7429eaf2335b1000b39e283544a198c4",
+    "geometry_generator": "gdsfactory==7.8.*",
+    "code_snapshot_caveat": "The pinned repository commit post-dates parts of the reported experiments. It is normative only for GDS/YAML geometry provenance; the paper text and tables are authoritative for solver settings and results.",
+    "redistribution_caveat": "The repository states that its code is provided for peer review and academic reproducibility but does not provide a conventional open-source license. GDS files are external inputs until redistribution permission is confirmed.",
+    "reported_solvers": {
+      "tidy3d": "2.7.7",
+      "lumerical_local": "2025 R1 (8.33.3999)",
+      "lumerical_cloud": "2025 R2.1"
+    },
+    "hardware_caveat": "Tidy3D allocation was dynamic; only the 25-cell mode-converter run was identified as using eight A100 GPUs. Lumerical Cloud Burst used EC2 G6e instances with up to eight L40S GPUs. Wall times are not identical-hardware comparisons."
+  },
+  "common": {
+    "dimensions": 3,
+    "center_wavelength_um": 1.55,
+    "runtime_bandwidth_nm": 20.0,
+    "bandwidth_sweep_nm": [20.0, 50.0],
+    "cells_per_material_wavelength": [6, 10, 15, 20, 25],
+    "auto_shutoff_threshold": 1e-5,
+    "port_extension_um": 10.0,
+    "in_plane_padding_um": 1.0,
+    "top_bottom_padding_um": 2.0,
+    "symmetry": "none",
+    "device_layer_thickness_um": 0.22,
+    "default_cladding": "SiO2 top and bottom",
+    "paper_default_boundary": "PML on all six faces",
+    "meep_boundary_adaptation": "PML on all six faces",
+    "resolution_conversion": "resolution_px_per_um = cells_per_material_wavelength * n_max(lambda_min) / lambda_min_um",
+    "mesh_caveat": "The paper solvers used automatic/custom nonuniform and conformal meshes. Meep's actual integer grid shape must be recorded; equal cells-per-material-wavelength does not imply equal grid counts.",
+    "material_mode_caveat": "The paper uses general complex pole/residue fits. A run is paper-material mode only after frequency-response tests prove an exact Meep mapping; otherwise it is a performance adaptation.",
+    "boundary_caveat": "The paper reports absorber boundaries for Tidy3D directional-coupler runs at 20 and 25 cells per wavelength and for all mode-converter resolutions. The pinned code currently selects Absorber generally, so it is not authoritative for the reported boundary choice."
+  },
+  "material_pole_convention": {
+    "equation": "epsilon(omega)=epsilon_inf+sum(a/(j*omega-c)+conj(a)/(j*omega-conj(c)))",
+    "fourier_time_convention": "exp(-i omega t)",
+    "frequency_unit": "radian/second",
+    "residue_unit": "radian/second"
+  },
+  "materials": {
+    "Si": {
+      "epsilon_infinity": 10.67,
+      "pole_residue_pairs": [
+        {
+          "c": {"real": -117.30, "imag": -2.52e15},
+          "a": {"real": 117.28, "imag": 1.33e15}
+        },
+        {
+          "c": {"real": -30.35, "imag": -1.42e15},
+          "a": {"real": 2.38, "imag": 2.91e12}
+        }
+      ],
+      "reported_fit_rms": 1.50e-2,
+      "model_scope": "Published Tidy3D pole/residue fit. Lumerical used a two-coefficient MCM fit with RMS 2.15e-5 but did not disclose its coefficients."
+    },
+    "SiO2": {
+      "epsilon_infinity": 1.28,
+      "pole_residue_pairs": [
+        {
+          "c": {"real": -34.36, "imag": -1.84e14},
+          "a": {"real": -0.014, "imag": 8.87e13}
+        },
+        {
+          "c": {"real": -843.41, "imag": -1.83e16},
+          "a": {"real": 713.55, "imag": 7.50e15}
+        }
+      ],
+      "reported_fit_rms": 8.63e-6,
+      "model_scope": "Published Tidy3D pole/residue fit. Lumerical used constant relative permittivity 2.09 over the simulation bandwidth with RMS 2.43e-4."
+    },
+    "Si3N4": {
+      "index_at_1p55_um": 2.0,
+      "use": "PSR top cladding only"
+    }
+  },
+  "devices": {
+    "coupler": {
+      "display_name": "Directional coupler",
+      "gds_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/coupler.gds",
+      "gds_sha256": "1b5ae8e42c510aee635d403b5bd9a90484b368766e1de60a6ef58a07d26d990e",
+      "domain_um": [42.0, 7.0, 4.0],
+      "geometry": "Two 0.5 um wide, 0.22 um high Si waveguides; 20 um coupling region; 0.236 um gap.",
+      "input": "TE0 at lower-left port",
+      "target": "TE0 at cross port",
+      "cladding": "SiO2 top and bottom",
+      "boundary_exception": "Reported Tidy3D runs at 20 and 25 cells per wavelength used Absorber instead of PML.",
+      "timings": {
+        "6": {"tidy3d_s": 18, "lumerical_local_s": 148, "lumerical_local_peak_gb": 0.35, "lumerical_cloud_s": 13},
+        "10": {"tidy3d_s": 36, "lumerical_local_s": 356, "lumerical_local_peak_gb": 0.92, "lumerical_cloud_s": 19},
+        "15": {"tidy3d_s": 63, "lumerical_local_s": 1293, "lumerical_local_peak_gb": 2.42, "lumerical_cloud_s": 42},
+        "20": {"tidy3d_s": 150, "lumerical_local_s": 2606, "lumerical_local_peak_gb": 5.01, "lumerical_cloud_s": 77},
+        "25": {"tidy3d_s": 626, "lumerical_local_s": 4856, "lumerical_local_peak_gb": 9.07, "lumerical_cloud_s": 158}
+      },
+      "workload_25": {
+        "tidy3d": {"grid_shape": [2434, 395, 184], "grid_points": 177000000, "iterations": 61812, "physical_time_s": 2.06e-12},
+        "lumerical": {"grid_shape": [2391, 332, 122], "grid_points": 96800000, "iterations": 21303, "physical_time_s": 7.05e-13}
+      },
+      "paper_results": {"required_resolution": {"lumerical": 15, "tidy3d": 15}, "bandwidth_variation_percent": {"lumerical": 3.0, "tidy3d": 0.2}, "inter_solver_discrepancy_percent": 3.7}
+    },
+    "crossing": {
+      "display_name": "Waveguide crossing",
+      "gds_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/crossing.gds",
+      "gds_sha256": "b5010e32620d1ea99d89a852dfd993ef9f32da2599cba2eada0569a2e3ca2afd",
+      "domain_um": [10.0, 11.0, 4.0],
+      "geometry": "1.2 um central Si square; four 3.4 um tapers to 0.5 um waveguides; 0.22 um device layer; 0.15 um slab with orthogonal 6.0 by 2.2 um ellipses.",
+      "input": "TE0 at left port",
+      "target": "TE0 at through port",
+      "cladding": "SiO2 top and bottom",
+      "boundary_exception": null,
+      "timings": {
+        "6": {"tidy3d_s": 10, "lumerical_local_s": 31, "lumerical_local_peak_gb": 0.23, "lumerical_cloud_s": 9},
+        "10": {"tidy3d_s": 19, "lumerical_local_s": 85, "lumerical_local_peak_gb": 0.51, "lumerical_cloud_s": 10},
+        "15": {"tidy3d_s": 29, "lumerical_local_s": 234, "lumerical_local_peak_gb": 1.26, "lumerical_cloud_s": 15},
+        "20": {"tidy3d_s": 104, "lumerical_local_s": 591, "lumerical_local_peak_gb": 2.57, "lumerical_cloud_s": 23},
+        "25": {"tidy3d_s": 78, "lumerical_local_s": 1268, "lumerical_local_peak_gb": 4.55, "lumerical_cloud_s": 39}
+      },
+      "workload_25": {
+        "tidy3d": {"grid_shape": [587, 643, 128], "grid_points": 48300000, "iterations": 20659, "physical_time_s": 6.83e-13},
+        "lumerical": {"grid_shape": [584, 638, 122], "grid_points": 45500000, "iterations": 10843, "physical_time_s": 3.59e-13}
+      },
+      "paper_results": {"required_resolution": {"lumerical": 15, "tidy3d": 10}, "bandwidth_variation_percent": {"lumerical": 0.1, "tidy3d": 0.03}, "inter_solver_discrepancy_percent": 0.2}
+    },
+    "mmi2x2": {
+      "display_name": "2x2 MMI",
+      "gds_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/mmi2x2_with_sbend.gds",
+      "gds_sha256": "a7f689c984135f44105bf0b4b9d604d9fa30c73df3d5d3f9800c8d3a6216c78a",
+      "domain_um": [34.0, 7.5, 4.0],
+      "geometry": "GDSFactory mmi2x2_with_sbend; 0.5 um input/output waveguides taper to 0.7 um over 1.0 um; 0.22 um Si device layer.",
+      "input": "TE0 at lower-left port",
+      "target": "TE0 at cross port",
+      "cladding": "SiO2 top and bottom",
+      "boundary_exception": null,
+      "timings": {
+        "6": {"tidy3d_s": 11, "lumerical_local_s": 98, "lumerical_local_peak_gb": 0.32, "lumerical_cloud_s": 12},
+        "10": {"tidy3d_s": 34, "lumerical_local_s": 259, "lumerical_local_peak_gb": 0.82, "lumerical_cloud_s": 15},
+        "15": {"tidy3d_s": 45, "lumerical_local_s": 905, "lumerical_local_peak_gb": 2.15, "lumerical_cloud_s": 34},
+        "20": {"tidy3d_s": 63, "lumerical_local_s": 2182, "lumerical_local_peak_gb": 4.48, "lumerical_cloud_s": 72},
+        "25": {"tidy3d_s": 163, "lumerical_local_s": 4813, "lumerical_local_peak_gb": 8.10, "lumerical_cloud_s": 119}
+      },
+      "workload_25": {
+        "tidy3d": {"grid_shape": [1929, 367, 128], "grid_points": 90600000, "iterations": 34262, "physical_time_s": 1.14e-12},
+        "lumerical": {"grid_shape": [1939, 363, 122], "grid_points": 85900000, "iterations": 23928, "physical_time_s": 7.92e-13}
+      },
+      "paper_results": {"required_resolution": {"lumerical": 15, "tidy3d": 15}, "bandwidth_variation_percent": {"lumerical": 0.05, "tidy3d": 0.05}, "inter_solver_discrepancy_percent": 0.5}
+    },
+    "mode_converter": {
+      "display_name": "Mode converter",
+      "gds_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/mode_converter.gds",
+      "gds_sha256": "d5b29cbc93757def824c730d988fbb33e8fe7a8be9f9095f45abd822b5c95784",
+      "domain_um": [72.0, 10.5, 4.0],
+      "geometry": "0.5 um and 1.0 um waveguides with 20 um coupling length and 0.15 um gap; the wider guide tapers from 1.0 to 1.2 um over 25 um before and after the coupling section; 0.22 um Si.",
+      "input": "TE0 in narrow guide",
+      "target": "TE1 in wide guide",
+      "cladding": "SiO2 top and bottom",
+      "boundary_exception": "Reported Tidy3D runs used Absorber instead of PML at every resolution.",
+      "timings": {
+        "6": {"tidy3d_s": 63, "lumerical_local_s": 750, "lumerical_local_peak_gb": 0.71, "lumerical_cloud_s": 30},
+        "10": {"tidy3d_s": 518, "lumerical_local_s": 3599, "lumerical_local_peak_gb": 2.15, "lumerical_cloud_s": 108},
+        "15": {"tidy3d_s": 413, "lumerical_local_s": 14417, "lumerical_local_peak_gb": 6.00, "lumerical_cloud_s": 393},
+        "20": {"tidy3d_s": 133, "lumerical_local_s": 40710, "lumerical_local_peak_gb": 12.90, "lumerical_cloud_s": 384},
+        "25": {"tidy3d_s": 2011, "lumerical_local_s": 91484, "lumerical_local_peak_gb": 23.63, "lumerical_cloud_s": 810}
+      },
+      "workload_25": {
+        "tidy3d": {"grid_shape": [4115, 577, 184], "grid_points": 437000000, "iterations": 165849, "physical_time_s": 5.53e-12},
+        "lumerical": {"grid_shape": [4084, 518, 122], "grid_points": 258000000, "iterations": 156383, "physical_time_s": 5.18e-12}
+      },
+      "paper_results": {"required_resolution": {"lumerical": 10, "tidy3d": 15}, "bandwidth_variation_percent": {"lumerical": 9.0, "tidy3d": 3.0}, "inter_solver_discrepancy_percent": 16.0}
+    },
+    "psr": {
+      "display_name": "Polarization splitter rotator",
+      "gds_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/polarization_splitter_rotator.gds",
+      "gds_sha256": "a6e91e4b96d5f9d09d9145a77044a7e900d21302c58e381e0a0488af7e420ae0",
+      "domain_um": [73.2, 8.9, 4.0],
+      "geometry": "GDSFactory polarization_splitter_rotator; 0.15 um coupling gap, 7.0 um coupler, 4.0/44.0 um input tapers, 0.9/0.405 um coupler widths, 0.54 um output; 0.22 um Si.",
+      "input": "TM0 at input port",
+      "target": "TE0 at upper output",
+      "cladding": "SiO2 bottom and Si3N4 top (n approximately 2.0)",
+      "boundary_exception": null,
+      "timings": {
+        "6": {"tidy3d_s": 22, "lumerical_local_s": 303, "lumerical_local_peak_gb": 0.66, "lumerical_cloud_s": 25},
+        "10": {"tidy3d_s": 65, "lumerical_local_s": 1073, "lumerical_local_peak_gb": 2.14, "lumerical_cloud_s": 58},
+        "15": {"tidy3d_s": 81, "lumerical_local_s": 3478, "lumerical_local_peak_gb": 6.05, "lumerical_cloud_s": 150},
+        "20": {"tidy3d_s": 613, "lumerical_local_s": 9665, "lumerical_local_peak_gb": 13.06, "lumerical_cloud_s": 277},
+        "25": {"tidy3d_s": 1271, "lumerical_local_s": 21896, "lumerical_local_peak_gb": 24.01, "lumerical_cloud_s": 481}
+      },
+      "workload_25": {
+        "tidy3d": {"grid_shape": [4182, 524, 200], "grid_points": 438000000, "iterations": 74879, "physical_time_s": 2.50e-12},
+        "lumerical": {"grid_shape": [4152, 463, 137], "grid_points": 263000000, "iterations": 36980, "physical_time_s": 1.22e-12}
+      },
+      "paper_results": {"required_resolution": {"lumerical": 15, "tidy3d": 20}, "bandwidth_variation_percent": {"lumerical": 6.0, "tidy3d": 0.1}, "inter_solver_discrepancy_percent": 2.0}
+    },
+    "ring": {
+      "display_name": "Ring resonator",
+      "gds_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/ring.gds",
+      "gds_sha256": "8f32ae9d3b907d15bd2ddebc36ac3db47e636d829c0b49a3a636ecbf154a3aa2",
+      "domain_um": [32.0, 24.05, 4.0],
+      "geometry": "4.0 um lower directional coupler with 0.2 um gap, two 0.6 um vertical straights, 4.0 um top straight, four 10 um-radius bends, and 0.5 um waveguide width; 0.22 um Si.",
+      "input": "TE0 in bus waveguide",
+      "target": "Through-port resonance, FWHM, and Q",
+      "cladding": "SiO2 top and bottom",
+      "boundary_exception": null,
+      "timings": {
+        "6": {"tidy3d_s": 233, "lumerical_local_s": 1168, "lumerical_local_peak_gb": 3.14, "lumerical_cloud_s": 52},
+        "10": {"tidy3d_s": 307, "lumerical_local_s": 4685, "lumerical_local_peak_gb": 8.36, "lumerical_cloud_s": 157},
+        "15": {"tidy3d_s": 1104, "lumerical_local_s": 16815, "lumerical_local_peak_gb": 18.50, "lumerical_cloud_s": 476},
+        "20": {"tidy3d_s": 2594, "lumerical_local_s": 44530, "lumerical_local_peak_gb": 32.62, "lumerical_cloud_s": 732},
+        "25": {"tidy3d_s": 2819, "lumerical_local_s": 101191, "lumerical_local_peak_gb": 49.42, "lumerical_cloud_s": 1433}
+      },
+      "workload_25": {
+        "tidy3d": {"grid_shape": [1873, 1358, 184], "grid_points": 468000000, "iterations": 192000, "physical_time_s": 6.40e-12},
+        "lumerical": {"grid_shape": [1826, 1302, 122], "grid_points": 290000000, "iterations": 195000, "physical_time_s": 6.40e-12}
+      },
+      "paper_results": {"required_resolution": {"lumerical": 20, "tidy3d": 20}, "bandwidth_variation_percent": {"lumerical": 47.0, "tidy3d": 0.5}, "inter_solver_discrepancy_percent": 2.0}
+    }
+  }
+}

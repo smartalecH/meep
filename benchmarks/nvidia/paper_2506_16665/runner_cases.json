@@ -1,0 +1,232 @@
+{
+  "schema_version": 1,
+  "units": {
+    "length": "um",
+    "angle": "degrees",
+    "wavelength": "um"
+  },
+  "assets": {
+    "layer_stack": {
+      "relative_path": "stack_universal.json",
+      "sha256": "1c030e59c2ddf79f3a43ef079132c037ee44e3df9535bc1b44232b2a90f60213"
+    }
+  },
+  "geometry_import": {
+    "coordinate_units": "um",
+    "gds_scale": 1.0,
+    "rotation_deg": 0.0,
+    "reflect_x": false,
+    "reflect_y": false,
+    "translation_rule": "center_extended_geometry_bounds_at_origin",
+    "port_extension_um": 10.0
+  },
+  "layers": [
+    {
+      "name": "Si",
+      "gds_layer": 1,
+      "gds_datatype": 0,
+      "z_min_um": 0.0,
+      "z_max_um": 0.22,
+      "material": "Si"
+    },
+    {
+      "name": "SLAB",
+      "gds_layer": 2,
+      "gds_datatype": 0,
+      "z_min_um": 0.0,
+      "z_max_um": 0.15,
+      "material": "Si"
+    }
+  ],
+  "cell": {
+    "x_y_extent_rule": "paper_domain_um centered at origin after geometry transform",
+    "z_min_um": -2.0,
+    "z_max_um": 2.0,
+    "in_plane_padding_um": 1.0,
+    "background_material": "SiO2"
+  },
+  "time_stepping": {
+    "courant_factor": 0.5
+  },
+  "boundaries": {
+    "kind": "pml",
+    "thickness_um": 1.0,
+    "sides": ["x_low", "x_high", "y_low", "y_high", "z_low", "z_high"],
+    "adaptation": "Stable Meep benchmark choice; paper/pipeline absorber exceptions remain provenance annotations."
+  },
+  "source_defaults": {
+    "kind": "eigenmode_gaussian",
+    "mode_count": 5,
+    "mode_order": 0,
+    "meep_band": 1,
+    "parity": "NO_PARITY",
+    "direction": "+",
+    "plane_offset_from_port_um": 0.0,
+    "transverse_padding_um": 4.0,
+    "z_span_um": 2.0,
+    "spectral_envelope": {
+      "kind": "gaussian_frequency",
+      "bandwidth_definition": "full_centered_wavelength_interval",
+      "frequency_conversion": "reciprocal_endpoint_span"
+    }
+  },
+  "monitor_defaults": {
+    "mode_count": 5,
+    "plane_offset_from_port_um": 0.0,
+    "transverse_padding_um": 4.0,
+    "z_span_um": 2.0,
+    "frequency_sampling": {
+      "domain": "wavelength",
+      "step_nm": 10.0,
+      "inclusive_endpoints": true
+    }
+  },
+  "decay_stop": {
+    "observable": "total_field_energy",
+    "region": {
+      "kind": "non_pml_cell"
+    },
+    "relative_threshold": 1e-05,
+    "sampling_interval_meep_time": 50.0
+  },
+  "observable_policy": {
+    "schema_version": 1,
+    "reference_kind": "cpu_native_baseline",
+    "reference_artifact_schema_version": 1,
+    "tolerances_by_precision": {
+      "native": {"absolute": 1e-07, "relative": 1e-07},
+      "f32": {"absolute": 0.0005, "relative": 0.0005},
+      "mixed": {"absolute": 0.0005, "relative": 0.0005}
+    }
+  },
+  "cases": {
+    "coupler": {
+      "gds_cell_name": "coupler",
+      "yaml_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/coupler.yml",
+      "yaml_sha256": "d5edfc04c8a2da9e4f6fcbc7d0fa3d38ad7da19810a8d5e5f93dbabc321b3b8e",
+      "active_layers": ["Si"],
+      "ports": {
+        "o1": {"center_um": [-10.0, -1.632], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o2": {"center_um": [-10.0, 2.368], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o3": {"center_um": [30.0, 2.368], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o4": {"center_um": [30.0, -1.632], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]}
+      },
+      "source": {"port": "o1", "polarization": "TE", "mode_order": 0},
+      "monitors": [
+        {"name": "input_incident", "kind": "mode", "port": "o1", "polarization": "TE", "mode_order": 0, "direction": "into_device", "plane_offset_from_port_um": 1.0, "observable": "incident_power"},
+        {"name": "cross_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "transmission", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
+      ],
+      "required_observables": [
+        {"name": "target_mode_transmission", "monitor": "cross_te0", "unit": "1"},
+        {"name": "excess_loss_db", "monitor": "cross_te0", "unit": "dB"}
+      ]
+    },
+    "crossing": {
+      "gds_cell_name": "crossing",
+      "yaml_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/crossing.yml",
+      "yaml_sha256": "fd013b108c3ffea407368145953b73c6d5cf8e72899c7808406534193f9e490f",
+      "active_layers": ["Si", "SLAB"],
+      "ports": {
+        "o1": {"center_um": [-4.0, 0.0], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o2": {"center_um": [0.0, 4.0], "orientation_deg": 90.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o3": {"center_um": [4.0, 0.0], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o4": {"center_um": [0.0, -4.0], "orientation_deg": 270.0, "width_um": 0.5, "gds_layer": [1, 0]}
+      },
+      "source": {"port": "o1", "polarization": "TE", "mode_order": 0},
+      "monitors": [
+        {"name": "input_incident", "kind": "mode", "port": "o1", "polarization": "TE", "mode_order": 0, "direction": "into_device", "plane_offset_from_port_um": 1.0, "observable": "incident_power"},
+        {"name": "through_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "transmission", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
+      ],
+      "required_observables": [
+        {"name": "target_mode_transmission", "monitor": "through_te0", "unit": "1"},
+        {"name": "excess_loss_db", "monitor": "through_te0", "unit": "dB"}
+      ]
+    },
+    "mmi2x2": {
+      "gds_cell_name": "mmi2x2_with_sbend",
+      "yaml_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/mmi2x2_with_sbend.yml",
+      "yaml_sha256": "3d8d60ccddaf27b77221d0c230e729705280c4d74a24567b55db3d57a5f13462",
+      "active_layers": ["Si"],
+      "ports": {
+        "o1": {"center_um": [-12.0, -2.25], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o2": {"center_um": [-12.0, 2.25], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o3": {"center_um": [20.0, 2.25], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o4": {"center_um": [20.0, -2.25], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]}
+      },
+      "source": {"port": "o1", "polarization": "TE", "mode_order": 0},
+      "monitors": [
+        {"name": "input_incident", "kind": "mode", "port": "o1", "polarization": "TE", "mode_order": 0, "direction": "into_device", "plane_offset_from_port_um": 1.0, "observable": "incident_power"},
+        {"name": "cross_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "transmission", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
+      ],
+      "required_observables": [
+        {"name": "target_mode_transmission", "monitor": "cross_te0", "unit": "1"},
+        {"name": "excess_loss_db", "monitor": "cross_te0", "unit": "dB"}
+      ]
+    },
+    "mode_converter": {
+      "gds_cell_name": "mode_converter_gap0p15_length20",
+      "yaml_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/mode_converter.yml",
+      "yaml_sha256": "633f6b50b62410e4a789baa90a861c2d5d0b4f9bc45f11035dda7ff7f3fa2821",
+      "active_layers": ["Si"],
+      "ports": {
+        "o1": {"center_um": [-14.142, 6.758], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o2": {"center_um": [-25.0, 0.0], "orientation_deg": 180.0, "width_um": 1.2, "gds_layer": [1, 0]},
+        "o3": {"center_um": [45.0, 0.0], "orientation_deg": 0.0, "width_um": 1.2, "gds_layer": [1, 0]},
+        "o4": {"center_um": [34.142, 6.758], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]}
+      },
+      "source": {"port": "o1", "polarization": "TE", "mode_order": 0},
+      "monitors": [
+        {"name": "input_incident", "kind": "mode", "port": "o1", "polarization": "TE", "mode_order": 0, "direction": "into_device", "plane_offset_from_port_um": 1.0, "observable": "incident_power"},
+        {"name": "converted_te1", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 1, "observable": "conversion_efficiency", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}},
+        {"name": "residual_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "crosstalk", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
+      ],
+      "required_observables": [
+        {"name": "te1_conversion_efficiency", "monitor": "converted_te1", "unit": "1"},
+        {"name": "te0_crosstalk", "monitor": "residual_te0", "unit": "1"}
+      ]
+    },
+    "psr": {
+      "gds_cell_name": "polarization_splitter_rotator",
+      "yaml_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/polarization_splitter_rotator.yml",
+      "yaml_sha256": "cff57ca7c1348980867d93b3fced50391d495891b05866d1339b76b3facea7e8",
+      "active_layers": ["Si"],
+      "ports": {
+        "o1": {"center_um": [-49.867, 0.0], "orientation_deg": 180.0, "width_um": 0.54, "gds_layer": [1, 0]},
+        "o2": {"center_um": [21.33, 5.802], "orientation_deg": 0.0, "width_um": 0.54, "gds_layer": [1, 0]},
+        "o3": {"center_um": [21.33, 0.0], "orientation_deg": 0.0, "width_um": 0.54, "gds_layer": [1, 0]}
+      },
+      "source": {"port": "o1", "polarization": "TM", "mode_order": 0},
+      "monitors": [
+        {"name": "input_incident", "kind": "mode", "port": "o1", "polarization": "TM", "mode_order": 0, "direction": "into_device", "plane_offset_from_port_um": 1.0, "observable": "incident_power"},
+        {"name": "rotated_te0", "kind": "mode", "port": "o2", "polarization": "TE", "mode_order": 0, "observable": "conversion_efficiency", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}},
+        {"name": "residual_tm0", "kind": "mode", "port": "o2", "polarization": "TM", "mode_order": 0, "observable": "crosstalk", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
+      ],
+      "required_observables": [
+        {"name": "te0_conversion_efficiency", "monitor": "rotated_te0", "unit": "1"},
+        {"name": "tm0_crosstalk", "monitor": "residual_tm0", "unit": "1"}
+      ],
+      "top_cladding": {"material": "Si3N4", "refractive_index": 2.0}
+    },
+    "ring": {
+      "gds_cell_name": "ring_single",
+      "yaml_relative_path": "gds_library/cells_from_gds/gdsfactory_generic_pdk/ring.yml",
+      "yaml_sha256": "2441532a212cb1732353e4344b531f9065f275da4aca6967832691cfa050e4c6",
+      "active_layers": ["Si"],
+      "ports": {
+        "o1": {"center_um": [-17.0, 0.0], "orientation_deg": 180.0, "width_um": 0.5, "gds_layer": [1, 0]},
+        "o2": {"center_um": [13.0, 0.0], "orientation_deg": 0.0, "width_um": 0.5, "gds_layer": [1, 0]}
+      },
+      "source": {"port": "o1", "polarization": "TE", "mode_order": 0},
+      "monitors": [
+        {"name": "input_incident", "kind": "mode", "port": "o1", "polarization": "TE", "mode_order": 0, "direction": "into_device", "plane_offset_from_port_um": 1.0, "observable": "incident_power"},
+        {"name": "through_te0", "kind": "mode", "port": "o2", "polarization": "TE", "mode_order": 0, "observable": "transmission_spectrum", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}, "frequency_sampling": {"domain": "wavelength", "step_nm": 0.2, "inclusive_endpoints": true}},
+        {"name": "ring_resonance", "kind": "derived_resonance", "input_monitor": "through_te0", "input_quantity": "normalized_mode_power", "normalization": "divide by maximum over sampled band", "interpolation": {"kind": "cubic_spline", "sample_count": 1000}, "half_depth_definition": "0.5 * (1 + minimum_normalized_transmission)", "resonance_wavelength_rule": "midpoint of the two half-depth crossings", "fwhm_rule": "wavelength difference between the two half-depth crossings", "quality_factor_rule": "resonance_wavelength_um / fwhm_um", "outputs": ["resonance_wavelength_um", "fwhm_um", "quality_factor"]}
+      ],
+      "required_observables": [
+        {"name": "resonance_wavelength_um", "monitor": "ring_resonance", "unit": "um"},
+        {"name": "fwhm_um", "monitor": "ring_resonance", "unit": "um"},
+        {"name": "quality_factor", "monitor": "ring_resonance", "unit": "1"}
+      ]
+    }
+  }
+}
