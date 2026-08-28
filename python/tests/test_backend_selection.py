@@ -35,6 +35,30 @@ def _sim(**kwargs):
 
 
 class TestBackendSelection(unittest.TestCase):
+    def test_backend_implementation_details_are_private(self):
+        sim = _sim()
+        sim.init_sim()
+        hidden = (
+            "advance_cpu",
+            "select_backend",
+            "init_backend",
+            "halos",
+            "array_catalog",
+            "storage_plan",
+            "step_plans",
+            "descriptors",
+            "backend",
+            "backend_state",
+            "executable",
+            "initialization_plan",
+            "dirty_mask",
+            "mutation_generation",
+            "prepared_classification_hash",
+        )
+        for name in hidden:
+            with self.subTest(name=name):
+                self.assertFalse(hasattr(sim.fields, name))
+
     def test_default_is_cpu(self):
         sim = _sim()
         sim.init_sim()
