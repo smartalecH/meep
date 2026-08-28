@@ -184,6 +184,34 @@ void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *head
   backend_reconcile_host_access(local_error, site);
 }
 
+bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
+                            std::complex<double> *local_result, size_t result_count,
+                            std::string &local_error, const char *site) {
+  if (!backend_host_refresh_required(owner) ||
+      !owner.backend->supports_compact_dft_reductions())
+    return false;
+
+  if (local_error.empty())
+    try {
+      if (!local_result && result_count)
+        throw std::invalid_argument("compact DFT reduction has no result buffer");
+      if (request.result_count != result_count)
+        throw std::invalid_argument("compact DFT reduction result-count mismatch");
+      if (result_count)
+        std::fill(local_result, local_result + result_count, std::complex<double>(0.0, 0.0));
+      owner.backend->reduce_dft(request, local_result, result_count);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown compact DFT reduction failure";
+    }
+
+  backend_reconcile_host_access(local_error, site);
+  return true;
+}
+
 void backend_prepare_checkpoint_load(fields &f) {
   std::string local_error;
   if (f.backend_state)
