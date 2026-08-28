@@ -1308,7 +1308,24 @@ complex<double> fields::process_dft_component(dft_chunk **chunklists, int num_ch
   if (component_index(c) == -1) {
     ic_conjugate = -((int)c);
     num_chunklists = 1;
-    c = chunklists[0]->c;
+    const int local_component = chunklists[0] ? int(chunklists[0]->c) : -1;
+    const int normalized_component = max_to_all(local_component);
+    if (normalized_component < 0)
+      meep::abort("cannot normalize an encoded DFT component without any DFT chunks");
+    c = component(normalized_component);
+  }
+
+  /* Normalize encoded components first: overlap callers encode conjugation in
+     `c`, while the storage catalog contains the concrete chunk component.
+     DFT storage is point-major/frequency-minor, so one requested frequency is
+     strided and the smallest contiguous transfer is the matching accumulator. */
+  if (backend_host_refresh_required(*this)) {
+    std::string local_error;
+    for (int ncl = 0; ncl < num_chunklists; ++ncl)
+      for (dft_chunk *chunk = chunklists[ncl]; chunk; chunk = chunk->next_in_dft)
+        if (chunk->c == c)
+          backend_read_host_range(*this, chunk->dft, chunk->N * chunk->omega.size(), local_error);
+    backend_reconcile_host_access(local_error, "fields::process_dft_component");
   }
 
   ivec min_corner, max_corner;
