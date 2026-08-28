@@ -56,7 +56,14 @@ struct constitutive_launch {
   flat_region region;
   void *target;
   const void *primary;
+  const void *cross1;
+  const void *cross2;
   const void *diagonal;
+  const void *offdiagonal1;
+  const void *offdiagonal2;
+  ptrdiff_t primary_stride;
+  ptrdiff_t cross1_stride;
+  ptrdiff_t cross2_stride;
   void *target_w;
   pml_profile_launch pml;
   scalar_precision precision;
