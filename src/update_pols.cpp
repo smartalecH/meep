@@ -30,15 +30,17 @@ using namespace std;
 namespace meep {
 
 void fields::update_pols(field_type ft) {
+  bool allocated = false;
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
-      if (chunks[i]->update_pols(ft)) {
-        invalidate(*this, MutationKind::field_layout);
-        note_connections_invalidated(*this);
-        chunk_connections_valid = false;
-        assert(changed_materials);
-        assert(needs_connection_sync(*this));
-      }
+      if (chunks[i]->update_pols(ft)) allocated = true;
+  if (or_to_all(allocated)) {
+    invalidate(*this, MutationKind::field_layout);
+    note_connections_invalidated(*this);
+    chunk_connections_valid = false;
+    assert(changed_materials);
+    assert(needs_connection_sync(*this));
+  }
 }
 
 bool fields_chunk::update_pols(field_type ft) {

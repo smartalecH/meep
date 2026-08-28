@@ -587,7 +587,7 @@ void fields::_require_component(component c, bool aniso2d) {
         if (chunks[i]->alloc_f(c_alloc)) need_to_reconnect++;
   }
 
-  if (need_to_reconnect) {
+  if (or_to_all(need_to_reconnect != 0)) {
     figure_out_step_plan();
     // we will eventually call sync_chunk_connections() to synchronize this across processes:
     invalidate(*this, MutationKind::field_layout);
