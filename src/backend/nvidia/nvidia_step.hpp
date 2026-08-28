@@ -26,6 +26,14 @@ struct flat_region {
   ptrdiff_t strides[3];
 };
 
+struct pml_profile_launch {
+  const void *sigma;
+  const void *kappa;
+  const void *inverse;
+  ptrdiff_t base;
+  ptrdiff_t strides[3];
+};
+
 struct curl_launch {
   flat_region region;
   void *target;
@@ -33,7 +41,14 @@ struct curl_launch {
   const void *minus_source;
   ptrdiff_t plus_stride;
   ptrdiff_t minus_stride;
+  void *target_u;
+  const void *conductivity;
+  const void *conductivity_inverse;
+  void *target_conductivity;
+  pml_profile_launch pml;
+  pml_profile_launch pml_u;
   double dtdx;
+  double dt;
   scalar_precision precision;
 };
 
@@ -42,6 +57,8 @@ struct constitutive_launch {
   void *target;
   const void *primary;
   const void *diagonal;
+  void *target_w;
+  pml_profile_launch pml;
   scalar_precision precision;
 };
 

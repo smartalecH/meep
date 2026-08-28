@@ -20,6 +20,7 @@
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -33,6 +34,18 @@ static void require(bool condition, const char *message) {
 }
 
 static double isotropic_eps(const vec &p) { return p.x() < 0.0 ? 2.0 : 3.0; }
+static double uniform_conductivity(const vec &) { return 0.17; }
+static double unit_value(const vec &) { return 1.0; }
+
+class offdiagonal_material : public material_function {
+public:
+  void eff_chi1inv_row(component c, double row[3], const volume &, double, int) override {
+    row[0] = row[1] = row[2] = 0.0;
+    const int d = component_index(c);
+    row[d] = 0.5;
+    row[(d + 1) % 3] = 0.05;
+  }
+};
 
 static realnum initial_value(size_t array, size_t element) {
   return realnum(0.02 * sin(double(17 * array + element)) +
@@ -111,12 +124,46 @@ static void require_halo_phases(const fields &f, unsigned int required) {
   require((observed & required) == required, "required same-rank halo transform was not prepared");
 }
 
-static void run_case(const char *name, precision_policy_kind policy, bool real_fields,
+static void require_physics_variants(const StepPlan &plan, unsigned int required_curl_combinations,
+                                     bool require_constitutive_pml) {
+  unsigned int observed_curl_combinations = 0;
+  bool observed_constitutive_pml = false;
+  for (size_t i = 0; i < plan.db_updates.size(); ++i) {
+    const uint32_t variants = plan.db_updates[i].region.variant_key;
+    const unsigned int combination = unsigned((variants & curl_has_pml) != 0) |
+                                     (unsigned((variants & curl_has_pml_aux) != 0) << 1) |
+                                     (unsigned((variants & curl_has_conductivity) != 0) << 2);
+    observed_curl_combinations |= 1u << combination;
+  }
+  for (size_t i = 0; i < plan.eh_updates.size(); ++i)
+    observed_constitutive_pml |=
+        (plan.eh_updates[i].region.variant_key & constitutive_has_pml) != 0;
+  require((observed_curl_combinations & required_curl_combinations) == required_curl_combinations,
+          "required NVIDIA curl PML/conductivity combination was not prepared");
+  require(!require_constitutive_pml || observed_constitutive_pml,
+          "required diagonal constitutive PML variant was not prepared");
+}
+
+static void set_uniform_conductivity(structure &s) {
+  s.set_conductivity(Bx, uniform_conductivity);
+  s.set_conductivity(By, uniform_conductivity);
+  s.set_conductivity(Bz, uniform_conductivity);
+  s.set_conductivity(Dx, uniform_conductivity);
+  s.set_conductivity(Dy, uniform_conductivity);
+  s.set_conductivity(Dz, uniform_conductivity);
+}
+
+static void run_case(const char *name, const grid_volume &gv, precision_policy_kind policy,
+                     bool real_fields, const boundary_region &boundaries,
                      const symmetry &symmetries, int chunks, const vec *bloch,
-                     unsigned int required_halo_phases, bool check_lifecycle) {
-  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
-  structure cpu_structure(gv, isotropic_eps, no_pml(), symmetries, chunks);
-  structure gpu_structure(gv, isotropic_eps, no_pml(), symmetries, chunks);
+                     unsigned int required_halo_phases, unsigned int required_curl_combinations,
+                     bool require_constitutive_pml, bool conductivity, bool check_lifecycle) {
+  structure cpu_structure(gv, isotropic_eps, boundaries, symmetries, chunks);
+  structure gpu_structure(gv, isotropic_eps, boundaries, symmetries, chunks);
+  if (conductivity) {
+    set_uniform_conductivity(cpu_structure);
+    set_uniform_conductivity(gpu_structure);
+  }
 
   fields cpu(&cpu_structure);
   if (real_fields)
@@ -139,16 +186,24 @@ static void run_case(const char *name, precision_policy_kind policy, bool real_f
   gpu.require_component(Ez);
   gpu.init_backend();
   require_halo_phases(gpu, required_halo_phases);
+  const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
+  require_physics_variants(prepared, required_curl_combinations, require_constitutive_pml);
 
   const bool f32 = policy == precision_policy_kind::f32;
   if (f32) round_real_arrays(*cpu.array_catalog);
   initialize_fields(cpu, gpu, f32);
 
-  cpu.advance(3);
-  gpu.advance(3);
-  require(cpu.t == gpu.t, "NVIDIA timestep did not advance host time");
-  const double tolerance = f32 ? 3e-6 : 2e-13;
-  compare_fields(cpu, gpu, tolerance);
+  const double tolerance = f32 ? 2e-5 : 2e-13;
+  const int checkpoints[] = {1, 2, 100};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA timestep did not advance host time");
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoints[i];
+  }
 
   if (check_lifecycle) {
     invalidate(gpu, MutationKind::field_layout, "nvidia_timestep migration test");
@@ -201,11 +256,28 @@ static void test_rejections() {
     require_advance_rejected(f, "does not support sources");
   }
   {
-    structure s(gv, isotropic_eps, pml(0.25), identity(), 1);
+    offdiagonal_material material;
+    structure s(gv, material, no_pml(), identity(), 1);
     fields f(&s, options);
     f.use_real_fields();
     f.require_component(Ez);
-    require_advance_rejected(f, "PML");
+    require_advance_rejected(f, "anisotropy");
+  }
+  {
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    s.set_chi3(unit_value);
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ez);
+    require_advance_rejected(f, "nonlinearity");
+  }
+  {
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    s.add_susceptibility(unit_value, E_stuff, lorentzian_susceptibility(1.1, 0.05));
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ez);
+    require_advance_rejected(f, "dispersion");
   }
   {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
@@ -221,16 +293,27 @@ int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
   set_finite_check_mode(FiniteCheckMode::off);
-  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
-  const vec bloch(0.17, 0.11);
+  const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
+  const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
+  const vec bloch2(0.17, 0.11);
+  const vec bloch3(0.11, 0.07, 0.05);
+  const boundary_region xy_pml = pml(0.4, X) + pml(0.4, Y);
   const precision_policy_kind policies[] = {precision_policy_kind::native,
                                             precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
-    run_case("real-copy", policies[p], true, identity(), 4, NULL, 1u << CONNECT_COPY, true);
-    run_case("complex-phase", policies[p], false, identity(), 4, &bloch,
-             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), false);
-    run_case("complex-negate", policies[p], false, -mirror(Y, gv), 2, NULL, 1u << CONNECT_NEGATE,
-             false);
+    run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
+             1u << 0, false, false, true);
+    run_case("complex-phase", gv2, policies[p], false, no_pml(), identity(), 4, &bloch2,
+             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), 1u << 0, false, false, false);
+    run_case("complex-negate", gv2, policies[p], false, no_pml(), -mirror(Y, gv2), 2, NULL,
+             1u << CONNECT_NEGATE, 1u << 0, false, false, false);
+    run_case("real-conductivity", gv3, policies[p], true, no_pml(), identity(), 2, NULL,
+             1u << CONNECT_COPY, 1u << 4, false, true, false);
+    run_case("real-pml-conductivity", gv3, policies[p], true, xy_pml, identity(), 2, NULL,
+             1u << CONNECT_COPY, (1u << 5) | (1u << 6) | (1u << 7), true, true, false);
+    run_case("complex-pml", gv3, policies[p], false, xy_pml, identity(), 2, &bloch3,
+             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), (1u << 1) | (1u << 2) | (1u << 3), true,
+             false, false);
   }
   test_rejections();
   master_printf("nvidia_timestep: PASS\n");
