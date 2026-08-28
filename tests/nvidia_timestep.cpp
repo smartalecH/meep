@@ -180,21 +180,27 @@ static void set_uniform_conductivity(structure &s) {
   s.set_conductivity(Dz, uniform_conductivity);
 }
 
-static void require_source_plan(fields &f, bool conductivity) {
+static void require_source_plan(fields &f, bool conductivity, bool integrated,
+                                bool expect_cross_copy) {
   require(f.descriptors, "source test has no prepared descriptor set");
   const SourcePlan &sources = f.descriptors->sources;
   require(sources.source_times.size() == 1 && sources.scalars.size() == 1,
           "point source did not prepare one scalar slot");
   require(sources.source_times[0].source_time_id == 0 && sources.source_times[0].scalar_slot == 0,
           "point source scalar mapping is not canonical");
-  require(sources.sources.size() == 1, "point source did not prepare one spatial descriptor");
-  const SourceDescriptor &source = sources.sources[0];
-  require(!source.integrated && source.source_time_id == 0 && !source.indices.empty() &&
-              source.indices.size() == source.complex_amplitudes.size(),
-          "point-source descriptor shape is invalid");
-  require(is_valid(source.destination), "point source has no destination");
-  require(is_valid(source.condinv) == conductivity,
-          "point-source conductivity descriptor does not match the material");
+  require(!sources.sources.empty(), "point source did not prepare a spatial descriptor");
+  for (size_t i = 0; i < sources.sources.size(); ++i) {
+    const SourceDescriptor &source = sources.sources[i];
+    require(source.integrated == integrated && source.source_time_id == 0 &&
+                !source.indices.empty() &&
+                source.indices.size() == source.complex_amplitudes.size(),
+            "point-source descriptor shape is invalid");
+    require(is_valid(source.destination), "point source has no destination");
+    require(is_valid(source.integrated_destination) == integrated,
+            "point-source integrated destination does not match its mode");
+    require(is_valid(source.condinv) == conductivity,
+            "point-source conductivity descriptor does not match the material");
+  }
 
   const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
   size_t evaluations = 0, source_spans = 0;
@@ -205,19 +211,38 @@ static void require_source_plan(fields &f, bool conductivity) {
               "source evaluation does not cover the scalar descriptor");
       ++evaluations;
     }
-    if (op.kind == OpKind::apply_sources) {
+    if (!integrated && op.kind == OpKind::apply_sources) {
       if (op.ft == D_stuff) {
-        require(op.source_descriptor_index == 0 && op.source_descriptor_count == 1,
+        require(op.source_descriptor_index == 0 &&
+                    op.source_descriptor_count == sources.sources.size(),
                 "D source operation does not cover the point descriptor");
-        ++source_spans;
+        source_spans += op.source_descriptor_count;
       }
       else
         require(op.source_descriptor_count == 0,
                 "point source was attached to the wrong field-type operation");
     }
+    if (integrated && op.kind == OpKind::update_eh && op.ft == E_stuff) {
+      require(op.source_descriptor_index == 0 &&
+                  op.source_descriptor_count == sources.sources.size(),
+              "integrated source was not attached to the E update");
+      source_spans += op.source_descriptor_count;
+      bool have_primary_copy = false, have_cross_copy = false;
+      for (size_t j = op.descriptor_index;
+           j < size_t(op.descriptor_index) + op.descriptor_count; ++j) {
+        const ConstitutiveUpdate &update = plan.eh_updates[j];
+        have_primary_copy |= is_valid(update.primary) && update.primary != update.base_primary;
+        have_cross_copy |=
+            (is_valid(update.cross1) && update.cross1 != update.base_cross1) ||
+            (is_valid(update.cross2) && update.cross2 != update.base_cross2);
+      }
+      require(have_primary_copy, "integrated source has no prepared primary copy");
+      require(have_cross_copy == expect_cross_copy,
+              "integrated source cross-copy coverage differs from expectation");
+    }
   }
   require(evaluations == 4, "ordinary source plan did not schedule four scalar evaluations");
-  require(source_spans == 1, "point-source descriptor span was not unique");
+  require(source_spans == sources.sources.size(), "point-source descriptor span was not unique");
 }
 
 static void compare_source_scalars(const fields &cpu, const fields &gpu) {
@@ -244,30 +269,42 @@ static void compare_source_scalars(const fields &cpu, const fields &gpu) {
 }
 
 static void run_source_case(const char *name, precision_policy_kind policy, bool real_fields,
-                            bool conductivity) {
-  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
-  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
-  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+                            bool conductivity, bool integrated = false,
+                            material_function *material = NULL,
+                            const boundary_region *boundaries = NULL) {
+  const bool anisotropic = material != NULL;
+  const grid_volume gv = anisotropic ? vol3d(2.0, 2.0, 2.0, 5.0) : vol2d(2.0, 2.0, 8.0);
+  const boundary_region no_boundaries = no_pml();
+  const boundary_region &boundary = boundaries ? *boundaries : no_boundaries;
+  std::unique_ptr<structure> cpu_structure, gpu_structure;
+  if (material) {
+    cpu_structure.reset(new structure(gv, *material, boundary, identity(), 1));
+    gpu_structure.reset(new structure(gv, *material, boundary, identity(), 1));
+  }
+  else {
+    cpu_structure.reset(new structure(gv, isotropic_eps, boundary, identity(), 1));
+    gpu_structure.reset(new structure(gv, isotropic_eps, boundary, identity(), 1));
+  }
   if (conductivity) {
-    cpu_structure.set_conductivity(Dz, uniform_conductivity);
-    gpu_structure.set_conductivity(Dz, uniform_conductivity);
+    cpu_structure->set_conductivity(Dz, uniform_conductivity);
+    gpu_structure->set_conductivity(Dz, uniform_conductivity);
   }
 
-  fields cpu(&cpu_structure);
+  fields cpu(cpu_structure.get());
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
-  fields gpu(&gpu_structure, options);
+  fields gpu(gpu_structure.get(), options);
   if (real_fields) {
     cpu.use_real_fields();
     gpu.use_real_fields();
   }
   gaussian_src_time cpu_time(0.31, 0.14), gpu_time(0.31, 0.14);
-  cpu_time.is_integrated = false;
-  gpu_time.is_integrated = false;
+  cpu_time.is_integrated = integrated;
+  gpu_time.is_integrated = integrated;
   const std::complex<double> amplitude =
       real_fields ? std::complex<double>(0.37, 0.0) : std::complex<double>(0.37, -0.23);
-  const vec location(0.73, 0.83);
+  const vec location = anisotropic ? vec(0.73, 0.83, 0.41) : vec(0.73, 0.83);
   cpu.add_point_source(Ez, cpu_time, location, amplitude);
   gpu.add_point_source(Ez, gpu_time, location, amplitude);
 
@@ -275,8 +312,8 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
   cpu.advance(1);
   cpu.t = 0;
   gpu.init_backend();
-  require_source_plan(cpu, conductivity);
-  require_source_plan(gpu, conductivity);
+  require_source_plan(cpu, conductivity, integrated, anisotropic && integrated);
+  require_source_plan(gpu, conductivity, integrated, anisotropic && integrated);
 
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
@@ -467,14 +504,6 @@ static void test_rejections() {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
     fields f(&s, options);
     f.use_real_fields();
-    gaussian_src_time src(0.3, 0.1);
-    f.add_point_source(Ez, src, vec(0.1, 0.1));
-    require_advance_rejected(f, "does not support integrated sources");
-  }
-  {
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    fields f(&s, options);
-    f.use_real_fields();
     custom_src_time src(custom_source_value, NULL);
     src.is_integrated = false;
     f.add_point_source(Ez, src, vec(0.1, 0.1));
@@ -560,6 +589,9 @@ int main(int argc, char **argv) {
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
     run_source_case("real-point-source", policies[p], true, false);
     run_source_case("complex-conductive-point-source", policies[p], false, true);
+    run_source_case("real-integrated-point-source", policies[p], true, false, true);
+    run_source_case("complex-integrated-anisotropic-pml", policies[p], false, false, true,
+                    &two_offdiagonals, &xy_pml);
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
              1u << 0, 1u << 0, false, true);
     run_case("complex-phase", gv2, policies[p], false, no_pml(), identity(), 4, &bloch2,
