@@ -29,6 +29,7 @@
 #include "backend/halo_plan.hpp"
 #include "backend/prepare.hpp"
 #include "backend/step_plan.hpp"
+#include "backend/backend.hpp"
 #include "backend/storage_plan.hpp"
 
 #include "config.h"
@@ -53,7 +54,18 @@ void fields::step() { advance(1); }
    are ruled out by the stronger requirement that timing scopes and progress
    output stay identical. The per-iteration cost of both is negligible next to
    a timestep. */
+/* Routes through the selected backend: one virtual call per batch, never per
+   operation and certainly never per voxel. The CPU backend calls straight back
+   into advance_cpu(). */
 void fields::advance(int n) {
+  if (n <= 0) return;
+  init_backend();
+  if (!executable) executable = backend->compile(step_plan_for(StepProgram::ordinary),
+                                                 *backend_state);
+  backend->advance(*executable, *backend_state, n);
+}
+
+void fields::advance_cpu(int n) {
   if (n <= 0) return;
   /* Storage is realized before the loop, never inside it. From here the
      timestep only executes. */
