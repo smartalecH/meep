@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -37,14 +38,28 @@ static double isotropic_eps(const vec &p) { return p.x() < 0.0 ? 2.0 : 3.0; }
 static double uniform_conductivity(const vec &) { return 0.17; }
 static double unit_value(const vec &) { return 1.0; }
 
-class offdiagonal_material : public material_function {
+class linear_anisotropic_material : public material_function {
 public:
+  explicit linear_anisotropic_material(bool full) : full_(full) {}
+
   void eff_chi1inv_row(component c, double row[3], const volume &, double, int) override {
     row[0] = row[1] = row[2] = 0.0;
     const int d = component_index(c);
-    row[d] = 0.5;
-    row[(d + 1) % 3] = 0.05;
+    row[d] = 0.5 + 0.05 * d;
+    if (full_) {
+      static const double offdiagonal[3][3] = {
+          {0.0, 0.03, -0.02}, {0.03, 0.0, 0.04}, {-0.02, 0.04, 0.0}};
+      for (int other = 0; other < 3; ++other)
+        if (other != d) row[other] = offdiagonal[d][other];
+    }
+    else {
+      if (d == X) row[Z] = 0.04;
+      if (d == Z) row[X] = 0.04;
+    }
   }
+
+private:
+  bool full_;
 };
 
 static realnum initial_value(size_t array, size_t element) {
@@ -125,9 +140,9 @@ static void require_halo_phases(const fields &f, unsigned int required) {
 }
 
 static void require_physics_variants(const StepPlan &plan, unsigned int required_curl_combinations,
-                                     bool require_constitutive_pml) {
+                                     unsigned int required_constitutive_combinations) {
   unsigned int observed_curl_combinations = 0;
-  bool observed_constitutive_pml = false;
+  unsigned int observed_constitutive_combinations = 0;
   for (size_t i = 0; i < plan.db_updates.size(); ++i) {
     const uint32_t variants = plan.db_updates[i].region.variant_key;
     const unsigned int combination = unsigned((variants & curl_has_pml) != 0) |
@@ -135,13 +150,21 @@ static void require_physics_variants(const StepPlan &plan, unsigned int required
                                      (unsigned((variants & curl_has_conductivity) != 0) << 2);
     observed_curl_combinations |= 1u << combination;
   }
-  for (size_t i = 0; i < plan.eh_updates.size(); ++i)
-    observed_constitutive_pml |=
-        (plan.eh_updates[i].region.variant_key & constitutive_has_pml) != 0;
+  for (size_t i = 0; i < plan.eh_updates.size(); ++i) {
+    const uint32_t variants = plan.eh_updates[i].region.variant_key;
+    const unsigned int offdiagonals =
+        (variants & constitutive_two_offdiagonals)
+            ? 2
+            : unsigned((variants & constitutive_one_offdiagonal) != 0);
+    const unsigned int combination =
+        offdiagonals + (unsigned((variants & constitutive_has_pml) != 0) * 3);
+    observed_constitutive_combinations |= 1u << combination;
+  }
   require((observed_curl_combinations & required_curl_combinations) == required_curl_combinations,
           "required NVIDIA curl PML/conductivity combination was not prepared");
-  require(!require_constitutive_pml || observed_constitutive_pml,
-          "required diagonal constitutive PML variant was not prepared");
+  require((observed_constitutive_combinations & required_constitutive_combinations) ==
+              required_constitutive_combinations,
+          "required NVIDIA constitutive PML/anisotropy combination was not prepared");
 }
 
 static void set_uniform_conductivity(structure &s) {
@@ -157,15 +180,23 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
                      bool real_fields, const boundary_region &boundaries,
                      const symmetry &symmetries, int chunks, const vec *bloch,
                      unsigned int required_halo_phases, unsigned int required_curl_combinations,
-                     bool require_constitutive_pml, bool conductivity, bool check_lifecycle) {
-  structure cpu_structure(gv, isotropic_eps, boundaries, symmetries, chunks);
-  structure gpu_structure(gv, isotropic_eps, boundaries, symmetries, chunks);
+                     unsigned int required_constitutive_combinations, bool conductivity,
+                     bool check_lifecycle, material_function *material = NULL) {
+  std::unique_ptr<structure> cpu_structure, gpu_structure;
+  if (material) {
+    cpu_structure.reset(new structure(gv, *material, boundaries, symmetries, chunks));
+    gpu_structure.reset(new structure(gv, *material, boundaries, symmetries, chunks));
+  }
+  else {
+    cpu_structure.reset(new structure(gv, isotropic_eps, boundaries, symmetries, chunks));
+    gpu_structure.reset(new structure(gv, isotropic_eps, boundaries, symmetries, chunks));
+  }
   if (conductivity) {
-    set_uniform_conductivity(cpu_structure);
-    set_uniform_conductivity(gpu_structure);
+    set_uniform_conductivity(*cpu_structure);
+    set_uniform_conductivity(*gpu_structure);
   }
 
-  fields cpu(&cpu_structure);
+  fields cpu(cpu_structure.get());
   if (real_fields)
     cpu.use_real_fields();
   else if (bloch)
@@ -178,7 +209,7 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
-  fields gpu(&gpu_structure, options);
+  fields gpu(gpu_structure.get(), options);
   if (real_fields)
     gpu.use_real_fields();
   else if (bloch)
@@ -187,7 +218,8 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   gpu.init_backend();
   require_halo_phases(gpu, required_halo_phases);
   const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
-  require_physics_variants(prepared, required_curl_combinations, require_constitutive_pml);
+  require_physics_variants(prepared, required_curl_combinations,
+                           required_constitutive_combinations);
 
   const bool f32 = policy == precision_policy_kind::f32;
   if (f32) round_real_arrays(*cpu.array_catalog);
@@ -256,14 +288,6 @@ static void test_rejections() {
     require_advance_rejected(f, "does not support sources");
   }
   {
-    offdiagonal_material material;
-    structure s(gv, material, no_pml(), identity(), 1);
-    fields f(&s, options);
-    f.use_real_fields();
-    f.require_component(Ez);
-    require_advance_rejected(f, "anisotropy");
-  }
-  {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
     s.set_chi3(unit_value);
     fields f(&s, options);
@@ -298,22 +322,29 @@ int main(int argc, char **argv) {
   const vec bloch2(0.17, 0.11);
   const vec bloch3(0.11, 0.07, 0.05);
   const boundary_region xy_pml = pml(0.4, X) + pml(0.4, Y);
+  linear_anisotropic_material one_offdiagonal(false);
+  linear_anisotropic_material two_offdiagonals(true);
   const precision_policy_kind policies[] = {precision_policy_kind::native,
                                             precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
-             1u << 0, false, false, true);
+             1u << 0, 1u << 0, false, true);
     run_case("complex-phase", gv2, policies[p], false, no_pml(), identity(), 4, &bloch2,
-             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), 1u << 0, false, false, false);
+             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), 1u << 0, 1u << 0, false, false);
     run_case("complex-negate", gv2, policies[p], false, no_pml(), -mirror(Y, gv2), 2, NULL,
-             1u << CONNECT_NEGATE, 1u << 0, false, false, false);
+             1u << CONNECT_NEGATE, 1u << 0, 1u << 0, false, false);
     run_case("real-conductivity", gv3, policies[p], true, no_pml(), identity(), 2, NULL,
-             1u << CONNECT_COPY, 1u << 4, false, true, false);
+             1u << CONNECT_COPY, 1u << 4, 1u << 0, true, false);
     run_case("real-pml-conductivity", gv3, policies[p], true, xy_pml, identity(), 2, NULL,
-             1u << CONNECT_COPY, (1u << 5) | (1u << 6) | (1u << 7), true, true, false);
+             1u << CONNECT_COPY, (1u << 5) | (1u << 6) | (1u << 7), 1u << 3, true, false);
     run_case("complex-pml", gv3, policies[p], false, xy_pml, identity(), 2, &bloch3,
-             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), (1u << 1) | (1u << 2) | (1u << 3), true,
-             false, false);
+             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), (1u << 1) | (1u << 2) | (1u << 3),
+             1u << 3, false, false);
+    run_case("real-anisotropic-2x2", gv3, policies[p], true, no_pml(), identity(), 2, NULL,
+             1u << CONNECT_COPY, 1u << 0, 1u << 1, false, false, &one_offdiagonal);
+    run_case("complex-anisotropic-3x3-pml", gv3, policies[p], false, xy_pml, identity(), 2, &bloch3,
+             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), (1u << 1) | (1u << 2) | (1u << 3),
+             1u << 5, false, false, &two_offdiagonals);
   }
   test_rejections();
   master_printf("nvidia_timestep: PASS\n");
