@@ -32,6 +32,107 @@ using namespace std;
 
 namespace meep {
 
+namespace {
+
+void record_dft_reduction_error(std::string &local_error, const std::exception &e) {
+  if (local_error.empty()) local_error = e.what();
+}
+
+DftReductionRegion contiguous_dft_region(size_t points) {
+  DftReductionRegion region = {0, {points, 1, 1}, {1, 0, 0}};
+  return region;
+}
+
+bool locate_dft_array(fields &owner, const dft_chunk *chunk, ArrayId &id,
+                      std::string &local_error) {
+  if (!chunk || !chunk->dft) {
+    if (local_error.empty()) local_error = "compact DFT reduction has a null accumulator";
+    return false;
+  }
+  try {
+    if (!owner.array_catalog)
+      throw std::logic_error("compact DFT reduction requires a storage catalog");
+    ptrdiff_t offset = 0;
+    if (!owner.array_catalog->locate(chunk->dft, id, offset))
+      throw std::out_of_range("DFT accumulator is absent from the storage catalog");
+    if (offset != 0)
+      throw std::invalid_argument("compact DFT reduction does not support suballocated arrays");
+    return true;
+  }
+  catch (const std::exception &e) {
+    record_dft_reduction_error(local_error, e);
+    return false;
+  }
+}
+
+bool append_dft_product_term(fields &owner, DftReductionRequest &request, const dft_chunk *left,
+                             const dft_chunk *right, size_t frequencies,
+                             std::complex<double> weight, std::string &local_error) {
+  try {
+    DftReductionTerm term;
+    if (!locate_dft_array(owner, left, term.left, local_error) ||
+        !locate_dft_array(owner, right, term.right, local_error))
+      return false;
+    term.storage_points = left->N;
+    term.frequencies = frequencies;
+    term.region = contiguous_dft_region(left->N);
+    term.weight = weight;
+    request.terms.push_back(term);
+    return true;
+  }
+  catch (const std::exception &e) {
+    record_dft_reduction_error(local_error, e);
+    return false;
+  }
+}
+
+bool append_dft_norm_term(fields &owner, DftReductionRequest &request, const dft_chunk *chunk,
+                          grid_volume fgv, std::string &local_error) {
+  DftReductionTerm term;
+  if (!locate_dft_array(owner, chunk, term.left, local_error)) return false;
+  term.right = invalid_array();
+  term.storage_points = chunk->N;
+  term.frequencies = chunk->omega.size();
+  term.weight = std::complex<double>(1.0, 0.0);
+  term.region = contiguous_dft_region(chunk->N);
+  try {
+    if (chunk->persist) {
+      grid_volume subgv = fgv.subvolume(chunk->is, chunk->ie, chunk->c);
+      const ptrdiff_t base = subgv.index(chunk->c, chunk->is_old);
+      if (base < 0) throw std::out_of_range("persistent DFT reduction has a negative base");
+      term.region.base = size_t(base);
+      for (int axis = 0; axis < 3; ++axis) {
+        const direction d = subgv.yucky_direction(axis);
+        const int delta = chunk->ie_old.in_direction(d) - chunk->is_old.in_direction(d);
+        const ptrdiff_t stride = subgv.stride(d);
+        if (delta < 0 || (delta & 1) || stride < 0)
+          throw std::invalid_argument("persistent DFT reduction has an irregular region");
+        term.region.counts[axis] = size_t(delta / 2) + 1;
+        term.region.strides[axis] = size_t(stride);
+      }
+    }
+    request.terms.push_back(term);
+    return true;
+  }
+  catch (const std::exception &e) {
+    record_dft_reduction_error(local_error, e);
+    return false;
+  }
+}
+
+bool begin_compact_dft_request(fields *owner, DftReductionKind kind, size_t result_count,
+                               DftReductionRequest &request) {
+  if (!owner || !backend_host_refresh_required(*owner) ||
+      !owner->backend->supports_compact_dft_reductions())
+    return false;
+  request.kind = kind;
+  request.accumulation_precision = policy_for(owner->options.precision).reduction;
+  request.result_count = result_count;
+  return true;
+}
+
+} // namespace
+
 std::vector<double> linspace(double freq_min, double freq_max, size_t Nfreq) {
   double dfreq = Nfreq <= 1 ? 0.0 : (freq_max - freq_min) / (Nfreq - 1);
   std::vector<double> freq(Nfreq);
@@ -405,17 +506,29 @@ static double dft_norm2_from_host(const dft_chunk &chunk, grid_volume fgv);
    (Collective operation.) */
 double fields::dft_norm() {
   am_now_working_on(Other);
+  DftReductionRequest request;
   std::string local_error;
-  if (backend_host_refresh_required(*this)) {
+  std::complex<double> compact_result(0.0, 0.0);
+  bool compact = begin_compact_dft_request(this, DftReductionKind::norm2, 1, request);
+  if (compact) {
+    for (int i = 0; i < num_chunks; ++i)
+      if (chunks[i]->is_mine())
+        for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
+          append_dft_norm_term(*this, request, cur, gv, local_error);
+    compact = backend_try_reduce_dft(*this, request, &compact_result, 1, local_error,
+                                     "fields::dft_norm");
+  }
+  else if (backend_host_refresh_required(*this)) {
     for (int i = 0; i < num_chunks; ++i)
       if (chunks[i]->is_mine())
         for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
           backend_read_dft_chunk(cur, local_error);
     backend_reconcile_host_access(local_error, "fields::dft_norm");
   }
-  double sum = 0.0;
-  for (int i = 0; i < num_chunks; i++)
-    if (chunks[i]->is_mine()) sum += chunks[i]->dft_norm2(gv);
+  double sum = compact ? compact_result.real() : 0.0;
+  if (!compact)
+    for (int i = 0; i < num_chunks; i++)
+      if (chunks[i]->is_mine()) sum += chunks[i]->dft_norm2(gv);
   finished_working();
   return std::sqrt(sum_to_all(sum));
 }
@@ -675,18 +788,35 @@ dft_flux::dft_flux(const dft_flux &f) : where(f.where) {
 dft_flux::~dft_flux() { invalidate_eigenmode_cache(); }
 
 double *dft_flux::flux() {
-  dft_chunk *chains[2] = {E, H};
-  if (monitor_lifetime && monitor_lifetime->owner)
-    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_flux::flux");
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
     F[i] = 0;
-  for (dft_chunk *curE = E, *curH = H; curE && curH;
-       curE = curE->next_in_dft, curH = curH->next_in_dft)
-    for (size_t k = 0; k < curE->N; ++k)
-      for (size_t i = 0; i < Nfreq; ++i)
-        F[i] += real(curE->dft[k * Nfreq + i] * conj(curH->dft[k * Nfreq + i]));
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  DftReductionRequest request;
+  std::vector<std::complex<double> > compact_result(Nfreq);
+  std::string local_error;
+  bool compact = begin_compact_dft_request(owner, DftReductionKind::real_weighted_product, Nfreq,
+                                           request);
+  if (compact) {
+    dft_chunk *curE = E, *curH = H;
+    for (; curE && curH; curE = curE->next_in_dft, curH = curH->next_in_dft)
+      append_dft_product_term(*owner, request, curE, curH, Nfreq, 1.0, local_error);
+    if ((curE || curH) && local_error.empty()) local_error = "DFT flux chain-length mismatch";
+    compact = backend_try_reduce_dft(*owner, request, compact_result.data(), Nfreq, local_error,
+                                     "dft_flux::flux");
+    for (size_t i = 0; i < Nfreq; ++i)
+      F[i] = compact_result[i].real();
+  }
+  else {
+    dft_chunk *chains[2] = {E, H};
+    if (owner) backend_refresh_dft_chains(*owner, 2, chains, "dft_flux::flux");
+    for (dft_chunk *curE = E, *curH = H; curE && curH;
+         curE = curE->next_in_dft, curH = curH->next_in_dft)
+      for (size_t k = 0; k < curE->N; ++k)
+        for (size_t i = 0; i < Nfreq; ++i)
+          F[i] += real(curE->dft[k * Nfreq + i] * conj(curH->dft[k * Nfreq + i]));
+  }
   double *Fsum = new double[Nfreq];
   sum_to_all(F, Fsum, int(Nfreq));
   delete[] F;
@@ -694,18 +824,32 @@ double *dft_flux::flux() {
 }
 
 std::vector<std::complex<double> > dft_flux::complexflux() {
-  dft_chunk *chains[2] = {E, H};
-  if (monitor_lifetime && monitor_lifetime->owner)
-    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_flux::complexflux");
   const size_t Nfreq = freq.size();
   std::vector<std::complex<double> > F(Nfreq);
   for (size_t i = 0; i < Nfreq; ++i)
     F[i] = 0.0;
-  for (dft_chunk *curE = E, *curH = H; curE && curH;
-       curE = curE->next_in_dft, curH = curH->next_in_dft)
-    for (size_t k = 0; k < curE->N; ++k)
-      for (size_t i = 0; i < Nfreq; ++i)
-        F[i] += curE->dft[k * Nfreq + i] * conj(curH->dft[k * Nfreq + i]);
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  DftReductionRequest request;
+  std::string local_error;
+  bool compact = begin_compact_dft_request(owner, DftReductionKind::complex_weighted_product,
+                                           Nfreq, request);
+  if (compact) {
+    dft_chunk *curE = E, *curH = H;
+    for (; curE && curH; curE = curE->next_in_dft, curH = curH->next_in_dft)
+      append_dft_product_term(*owner, request, curE, curH, Nfreq, 1.0, local_error);
+    if ((curE || curH) && local_error.empty()) local_error = "DFT flux chain-length mismatch";
+    compact = backend_try_reduce_dft(*owner, request, F.data(), Nfreq, local_error,
+                                     "dft_flux::complexflux");
+  }
+  else {
+    dft_chunk *chains[2] = {E, H};
+    if (owner) backend_refresh_dft_chains(*owner, 2, chains, "dft_flux::complexflux");
+    for (dft_chunk *curE = E, *curH = H; curE && curH;
+         curE = curE->next_in_dft, curH = curH->next_in_dft)
+      for (size_t k = 0; k < curE->N; ++k)
+        for (size_t i = 0; i < Nfreq; ++i)
+          F[i] += curE->dft[k * Nfreq + i] * conj(curH->dft[k * Nfreq + i]);
+  }
   std::vector<std::complex<double> > Fsum(Nfreq);
   sum_to_all(&F[0], &Fsum[0], int(Nfreq));
   return Fsum;
@@ -826,18 +970,35 @@ dft_energy::dft_energy(const dft_energy &f) : where(f.where) {
 }
 
 double *dft_energy::electric() {
-  dft_chunk *chains[2] = {E, D};
-  if (monitor_lifetime && monitor_lifetime->owner)
-    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_energy::electric");
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
     F[i] = 0;
-  for (dft_chunk *curE = E, *curD = D; curE && curD;
-       curE = curE->next_in_dft, curD = curD->next_in_dft)
-    for (size_t k = 0; k < curE->N; ++k)
-      for (size_t i = 0; i < Nfreq; ++i)
-        F[i] += 0.5 * real(conj(curE->dft[k * Nfreq + i]) * curD->dft[k * Nfreq + i]);
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  DftReductionRequest request;
+  std::vector<std::complex<double> > compact_result(Nfreq);
+  std::string local_error;
+  bool compact = begin_compact_dft_request(owner, DftReductionKind::real_weighted_product, Nfreq,
+                                           request);
+  if (compact) {
+    dft_chunk *curD = D, *curE = E;
+    for (; curD && curE; curD = curD->next_in_dft, curE = curE->next_in_dft)
+      append_dft_product_term(*owner, request, curD, curE, Nfreq, 0.5, local_error);
+    if ((curD || curE) && local_error.empty()) local_error = "electric DFT chain-length mismatch";
+    compact = backend_try_reduce_dft(*owner, request, compact_result.data(), Nfreq, local_error,
+                                     "dft_energy::electric");
+    for (size_t i = 0; i < Nfreq; ++i)
+      F[i] = compact_result[i].real();
+  }
+  else {
+    dft_chunk *chains[2] = {E, D};
+    if (owner) backend_refresh_dft_chains(*owner, 2, chains, "dft_energy::electric");
+    for (dft_chunk *curE = E, *curD = D; curE && curD;
+         curE = curE->next_in_dft, curD = curD->next_in_dft)
+      for (size_t k = 0; k < curE->N; ++k)
+        for (size_t i = 0; i < Nfreq; ++i)
+          F[i] += 0.5 * real(conj(curE->dft[k * Nfreq + i]) * curD->dft[k * Nfreq + i]);
+  }
   double *Fsum = new double[Nfreq];
   sum_to_all(F, Fsum, int(Nfreq));
   delete[] F;
@@ -845,18 +1006,35 @@ double *dft_energy::electric() {
 }
 
 double *dft_energy::magnetic() {
-  dft_chunk *chains[2] = {H, B};
-  if (monitor_lifetime && monitor_lifetime->owner)
-    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_energy::magnetic");
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
     F[i] = 0;
-  for (dft_chunk *curH = H, *curB = B; curH && curB;
-       curH = curH->next_in_dft, curB = curB->next_in_dft)
-    for (size_t k = 0; k < curH->N; ++k)
-      for (size_t i = 0; i < Nfreq; ++i)
-        F[i] += 0.5 * real(conj(curH->dft[k * Nfreq + i]) * curB->dft[k * Nfreq + i]);
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  DftReductionRequest request;
+  std::vector<std::complex<double> > compact_result(Nfreq);
+  std::string local_error;
+  bool compact = begin_compact_dft_request(owner, DftReductionKind::real_weighted_product, Nfreq,
+                                           request);
+  if (compact) {
+    dft_chunk *curB = B, *curH = H;
+    for (; curB && curH; curB = curB->next_in_dft, curH = curH->next_in_dft)
+      append_dft_product_term(*owner, request, curB, curH, Nfreq, 0.5, local_error);
+    if ((curB || curH) && local_error.empty()) local_error = "magnetic DFT chain-length mismatch";
+    compact = backend_try_reduce_dft(*owner, request, compact_result.data(), Nfreq, local_error,
+                                     "dft_energy::magnetic");
+    for (size_t i = 0; i < Nfreq; ++i)
+      F[i] = compact_result[i].real();
+  }
+  else {
+    dft_chunk *chains[2] = {H, B};
+    if (owner) backend_refresh_dft_chains(*owner, 2, chains, "dft_energy::magnetic");
+    for (dft_chunk *curH = H, *curB = B; curH && curB;
+         curH = curH->next_in_dft, curB = curB->next_in_dft)
+      for (size_t k = 0; k < curH->N; ++k)
+        for (size_t i = 0; i < Nfreq; ++i)
+          F[i] += 0.5 * real(conj(curH->dft[k * Nfreq + i]) * curB->dft[k * Nfreq + i]);
+  }
   double *Fsum = new double[Nfreq];
   sum_to_all(F, Fsum, int(Nfreq));
   delete[] F;
