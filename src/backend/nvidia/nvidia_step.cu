@@ -129,7 +129,16 @@ __global__ void curl_kernel(curl_launch update, size_t points) {
               (((kappa_u[ku] - sigma_u[ku]) * target[i] + target_u[i]) - previous_u);
 }
 
-template <typename T, bool Pml>
+template <typename T>
+__device__ T offdiagonal_value(const T *coefficient, const T *field, ptrdiff_t i,
+                               ptrdiff_t primary_stride, ptrdiff_t cross_stride) {
+  return T(0.25) *
+         ((field[i] + field[i - cross_stride]) * coefficient[i] +
+          (field[i + primary_stride] + field[(i + primary_stride) - cross_stride]) *
+              coefficient[i + primary_stride]);
+}
+
+template <typename T, bool Pml, unsigned int Offdiagonals>
 __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
@@ -138,6 +147,14 @@ __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   const ptrdiff_t i = region_index(update.region, i0, i1, i2);
   T value = static_cast<const T *>(update.primary)[i];
   if (update.diagonal) value *= static_cast<const T *>(update.diagonal)[i];
+  if (Offdiagonals >= 1)
+    value += offdiagonal_value(static_cast<const T *>(update.offdiagonal1),
+                               static_cast<const T *>(update.cross1), i, update.primary_stride,
+                               update.cross1_stride);
+  if (Offdiagonals >= 2)
+    value += offdiagonal_value(static_cast<const T *>(update.offdiagonal2),
+                               static_cast<const T *>(update.cross2), i, update.primary_stride,
+                               update.cross2_stride);
   T *target = static_cast<T *>(update.target);
   if (!Pml) {
     target[i] = value;
@@ -209,12 +226,12 @@ void launch_curl_t(const curl_launch &update, const stream &execution_stream) {
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA curl");
 }
 
-template <typename T, bool Pml>
+template <typename T, bool Pml, unsigned int Offdiagonals>
 void launch_constitutive_t(const constitutive_launch &update, const stream &execution_stream) {
   const size_t points = checked_points(update.region);
   unsigned int blocks = 0, threads = 0;
   launch_geometry(update.region, blocks, threads);
-  constitutive_kernel<T, Pml>
+  constitutive_kernel<T, Pml, Offdiagonals>
       <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
           update, points);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA constitutive update");
@@ -310,20 +327,41 @@ void launch_constitutive(const constitutive_launch &update, const stream &execut
   if (!update.target || !update.primary)
     throw std::invalid_argument("NVIDIA constitutive launch has incomplete operands");
   const bool pml = update.pml.sigma != NULL;
+  if (update.offdiagonal2 && !update.offdiagonal1)
+    throw std::invalid_argument(
+        "NVIDIA constitutive launch has a second off-diagonal without first");
+  const unsigned int offdiagonals = update.offdiagonal2 ? 2u : update.offdiagonal1 ? 1u : 0u;
+  if ((offdiagonals >= 1 && (!update.cross1 || !update.diagonal)) ||
+      (offdiagonals >= 2 && !update.cross2))
+    throw std::invalid_argument("NVIDIA constitutive anisotropic state is incomplete");
   if (pml && (!update.target_w || !update.pml.kappa))
     throw std::invalid_argument("NVIDIA constitutive PML state is incomplete");
-  if (update.precision == scalar_precision::f32) {
-    if (pml)
-      launch_constitutive_t<float, true>(update, execution_stream);
-    else
-      launch_constitutive_t<float, false>(update, execution_stream);
-  }
-  else {
-    if (pml)
-      launch_constitutive_t<double, true>(update, execution_stream);
-    else
-      launch_constitutive_t<double, false>(update, execution_stream);
-  }
+#define LAUNCH_CONSTITUTIVE(T, P, O) launch_constitutive_t<T, P, O>(update, execution_stream)
+#define DISPATCH_CONSTITUTIVE(T)                                                                  \
+  do {                                                                                            \
+    if (pml) {                                                                                    \
+      if (offdiagonals == 2)                                                                      \
+        LAUNCH_CONSTITUTIVE(T, true, 2);                                                          \
+      else if (offdiagonals == 1)                                                                 \
+        LAUNCH_CONSTITUTIVE(T, true, 1);                                                          \
+      else                                                                                        \
+        LAUNCH_CONSTITUTIVE(T, true, 0);                                                          \
+    }                                                                                             \
+    else {                                                                                        \
+      if (offdiagonals == 2)                                                                      \
+        LAUNCH_CONSTITUTIVE(T, false, 2);                                                         \
+      else if (offdiagonals == 1)                                                                 \
+        LAUNCH_CONSTITUTIVE(T, false, 1);                                                         \
+      else                                                                                        \
+        LAUNCH_CONSTITUTIVE(T, false, 0);                                                         \
+    }                                                                                             \
+  } while (0)
+  if (update.precision == scalar_precision::f32)
+    DISPATCH_CONSTITUTIVE(float);
+  else
+    DISPATCH_CONSTITUTIVE(double);
+#undef DISPATCH_CONSTITUTIVE
+#undef LAUNCH_CONSTITUTIVE
 }
 
 void launch_zero(const zero_launch &update, const stream &execution_stream) {
