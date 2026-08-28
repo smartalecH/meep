@@ -132,6 +132,10 @@ public:
 
   bool contains(const StorageKey &key) const { return index_.count(key) != 0; }
   bool contains_address(const void *p) const { return by_address_.count(p) != 0; }
+  /* Resolve an address within a registered allocation to its canonical array
+     and element offset. This is used to translate the independently-built
+     halo tables without relying on coincidental numeric ArrayIds. */
+  bool locate(const void *p, ArrayId &id, ptrdiff_t &element_offset) const;
   ArrayId find(const StorageKey &key) const {
     auto it = index_.find(key);
     return it == index_.end() ? invalid_array() : ArrayId{it->second};

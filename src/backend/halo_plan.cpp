@@ -16,6 +16,7 @@
 */
 
 #include "backend/halo_plan.hpp"
+#include "backend/storage_plan.hpp"
 
 namespace meep {
 
@@ -178,6 +179,77 @@ CoalesceStats coalesce_stats(const std::vector<HaloPlan> &plans) {
   }
   st.total_elements = st.slab_elements + st.residue_elements;
   return st;
+}
+
+namespace {
+
+bool remap_elements(const std::vector<ElementRef> &source, const HaloArrayTable &source_arrays,
+                    const CpuArrayCatalog &catalog, std::vector<ElementRef> &destination,
+                    std::string &why) {
+  destination.clear();
+  destination.reserve(source.size());
+  for (size_t i = 0; i < source.size(); ++i) {
+    const ElementRef &ref = source[i];
+    const realnum *address = source_arrays.base(ref.array) + ref.index;
+    ArrayId id = invalid_array();
+    ptrdiff_t offset = 0;
+    if (!catalog.locate(address, id, offset)) {
+      why = "halo element is not represented in the canonical storage catalog";
+      destination.clear();
+      return false;
+    }
+    destination.push_back(ElementRef{id, offset});
+  }
+  return true;
+}
+
+void expand_zero(const ZeroPlan &source, std::vector<ElementRef> &out) {
+  out.clear();
+  for (size_t i = 0; i < source.slabs.size(); ++i) {
+    const SlabRef &slab = source.slabs[i];
+    for (int i0 = 0; i0 < slab.counts[0]; ++i0)
+      for (int i1 = 0; i1 < slab.counts[1]; ++i1)
+        for (int i2 = 0; i2 < slab.counts[2]; ++i2)
+          out.push_back(ElementRef{
+              slab.array, slab.base + ptrdiff_t(i0) * slab.strides[0] +
+                              ptrdiff_t(i1) * slab.strides[1] +
+                              ptrdiff_t(i2) * slab.strides[2]});
+  }
+  out.insert(out.end(), source.residue.begin(), source.residue.end());
+}
+
+} // namespace
+
+bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, int field_interleave, HaloPlan &destination,
+                     std::string &why) {
+  why.clear();
+  destination = source;
+
+  std::vector<ElementRef> source_gather, source_scatter, gather, scatter;
+  expand_gather(source, source_gather);
+  expand_scatter(source, source_scatter);
+  if (!remap_elements(source_gather, source_arrays, catalog, gather, why) ||
+      !remap_elements(source_scatter, source_arrays, catalog, scatter, why))
+    return false;
+
+  const int interleave = source.ft == PE_stuff || source.ft == PH_stuff ? 1 : field_interleave;
+  coalesce_into_slabs(gather, interleave, destination.gather_slabs, destination.gather,
+                      destination.gather_order);
+  coalesce_into_slabs(scatter, interleave, destination.scatter_slabs, destination.scatter,
+                      destination.scatter_order);
+  return true;
+}
+
+bool remap_zero_plan(const ZeroPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, ZeroPlan &destination, std::string &why) {
+  why.clear();
+  std::vector<ElementRef> expanded, remapped, unused_residue;
+  std::vector<HaloSegment> unused_order;
+  expand_zero(source, expanded);
+  if (!remap_elements(expanded, source_arrays, catalog, remapped, why)) return false;
+  coalesce_into_slabs(remapped, 1, destination.slabs, destination.residue, unused_order);
+  return true;
 }
 
 } // namespace meep
