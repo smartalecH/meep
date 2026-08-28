@@ -100,6 +100,9 @@ struct DftDescriptor {
   ArrayId accumulator;   // complex, monitor precision; layout [voxel][frequency]
   ArrayId phase_scratch; // Nomega entries, recomputed from the step time
   ArrayRef source_field;
+  ArrayRef source_field_imag; // invalid for real fields
+  std::vector<double> omega;  // angular frequencies, in live dft_chunk order
+  std::complex<double> scale; // stored_weight * symmetry phase * dt factor
   int chunk;
   component c;
   ptrdiff_t avg1, avg2; // Yee-to-centered offsets; 0 when not centered

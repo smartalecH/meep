@@ -37,6 +37,7 @@
 
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
+#include "backend/descriptors.hpp"
 
 namespace meep {
 
@@ -216,6 +217,7 @@ struct StepPlan {
   std::vector<Operation> operations;
   std::vector<CurlUpdate> db_updates;
   std::vector<ConstitutiveUpdate> eh_updates;
+  std::vector<DftDescriptor> dft_updates;
   uint64_t source_signature;
   uint64_t signature;
 
@@ -224,6 +226,7 @@ struct StepPlan {
     operations.clear();
     db_updates.clear();
     eh_updates.clear();
+    dft_updates.clear();
     source_signature = 0;
     signature = 0;
   }
