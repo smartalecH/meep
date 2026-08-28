@@ -14,6 +14,7 @@
 
 #include <meep.hpp>
 
+#include "backend/descriptors.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
@@ -159,8 +160,32 @@ static void check_prepared_updates() {
 
   StepPlan plan = build_step_plan(f, StepProgram::ordinary);
   size_t update_ops = 0;
+  size_t source_evaluations = 0, source_applications = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
+    if (op.kind == OpKind::evaluate_source_scalars) {
+      ++source_evaluations;
+      CHECK(op.descriptor_index == 0 &&
+                op.descriptor_count == f.descriptors->sources.source_times.size(),
+            "source evaluation has the wrong source-time span");
+    }
+    if (op.kind == OpKind::apply_sources && op.source_descriptor_count) {
+      ++source_applications;
+      CHECK(op.ft == D_stuff, "the electric source was attached to the wrong field type");
+      CHECK(size_t(op.source_descriptor_index) + op.source_descriptor_count <=
+                f.descriptors->sources.sources.size(),
+            "source application span is out of range");
+      for (size_t i = op.source_descriptor_index;
+           i < size_t(op.source_descriptor_index) + op.source_descriptor_count; ++i) {
+        const SourceDescriptor &d = f.descriptors->sources.sources[i];
+        CHECK(d.ft == op.ft && !d.integrated,
+              "ordinary source span contains the wrong source kind");
+        CHECK(has_access(op, d.destination, AccessMode::read_write) &&
+                  has_access(op, d.destination_imag, AccessMode::read_write) &&
+                  has_access(op, d.condinv, AccessMode::read),
+              "ordinary source access set is incomplete");
+      }
+    }
     if (op.kind != OpKind::update_db && op.kind != OpKind::update_eh) continue;
     ++update_ops;
     CHECK(or_to_all(op.descriptor_count > 0), "%s has an empty descriptor span on every rank",
@@ -224,6 +249,12 @@ static void check_prepared_updates() {
   }
   CHECK(update_ops == 4, "expected four Maxwell update operations, got %zu", update_ops);
   check_finite_value_accesses(f, plan);
+  CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",
+        source_evaluations);
+  const size_t global_source_applications = sum_to_all(source_applications);
+  CHECK(global_source_applications == 1,
+        "expected one nonempty source application globally, got %zu",
+        global_source_applications);
 
   CHECK(compute_step_plan_signature(plan) == plan.signature,
         "stored signature differs from structural signature");
@@ -341,9 +372,20 @@ static void check_integrated_source_inputs() {
 
   const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
   size_t prepared = 0;
+  size_t integrated_spans = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
     if (op.kind != OpKind::update_eh || op.ft != E_stuff) continue;
+    if (op.source_descriptor_count) ++integrated_spans;
+    for (size_t si = op.source_descriptor_index;
+         si < size_t(op.source_descriptor_index) + op.source_descriptor_count; ++si) {
+      const SourceDescriptor &source = f.descriptors->sources.sources[si];
+      CHECK(source.ft == D_stuff && source.integrated,
+            "E update contains the wrong integrated source descriptor");
+      CHECK(has_access(op, source.destination, AccessMode::read) &&
+                has_access(op, source.integrated_destination, AccessMode::read_write),
+            "integrated source access set is incomplete");
+    }
     for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
          ++i) {
       const ConstitutiveUpdate &d = plan.eh_updates[i];
@@ -358,6 +400,8 @@ static void check_integrated_source_inputs() {
       }
     }
   }
+  CHECK(sum_to_all(integrated_spans) > 0,
+        "integrated electric source is absent from every E-update source span");
   CHECK(or_to_all(prepared > 0), "integrated source produced no prepared f_minus_p inputs");
 }
 
