@@ -111,11 +111,77 @@ public:
     return c;
   }
   bool requires_full_storage_preparation() const override { return true; }
+  void prepare_state_rebuild(BackendState &, DirtyMask) override {}
   bool accepts(const execution_options &, std::string &) const override { return true; }
 
 private:
   fields &f;
   lifetime_counts &counts;
+};
+
+struct rebuild_trace {
+  std::vector<std::string> events;
+  DirtyMask reasons;
+
+  rebuild_trace() : reasons(dirty_none) {}
+};
+
+struct rebuild_state : BackendState {
+  explicit rebuild_state(rebuild_trace &trace_) : trace(trace_) {}
+  ~rebuild_state() override { trace.events.push_back("destroy-state"); }
+  rebuild_trace &trace;
+};
+
+struct rebuild_executable : Executable {
+  explicit rebuild_executable(rebuild_trace &trace_) : trace(trace_) {}
+  ~rebuild_executable() override { trace.events.push_back("destroy-executable"); }
+  rebuild_trace &trace;
+};
+
+class rebuild_backend_base : public ExecutionBackend {
+public:
+  explicit rebuild_backend_base(rebuild_trace &trace_) : trace(trace_) {}
+
+  BackendState *create_state(const StoragePlan &) override {
+    trace.events.push_back("create-state");
+    return new rebuild_state(trace);
+  }
+  void initialize(const InitializationPlan &, BackendState &) override {}
+  MaterialClassification classify_state(const StoragePlan &, BackendState &) override {
+    return MaterialClassification();
+  }
+  void finalize_storage(const StoragePlan &, BackendState &) override {}
+  Executable *compile(const StepPlan &, BackendState &) override {
+    return new rebuild_executable(trace);
+  }
+  void advance(Executable &, BackendState &, int) override {}
+  void read(ArrayRef, void *, size_t) override {}
+  void write(ArrayRef, const void *, size_t) override {}
+  void synchronize() override {}
+  backend_capabilities capabilities() const override {
+    backend_capabilities result;
+    result.supports_native = true;
+    result.supports_mixed = false;
+    result.supports_f32 = false;
+    result.memory_budget_bytes = 0;
+    result.name = "tracking";
+    return result;
+  }
+  bool requires_full_storage_preparation() const override { return true; }
+  bool accepts(const execution_options &, std::string &) const override { return true; }
+
+protected:
+  rebuild_trace &trace;
+};
+
+class rebuild_tracking_backend : public rebuild_backend_base {
+public:
+  explicit rebuild_tracking_backend(rebuild_trace &trace_) : rebuild_backend_base(trace_) {}
+
+  void prepare_state_rebuild(BackendState &, DirtyMask reasons) override {
+    trace.events.push_back("prepare-rebuild");
+    trace.reasons = reasons;
+  }
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL) {
@@ -430,6 +496,80 @@ static void test_initialization_plan() {
   delete s;
 }
 
+/* A storage rebuild must give the backend a chance to preserve authoritative
+   values before either its executable or state is destroyed. A refusal leaves
+   both objects live. */
+static void test_authority_safe_state_rebuild() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+
+  rebuild_trace trace;
+  rebuild_backend_base *tracking = new rebuild_tracking_backend(trace);
+  f->backend = tracking;
+  f->backend_state = tracking->create_state(*f->storage_plan);
+  StepPlan plan;
+  f->executable = tracking->compile(plan, *f->backend_state);
+  trace.events.clear();
+  clear_dirty(*f, DirtyMask(f->dirty_mask));
+  invalidate(*f, MutationKind::field_layout);
+
+  f->init_backend();
+  CHECK(trace.events.size() == 4, "rebuild produced %zu events, expected 4", trace.events.size());
+  if (trace.events.size() == 4) {
+    CHECK(trace.events[0] == "prepare-rebuild", "first rebuild event is %s",
+          trace.events[0].c_str());
+    CHECK(trace.events[1] == "destroy-executable", "second rebuild event is %s",
+          trace.events[1].c_str());
+    CHECK(trace.events[2] == "destroy-state", "third rebuild event is %s",
+          trace.events[2].c_str());
+    CHECK(trace.events[3] == "create-state", "fourth rebuild event is %s",
+          trace.events[3].c_str());
+  }
+  CHECK((trace.reasons & dirty_storage) != 0, "rebuild hook did not receive dirty_storage");
+
+  delete f;
+  delete s;
+
+  build(&s, &f);
+  rebuild_trace refused;
+  tracking = new rebuild_backend_base(refused);
+  f->backend = tracking;
+  f->backend_state = tracking->create_state(*f->storage_plan);
+  BackendState *live_state = f->backend_state;
+  refused.events.clear();
+  clear_dirty(*f, DirtyMask(f->dirty_mask));
+  invalidate(*f, MutationKind::field_layout);
+  bool rejected = false;
+  try { f->init_backend(); }
+  catch (const std::logic_error &) { rejected = true; }
+  CHECK(rejected, "backend rebuild refusal did not propagate");
+  CHECK(f->backend_state == live_state, "a refused rebuild destroyed the live state");
+  CHECK(f->executable == NULL, "refused rebuild unexpectedly created an executable");
+  CHECK(refused.events.empty(), "default-safe rebuild destroyed or replaced the live state");
+
+  clear_dirty(*f, DirtyMask(f->dirty_mask));
+  delete f;
+  delete s;
+}
+
+static void test_cpu_state_rebuild_is_safe_noop() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->advance(1);
+  CHECK(f->backend_state != NULL && f->executable != NULL,
+        "CPU advance did not create backend artifacts");
+
+  invalidate(*f, MutationKind::field_layout);
+  f->init_backend();
+  CHECK(f->backend_state != NULL, "CPU state rebuild did not create a replacement state");
+  CHECK(f->executable == NULL, "CPU state rebuild retained a stale executable");
+
+  delete f;
+  delete s;
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -440,6 +580,8 @@ int main(int argc, char **argv) {
   test_precision_policy();
   test_backend_lifecycle_epoch();
   test_initialization_plan();
+  test_authority_safe_state_rebuild();
+  test_cpu_state_rebuild_is_safe_noop();
 
   if (failures) {
     master_printf("backend_api: %d FAILURE(S)\n", failures);
