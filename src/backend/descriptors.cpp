@@ -802,4 +802,20 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
   }
 }
 
+void refresh_operation_descriptors(fields &f, bool rebuild_all) {
+  if (rebuild_all || is_dirty(f, dirty_source_plan))
+    build_source_descriptors(f, f.descriptors->sources);
+  if (rebuild_all || is_dirty(f, dirty_monitor_plan))
+    build_dft_descriptors(f, f.descriptors->dfts);
+  if (rebuild_all) build_polarization_descriptors(f, f.descriptors->polarizations);
+
+  /* Region plans are produced for a particular public query/monitor volume by
+     prepare_loop_in_chunks rather than from one global definition. The shared
+     DescriptorSet therefore acts only as their cache: invalidation discards
+     it, and the consumer rebuilds the requested regions on demand. */
+  if (rebuild_all || is_dirty(f, dirty_regions)) f.descriptors->regions.clear();
+
+  clear_dirty(f, dirty_source_plan | dirty_monitor_plan | dirty_regions);
+}
+
 } // namespace meep
