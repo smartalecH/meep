@@ -21,6 +21,7 @@
 #include <string.h>
 #include <algorithm>
 #include <assert.h>
+#include <memory>
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/backend.hpp"
@@ -789,9 +790,7 @@ dft_flux::~dft_flux() { invalidate_eigenmode_cache(); }
 
 double *dft_flux::flux() {
   const size_t Nfreq = freq.size();
-  double *F = new double[Nfreq];
-  for (size_t i = 0; i < Nfreq; ++i)
-    F[i] = 0;
+  std::vector<double> F(Nfreq, 0.0);
   fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
   DftReductionRequest request;
   std::vector<std::complex<double> > compact_result(Nfreq);
@@ -817,10 +816,9 @@ double *dft_flux::flux() {
         for (size_t i = 0; i < Nfreq; ++i)
           F[i] += real(curE->dft[k * Nfreq + i] * conj(curH->dft[k * Nfreq + i]));
   }
-  double *Fsum = new double[Nfreq];
-  sum_to_all(F, Fsum, int(Nfreq));
-  delete[] F;
-  return Fsum;
+  std::unique_ptr<double[]> Fsum(new double[Nfreq]);
+  sum_to_all(F.data(), Fsum.get(), int(Nfreq));
+  return Fsum.release();
 }
 
 std::vector<std::complex<double> > dft_flux::complexflux() {
@@ -971,9 +969,7 @@ dft_energy::dft_energy(const dft_energy &f) : where(f.where) {
 
 double *dft_energy::electric() {
   const size_t Nfreq = freq.size();
-  double *F = new double[Nfreq];
-  for (size_t i = 0; i < Nfreq; ++i)
-    F[i] = 0;
+  std::vector<double> F(Nfreq, 0.0);
   fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
   DftReductionRequest request;
   std::vector<std::complex<double> > compact_result(Nfreq);
@@ -999,17 +995,14 @@ double *dft_energy::electric() {
         for (size_t i = 0; i < Nfreq; ++i)
           F[i] += 0.5 * real(conj(curE->dft[k * Nfreq + i]) * curD->dft[k * Nfreq + i]);
   }
-  double *Fsum = new double[Nfreq];
-  sum_to_all(F, Fsum, int(Nfreq));
-  delete[] F;
-  return Fsum;
+  std::unique_ptr<double[]> Fsum(new double[Nfreq]);
+  sum_to_all(F.data(), Fsum.get(), int(Nfreq));
+  return Fsum.release();
 }
 
 double *dft_energy::magnetic() {
   const size_t Nfreq = freq.size();
-  double *F = new double[Nfreq];
-  for (size_t i = 0; i < Nfreq; ++i)
-    F[i] = 0;
+  std::vector<double> F(Nfreq, 0.0);
   fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
   DftReductionRequest request;
   std::vector<std::complex<double> > compact_result(Nfreq);
@@ -1035,22 +1028,19 @@ double *dft_energy::magnetic() {
         for (size_t i = 0; i < Nfreq; ++i)
           F[i] += 0.5 * real(conj(curH->dft[k * Nfreq + i]) * curB->dft[k * Nfreq + i]);
   }
-  double *Fsum = new double[Nfreq];
-  sum_to_all(F, Fsum, int(Nfreq));
-  delete[] F;
-  return Fsum;
+  std::unique_ptr<double[]> Fsum(new double[Nfreq]);
+  sum_to_all(F.data(), Fsum.get(), int(Nfreq));
+  return Fsum.release();
 }
 
 double *dft_energy::total() {
   const size_t Nfreq = freq.size();
-  double *Fe = electric();
-  double *Fm = magnetic();
-  double *F = new double[Nfreq];
+  std::unique_ptr<double[]> Fe(electric());
+  std::unique_ptr<double[]> Fm(magnetic());
+  std::unique_ptr<double[]> F(new double[Nfreq]);
   for (size_t i = 0; i < Nfreq; ++i)
     F[i] = Fe[i] + Fm[i];
-  delete[] Fe;
-  delete[] Fm;
-  return F;
+  return F.release();
 }
 
 dft_energy fields::add_dft_energy(const volume_list *where_, const double *freq, size_t Nfreq,
