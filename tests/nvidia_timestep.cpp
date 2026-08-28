@@ -19,6 +19,7 @@
 #include <meep.hpp>
 
 #include "backend/backend.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
@@ -176,6 +177,126 @@ static void set_uniform_conductivity(structure &s) {
   s.set_conductivity(Dx, uniform_conductivity);
   s.set_conductivity(Dy, uniform_conductivity);
   s.set_conductivity(Dz, uniform_conductivity);
+}
+
+static void require_source_plan(fields &f, bool conductivity) {
+  require(f.descriptors, "source test has no prepared descriptor set");
+  const SourcePlan &sources = f.descriptors->sources;
+  require(sources.source_times.size() == 1 && sources.scalars.size() == 1,
+          "point source did not prepare one scalar slot");
+  require(sources.source_times[0].source_time_id == 0 && sources.source_times[0].scalar_slot == 0,
+          "point source scalar mapping is not canonical");
+  require(sources.sources.size() == 1, "point source did not prepare one spatial descriptor");
+  const SourceDescriptor &source = sources.sources[0];
+  require(!source.integrated && source.source_time_id == 0 && !source.indices.empty() &&
+              source.indices.size() == source.complex_amplitudes.size(),
+          "point-source descriptor shape is invalid");
+  require(is_valid(source.destination), "point source has no destination");
+  require(is_valid(source.condinv) == conductivity,
+          "point-source conductivity descriptor does not match the material");
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t evaluations = 0, source_spans = 0;
+  for (size_t i = 0; i < plan.operations.size(); ++i) {
+    const Operation &op = plan.operations[i];
+    if (op.kind == OpKind::evaluate_source_scalars) {
+      require(op.descriptor_index == 0 && op.descriptor_count == 1,
+              "source evaluation does not cover the scalar descriptor");
+      ++evaluations;
+    }
+    if (op.kind == OpKind::apply_sources) {
+      if (op.ft == D_stuff) {
+        require(op.source_descriptor_index == 0 && op.source_descriptor_count == 1,
+                "D source operation does not cover the point descriptor");
+        ++source_spans;
+      }
+      else
+        require(op.source_descriptor_count == 0,
+                "point source was attached to the wrong field-type operation");
+    }
+  }
+  require(evaluations == 4, "ordinary source plan did not schedule four scalar evaluations");
+  require(source_spans == 1, "point-source descriptor span was not unique");
+}
+
+static void compare_source_scalars(const fields &cpu, const fields &gpu) {
+  require(cpu.descriptors && gpu.descriptors, "source scalar comparison has no descriptors");
+  const std::vector<SourceDescriptor> &cpu_sources = cpu.descriptors->sources.sources;
+  const std::vector<SourceDescriptor> &gpu_sources = gpu.descriptors->sources.sources;
+  require(cpu_sources.size() == gpu_sources.size(),
+          "CPU and NVIDIA source descriptor counts differ");
+  for (size_t i = 0; i < cpu_sources.size(); ++i) {
+    require(cpu_sources[i].source_time_id == gpu_sources[i].source_time_id &&
+                cpu_sources[i].indices == gpu_sources[i].indices &&
+                cpu_sources[i].complex_amplitudes == gpu_sources[i].complex_amplitudes,
+            "CPU and NVIDIA source descriptor order differs");
+  }
+  const std::vector<SourceStepScalar> &expected = cpu.descriptors->sources.scalars;
+  const std::vector<SourceStepScalar> &observed = gpu.descriptors->sources.scalars;
+  require(expected.size() == observed.size(), "CPU and NVIDIA source scalar counts differ");
+  for (size_t i = 0; i < expected.size(); ++i) {
+    require(expected[i].current == observed[i].current,
+            "NVIDIA current scalar differs from host evaluation");
+    require(expected[i].dipole == observed[i].dipole,
+            "NVIDIA dipole scalar differs from host evaluation");
+  }
+}
+
+static void run_source_case(const char *name, precision_policy_kind policy, bool real_fields,
+                            bool conductivity) {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  if (conductivity) {
+    cpu_structure.set_conductivity(Dz, uniform_conductivity);
+    gpu_structure.set_conductivity(Dz, uniform_conductivity);
+  }
+
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  gaussian_src_time cpu_time(0.31, 0.14), gpu_time(0.31, 0.14);
+  cpu_time.is_integrated = false;
+  gpu_time.is_integrated = false;
+  const std::complex<double> amplitude =
+      real_fields ? std::complex<double>(0.37, 0.0) : std::complex<double>(0.37, -0.23);
+  const vec location(0.73, 0.83);
+  cpu.add_point_source(Ez, cpu_time, location, amplitude);
+  gpu.add_point_source(Ez, gpu_time, location, amplitude);
+
+  /* Prepare the CPU catalog without retaining the preparation step's fields. */
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  require_source_plan(cpu, conductivity);
+  require_source_plan(gpu, conductivity);
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
+  const double tolerance = narrowed ? 2e-5 : 2e-13;
+  const int checkpoints[] = {1, 2, 8};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA source timestep did not advance host time");
+    compare_fields(cpu, gpu, tolerance);
+    compare_source_scalars(cpu, gpu);
+    previous = checkpoints[i];
+  }
+  master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
+}
+
+static std::complex<double> custom_source_value(double time, void *) {
+  return std::complex<double>(time, -0.5 * time);
 }
 
 static void run_case(const char *name, const grid_volume &gv, precision_policy_kind policy,
@@ -347,7 +468,16 @@ static void test_rejections() {
     f.use_real_fields();
     gaussian_src_time src(0.3, 0.1);
     f.add_point_source(Ez, src, vec(0.1, 0.1));
-    require_advance_rejected(f, "does not support sources");
+    require_advance_rejected(f, "does not support integrated sources");
+  }
+  {
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    fields f(&s, options);
+    f.use_real_fields();
+    custom_src_time src(custom_source_value, NULL);
+    src.is_integrated = false;
+    f.add_point_source(Ez, src, vec(0.1, 0.1));
+    require_advance_rejected(f, "does not support custom source times");
   }
   {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
@@ -381,6 +511,8 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    run_source_case("real-point-source", policies[p], true, false);
+    run_source_case("complex-conductive-point-source", policies[p], false, true);
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
              1u << 0, 1u << 0, false, true);
     run_case("complex-phase", gv2, policies[p], false, no_pml(), identity(), 4, &bloch2,
