@@ -20,10 +20,49 @@
 
 #include <meep.hpp>
 #include "backend/backend.hpp"
+#include "backend/precision.hpp"
+#include "backend/storage_plan.hpp"
 
 using namespace std;
 
 namespace meep {
+
+namespace {
+
+bool append_force_terms(fields &owner, DftReductionRequest &request, const dft_chunk *left,
+                        const dft_chunk *right, size_t frequencies, std::string &local_error) {
+  const dft_chunk *cur_left = left, *cur_right = right;
+  for (; cur_left && cur_right;
+       cur_left = cur_left->next_in_dft, cur_right = cur_right->next_in_dft) {
+    try {
+      if (!owner.array_catalog)
+        throw std::logic_error("compact DFT reduction requires a storage catalog");
+      DftReductionTerm term;
+      ptrdiff_t left_offset = 0, right_offset = 0;
+      if (!owner.array_catalog->locate(cur_left->dft, term.left, left_offset) || left_offset != 0)
+        throw std::out_of_range("force DFT accumulator is absent from the storage catalog");
+      if (!owner.array_catalog->locate(cur_right->dft, term.right, right_offset) ||
+          right_offset != 0)
+        throw std::out_of_range("force DFT pair is absent from the storage catalog");
+      term.storage_points = cur_left->N;
+      term.frequencies = frequencies;
+      term.region = DftReductionRegion{0, {cur_left->N, 1, 1}, {1, 0, 0}};
+      term.weight = cur_left->extra_weight;
+      request.terms.push_back(term);
+    }
+    catch (const std::exception &e) {
+      if (local_error.empty()) local_error = e.what();
+      return false;
+    }
+  }
+  if ((cur_left || cur_right) && local_error.empty()) {
+    local_error = "force DFT chain-length mismatch";
+    return false;
+  }
+  return true;
+}
+
+} // namespace
 
 dft_force::dft_force(dft_chunk *offdiag1_, dft_chunk *offdiag2_, dft_chunk *diag_, double fmin,
                      double fmax, int Nf, const volume &where_)
@@ -105,17 +144,35 @@ static void stress_sum(size_t Nfreq, double *F, const dft_chunk *F1, const dft_c
 }
 
 double *dft_force::force() {
-  dft_chunk *chains[3] = {offdiag1, offdiag2, diag};
-  if (monitor_lifetime && monitor_lifetime->owner)
-    backend_refresh_dft_chains(*monitor_lifetime->owner, 3, chains, "dft_force::force");
-
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
     F[i] = 0;
 
-  stress_sum(Nfreq, F, offdiag1, offdiag2);
-  stress_sum(Nfreq, F, diag, diag);
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  const bool compact_supported =
+      owner && backend_host_refresh_required(*owner) &&
+      owner->backend->supports_compact_dft_reductions();
+  if (compact_supported) {
+    DftReductionRequest request;
+    request.kind = DftReductionKind::real_weighted_product;
+    request.accumulation_precision = policy_for(owner->options.precision).reduction;
+    request.result_count = Nfreq;
+    std::string local_error;
+    append_force_terms(*owner, request, offdiag1, offdiag2, Nfreq, local_error);
+    append_force_terms(*owner, request, diag, diag, Nfreq, local_error);
+    std::vector<std::complex<double> > compact_result(Nfreq);
+    backend_try_reduce_dft(*owner, request, compact_result.data(), Nfreq, local_error,
+                           "dft_force::force");
+    for (size_t i = 0; i < Nfreq; ++i)
+      F[i] = compact_result[i].real();
+  }
+  else {
+    dft_chunk *chains[3] = {offdiag1, offdiag2, diag};
+    if (owner) backend_refresh_dft_chains(*owner, 3, chains, "dft_force::force");
+    stress_sum(Nfreq, F, offdiag1, offdiag2);
+    stress_sum(Nfreq, F, diag, diag);
+  }
 
   double *Fsum = new double[Nfreq];
   sum_to_all(F, Fsum, int(Nfreq));
