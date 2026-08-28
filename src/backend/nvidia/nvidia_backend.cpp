@@ -12,6 +12,7 @@
 #include <string.h>
 
 #include <algorithm>
+#include <cmath>
 #include <complex>
 #include <limits>
 #include <memory>
@@ -20,10 +21,12 @@
 #include <vector>
 
 #include "backend/initialization_plan.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/nvidia/arena.hpp"
 #include "backend/nvidia/runtime.hpp"
+#include "backend/nvidia/nvidia_sources.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
 #include "meep_internals.hpp"
 
@@ -322,6 +325,8 @@ struct NvidiaCompiledOperation {
   size_t count;
   size_t halo_first;
   size_t halo_count;
+  size_t source_staging_offset;
+  double source_time_offset;
 };
 
 struct NvidiaCompiledHalo {
@@ -345,11 +350,14 @@ public:
                    const std::vector<nvidia::halo_gather_entry> &halo_gathers,
                    const std::vector<nvidia::halo_scatter_entry> &halo_scatters,
                    size_t halo_scratch_bytes, const std::vector<NvidiaFiniteCheck> &finite_checks,
+                   const std::vector<nvidia::point_source_launch> &point_sources,
+                   size_t source_scalar_count, size_t source_staging_elements,
                    NvidiaBackendState &state)
       : owner_(owner), signature_(signature), storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
-        halo_plans_(halo_plans), finite_checks_(finite_checks) {
+        halo_plans_(halo_plans), finite_checks_(finite_checks), point_sources_(point_sources),
+        source_scalar_count_(source_scalar_count) {
     try {
       nvidia::device_scope scope(state.device_);
       if (!halo_gathers.empty()) {
@@ -371,6 +379,15 @@ public:
         finite_result_.allocate(sizeof(uint64_t), state.device_);
         finite_result_host_.allocate(sizeof(uint64_t));
       }
+      if (source_scalar_count_) {
+        source_scalars_.allocate(checked_product(source_scalar_count_,
+                                                 sizeof(nvidia::source_scalar),
+                                                 "allocating NVIDIA source scalars"),
+                                 state.device_);
+        source_staging_.allocate(checked_product(source_staging_elements,
+                                                 sizeof(nvidia::source_scalar),
+                                                 "allocating NVIDIA source-scalar staging"));
+      }
       if (!halo_gathers.empty() || !halo_scatters.empty()) state.transfer_->synchronize();
     }
     catch (...) {
@@ -387,12 +404,16 @@ public:
   std::vector<nvidia::constitutive_launch> constitutive_updates_;
   std::vector<nvidia::zero_launch> zero_updates_;
   std::vector<NvidiaCompiledHalo> halo_plans_;
+  std::vector<NvidiaFiniteCheck> finite_checks_;
+  std::vector<nvidia::point_source_launch> point_sources_;
+  size_t source_scalar_count_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
   nvidia::device_buffer halo_scratch_;
-  std::vector<NvidiaFiniteCheck> finite_checks_;
   nvidia::device_buffer finite_result_;
   nvidia::pinned_buffer finite_result_host_;
+  nvidia::device_buffer source_scalars_;
+  nvidia::pinned_buffer source_staging_;
 };
 
 namespace {
@@ -436,6 +457,58 @@ void *optional_mutable_device_address(NvidiaBackendState &state, ArrayId id,
 
 void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum, ptrdiff_t maximum,
                           const char *what);
+
+nvidia::point_source_launch compile_point_source(const SourceDescriptor &source,
+                                                 const SourcePlan &source_plan, size_t point,
+                                                 const fields &f, NvidiaBackendState &state) {
+  if (source.integrated)
+    throw std::invalid_argument("NVIDIA PR3 does not support integrated sources");
+  if (source.indices.empty() || source.indices.size() != source.complex_amplitudes.size())
+    throw std::invalid_argument("NVIDIA source descriptor has invalid spatial data");
+  if (point >= source.indices.size())
+    throw std::out_of_range("NVIDIA source point is out of range");
+  if (source.source_time_id >= source_plan.source_times.size())
+    throw std::out_of_range("source descriptor has an invalid source-time ID");
+  const SourceTimeDescriptor &time = source_plan.source_times[source.source_time_id];
+  if (time.source_time_id != source.source_time_id ||
+      time.scalar_slot >= source_plan.scalars.size())
+    throw std::invalid_argument("source descriptor has a non-canonical scalar mapping");
+  if (time.is_integrated)
+    throw std::invalid_argument("NVIDIA PR3 does not support integrated sources");
+
+  nvidia::point_source_launch result = {};
+  result.precision = scalar_precision_for(state.plan_, source.destination, "source target");
+  result.target_real = device_address(state, source.destination, "source target");
+  result.target_imag = optional_mutable_device_address(state, source.destination_imag,
+                                                       result.precision, "source imaginary target");
+  result.conductivity_inverse = optional_device_address(state, source.condinv, result.precision,
+                                                        "source conductivity inverse");
+  result.index = source.indices[point];
+  result.scalar_slot = time.scalar_slot;
+  result.amplitude_real = source.complex_amplitudes[point].real();
+  result.amplitude_imag = source.complex_amplitudes[point].imag();
+  result.dt = f.dt;
+  validate_index_range(state.plan_, source.destination, result.index, result.index,
+                       "source target");
+  if (is_valid(source.destination_imag))
+    validate_index_range(state.plan_, source.destination_imag, result.index, result.index,
+                         "source imaginary target");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, result.index, result.index,
+                         "source conductivity inverse");
+  if (f.is_real && result.target_imag)
+    throw std::invalid_argument("real NVIDIA fields have an imaginary source target");
+  if (!f.is_real && !result.target_imag)
+    throw std::invalid_argument("complex NVIDIA fields have no imaginary source target");
+  return result;
+}
+
+void evaluate_supported_source_scalars(fields &f, double offset_in_dt) {
+  const size_t time_slot = offset_in_dt == 0.0 ? 0 : offset_in_dt == 0.5 ? 1 : 2;
+  for (src_time *source = f.sources; source; source = source->next)
+    source->update(f.step_source_times[time_slot], f.dt);
+  populate_source_scalars(f, f.descriptors->sources);
+}
 
 nvidia::pml_profile_launch compile_pml_profile(const PmlProfile &source,
                                                const nvidia::flat_region &region,
@@ -1034,8 +1107,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 supports Cartesian fields with m=beta=0 only");
     if (f_.is_phasing())
       throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
-    if (f_.sources)
-      throw std::invalid_argument("NVIDIA PR2 source-free slice does not support sources");
     if (f_.fluxes || has_dfts(f_))
       throw std::invalid_argument("NVIDIA PR2 source-free slice does not support monitors");
     if (has_polarization(f_))
@@ -1048,6 +1119,31 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     if (!f_.halos || !f_.array_catalog)
       throw std::logic_error("NVIDIA PR2 requires prepared halo and storage plans");
 
+    const SourcePlan *source_plan = f_.descriptors ? &f_.descriptors->sources : NULL;
+    if (f_.sources && !source_plan)
+      throw std::logic_error("NVIDIA PR3 requires prepared source descriptors");
+    if (source_plan) {
+      if (source_plan->source_times.size() != source_plan->scalars.size())
+        throw std::invalid_argument("NVIDIA source scalar and source-time counts differ");
+      for (size_t i = 0; i < source_plan->source_times.size(); ++i) {
+        const SourceTimeDescriptor &time = source_plan->source_times[i];
+        if (time.source_time_id != i || time.scalar_slot != i)
+          throw std::invalid_argument("NVIDIA source-time descriptors are not canonical");
+        if (time.is_integrated)
+          throw std::invalid_argument("NVIDIA PR3 does not support integrated sources");
+        switch (time.kind) {
+          case SourceTimeKind::gaussian:
+          case SourceTimeKind::continuous: break;
+          case SourceTimeKind::host_custom:
+            throw std::invalid_argument("NVIDIA PR3 does not support custom source times");
+          default: throw std::invalid_argument("NVIDIA source-time kind is invalid");
+        }
+      }
+      for (size_t i = 0; i < source_plan->sources.size(); ++i)
+        if (source_plan->sources[i].integrated)
+          throw std::invalid_argument("NVIDIA PR3 does not support integrated sources");
+    }
+
     std::vector<NvidiaCompiledOperation> operations;
     std::vector<nvidia::curl_launch> curl_updates;
     std::vector<nvidia::constitutive_launch> constitutive_updates;
@@ -1058,6 +1154,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<NvidiaFiniteCheck> finite_checks;
     size_t halo_scratch_bytes = 0;
     uint64_t finite_elements = 0;
+    std::vector<nvidia::point_source_launch> point_sources;
+    size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
 
     /* Capability validation is deliberately fail-fast. The first local reason
@@ -1065,7 +1163,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
        rank can enter execution after any rank rejected its plan. */
     for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
       const Operation &op = plan.operations[oi];
-      NvidiaCompiledOperation compiled{op.kind, 0, 0, 0, 0};
+      NvidiaCompiledOperation compiled{op.kind, 0, 0, 0, 0, 0, op.source_time_offset};
       switch (op.kind) {
         case OpKind::update_db: {
           if (size_t(op.descriptor_index) + op.descriptor_count > plan.db_updates.size()) {
@@ -1081,6 +1179,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           break;
         }
         case OpKind::update_eh: {
+          if (op.source_descriptor_count) {
+            set_reason(local_error, oi, "integrated source span is not supported");
+            break;
+          }
           if (size_t(op.descriptor_index) + op.descriptor_count > plan.eh_updates.size()) {
             set_reason(local_error, oi, "constitutive descriptor span is out of range");
             break;
@@ -1154,15 +1256,56 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           if (!compiled.count) set_reason(local_error, oi, "finite-value check span is empty");
           break;
         }
+        case OpKind::apply_sources: {
+          if (!source_plan) {
+            set_reason(local_error, oi, "source operation has no prepared source plan");
+            break;
+          }
+          if (size_t(op.source_descriptor_index) + op.source_descriptor_count >
+              source_plan->sources.size()) {
+            set_reason(local_error, oi, "source descriptor span is out of range");
+            break;
+          }
+          compiled.first = point_sources.size();
+          for (size_t i = op.source_descriptor_index;
+               i < size_t(op.source_descriptor_index) + op.source_descriptor_count; ++i) {
+            if (source_plan->sources[i].ft != op.ft)
+              throw std::invalid_argument("source descriptor span has the wrong field type");
+            const SourceDescriptor &source = source_plan->sources[i];
+            for (size_t point = 0; point < source.indices.size(); ++point)
+              point_sources.push_back(compile_point_source(source, *source_plan, point, f_, state));
+          }
+          compiled.count = point_sources.size() - compiled.first;
+          break;
+        }
+        case OpKind::evaluate_source_scalars: {
+          if (!source_plan) {
+            set_reason(local_error, oi, "source evaluation has no prepared source plan");
+            break;
+          }
+          if (op.descriptor_index != 0 || op.descriptor_count != source_plan->source_times.size()) {
+            set_reason(local_error, oi, "source-time descriptor span is not complete");
+            break;
+          }
+          if (op.source_time_offset != 0.0 && op.source_time_offset != 0.5 &&
+              op.source_time_offset != 1.0) {
+            set_reason(local_error, oi, "source-time offset is invalid");
+            break;
+          }
+          compiled.count = source_plan->scalars.size();
+          compiled.source_staging_offset = source_staging_elements;
+          if (compiled.count > std::numeric_limits<size_t>::max() - source_staging_elements)
+            throw std::overflow_error("NVIDIA source-scalar staging size overflow");
+          source_staging_elements += compiled.count;
+          break;
+        }
         case OpKind::restore_magnetic_fields:
         case OpKind::update_material_coefficients:
-        case OpKind::apply_sources:
         case OpKind::update_polarization:
         case OpKind::increment_time:
         case OpKind::synchronize_magnetic_fields: break;
 
         case OpKind::phase_material:
-        case OpKind::evaluate_source_scalars:
         case OpKind::zero_boundary:
         case OpKind::pack_halo:
         case OpKind::exchange_local:
@@ -1181,10 +1324,11 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     }
 
     if (local_error.empty())
-      executable.reset(new NvidiaExecutable(this, plan.signature, state.fingerprint_, operations,
-                                            curl_updates, constitutive_updates, zero_updates,
-                                            halo_plans, halo_gathers, halo_scatters,
-                                            halo_scratch_bytes, finite_checks, state));
+      executable.reset(new NvidiaExecutable(
+          this, plan.signature, state.fingerprint_, operations, curl_updates, constitutive_updates,
+          zero_updates, halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, finite_checks,
+          point_sources, source_plan ? source_plan->scalars.size() : 0,
+          source_staging_elements, state));
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -1215,6 +1359,9 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   try {
     nvidia::device_scope scope(state.device_);
     for (int step = 0; step < num_steps; ++step) {
+      f_.step_source_times[0] = f_.time();
+      f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
+      f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
       for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
         const NvidiaCompiledOperation &op = executable.operations_[oi];
         switch (op.kind) {
@@ -1241,6 +1388,34 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               nvidia::launch_halo_scatter(
                   executable.halo_plans_[i].scatter, executable.halo_scatters_.opaque_handle(),
                   executable.halo_scratch_.opaque_handle(), *state.transfer_);
+            break;
+          case OpKind::evaluate_source_scalars: {
+            evaluate_supported_source_scalars(f_, op.source_time_offset);
+            const SourcePlan &source_plan = f_.descriptors->sources;
+            if (source_plan.scalars.size() != executable.source_scalar_count_ ||
+                op.count != executable.source_scalar_count_)
+              throw std::logic_error("NVIDIA source scalar block changed after compilation");
+            nvidia::source_scalar *staging =
+                static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+                op.source_staging_offset;
+            for (size_t i = 0; i < op.count; ++i) {
+              staging[i].current_real = source_plan.scalars[i].current.real();
+              staging[i].current_imag = source_plan.scalars[i].current.imag();
+              staging[i].dipole_real = source_plan.scalars[i].dipole.real();
+              staging[i].dipole_imag = source_plan.scalars[i].dipole.imag();
+            }
+            nvidia::copy_host_to_device_async(executable.source_scalars_, 0, staging,
+                                              checked_product(op.count,
+                                                              sizeof(nvidia::source_scalar),
+                                                              "uploading NVIDIA source scalars"),
+                                              *state.transfer_);
+            break;
+          }
+          case OpKind::apply_sources:
+            for (size_t i = op.first; i < op.first + op.count; ++i)
+              nvidia::launch_point_source(executable.point_sources_[i],
+                                          executable.source_scalars_.opaque_handle(),
+                                          *state.transfer_);
             break;
           case OpKind::increment_time: ++f_.t; break;
           case OpKind::finite_value_check: {
