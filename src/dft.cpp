@@ -222,11 +222,6 @@ void begin_dft_monitor_removal(const std::shared_ptr<dft_monitor_lifetime> &life
   invalidate(*owner, MutationKind::monitor_definition, site);
 }
 
-static void sync_dft_chain(dft_chunk *chunks) {
-  for (dft_chunk *cur = chunks; cur; cur = cur->next_in_dft)
-    cur->sync_dft_to_host();
-}
-
 static bool attached_dft_chain(const dft_chunk *chunks) {
   for (const dft_chunk *cur = chunks; cur; cur = cur->next_in_dft)
     if (cur->attached_to_fields) return true;
@@ -403,11 +398,21 @@ void dft_chunk::update_dft(double time) {
   }
 }
 
+static double dft_norm2_from_host(const dft_chunk &chunk, grid_volume fgv);
+
 /* Return the L2 norm of the DFTs themselves.  This is useful
    to check whether the simulation is finished (whether all relevant fields have decayed).
    (Collective operation.) */
 double fields::dft_norm() {
   am_now_working_on(Other);
+  std::string local_error;
+  if (backend_host_refresh_required(*this)) {
+    for (int i = 0; i < num_chunks; ++i)
+      if (chunks[i]->is_mine())
+        for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
+          backend_read_dft_chunk(cur, local_error);
+    backend_reconcile_host_access(local_error, "fields::dft_norm");
+  }
   double sum = 0.0;
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) sum += chunks[i]->dft_norm2(gv);
@@ -418,26 +423,25 @@ double fields::dft_norm() {
 double fields_chunk::dft_norm2(grid_volume fgv) const {
   double sum = 0.0;
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_chunk)
-    sum += cur->norm2(fgv);
+    sum += dft_norm2_from_host(*cur, fgv);
   return sum;
 }
 
 static double sqr(std::complex<realnum> x) { return (x * std::conj(x)).real(); }
 
-double dft_chunk::norm2(grid_volume fgv) const {
-  sync_dft_to_host();
-  if (!fc->f[c][0]) return 0.0;
+static double dft_norm2_from_host(const dft_chunk &chunk, grid_volume fgv) {
+  if (!chunk.fc->f[chunk.c][0]) return 0.0;
   double sum = 0.0;
   size_t idx_dft;
-  const size_t Nomega = omega.size();
+  const size_t Nomega = chunk.omega.size();
   /* looping over chunks that have been "expanded"
   for adjoint calculations requires some care. Namely,
   we want to make sure we don't double count the padding
   and can replicate results with different chunk combinations.
   */
-  if (persist) {
-    grid_volume subgv = fgv.subvolume(is, ie, c);
-    LOOP_OVER_IVECS(subgv, is_old, ie_old, idx) {
+  if (chunk.persist) {
+    grid_volume subgv = fgv.subvolume(chunk.is, chunk.ie, chunk.c);
+    LOOP_OVER_IVECS(subgv, chunk.is_old, chunk.ie_old, idx) {
       /* index by position: the loop counter is not a valid dft[] index here,
          because the persist pad can leave `is` off this component's yee lattice
          and only grid_volume::index() accounts for the yee shift. Getting this
@@ -445,10 +449,10 @@ double dft_chunk::norm2(grid_volume fgv) const {
          the chunk division, which is exactly what the comment above promises it
          does not. */
       IVEC_LOOP_ILOC(subgv, ip);
-      ptrdiff_t didx = subgv.index(c, ip);
-      if (didx < 0 || (size_t)didx >= N) continue;
+      ptrdiff_t didx = subgv.index(chunk.c, ip);
+      if (didx < 0 || (size_t)didx >= chunk.N) continue;
       for (size_t i = 0; i < Nomega; ++i)
-        sum += sqr(dft[Nomega * didx + i]);
+        sum += sqr(chunk.dft[Nomega * didx + i]);
     }
   }
   /* note we place the if outside of the
@@ -457,14 +461,19 @@ double dft_chunk::norm2(grid_volume fgv) const {
   (at the expense of uglier code).
    */
   else {
-    LOOP_OVER_IVECS(fgv, is, ie, idx) {
+    LOOP_OVER_IVECS(fgv, chunk.is, chunk.ie, idx) {
       idx_dft = IVEC_LOOP_COUNTER;
       for (size_t i = 0; i < Nomega; ++i)
-        sum += sqr(dft[Nomega * idx_dft + i]);
+        sum += sqr(chunk.dft[Nomega * idx_dft + i]);
     }
   }
 
   return sum;
+}
+
+double dft_chunk::norm2(grid_volume fgv) const {
+  sync_dft_to_host();
+  return dft_norm2_from_host(*this, fgv);
 }
 
 // return the maximum decimation factor across
@@ -555,6 +564,18 @@ size_t dft_chunks_Ntotal(dft_chunk *dft_chunks, size_t *my_start, bool single_pa
 // Note: the file must have been created in parallel mode, typically via fields::open_h5file.
 void save_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const char *dprefix,
                    bool single_parallel_file) {
+  if (single_parallel_file) {
+    std::string local_error;
+    bool local_refresh = false;
+    for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
+      fields *owner = cur->monitor_lifetime ? cur->monitor_lifetime->owner : NULL;
+      local_refresh = local_refresh || (owner && backend_host_refresh_required(*owner));
+    }
+    backend_read_dft_chain(dft_chunks, local_error);
+    if (or_to_all(local_refresh))
+      backend_reconcile_host_access(local_error, "save_dft_hdf5");
+  }
+
   size_t istart;
   size_t n = dft_chunks_Ntotal(dft_chunks, &istart, single_parallel_file);
 
@@ -566,7 +587,7 @@ void save_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const 
   file->create_data(dataname, 1, &n);
 
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
-    cur->sync_dft_to_host();
+    if (!single_parallel_file) cur->sync_dft_to_host();
     size_t Nchunk = cur->N * cur->omega.size() * 2;
     file->write_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
     istart += Nchunk;
@@ -654,8 +675,9 @@ dft_flux::dft_flux(const dft_flux &f) : where(f.where) {
 dft_flux::~dft_flux() { invalidate_eigenmode_cache(); }
 
 double *dft_flux::flux() {
-  sync_dft_chain(E);
-  sync_dft_chain(H);
+  dft_chunk *chains[2] = {E, H};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_flux::flux");
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
@@ -672,8 +694,9 @@ double *dft_flux::flux() {
 }
 
 std::vector<std::complex<double> > dft_flux::complexflux() {
-  sync_dft_chain(E);
-  sync_dft_chain(H);
+  dft_chunk *chains[2] = {E, H};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_flux::complexflux");
   const size_t Nfreq = freq.size();
   std::vector<std::complex<double> > F(Nfreq);
   for (size_t i = 0; i < Nfreq; ++i)
@@ -803,8 +826,9 @@ dft_energy::dft_energy(const dft_energy &f) : where(f.where) {
 }
 
 double *dft_energy::electric() {
-  sync_dft_chain(E);
-  sync_dft_chain(D);
+  dft_chunk *chains[2] = {E, D};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_energy::electric");
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
@@ -821,8 +845,9 @@ double *dft_energy::electric() {
 }
 
 double *dft_energy::magnetic() {
-  sync_dft_chain(H);
-  sync_dft_chain(B);
+  dft_chunk *chains[2] = {H, B};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 2, chains, "dft_energy::magnetic");
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
@@ -1075,8 +1100,6 @@ complex<double> dft_chunk::process_dft_component(int rank, direction *ds, ivec m
                                                  complex<realnum> *field_array, void *mode1_data,
                                                  void *mode2_data, int ic_conjugate,
                                                  bool retain_interp_weights, fields *parent) {
-  sync_dft_to_host();
-
   if ((num_freq < 0) || (num_freq > static_cast<int>(omega.size()) - 1))
     meep::abort("process_dft_component: frequency index %d is outside the range of the frequency "
                 "array of size %lu",

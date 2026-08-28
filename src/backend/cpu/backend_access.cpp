@@ -156,6 +156,34 @@ void backend_refresh_host_fields(fields &owner, int count, const component *comp
   backend_reconcile_host_access(data.local_error, site);
 }
 
+bool backend_read_dft_chunk(const dft_chunk *chunk, std::string &local_error) {
+  if (!chunk || !local_error.empty()) return local_error.empty();
+  fields *owner = chunk->monitor_lifetime ? chunk->monitor_lifetime->owner : NULL;
+  if (!owner || !backend_host_refresh_required(*owner)) return true;
+
+  ArrayId id;
+  ptrdiff_t offset;
+  if (!owner->array_catalog || !owner->array_catalog->locate(chunk->dft, id, offset)) {
+    if (!chunk->attached_to_fields || is_dirty(*owner, dirty_storage)) return true;
+  }
+  return backend_read_host_range(*owner, chunk->dft, chunk->N * chunk->omega.size(), local_error);
+}
+
+bool backend_read_dft_chain(const dft_chunk *head, std::string &local_error) {
+  for (const dft_chunk *cur = head; cur; cur = cur->next_in_dft)
+    if (!backend_read_dft_chunk(cur, local_error)) return false;
+  return true;
+}
+
+void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *heads,
+                                const char *site) {
+  if (!backend_host_refresh_required(owner)) return;
+  std::string local_error;
+  for (int i = 0; i < count; ++i)
+    backend_read_dft_chain(heads[i], local_error);
+  backend_reconcile_host_access(local_error, site);
+}
+
 void backend_prepare_checkpoint_load(fields &f) {
   std::string local_error;
   if (f.backend_state)
