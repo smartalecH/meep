@@ -29,6 +29,7 @@
 #define MEEP_BACKEND_HALO_PLAN_HPP
 
 #include <complex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -36,6 +37,8 @@
 #include "backend/array_ref.hpp"
 
 namespace meep {
+
+class CpuArrayCatalog;
 
 /* --- CPU array table -------------------------------------------------------
    The single place that knows what address an ArrayId currently resolves to.
@@ -175,6 +178,13 @@ struct CoalesceStats {
 
 CoalesceStats coalesce_stats(const std::vector<HaloPlan> &plans);
 
+/* Translate a CPU halo plan's private array IDs into the canonical storage
+   catalog namespace. The source plan remains unchanged and continues to serve
+   the legacy CPU executor. */
+bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, int field_interleave, HaloPlan &destination,
+                     std::string &why);
+
 /* Metal-zero lists get the same treatment: they were one realnum* per zeroed
    point in fields_chunk::zeroes. Order is irrelevant here since every write is
    a zero, so no HaloSegment list is needed. */
@@ -182,6 +192,9 @@ struct ZeroPlan {
   std::vector<SlabRef> slabs;
   std::vector<ElementRef> residue;
 };
+
+bool remap_zero_plan(const ZeroPlan &source, const HaloArrayTable &source_arrays,
+                     const CpuArrayCatalog &catalog, ZeroPlan &destination, std::string &why);
 
 /* Everything the boundary exchange needs that used to be host addresses.
    Owned by `fields` through an opaque pointer so that none of these types
