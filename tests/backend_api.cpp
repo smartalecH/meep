@@ -251,6 +251,11 @@ static void build(structure **sp, fields **fp, const execution_options *opts = N
   (*fp)->add_point_source(Ez, src, vec(0.11, 0.13));
 }
 
+static std::complex<double> multiply_fields(const std::complex<realnum> *values, const vec &,
+                                            void *) {
+  return values[0] * values[1];
+}
+
 /* Selection: cpu accepted, nvidia and non-native precision rejected -- and
    rejected identically on every rank, since a rank that accepted while its
    peers aborted would hang rather than fail. */
@@ -744,6 +749,25 @@ static void test_backend_safe_host_access() {
   CHECK(sum_to_all(int(integration_failure)) == count_processors(),
         "integration read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
+
+  structure *s2;
+  fields *f2;
+  build(&s2, &f2);
+  rebuild_trace rebuilds2;
+  access_trace accesses2;
+  f2->backend = new access_tracking_backend(*f2, rebuilds2, accesses2);
+  f2->advance(1);
+  accesses2.fail_read_rank = 0;
+  bool integration2_failure = false;
+  try {
+    (void)f->integrate2(*f2, 1, components, 1, components, multiply_fields, NULL, access_region);
+  }
+  catch (const std::runtime_error &) { integration2_failure = true; }
+  CHECK(sum_to_all(int(integration2_failure)) == count_processors(),
+        "second integration read failure was not reconciled on every rank");
+  accesses2.fail_read_rank = -1;
+  delete f2;
+  delete s2;
 
 #ifdef HAVE_HDF5
   accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
