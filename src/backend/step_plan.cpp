@@ -16,9 +16,13 @@
 */
 
 #include <stdio.h>
+#include <string.h>
+
+#include <algorithm>
 
 #include "backend/step_plan.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
@@ -69,20 +73,144 @@ static const char *ft_name(field_type ft) {
 
 namespace {
 
+ArrayId find_array(fields &f, int chunk, array_kind kind, int c, int cmp, int aux) {
+  if (!f.array_catalog) return invalid_array();
+  return f.array_catalog->find(StorageKey{chunk, int(kind), c, cmp, aux});
+}
+
+UpdateRegion make_region(const grid_volume &gv, int chunk, component c, int cmp, const ivec &begin,
+                         const ivec &end) {
+  UpdateRegion r;
+  r.chunk = chunk;
+  r.c = c;
+  r.cmp = cmp;
+  r.begin = begin;
+  r.end = end;
+  r.base = 0;
+  for (int axis = 0; axis < 3; ++axis) {
+    const direction d = gv.yucky_direction(axis);
+    r.counts[axis] = size_t((end.yucky_val(axis) - begin.yucky_val(axis)) / 2 + 1);
+    r.strides[axis] = gv.stride(d);
+    r.base += size_t((begin.yucky_val(axis) - gv.little_corner().yucky_val(axis)) / 2) *
+              size_t(r.strides[axis]);
+  }
+  r.variant_key = 0;
+  return r;
+}
+
+PmlProfile no_pml_profile() {
+  PmlProfile p;
+  p.sig = p.kap = p.siginv = invalid_array();
+  p.base = 0;
+  p.strides[0] = p.strides[1] = p.strides[2] = 0;
+  return p;
+}
+
+PmlProfile make_pml_profile(fields &f, const fields_chunk &fc, int chunk, direction d,
+                            const ivec &begin) {
+  if (d == NO_DIRECTION) return no_pml_profile();
+  PmlProfile p;
+  p.sig = find_array(f, chunk, array_kind::pml_sig, -1, -1, int(d));
+  p.kap = find_array(f, chunk, array_kind::pml_kap, -1, -1, int(d));
+  p.siginv = find_array(f, chunk, array_kind::pml_siginv, -1, -1, int(d));
+  p.base = begin.in_direction(d) - fc.gv.little_corner().in_direction(d);
+  for (int axis = 0; axis < 3; ++axis)
+    p.strides[axis] = fc.gv.yucky_direction(axis) == d ? 2 : 0;
+  return p;
+}
+
+void add_access(fields &f, Operation &op, ArrayId id, AccessMode mode) {
+  if (!is_valid(id) || !f.array_catalog || id.value >= f.array_catalog->size()) return;
+  for (size_t i = 0; i < op.accesses.size(); ++i) {
+    BufferAccess &existing = op.accesses[i];
+    if (existing.array.id != id) continue;
+    if (existing.mode != mode) existing.mode = AccessMode::read_write;
+    return;
+  }
+  const ArraySpec &spec = f.array_catalog->spec(id);
+  op.accesses.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
+}
+
+struct CurlSources {
+  bool have_plus;
+  bool have_minus;
+  component plus_component;
+  component minus_component;
+  direction plus_direction;
+  direction minus_direction;
+
+  CurlSources()
+      : have_plus(false), have_minus(false), plus_component(NO_COMPONENT),
+        minus_component(NO_COMPONENT), plus_direction(NO_DIRECTION),
+        minus_direction(NO_DIRECTION) {}
+};
+
+bool cross_is_negative(direction a, direction b) {
+  if (a >= R) a = direction(a - 3);
+  if (b >= R) b = direction(b - 3);
+  return ((3 + b - a) % 3) == 2;
+}
+
+direction cross_direction(direction a, direction b) {
+  if (a == b) meep::abort("bug - cross_direction expects different directions");
+  const bool cylindrical = a >= R || b >= R;
+  if (a >= R) a = direction(a - 3);
+  if (b >= R) b = direction(b - 3);
+  direction result = direction((3 + 2 * a - b) % 3);
+  if (cylindrical && result < Z) result = direction(result + 3);
+  return result;
+}
+
+CurlSources curl_sources_for(const fields_chunk &fc, component target) {
+  CurlSources result;
+  const direction target_direction = component_direction(target);
+  FOR_COMPONENTS(source) {
+    if (!((is_electric(target) && is_magnetic(source)) ||
+          (is_D(target) && is_magnetic(source)) ||
+          (is_magnetic(target) && is_electric(source)) ||
+          (is_B(target) && is_electric(source))))
+      continue;
+    const direction source_direction = component_direction(source);
+    if (target_direction == source_direction || !fc.gv.has_field(source) ||
+        !fc.gv.has_field(target))
+      continue;
+    const direction derivative = cross_direction(target_direction, source_direction);
+    if (!(has_direction(fc.gv.dim, derivative) ||
+          (fc.gv.dim == Dcyl && has_field_direction(fc.gv.dim, derivative))))
+      continue;
+    if (cross_is_negative(source_direction, target_direction)) {
+      result.have_minus = true;
+      result.minus_component = source;
+      result.minus_direction = derivative;
+    }
+    else {
+      result.have_plus = true;
+      result.plus_component = source;
+      result.plus_direction = derivative;
+    }
+  }
+  return result;
+}
+
 class StepPlanBuilder {
 public:
-  explicit StepPlanBuilder(StepProgram program) { plan_.program = program; }
+  explicit StepPlanBuilder(fields &f, StepProgram program) : f_(f) { plan_.program = program; }
 
-  void add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
-           double src_offset = 0.0) {
+  Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
+                 double src_offset = 0.0) {
     Operation op;
     op.kind = k;
     op.descriptor_index = 0;
+    op.descriptor_count = 0;
     op.guard = g;
     op.ft = ft;
     op.source_time_offset = src_offset;
     plan_.operations.push_back(op);
+    return plan_.operations.back();
   }
+
+  void add_db(field_type ft);
+  void add_eh(field_type ft, Guard guard = guard_always());
 
   void add_if(bool present, OpKind k, field_type ft = field_type(NUM_FIELD_TYPES),
               double src_offset = 0.0) {
@@ -107,21 +235,280 @@ public:
   }
 
   StepPlan finish() {
-    uint64_t sig = 0xcbf29ce484222325ull;
-    for (const Operation &op : plan_.operations) {
-      sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
-      sig ^= uint64_t(op.ft) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
-      sig ^= uint64_t(op.guard.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
-    }
-    plan_.signature = sig;
+    plan_.signature = signature_for(plan_);
     return plan_;
   }
 
+  static uint64_t signature_for(const StepPlan &plan) {
+    uint64_t sig = 0xcbf29ce484222325ull;
+    mix(sig, uint64_t(plan.program));
+    for (const Operation &op : plan.operations) {
+      sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.ft) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.guard.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.guard.scalar_slot) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.guard.variant_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      uint64_t source_bits = 0;
+      static_assert(sizeof(source_bits) == sizeof(op.source_time_offset), "double is not 64-bit");
+      memcpy(&source_bits, &op.source_time_offset, sizeof(source_bits));
+      sig ^= source_bits + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      for (const BufferAccess &access : op.accesses) {
+        sig ^= uint64_t(access.array.id.value) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+        sig ^= uint64_t(access.array.offset) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+        sig ^= uint64_t(access.array.elements) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+        sig ^= uint64_t(access.mode) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      }
+    }
+    for (const CurlUpdate &d : plan.db_updates) hash_curl(sig, d);
+    for (const ConstitutiveUpdate &d : plan.eh_updates) hash_constitutive(sig, d);
+    return sig;
+  }
+
 private:
+  static void mix(uint64_t &sig, uint64_t value) {
+    sig ^= value + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+  }
+  static void mix_double(uint64_t &sig, double value) {
+    uint64_t bits = 0;
+    memcpy(&bits, &value, sizeof(bits));
+    mix(sig, bits);
+  }
+  static void hash_region(uint64_t &sig, const UpdateRegion &r) {
+    mix(sig, uint64_t(r.chunk));
+    mix(sig, uint64_t(r.c));
+    mix(sig, uint64_t(r.cmp));
+    mix(sig, uint64_t(r.base));
+    for (int i = 0; i < 3; ++i) {
+      mix(sig, uint64_t(r.counts[i]));
+      mix(sig, uint64_t(r.strides[i]));
+    }
+    mix(sig, uint64_t(r.variant_key));
+  }
+  static void hash_id(uint64_t &sig, ArrayId id) { mix(sig, uint64_t(id.value)); }
+  static void hash_pml(uint64_t &sig, const PmlProfile &p) {
+    hash_id(sig, p.sig);
+    hash_id(sig, p.kap);
+    hash_id(sig, p.siginv);
+    mix(sig, uint64_t(p.base));
+    for (int i = 0; i < 3; ++i) mix(sig, uint64_t(p.strides[i]));
+  }
+  static void hash_curl(uint64_t &sig, const CurlUpdate &d) {
+    hash_region(sig, d.region);
+    hash_id(sig, d.target);
+    hash_id(sig, d.plus_source);
+    hash_id(sig, d.minus_source);
+    mix(sig, uint64_t(d.plus_stride));
+    mix(sig, uint64_t(d.minus_stride));
+    hash_id(sig, d.target_u);
+    hash_id(sig, d.conductivity);
+    hash_id(sig, d.condinv);
+    hash_id(sig, d.target_cond);
+    hash_pml(sig, d.pml);
+    hash_pml(sig, d.pml_u);
+    mix_double(sig, d.dtdx);
+    mix_double(sig, d.dt);
+  }
+  static void hash_constitutive(uint64_t &sig, const ConstitutiveUpdate &d) {
+    hash_region(sig, d.region);
+    hash_id(sig, d.target);
+    hash_id(sig, d.primary);
+    hash_id(sig, d.cross1);
+    hash_id(sig, d.cross2);
+    hash_id(sig, d.diagonal);
+    hash_id(sig, d.offdiagonal1);
+    hash_id(sig, d.offdiagonal2);
+    mix(sig, uint64_t(d.primary_stride));
+    mix(sig, uint64_t(d.cross1_stride));
+    mix(sig, uint64_t(d.cross2_stride));
+    hash_id(sig, d.chi2);
+    hash_id(sig, d.chi3);
+    hash_id(sig, d.target_w);
+    hash_id(sig, d.previous_w);
+    hash_pml(sig, d.pml);
+  }
+
+  fields &f_;
   StepPlan plan_;
 };
 
+void StepPlanBuilder::add_db(field_type ft) {
+  Operation &op = add(OpKind::update_db, ft);
+  op.descriptor_index = uint32_t(plan_.db_updates.size());
+
+  for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+    if (!f_.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f_.chunks[chunk];
+    const int components = fc.is_real ? 1 : 2;
+    for (size_t tile = 0; tile < fc.gvs_tiled.size(); ++tile) {
+      const grid_volume &sub = fc.gvs_tiled[tile];
+      for (int cmp = 0; cmp < components; ++cmp) FOR_FT_COMPONENTS(ft, cc) {
+          const ArrayId target = find_array(f_, chunk, array_kind::f, int(cc), cmp, 0);
+          if (!is_valid(target)) continue;
+
+          const CurlSources sources = curl_sources_for(fc, cc);
+          const direction dc = component_direction(cc);
+          const direction dsig0 = cycle_direction(fc.gv.dim, dc, 1);
+          const direction dsig = fc.s->sigsize[dsig0] > 1 ? dsig0 : NO_DIRECTION;
+          const direction dsigu0 = cycle_direction(fc.gv.dim, dc, 2);
+          const direction dsigu = fc.s->sigsize[dsigu0] > 1 ? dsigu0 : NO_DIRECTION;
+
+          CurlUpdate d;
+          d.region = make_region(fc.gv, chunk, cc, cmp, sub.little_owned_corner0(cc),
+                                 sub.big_corner());
+          d.target = target;
+          d.plus_source = sources.have_plus
+                              ? find_array(f_, chunk, array_kind::f, int(sources.plus_component), cmp,
+                                           0)
+                              : invalid_array();
+          d.minus_source = sources.have_minus
+                               ? find_array(f_, chunk, array_kind::f, int(sources.minus_component),
+                                            cmp, 0)
+                               : invalid_array();
+          d.plus_stride = sources.have_plus ? fc.gv.stride(sources.plus_direction) : 0;
+          d.minus_stride = sources.have_minus ? fc.gv.stride(sources.minus_direction) : 0;
+          if (ft == D_stuff) {
+            d.plus_stride = -d.plus_stride;
+            d.minus_stride = -d.minus_stride;
+          }
+          d.target_u = find_array(f_, chunk, array_kind::f_u, int(cc), cmp, 0);
+          d.conductivity = find_array(f_, chunk, array_kind::conductivity, int(cc), -1, int(dc));
+          d.condinv = find_array(f_, chunk, array_kind::condinv, int(cc), -1, int(dc));
+          d.target_cond = find_array(f_, chunk, array_kind::f_cond, int(cc), cmp, 0);
+          d.pml = make_pml_profile(f_, fc, chunk, dsig, d.region.begin);
+          d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
+          d.dtdx = fc.Courant;
+          d.dt = fc.dt;
+          if (is_valid(d.plus_source) && is_valid(d.minus_source))
+            d.region.variant_key |= curl_has_second_derivative;
+          if (dsig != NO_DIRECTION) d.region.variant_key |= curl_has_pml;
+          if (dsigu != NO_DIRECTION) d.region.variant_key |= curl_has_pml_aux;
+          if (is_valid(d.conductivity)) d.region.variant_key |= curl_has_conductivity;
+          if (fc.bfast_scaled_k[0] || fc.bfast_scaled_k[1] || fc.bfast_scaled_k[2])
+            d.region.variant_key |= curl_has_bfast;
+
+          plan_.db_updates.push_back(d);
+          add_access(f_, op, d.target, AccessMode::read_write);
+          add_access(f_, op, d.plus_source, AccessMode::read);
+          add_access(f_, op, d.minus_source, AccessMode::read);
+          add_access(f_, op, d.target_u, AccessMode::read_write);
+          add_access(f_, op, d.conductivity, AccessMode::read);
+          add_access(f_, op, d.condinv, AccessMode::read);
+          add_access(f_, op, d.target_cond, AccessMode::read_write);
+          add_access(f_, op, d.pml.sig, AccessMode::read);
+          add_access(f_, op, d.pml.kap, AccessMode::read);
+          add_access(f_, op, d.pml.siginv, AccessMode::read);
+          add_access(f_, op, d.pml_u.sig, AccessMode::read);
+          add_access(f_, op, d.pml_u.kap, AccessMode::read);
+          add_access(f_, op, d.pml_u.siginv, AccessMode::read);
+        }
+    }
+  }
+  op.descriptor_count = uint32_t(plan_.db_updates.size()) - op.descriptor_index;
+}
+
+void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
+  Operation &op = add(OpKind::update_eh, ft, guard);
+  op.descriptor_index = uint32_t(plan_.eh_updates.size());
+  const field_type ft2 = ft == E_stuff ? D_stuff : B_stuff;
+
+  for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+    if (!f_.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f_.chunks[chunk];
+    const int components = fc.is_real ? 1 : 2;
+    for (size_t tile = 0; tile < fc.gvs_eh[ft].size(); ++tile) {
+      const grid_volume &sub = fc.gvs_eh[ft][tile];
+      for (int cmp = 0; cmp < components; ++cmp) FOR_FT_COMPONENTS(ft, ec) {
+          if (!fc.f[ec][cmp]) continue;
+          const component dc = field_type_component(ft2, ec);
+          if (fc.f[ec][cmp] == fc.f[dc][cmp]) continue;
+
+          const direction dec = component_direction(ec);
+          const direction d1 = cycle_direction(fc.gv.dim, dec, 1);
+          const direction d2 = cycle_direction(fc.gv.dim, dec, 2);
+          const component dc1 = direction_component(dc, d1);
+          const component dc2 = direction_component(dc, d2);
+          const direction dsigw = fc.s->sigsize[dec] > 1 ? dec : NO_DIRECTION;
+
+          ConstitutiveUpdate d;
+          d.region = make_region(fc.gv, chunk, ec, cmp, sub.little_owned_corner0(ec),
+                                 sub.big_corner());
+          d.target = find_array(f_, chunk, array_kind::f, int(ec), cmp, 0);
+          const ArrayId primary_minus_p =
+              find_array(f_, chunk, array_kind::f_minus_p, int(dc), cmp, 0);
+          const ArrayId cross1_minus_p =
+              find_array(f_, chunk, array_kind::f_minus_p, int(dc1), cmp, 0);
+          const ArrayId cross2_minus_p =
+              find_array(f_, chunk, array_kind::f_minus_p, int(dc2), cmp, 0);
+          d.primary = is_valid(primary_minus_p)
+                          ? primary_minus_p
+                          : find_array(f_, chunk, array_kind::f, int(dc), cmp, 0);
+          d.cross1 = is_valid(cross1_minus_p)
+                         ? cross1_minus_p
+                         : find_array(f_, chunk, array_kind::f, int(dc1), cmp, 0);
+          d.cross2 = is_valid(cross2_minus_p)
+                         ? cross2_minus_p
+                         : find_array(f_, chunk, array_kind::f, int(dc2), cmp, 0);
+          d.diagonal = find_array(f_, chunk, array_kind::chi1inv, int(ec), -1, int(dec));
+          d.offdiagonal1 = find_array(f_, chunk, array_kind::chi1inv, int(ec), -1, int(d1));
+          d.offdiagonal2 = find_array(f_, chunk, array_kind::chi1inv, int(ec), -1, int(d2));
+          d.primary_stride = fc.gv.stride(dec) * (ft == H_stuff ? -1 : 1);
+          d.cross1_stride = fc.gv.stride(d1) * (ft == H_stuff ? -1 : 1);
+          d.cross2_stride = fc.gv.stride(d2) * (ft == H_stuff ? -1 : 1);
+
+          /* Match step_update_EDHB's normalization: the one surviving
+             off-diagonal term is always slot 1. */
+          if ((!is_valid(d.cross1) && is_valid(d.cross2)) ||
+              (is_valid(d.cross1) && is_valid(d.cross2) && !is_valid(d.offdiagonal1) &&
+               is_valid(d.offdiagonal2))) {
+            std::swap(d.cross1, d.cross2);
+            std::swap(d.offdiagonal1, d.offdiagonal2);
+            std::swap(d.cross1_stride, d.cross2_stride);
+          }
+
+          d.chi2 = find_array(f_, chunk, array_kind::chi2, int(ec), -1, 0);
+          d.chi3 = find_array(f_, chunk, array_kind::chi3, int(ec), -1, 0);
+          d.target_w = find_array(f_, chunk, array_kind::f_w, int(ec), cmp, 0);
+          d.previous_w = find_array(f_, chunk, array_kind::f_w_prev, int(ec), cmp, 0);
+          d.pml = make_pml_profile(f_, fc, chunk, dsigw, d.region.begin);
+          if (is_valid(d.offdiagonal1)) d.region.variant_key |= constitutive_one_offdiagonal;
+          if (is_valid(d.offdiagonal2)) d.region.variant_key |= constitutive_two_offdiagonals;
+          if (dsigw != NO_DIRECTION) d.region.variant_key |= constitutive_has_pml;
+          if (is_valid(d.chi2) || is_valid(d.chi3))
+            d.region.variant_key |= constitutive_has_nonlinearity;
+          if (is_valid(primary_minus_p) || is_valid(cross1_minus_p) ||
+              is_valid(cross2_minus_p))
+            d.region.variant_key |= constitutive_has_minus_p;
+          if (tile == 0 && is_valid(d.previous_w))
+            d.region.variant_key |= constitutive_copy_w_previous;
+
+          plan_.eh_updates.push_back(d);
+          add_access(f_, op, d.target, AccessMode::read_write);
+          add_access(f_, op, d.primary, AccessMode::read);
+          add_access(f_, op, d.cross1, AccessMode::read);
+          add_access(f_, op, d.cross2, AccessMode::read);
+          add_access(f_, op, d.diagonal, AccessMode::read);
+          add_access(f_, op, d.offdiagonal1, AccessMode::read);
+          add_access(f_, op, d.offdiagonal2, AccessMode::read);
+          add_access(f_, op, d.chi2, AccessMode::read);
+          add_access(f_, op, d.chi3, AccessMode::read);
+          add_access(f_, op, d.target_w, AccessMode::read_write);
+          add_access(f_, op, d.previous_w, AccessMode::write);
+          add_access(f_, op, d.pml.sig, AccessMode::read);
+          add_access(f_, op, d.pml.kap, AccessMode::read);
+          add_access(f_, op, d.pml.siginv, AccessMode::read);
+        }
+    }
+  }
+  op.descriptor_count = uint32_t(plan_.eh_updates.size()) - op.descriptor_index;
+}
+
 } // namespace
+
+uint64_t compute_step_plan_signature(const StepPlan &plan) {
+  return StepPlanBuilder::signature_for(plan);
+}
 
 /* Transcribed from fields::step_once. Read the two side by side.
  *
@@ -129,7 +516,7 @@ private:
  * pack/transfer/unpack, which is why add_boundaries emits zero_boundary first.
  */
 StepPlan build_step_plan(fields &f, StepProgram program) {
-  StepPlanBuilder p(program);
+  StepPlanBuilder p(f, program);
   const bool cw = program == StepProgram::solve_cw;
 
   const bool has_sources = f.sources != NULL;
@@ -171,22 +558,22 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   if (phasing) {
     p.add(OpKind::phase_material, field_type(NUM_FIELD_TYPES), guard_static(true));
     p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_segment(0), 0.5);
-    p.add(OpKind::update_eh, H_stuff, guard_segment(0));
+    p.add_eh(H_stuff, guard_segment(0));
     p.add_boundaries(H_stuff, guard_segment(0));
     p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_segment(0), 1.0);
-    p.add(OpKind::update_eh, E_stuff, guard_segment(0));
+    p.add_eh(E_stuff, guard_segment(0));
     p.add_boundaries(E_stuff, guard_segment(0));
   }
 
   p.add(OpKind::update_material_coefficients);
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.0);
-  p.add(OpKind::update_db, B_stuff);
+  p.add_db(B_stuff);
   p.add(OpKind::apply_sources, B_stuff);
   p.add_boundaries(B_stuff);
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
-  p.add(OpKind::update_eh, H_stuff);
+  p.add_eh(H_stuff);
   p.add_boundaries(WH_stuff);
   p.add(OpKind::update_polarization, H_stuff);
   p.add_boundaries(PH_stuff);
@@ -195,12 +582,12 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   p.add_if(has_fluxes, OpKind::update_flux_half);
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
-  p.add(OpKind::update_db, D_stuff);
+  p.add_db(D_stuff);
   p.add(OpKind::apply_sources, D_stuff);
   p.add_boundaries(D_stuff);
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 1.0);
-  p.add(OpKind::update_eh, E_stuff);
+  p.add_eh(E_stuff);
   p.add_boundaries(WE_stuff);
   p.add(OpKind::update_polarization, E_stuff);
   p.add_boundaries(PE_stuff);
