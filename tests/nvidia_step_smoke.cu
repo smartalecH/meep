@@ -22,12 +22,15 @@ using meep::nvidia::device_buffer;
 using meep::nvidia::device_properties;
 using meep::nvidia::device_scope;
 using meep::nvidia::enumerate_devices;
+using meep::nvidia::fill_byte_async;
+using meep::nvidia::finite_check_launch;
 using meep::nvidia::flat_region;
 using meep::nvidia::halo_gather_entry;
 using meep::nvidia::halo_launch;
 using meep::nvidia::halo_scatter_entry;
 using meep::nvidia::launch_constitutive;
 using meep::nvidia::launch_curl;
+using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
 using meep::nvidia::launch_halo_scatter;
 using meep::nvidia::launch_zero;
@@ -429,6 +432,42 @@ template <typename T> static void check_device(int device) {
                 "anisotropic constitutive PML auxiliary or sentinel differs");
       }
     }
+
+  std::vector<T> finite_values(elements);
+  for (size_t i = 0; i < elements; ++i) finite_values[i] = T(0.125 * double(i) - 3.0);
+  device_buffer d_finite_values(bytes, device), d_finite_result(sizeof(uint64_t), device);
+  finite_check_launch finite = {};
+  finite.values = d_finite_values.opaque_handle();
+  finite.elements = elements;
+  finite.ordinal_base = 37;
+  finite.precision = precision;
+  uint64_t first_bad = 0;
+
+  copy_host_to_device_async(d_finite_values, 0, finite_values.data(), bytes, execution);
+  fill_byte_async(d_finite_result, 0, 0xff, sizeof(first_bad), execution);
+  launch_finite_check(finite, d_finite_result.opaque_handle(), execution);
+  copy_device_to_host_async(&first_bad, d_finite_result, 0, sizeof(first_bad), execution);
+  execution.synchronize();
+  require(first_bad == std::numeric_limits<uint64_t>::max(),
+          "finite-value check rejected finite input");
+
+  finite_values[13] = std::numeric_limits<T>::quiet_NaN();
+  finite_values[7] = std::numeric_limits<T>::infinity();
+  copy_host_to_device_async(d_finite_values, 0, finite_values.data(), bytes, execution);
+  fill_byte_async(d_finite_result, 0, 0xff, sizeof(first_bad), execution);
+  launch_finite_check(finite, d_finite_result.opaque_handle(), execution);
+  copy_device_to_host_async(&first_bad, d_finite_result, 0, sizeof(first_bad), execution);
+  execution.synchronize();
+  require(first_bad == finite.ordinal_base + 7,
+          "finite-value check did not select the lowest non-finite element");
+
+  finite_values[7] = T(0.875);
+  copy_host_to_device_async(d_finite_values, 0, finite_values.data(), bytes, execution);
+  fill_byte_async(d_finite_result, 0, 0xff, sizeof(first_bad), execution);
+  launch_finite_check(finite, d_finite_result.opaque_handle(), execution);
+  copy_device_to_host_async(&first_bad, d_finite_result, 0, sizeof(first_bad), execution);
+  execution.synchronize();
+  require(first_bad == finite.ordinal_base + 13, "finite-value check did not report NaN");
 
   std::vector<T> halo_values(8), halo_observed(8);
   for (size_t i = 0; i < halo_values.size(); ++i) halo_values[i] = T(i + 1);

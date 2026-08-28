@@ -329,6 +329,11 @@ struct NvidiaCompiledHalo {
   nvidia::halo_launch scatter;
 };
 
+struct NvidiaFiniteCheck {
+  nvidia::finite_check_launch launch;
+  StorageKey key;
+};
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, uint64_t signature, uint64_t storage_fingerprint,
@@ -339,11 +344,12 @@ public:
                    const std::vector<NvidiaCompiledHalo> &halo_plans,
                    const std::vector<nvidia::halo_gather_entry> &halo_gathers,
                    const std::vector<nvidia::halo_scatter_entry> &halo_scatters,
-                   size_t halo_scratch_bytes, NvidiaBackendState &state)
+                   size_t halo_scratch_bytes, const std::vector<NvidiaFiniteCheck> &finite_checks,
+                   NvidiaBackendState &state)
       : owner_(owner), signature_(signature), storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
-        halo_plans_(halo_plans) {
+        halo_plans_(halo_plans), finite_checks_(finite_checks) {
     try {
       nvidia::device_scope scope(state.device_);
       if (!halo_gathers.empty()) {
@@ -361,6 +367,10 @@ public:
                                           halo_scatters_.size(), *state.transfer_);
       }
       if (halo_scratch_bytes) halo_scratch_.allocate(halo_scratch_bytes, state.device_);
+      if (!finite_checks_.empty()) {
+        finite_result_.allocate(sizeof(uint64_t), state.device_);
+        finite_result_host_.allocate(sizeof(uint64_t));
+      }
       if (!halo_gathers.empty() || !halo_scatters.empty()) state.transfer_->synchronize();
     }
     catch (...) {
@@ -380,6 +390,9 @@ public:
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
   nvidia::device_buffer halo_scratch_;
+  std::vector<NvidiaFiniteCheck> finite_checks_;
+  nvidia::device_buffer finite_result_;
+  nvidia::pinned_buffer finite_result_host_;
 };
 
 namespace {
@@ -708,6 +721,35 @@ nvidia::zero_launch compile_zero(const ElementRef &source, NvidiaBackendState &s
   return compile_zero(slab, state);
 }
 
+NvidiaFiniteCheck compile_finite_check(const BufferAccess &source, uint64_t ordinal_base,
+                                       NvidiaBackendState &state) {
+  if (source.mode != AccessMode::read)
+    throw std::invalid_argument("finite-value check access is not read-only");
+  if (!is_valid(source.array.id) || source.array.id.value >= state.plan_.arrays.size())
+    throw std::out_of_range("finite-value check uses an invalid ArrayId");
+  const ArraySpec &spec = state.plan_.arrays[source.array.id.value];
+  const StorageKey &key = state.plan_.keys[source.array.id.value];
+  if (key.kind != int(array_kind::f) || spec.element_type != ElementType::realnum_value ||
+      is_valid(spec.alias_of) || !spec.elements)
+    throw std::invalid_argument("finite-value check access is not a canonical physical field");
+  if (source.array.offset != 0 || source.array.elements != spec.elements)
+    throw std::invalid_argument("finite-value check access does not cover its full allocation");
+  if (key.chunk < 0 || key.component_ < 0 || key.component_ >= NUM_FIELD_COMPONENTS ||
+      (key.cmp != 0 && key.cmp != 1))
+    throw std::invalid_argument("finite-value check access has invalid diagnostic attribution");
+  if (source.array.elements > std::numeric_limits<uint64_t>::max() - ordinal_base)
+    throw std::overflow_error("finite-value check ordinal range overflow");
+
+  NvidiaFiniteCheck result;
+  result.launch.values = device_address(state, source.array.id, "finite-value check input");
+  result.launch.elements = source.array.elements;
+  result.launch.ordinal_base = ordinal_base;
+  result.launch.precision =
+      scalar_precision_for(state.plan_, source.array.id, "finite-value check input");
+  result.key = key;
+  return result;
+}
+
 struct CompiledHaloRef {
   void *address;
   ptrdiff_t index;
@@ -1002,9 +1044,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 source-free slice does not support dispersion");
     if (has_magnetic_backups(state.plan_))
       throw std::invalid_argument("NVIDIA PR2 does not support synchronized magnetic fields");
-    if (finite_check_mode() != FiniteCheckMode::off)
-      throw std::invalid_argument(
-          "NVIDIA PR2 requires MEEP_FINITE_CHECK=off until device diagnostics land");
     if (!connections_are_current(f_))
       throw std::invalid_argument(
           "NVIDIA PR2 requires Phase 1 to finalize halo topology before backend compilation");
@@ -1018,7 +1057,9 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<NvidiaCompiledHalo> halo_plans;
     std::vector<nvidia::halo_gather_entry> halo_gathers;
     std::vector<nvidia::halo_scatter_entry> halo_scatters;
+    std::vector<NvidiaFiniteCheck> finite_checks;
     size_t halo_scratch_bytes = 0;
+    uint64_t finite_elements = 0;
     operations.reserve(plan.operations.size());
 
     /* Capability validation is deliberately fail-fast. The first local reason
@@ -1097,13 +1138,30 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           halo_scratch_bytes = std::max(halo_scratch_bytes, operation_scratch_bytes);
           break;
         }
+        case OpKind::finite_value_check: {
+          compiled.first = finite_checks.size();
+          uint32_t previous_id = 0;
+          bool have_previous = false;
+          for (size_t i = 0; i < op.accesses.size(); ++i) {
+            const BufferAccess &access = op.accesses[i];
+            if (have_previous && access.array.id.value <= previous_id)
+              throw std::invalid_argument(
+                  "finite-value check accesses are not in stable ArrayId order");
+            finite_checks.push_back(compile_finite_check(access, finite_elements, state));
+            finite_elements += access.array.elements;
+            previous_id = access.array.id.value;
+            have_previous = true;
+          }
+          compiled.count = finite_checks.size() - compiled.first;
+          if (!compiled.count) set_reason(local_error, oi, "finite-value check span is empty");
+          break;
+        }
         case OpKind::restore_magnetic_fields:
         case OpKind::update_material_coefficients:
         case OpKind::apply_sources:
         case OpKind::update_polarization:
         case OpKind::increment_time:
-        case OpKind::synchronize_magnetic_fields:
-        case OpKind::finite_value_check: break;
+        case OpKind::synchronize_magnetic_fields: break;
 
         case OpKind::phase_material:
         case OpKind::evaluate_source_scalars:
@@ -1125,9 +1183,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     }
 
     if (local_error.empty())
-      executable.reset(new NvidiaExecutable(
-          this, plan.signature, state.fingerprint_, operations, curl_updates, constitutive_updates,
-          zero_updates, halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, state));
+      executable.reset(new NvidiaExecutable(this, plan.signature, state.fingerprint_, operations,
+                                            curl_updates, constitutive_updates, zero_updates,
+                                            halo_plans, halo_gathers, halo_scatters,
+                                            halo_scratch_bytes, finite_checks, state));
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -1154,6 +1213,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
 
+  const FiniteCheckMode finite_mode = finite_check_mode();
   try {
     nvidia::device_scope scope(state.device_);
     for (int step = 0; step < num_steps; ++step) {
@@ -1185,6 +1245,47 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                   executable.halo_scratch_.opaque_handle(), *state.transfer_);
             break;
           case OpKind::increment_time: ++f_.t; break;
+          case OpKind::finite_value_check: {
+            const bool due = finite_mode == FiniteCheckMode::step ||
+                             (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps);
+            if (!due) break;
+            nvidia::fill_byte_async(executable.finite_result_, 0, 0xff, sizeof(uint64_t),
+                                    *state.transfer_);
+            for (size_t i = op.first; i < op.first + op.count; ++i)
+              nvidia::launch_finite_check(executable.finite_checks_[i].launch,
+                                          executable.finite_result_.opaque_handle(),
+                                          *state.transfer_);
+            nvidia::copy_device_to_host_async(executable.finite_result_host_.data(),
+                                              executable.finite_result_, 0, sizeof(uint64_t),
+                                              *state.transfer_);
+            state.transfer_->synchronize();
+
+            uint64_t first_bad = std::numeric_limits<uint64_t>::max();
+            memcpy(&first_bad, executable.finite_result_host_.data(), sizeof(first_bad));
+            if (first_bad == std::numeric_limits<uint64_t>::max()) break;
+
+            const NvidiaFiniteCheck *found = NULL;
+            size_t element = 0;
+            for (size_t i = op.first; i < op.first + op.count; ++i) {
+              const NvidiaFiniteCheck &scan = executable.finite_checks_[i];
+              if (first_bad >= scan.launch.ordinal_base &&
+                  first_bad - scan.launch.ordinal_base < scan.launch.elements) {
+                found = &scan;
+                element = size_t(first_bad - scan.launch.ordinal_base);
+                break;
+              }
+            }
+            if (!found)
+              throw std::logic_error("NVIDIA finite-value diagnostic returned an invalid ordinal");
+            if (!f_.nonfinite_flag) {
+              f_.nonfinite_flag = 1;
+              f_.first_bad_step = f_.t;
+              f_.first_bad_component = found->key.component_;
+            }
+            meep::abort(
+                "simulation fields are NaN or Inf (chunk %d, component %d, cmp %d, element %zu)",
+                found->key.chunk, found->key.component_, found->key.cmp, element);
+          }
           default: break; // capability validation proved these operations are no-ops
         }
       }
