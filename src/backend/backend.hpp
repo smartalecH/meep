@@ -117,6 +117,14 @@ void backend_refresh_host_fields(fields &owner, int count, const component *comp
                                  const volume &where, component cgrid, bool use_symmetry,
                                  bool snap_empty_dimensions, const char *site);
 
+/* Queue resident-to-host reads for one DFT accumulator or an entire
+   next_in_dft chain. These helpers are deliberately noncollective so callers
+   can batch every local read before reconciling once. */
+bool backend_read_dft_chunk(const dft_chunk *chunk, std::string &local_error);
+bool backend_read_dft_chain(const dft_chunk *head, std::string &local_error);
+void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *heads,
+                                const char *site);
+
 /* A checkpoint load may replace array allocations. Preserve authoritative
    resident state before those host pointers change, then retire the stale
    state/catalog consumers. */
