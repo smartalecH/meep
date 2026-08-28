@@ -21,6 +21,7 @@
    function in 2d or 3d. */
 
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 #include <assert.h>
 #include "config.h"
 #include <math.h>
@@ -351,17 +352,20 @@ void greencyl(std::complex<double> *EH, const vec &x, double freq, double eps, d
   }
 }
 
-void dft_near2far::farfield_lowlevel(std::complex<double> *EH, const vec &x, double greencyl_tol) {
+static void farfield_lowlevel_from_host(dft_chunk *chunks, const std::vector<double> &frequencies,
+                                        double eps, double mu, const direction periodic_d[2],
+                                        const int periodic_n[2], const double periodic_k[2],
+                                        const double period[2], std::complex<double> *EH,
+                                        const vec &x, double greencyl_tol) {
   if (x.dim != D3 && x.dim != D2 && x.dim != Dcyl)
     meep::abort("only 2d or 3d or cylindrical far-field computation is supported");
   greenfunc green = x.dim == D2 ? green2d : green3d;
 
-  const size_t Nfreq = freq.size();
+  const size_t Nfreq = frequencies.size();
   for (size_t i = 0; i < 6 * Nfreq; ++i)
     EH[i] = 0.0;
 
-  for (dft_chunk *f = F; f; f = f->next_in_dft) {
-    f->sync_dft_to_host();
+  for (dft_chunk *f = chunks; f; f = f->next_in_dft) {
     assert(Nfreq == f->omega.size());
 
     component c0 = component(f->vc); /* equivalent source component */
@@ -387,10 +391,11 @@ void dft_near2far::farfield_lowlevel(std::complex<double> *EH, const vec &x, dou
             double phase = phase0 + i1 * periodic_k[1];
             std::complex<double> cphase = std::polar(1.0, phase);
             if (x.dim == Dcyl)
-              greencyl(EH6, x, freq[i], eps, mu, xs, c0, f->dft[Nfreq * idx_dft + i], f->fc->m,
-                       greencyl_tol);
+              greencyl(EH6, x, frequencies[i], eps, mu, xs, c0,
+                       f->dft[Nfreq * idx_dft + i], f->fc->m, greencyl_tol);
             else
-              green(EH6, x, freq[i], eps, mu, xs, c0, f->dft[Nfreq * idx_dft + i]);
+              green(EH6, x, frequencies[i], eps, mu, xs, c0,
+                    f->dft[Nfreq * idx_dft + i]);
             for (int j = 0; j < 6; ++j)
               EH[i * 6 + j] += EH6[j] * cphase;
           }
@@ -399,6 +404,15 @@ void dft_near2far::farfield_lowlevel(std::complex<double> *EH, const vec &x, dou
       }
     }
   }
+}
+
+void dft_near2far::farfield_lowlevel(std::complex<double> *EH, const vec &x, double greencyl_tol) {
+  dft_chunk *chains[1] = {F};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 1, chains,
+                               "dft_near2far::farfield_lowlevel");
+  farfield_lowlevel_from_host(F, freq, eps, mu, periodic_d, periodic_n, periodic_k, period, EH, x,
+                              greencyl_tol);
 }
 
 std::complex<double> *dft_near2far::farfield(const vec &x, double greencyl_tol) {
@@ -414,6 +428,11 @@ std::complex<double> *dft_near2far::farfield(const vec &x, double greencyl_tol) 
 
 double *dft_near2far::get_farfields_array(const volume &where, int &rank, size_t *dims, size_t &N,
                                           double resolution, double greencyl_tol) {
+  dft_chunk *chains[1] = {F};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 1, chains,
+                               "dft_near2far::get_farfields_array");
+
   /* compute output grid size etc. */
   double dx[3] = {0, 0, 0};
   direction dirs[3] = {X, Y, Z};
@@ -461,7 +480,8 @@ double *dft_near2far::get_farfields_array(const volume &where, int &rank, size_t
           start = t;
           last_point = this_point;
         }
-        farfield_lowlevel(EH1, x, greencyl_tol);
+        farfield_lowlevel_from_host(F, freq, eps, mu, periodic_d, periodic_n, periodic_k, period,
+                                    EH1, x, greencyl_tol);
         if (verbosity > 1) all_wait(); // Allow consistent progress updates from master
         ptrdiff_t idx = (i0 * dims[1] + i1) * dims[2] + i2;
         for (size_t i = 0; i < Nfreq; ++i)
