@@ -20,6 +20,7 @@
 
 #include <algorithm>
 
+#include "backend/descriptors.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
@@ -204,6 +205,7 @@ public:
       plan_.cylindrical_origin_r.push_back(fc.gv.origin_r());
       plan_.cylindrical_zero_near_origin.push_back(fc.zero_fields_near_cylorigin ? 1 : 0);
     }
+    plan_.source_signature = f_.descriptors ? source_plan_signature(f_.descriptors->sources) : 0;
   }
 
   Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
@@ -220,6 +222,8 @@ public:
     op.cylindrical_origin_action_count = 0;
     op.polarization_subtraction_index = 0;
     op.polarization_subtraction_count = 0;
+    op.source_descriptor_index = 0;
+    op.source_descriptor_count = 0;
     op.guard = g;
     op.ft = ft;
     op.source_time_offset = src_offset;
@@ -229,6 +233,8 @@ public:
 
   void add_db(field_type ft);
   void add_eh(field_type ft, Guard guard = guard_always());
+  void add_source_evaluation(Guard guard, double src_offset);
+  void add_sources(field_type ft);
 
   void add_finite_value_check() {
     Operation &op = add(OpKind::finite_value_check);
@@ -281,12 +287,10 @@ public:
     mix(sig, uint64_t(plan.program));
     mix_double(sig, plan.beta);
     mix_double(sig, plan.cylindrical_m);
-    for (double k : plan.bfast_scaled_k)
-      mix_double(sig, k);
-    for (double origin : plan.cylindrical_origin_r)
-      mix_double(sig, origin);
-    for (uint8_t zero : plan.cylindrical_zero_near_origin)
-      mix(sig, uint64_t(zero));
+    for (double k : plan.bfast_scaled_k) mix_double(sig, k);
+    for (double origin : plan.cylindrical_origin_r) mix_double(sig, origin);
+    for (uint8_t zero : plan.cylindrical_zero_near_origin) mix(sig, uint64_t(zero));
+    mix(sig, plan.source_signature);
     for (const Operation &op : plan.operations) {
       sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.ft) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
@@ -304,6 +308,10 @@ public:
       sig ^= uint64_t(op.polarization_subtraction_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
              (sig >> 2);
       sig ^= uint64_t(op.polarization_subtraction_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
+             (sig >> 2);
+      sig ^= uint64_t(op.source_descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
+             (sig >> 2);
+      sig ^= uint64_t(op.source_descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
              (sig >> 2);
       uint64_t source_bits = 0;
       static_assert(sizeof(source_bits) == sizeof(op.source_time_offset), "double is not 64-bit");
@@ -534,7 +542,50 @@ private:
 
   fields &f_;
   StepPlan plan_;
+
+  void attach_source_span(Operation &op, field_type ft, bool integrated) {
+    if (!f_.descriptors) return;
+    const std::vector<SourceDescriptor> &sources = f_.descriptors->sources.sources;
+    bool started = false, finished = false;
+    for (size_t i = 0; i < sources.size(); ++i) {
+      const SourceDescriptor &d = sources[i];
+      const bool matches = d.ft == ft && d.integrated == integrated;
+      if (matches) {
+        if (finished) meep::abort("source descriptors for one operation are not contiguous");
+        if (!started) {
+          op.source_descriptor_index = uint32_t(i);
+          started = true;
+        }
+        ++op.source_descriptor_count;
+        if (integrated) {
+          add_access(f_, op, d.destination, AccessMode::read);
+          add_access(f_, op, d.destination_imag, AccessMode::read);
+          add_access(f_, op, d.integrated_destination, AccessMode::read_write);
+          add_access(f_, op, d.integrated_destination_imag, AccessMode::read_write);
+        }
+        else {
+          add_access(f_, op, d.destination, AccessMode::read_write);
+          add_access(f_, op, d.destination_imag, AccessMode::read_write);
+          add_access(f_, op, d.condinv, AccessMode::read);
+        }
+      }
+      else if (started)
+        finished = true;
+    }
+  }
 };
+
+void StepPlanBuilder::add_source_evaluation(Guard guard, double src_offset) {
+  Operation &op = add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard,
+                      src_offset);
+  if (f_.descriptors)
+    op.descriptor_count = uint32_t(f_.descriptors->sources.source_times.size());
+}
+
+void StepPlanBuilder::add_sources(field_type ft) {
+  Operation &op = add(OpKind::apply_sources, ft);
+  attach_source_span(op, ft, false);
+}
 
 void StepPlanBuilder::add_db(field_type ft) {
   Operation &op = add(OpKind::update_db, ft);
@@ -1085,6 +1136,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
     }
   }
   op.descriptor_count = uint32_t(plan_.eh_updates.size()) - op.descriptor_index;
+  attach_source_span(op, ft2, true);
 }
 
 } // namespace
@@ -1140,22 +1192,22 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
      between device segments. */
   if (phasing) {
     p.add(OpKind::phase_material, field_type(NUM_FIELD_TYPES), guard_static(true));
-    p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_segment(0), 0.5);
+    p.add_source_evaluation(guard_segment(0), 0.5);
     p.add_eh(H_stuff, guard_segment(0));
     p.add_boundaries(H_stuff, guard_segment(0));
-    p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_segment(0), 1.0);
+    p.add_source_evaluation(guard_segment(0), 1.0);
     p.add_eh(E_stuff, guard_segment(0));
     p.add_boundaries(E_stuff, guard_segment(0));
   }
 
   p.add(OpKind::update_material_coefficients);
 
-  p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.0);
+  if (has_sources) p.add_source_evaluation(guard_static(true), 0.0);
   p.add_db(B_stuff);
-  p.add(OpKind::apply_sources, B_stuff);
+  p.add_sources(B_stuff);
   p.add_boundaries(B_stuff);
 
-  p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
+  if (has_sources) p.add_source_evaluation(guard_static(true), 0.5);
   p.add_eh(H_stuff);
   p.add_boundaries(WH_stuff);
   p.add(OpKind::update_polarization, H_stuff);
@@ -1164,12 +1216,12 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
 
   p.add_if(has_fluxes, OpKind::update_flux_half);
 
-  p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
+  if (has_sources) p.add_source_evaluation(guard_static(true), 0.5);
   p.add_db(D_stuff);
-  p.add(OpKind::apply_sources, D_stuff);
+  p.add_sources(D_stuff);
   p.add_boundaries(D_stuff);
 
-  p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 1.0);
+  if (has_sources) p.add_source_evaluation(guard_static(true), 1.0);
   p.add_eh(E_stuff);
   p.add_boundaries(WE_stuff);
   p.add(OpKind::update_polarization, E_stuff);
