@@ -190,6 +190,9 @@ void populate_source_scalars(fields &f, SourcePlan &out);
 uint64_t source_plan_signature(const SourcePlan &plan);
 void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
+/* Rebuild dirty descriptor families after the storage catalog is stable.
+   rebuild_all is used by storage preparation because ArrayIds may have moved. */
+void refresh_operation_descriptors(fields &f, bool rebuild_all = false);
 
 } // namespace meep
 

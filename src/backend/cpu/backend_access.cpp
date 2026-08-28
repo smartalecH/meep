@@ -14,6 +14,7 @@
 #include "meep_internals.hpp"
 #include "backend/backend.hpp"
 #include "backend/cpu/cpu_backend.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
@@ -107,6 +108,11 @@ void fields::init_backend() {
     select_backend(opts);
   }
   if (!backend->requires_full_storage_preparation()) {
+    /* On the initial CPU step the lazy storage pass below the executor builds
+       descriptors after the catalog is complete. Once storage is current,
+       source-only mutations can refresh their descriptors without promoting
+       the CPU path to eager storage preparation. */
+    if (!is_dirty(*this, dirty_storage)) refresh_operation_descriptors(*this);
     if (!backend_state) backend_state = backend->create_state(*storage_plan);
     /* CPU storage is the host storage, so value mutations require no transfer. */
     clear_dirty(*this, dirty_initialization);
@@ -134,6 +140,11 @@ void fields::init_backend() {
     backend_state = backend->create_state(*storage_plan);
     dirty_mask |= dirty_initialization | dirty_classification;
   }
+
+  /* A source-definition change does not necessarily alter storage. Refresh it
+     while the old executable is still alive; advance() destroys that artifact
+     only after this succeeds and a new StepPlan exists. */
+  refresh_operation_descriptors(*this);
 
   if (is_dirty(*this, dirty_initialization)) {
     delete initialization_plan;
