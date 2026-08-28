@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include <memory>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -273,6 +274,67 @@ static void require_advance_rejected(fields &f, const char *expected) {
   require(rejected, "NVIDIA unsupported configuration was not rejected as expected");
 }
 
+static void run_finite_diagnostic_case(const char *name, precision_policy_kind policy,
+                                       FiniteCheckMode mode, bool poison, realnum value,
+                                       bool expect_rejection, int expected_step) {
+  set_finite_check_mode(mode);
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.init_backend();
+
+  const StepPlan prepared = build_step_plan(f, StepProgram::ordinary);
+  const Operation *finite = NULL;
+  for (size_t i = 0; i < prepared.operations.size(); ++i)
+    if (prepared.operations[i].kind == OpKind::finite_value_check) finite = &prepared.operations[i];
+  require(finite && !finite->accesses.empty(), "NVIDIA finite check has no declared spans");
+
+  int expected_component = -1;
+  if (poison) {
+    expected_component = f.storage_plan->keys[finite->accesses[0].array.id.value].component_;
+    for (size_t i = 0; i < finite->accesses.size(); ++i) {
+      const ArrayRef ref = finite->accesses[i].array;
+      std::vector<realnum> values(ref.elements, value);
+      f.backend->write(ref, values.data(), values.size() * sizeof(realnum));
+    }
+  }
+
+  bool rejected = false;
+  try {
+    f.advance(2);
+  }
+  catch (const std::runtime_error &error) {
+    rejected =
+        std::string(error.what()).find("simulation fields are NaN or Inf") != std::string::npos;
+    if (!expect_rejection || !rejected) throw;
+  }
+  require(rejected == expect_rejection, "NVIDIA finite-value diagnostic result differs");
+  require(f.t == expected_step, "NVIDIA finite-value diagnostic cadence differs");
+  require(f.nonfinite_flag == unsigned(expect_rejection),
+          "NVIDIA finite-value diagnostic flag differs");
+  if (expect_rejection) {
+    require(f.first_bad_step == expected_step, "NVIDIA first-bad step differs");
+    require(f.first_bad_component == expected_component, "NVIDIA first-bad component differs");
+  }
+  master_printf("nvidia_timestep: finite-%s/%s PASS\n", name,
+                policy == precision_policy_kind::f32 ? "f32" : "native");
+}
+
+static void test_finite_diagnostics(precision_policy_kind policy) {
+  run_finite_diagnostic_case("pass", policy, FiniteCheckMode::step, false, realnum(0), false, 2);
+  run_finite_diagnostic_case("nan-step", policy, FiniteCheckMode::step, true,
+                             std::numeric_limits<realnum>::quiet_NaN(), true, 1);
+  run_finite_diagnostic_case("inf-batch", policy, FiniteCheckMode::batch, true,
+                             std::numeric_limits<realnum>::infinity(), true, 2);
+  run_finite_diagnostic_case("off", policy, FiniteCheckMode::off, true,
+                             std::numeric_limits<realnum>::quiet_NaN(), false, 2);
+}
+
 static void test_rejections() {
   const grid_volume gv = vol2d(2.0, 2.0, 6.0);
   execution_options options;
@@ -345,7 +407,9 @@ int main(int argc, char **argv) {
     run_case("complex-anisotropic-3x3-pml", gv3, policies[p], false, xy_pml, identity(), 2, &bloch3,
              (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), (1u << 1) | (1u << 2) | (1u << 3),
              1u << 5, false, false, &two_offdiagonals);
+    test_finite_diagnostics(policies[p]);
   }
+  set_finite_check_mode(FiniteCheckMode::off);
   test_rejections();
   master_printf("nvidia_timestep: PASS\n");
   return 0;
