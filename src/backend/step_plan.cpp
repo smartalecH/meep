@@ -313,6 +313,9 @@ private:
   static void hash_constitutive(uint64_t &sig, const ConstitutiveUpdate &d) {
     hash_region(sig, d.region);
     hash_id(sig, d.target);
+    hash_id(sig, d.base_primary);
+    hash_id(sig, d.base_cross1);
+    hash_id(sig, d.base_cross2);
     hash_id(sig, d.primary);
     hash_id(sig, d.cross1);
     hash_id(sig, d.cross2);
@@ -441,15 +444,12 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
               find_array(f_, chunk, array_kind::f_minus_p, int(dc1), cmp, 0);
           const ArrayId cross2_minus_p =
               find_array(f_, chunk, array_kind::f_minus_p, int(dc2), cmp, 0);
-          d.primary = is_valid(primary_minus_p)
-                          ? primary_minus_p
-                          : find_array(f_, chunk, array_kind::f, int(dc), cmp, 0);
-          d.cross1 = is_valid(cross1_minus_p)
-                         ? cross1_minus_p
-                         : find_array(f_, chunk, array_kind::f, int(dc1), cmp, 0);
-          d.cross2 = is_valid(cross2_minus_p)
-                         ? cross2_minus_p
-                         : find_array(f_, chunk, array_kind::f, int(dc2), cmp, 0);
+          d.base_primary = find_array(f_, chunk, array_kind::f, int(dc), cmp, 0);
+          d.base_cross1 = find_array(f_, chunk, array_kind::f, int(dc1), cmp, 0);
+          d.base_cross2 = find_array(f_, chunk, array_kind::f, int(dc2), cmp, 0);
+          d.primary = is_valid(primary_minus_p) ? primary_minus_p : d.base_primary;
+          d.cross1 = is_valid(cross1_minus_p) ? cross1_minus_p : d.base_cross1;
+          d.cross2 = is_valid(cross2_minus_p) ? cross2_minus_p : d.base_cross2;
           d.diagonal = find_array(f_, chunk, array_kind::chi1inv, int(ec), -1, int(dec));
           d.offdiagonal1 = find_array(f_, chunk, array_kind::chi1inv, int(ec), -1, int(d1));
           d.offdiagonal2 = find_array(f_, chunk, array_kind::chi1inv, int(ec), -1, int(d2));
@@ -462,6 +462,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
           if ((!is_valid(d.cross1) && is_valid(d.cross2)) ||
               (is_valid(d.cross1) && is_valid(d.cross2) && !is_valid(d.offdiagonal1) &&
                is_valid(d.offdiagonal2))) {
+            std::swap(d.base_cross1, d.base_cross2);
             std::swap(d.cross1, d.cross2);
             std::swap(d.offdiagonal1, d.offdiagonal2);
             std::swap(d.cross1_stride, d.cross2_stride);
@@ -485,9 +486,15 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
 
           plan_.eh_updates.push_back(d);
           add_access(f_, op, d.target, AccessMode::read_write);
-          add_access(f_, op, d.primary, AccessMode::read);
-          add_access(f_, op, d.cross1, AccessMode::read);
-          add_access(f_, op, d.cross2, AccessMode::read);
+          add_access(f_, op, d.base_primary, AccessMode::read);
+          add_access(f_, op, d.base_cross1, AccessMode::read);
+          add_access(f_, op, d.base_cross2, AccessMode::read);
+          add_access(f_, op, d.primary,
+                     d.primary != d.base_primary ? AccessMode::read_write : AccessMode::read);
+          add_access(f_, op, d.cross1,
+                     d.cross1 != d.base_cross1 ? AccessMode::read_write : AccessMode::read);
+          add_access(f_, op, d.cross2,
+                     d.cross2 != d.base_cross2 ? AccessMode::read_write : AccessMode::read);
           add_access(f_, op, d.diagonal, AccessMode::read);
           add_access(f_, op, d.offdiagonal1, AccessMode::read);
           add_access(f_, op, d.offdiagonal2, AccessMode::read);
