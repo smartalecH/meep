@@ -19,8 +19,11 @@
 #include <vector>
 
 #include "backend/initialization_plan.hpp"
+#include "backend/diagnostics.hpp"
+#include "backend/halo_plan.hpp"
 #include "backend/nvidia/arena.hpp"
 #include "backend/nvidia/runtime.hpp"
+#include "backend/nvidia/nvidia_step.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
@@ -283,7 +286,7 @@ public:
   NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device, uint64_t state_token)
       : owner_(owner), plan_(plan), layout_(allocation_requests_for(plan_)), device_(device),
         state_token_(state_token), fingerprint_(storage_fingerprint(plan_)), initialized_(false),
-        transfer_failed_(false) {
+        transfer_failed_(false), device_authoritative_(false) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_));
@@ -303,24 +306,239 @@ public:
   uint64_t fingerprint_;
   bool initialized_;
   bool transfer_failed_;
+  bool device_authoritative_;
   std::unique_ptr<nvidia::device_arenas> arenas_;
   std::unique_ptr<nvidia::stream> transfer_;
   nvidia::pinned_buffer staging_;
 };
 
+struct NvidiaCompiledOperation {
+  OpKind kind;
+  size_t first;
+  size_t count;
+};
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, uint64_t signature, uint64_t storage_fingerprint,
-                   size_t operation_count, uint64_t state_token)
+                   uint64_t state_token,
+                   const std::vector<NvidiaCompiledOperation> &operations,
+                   const std::vector<nvidia::curl_launch> &curl_updates,
+                   const std::vector<nvidia::constitutive_launch> &constitutive_updates,
+                   const std::vector<nvidia::zero_launch> &zero_updates)
       : owner_(owner), state_token_(state_token), signature_(signature),
-        storage_fingerprint_(storage_fingerprint), operation_count_(operation_count) {}
+        storage_fingerprint_(storage_fingerprint),
+        operations_(operations), curl_updates_(curl_updates),
+        constitutive_updates_(constitutive_updates), zero_updates_(zero_updates) {}
 
   const NvidiaBackend *owner_;
   uint64_t state_token_;
   uint64_t signature_;
   uint64_t storage_fingerprint_;
-  size_t operation_count_;
+  std::vector<NvidiaCompiledOperation> operations_;
+  std::vector<nvidia::curl_launch> curl_updates_;
+  std::vector<nvidia::constitutive_launch> constitutive_updates_;
+  std::vector<nvidia::zero_launch> zero_updates_;
 };
+
+namespace {
+
+nvidia::scalar_precision scalar_precision_for(const StoragePlan &plan, ArrayId id,
+                                              const char *what) {
+  if (!is_valid(id) || id.value >= plan.arrays.size())
+    throw std::invalid_argument(std::string(what) + " uses an invalid ArrayId");
+  const ArraySpec &spec = plan.arrays[id.value];
+  if (spec.element_type != ElementType::realnum_value)
+    throw std::invalid_argument(std::string(what) + " is not a realnum array");
+  return spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
+                                        : nvidia::scalar_precision::f64;
+}
+
+void require_same_precision(const StoragePlan &plan, ArrayId id, nvidia::scalar_precision precision,
+                            const char *what) {
+  if (!is_valid(id)) return;
+  if (scalar_precision_for(plan, id, what) != precision)
+    throw std::invalid_argument(std::string(what) + " has a different storage precision");
+}
+
+void *device_address(NvidiaBackendState &state, ArrayId id, const char *what) {
+  (void)scalar_precision_for(state.plan_, id, what);
+  return state.arenas_->resolve(id.value).address;
+}
+
+const void *optional_device_address(NvidiaBackendState &state, ArrayId id,
+                                    nvidia::scalar_precision precision, const char *what) {
+  if (!is_valid(id)) return NULL;
+  require_same_precision(state.plan_, id, precision, what);
+  return state.arenas_->resolve(id.value).address;
+}
+
+nvidia::flat_region flat_region_for(const UpdateRegion &source) {
+  nvidia::flat_region result;
+  result.base = source.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!source.counts[axis]) throw std::invalid_argument("update descriptor has an empty axis");
+    if (source.strides[axis] < 0)
+      throw std::invalid_argument("update descriptor has a negative region stride");
+    result.counts[axis] = source.counts[axis];
+    result.strides[axis] = source.strides[axis];
+  }
+  return result;
+}
+
+ptrdiff_t checked_region_max(const nvidia::flat_region &region) {
+  if (region.base > size_t(std::numeric_limits<ptrdiff_t>::max()))
+    throw std::overflow_error("update descriptor base exceeds ptrdiff_t");
+  ptrdiff_t maximum = ptrdiff_t(region.base);
+  for (int axis = 0; axis < 3; ++axis) {
+    const size_t steps = region.counts[axis] - 1;
+    if (steps && size_t(region.strides[axis]) >
+                     size_t(std::numeric_limits<ptrdiff_t>::max() - maximum) / steps)
+      throw std::overflow_error("update descriptor index range overflow");
+    maximum += ptrdiff_t(steps) * region.strides[axis];
+  }
+  return maximum;
+}
+
+void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum, ptrdiff_t maximum,
+                          const char *what) {
+  if (!is_valid(id) || id.value >= plan.arrays.size())
+    throw std::invalid_argument(std::string(what) + " uses an invalid ArrayId");
+  if (minimum < 0 || maximum < minimum || size_t(maximum) >= plan.arrays[id.value].elements)
+    throw std::out_of_range(std::string(what) + " index range exceeds its array");
+}
+
+nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &state) {
+  const uint32_t supported_variants = curl_has_second_derivative;
+  if (source.region.variant_key & ~supported_variants)
+    throw std::invalid_argument("curl descriptor requires PML, conductivity, or BFAST");
+  if (is_valid(source.target_u) || is_valid(source.conductivity) || is_valid(source.condinv) ||
+      is_valid(source.target_cond) || is_valid(source.pml.sig) || is_valid(source.pml.kap) ||
+      is_valid(source.pml.siginv) || is_valid(source.pml_u.sig) || is_valid(source.pml_u.kap) ||
+      is_valid(source.pml_u.siginv))
+    throw std::invalid_argument("curl descriptor contains unsupported auxiliary arrays");
+
+  nvidia::curl_launch result;
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.target, "curl target");
+  result.target = device_address(state, source.target, "curl target");
+  result.plus_source =
+      optional_device_address(state, source.plus_source, result.precision, "curl plus source");
+  result.minus_source =
+      optional_device_address(state, source.minus_source, result.precision, "curl minus source");
+  if (!result.plus_source && !result.minus_source)
+    throw std::invalid_argument("curl descriptor has no source field");
+  result.plus_stride = source.plus_stride;
+  result.minus_stride = source.minus_stride;
+  result.dtdx = source.dtdx;
+
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
+                       "curl target");
+  if (is_valid(source.plus_source))
+    validate_index_range(state.plan_, source.plus_source,
+                         ptrdiff_t(result.region.base) + std::min<ptrdiff_t>(0, source.plus_stride),
+                         region_max + std::max<ptrdiff_t>(0, source.plus_stride),
+                         "curl plus source");
+  if (is_valid(source.minus_source))
+    validate_index_range(
+        state.plan_, source.minus_source,
+        ptrdiff_t(result.region.base) + std::min<ptrdiff_t>(0, source.minus_stride),
+        region_max + std::max<ptrdiff_t>(0, source.minus_stride), "curl minus source");
+  return result;
+}
+
+nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &source,
+                                                 NvidiaBackendState &state) {
+  if (source.region.variant_key)
+    throw std::invalid_argument(
+        "constitutive descriptor requires anisotropy, PML, nonlinearity, or polarization");
+  if (is_valid(source.offdiagonal1) || is_valid(source.offdiagonal2) || is_valid(source.chi2) ||
+      is_valid(source.chi3) || is_valid(source.target_w) || is_valid(source.previous_w) ||
+      is_valid(source.pml.sig) || is_valid(source.pml.kap) || is_valid(source.pml.siginv))
+    throw std::invalid_argument("constitutive descriptor contains unsupported auxiliary arrays");
+
+  nvidia::constitutive_launch result;
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.target, "constitutive target");
+  result.target = device_address(state, source.target, "constitutive target");
+  result.primary =
+      optional_device_address(state, source.primary, result.precision, "constitutive primary");
+  result.diagonal =
+      optional_device_address(state, source.diagonal, result.precision, "constitutive diagonal");
+  if (!result.primary) throw std::invalid_argument("constitutive descriptor has no primary field");
+
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
+                       "constitutive target");
+  validate_index_range(state.plan_, source.primary, ptrdiff_t(result.region.base), region_max,
+                       "constitutive primary");
+  if (is_valid(source.diagonal))
+    validate_index_range(state.plan_, source.diagonal, ptrdiff_t(result.region.base), region_max,
+                         "constitutive diagonal");
+  return result;
+}
+
+nvidia::zero_launch compile_zero(const SlabRef &source, NvidiaBackendState &state) {
+  nvidia::zero_launch result;
+  result.precision = scalar_precision_for(state.plan_, source.array, "metal-zero target");
+  result.target = device_address(state, source.array, "metal-zero target");
+  if (source.base < 0) throw std::out_of_range("metal-zero descriptor has a negative base");
+  result.region.base = size_t(source.base);
+  for (int axis = 0; axis < 3; ++axis) {
+    if (source.counts[axis] <= 0 || source.strides[axis] < 0)
+      throw std::invalid_argument("metal-zero descriptor has invalid geometry");
+    result.region.counts[axis] = size_t(source.counts[axis]);
+    result.region.strides[axis] = source.strides[axis];
+  }
+  validate_index_range(state.plan_, source.array, source.base, checked_region_max(result.region),
+                       "metal-zero target");
+  return result;
+}
+
+nvidia::zero_launch compile_zero(const ElementRef &source, NvidiaBackendState &state) {
+  SlabRef slab;
+  slab.array = source.array;
+  slab.base = source.index;
+  for (int axis = 0; axis < 3; ++axis) {
+    slab.counts[axis] = 1;
+    slab.strides[axis] = 0;
+  }
+  return compile_zero(slab, state);
+}
+
+bool has_polarization(const fields &f) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    FOR_FIELD_TYPES(ft) if (f.chunks[chunk]->pol[ft]) return true;
+  }
+  return false;
+}
+
+bool has_dfts(const fields &f) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine() && f.chunks[chunk]->dft_chunks) return true;
+  return false;
+}
+
+bool has_magnetic_backups(const StoragePlan &plan) {
+  for (size_t i = 0; i < plan.keys.size(); ++i) {
+    const int kind = plan.keys[i].kind;
+    if (kind == int(array_kind::f_backup) || kind == int(array_kind::f_u_backup) ||
+        kind == int(array_kind::f_w_backup) || kind == int(array_kind::f_cond_backup) ||
+        kind == int(array_kind::f_bfast_backup))
+      return true;
+  }
+  return false;
+}
+
+void set_reason(std::string &why, size_t operation, const char *detail) {
+  std::ostringstream message;
+  message << "NVIDIA PR2 unsupported operation at index " << operation << ": " << detail;
+  why = message.str();
+}
+
+} // namespace
 
 NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int selected_device)
     : f_(f), options_(options), device_(selected_device), device_memory_bytes_(0),
@@ -365,6 +583,9 @@ void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_sta
   try {
     if (state.transfer_failed_)
       throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
+    if (state.device_authoritative_)
+      throw std::logic_error(
+          "cannot refresh NVIDIA storage from a stale host mirror after device stepping");
     if (!f_.array_catalog)
       throw std::logic_error("NVIDIA initialization requires a prepared CPU catalog");
     const CpuArrayCatalog &catalog = *f_.array_catalog;
@@ -433,6 +654,7 @@ void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_sta
     throw std::runtime_error(local_error);
   }
   state.initialized_ = true;
+  state.device_authoritative_ = false;
 }
 
 MaterialClassification NvidiaBackend::classify_state(const StoragePlan &plan,
@@ -455,19 +677,146 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   NvidiaBackendState &state = checked_state(raw_state);
   if (!state.initialized_)
     throw std::logic_error("cannot compile against uninitialized NVIDIA storage");
-  const bool local_unsupported = !plan.operations.empty();
-  if (or_to_all(local_unsupported)) {
-    if (plan.operations.empty())
-      throw std::runtime_error(
-          "NVIDIA PR1 cannot compile because another rank has unsupported timestep operations");
-    const size_t i = 0;
-    std::ostringstream message;
-    message << "NVIDIA PR1 has no physics kernels: unsupported timestep operation "
-            << op_kind_name(plan.operations[i].kind) << " at index " << i << " (descriptor "
-            << plan.operations[i].descriptor_index << ")";
-    throw std::runtime_error(message.str());
+  std::unique_ptr<NvidiaExecutable> executable;
+  std::string local_error;
+  try {
+    if (plan.signature != compute_step_plan_signature(plan))
+      throw std::invalid_argument("NVIDIA PR2 received a stale StepPlan signature");
+    if (plan.program != StepProgram::ordinary)
+      throw std::invalid_argument("NVIDIA PR2 does not support solve_cw");
+    if (options_.precision == precision_policy_kind::mixed)
+      throw std::invalid_argument("NVIDIA PR2 supports precision=native and precision=f32 only");
+    if (count_processors() != 1)
+      throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
+    if (f_.gv.dim == Dcyl || f_.m != 0.0 || f_.beta != 0.0)
+      throw std::invalid_argument("NVIDIA PR2 supports Cartesian fields with m=beta=0 only");
+    if (f_.is_phasing())
+      throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
+    if (f_.sources)
+      throw std::invalid_argument("NVIDIA PR2 source-free slice does not support sources");
+    if (f_.fluxes || has_dfts(f_))
+      throw std::invalid_argument("NVIDIA PR2 source-free slice does not support monitors");
+    if (has_polarization(f_))
+      throw std::invalid_argument("NVIDIA PR2 source-free slice does not support dispersion");
+    if (has_magnetic_backups(state.plan_))
+      throw std::invalid_argument("NVIDIA PR2 does not support synchronized magnetic fields");
+    if (finite_check_mode() != FiniteCheckMode::off)
+      throw std::invalid_argument(
+          "NVIDIA PR2 requires MEEP_FINITE_CHECK=off until device diagnostics land");
+    if (!connections_are_current(f_))
+      throw std::invalid_argument(
+          "NVIDIA PR2 requires Phase 1 to finalize halo topology before backend compilation");
+    if (!f_.halos || !f_.array_catalog)
+      throw std::logic_error("NVIDIA PR2 requires prepared halo and storage plans");
+
+    std::vector<NvidiaCompiledOperation> operations;
+    std::vector<nvidia::curl_launch> curl_updates;
+    std::vector<nvidia::constitutive_launch> constitutive_updates;
+    std::vector<nvidia::zero_launch> zero_updates;
+    operations.reserve(plan.operations.size());
+
+    for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
+      const Operation &op = plan.operations[oi];
+      NvidiaCompiledOperation compiled{op.kind, 0, 0};
+      switch (op.kind) {
+        case OpKind::update_db: {
+          if (size_t(op.descriptor_index) + op.descriptor_count > plan.db_updates.size()) {
+            set_reason(local_error, oi, "curl descriptor span is out of range");
+            break;
+          }
+          compiled.first = curl_updates.size();
+          for (size_t i = op.descriptor_index;
+               i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
+            curl_updates.push_back(compile_curl(plan.db_updates[i], state));
+          compiled.count = curl_updates.size() - compiled.first;
+          if (!compiled.count) set_reason(local_error, oi, "curl descriptor span is empty");
+          break;
+        }
+        case OpKind::update_eh: {
+          if (size_t(op.descriptor_index) + op.descriptor_count > plan.eh_updates.size()) {
+            set_reason(local_error, oi, "constitutive descriptor span is out of range");
+            break;
+          }
+          compiled.first = constitutive_updates.size();
+          for (size_t i = op.descriptor_index;
+               i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
+            constitutive_updates.push_back(compile_constitutive(plan.eh_updates[i], state));
+          compiled.count = constitutive_updates.size() - compiled.first;
+          /* Vacuum H==B and E==D aliases legitimately produce no E/H work. */
+          break;
+        }
+        case OpKind::transfer_halo: {
+          for (size_t i = 0; i < f_.halos->plans.size(); ++i)
+            if (f_.halos->plans[i].ft == op.ft && f_.halos->plans[i].block_elements) {
+              set_reason(local_error, oi,
+                         "same-rank and remote halo exchange is deferred beyond this slice");
+              break;
+            }
+          if (!local_error.empty()) break;
+          if (op.ft < 0 || op.ft >= NUM_FIELD_TYPES) {
+            set_reason(local_error, oi, "boundary operation has an invalid field type");
+            break;
+          }
+          compiled.first = zero_updates.size();
+          const std::vector<ZeroPlan> &zeros = f_.halos->zeros[op.ft];
+          for (size_t chunk = 0; chunk < zeros.size(); ++chunk) {
+            ZeroPlan canonical;
+            std::string why;
+            if (!remap_zero_plan(zeros[chunk], f_.halos->arrays, *f_.array_catalog, canonical, why))
+              throw std::logic_error(std::string("cannot remap metal-zero plan: ") + why);
+            for (size_t i = 0; i < canonical.slabs.size(); ++i)
+              zero_updates.push_back(compile_zero(canonical.slabs[i], state));
+            for (size_t i = 0; i < canonical.residue.size(); ++i)
+              zero_updates.push_back(compile_zero(canonical.residue[i], state));
+          }
+          compiled.count = zero_updates.size() - compiled.first;
+          break;
+        }
+        case OpKind::restore_magnetic_fields:
+        case OpKind::update_material_coefficients:
+        case OpKind::apply_sources:
+        case OpKind::update_polarization:
+        case OpKind::increment_time:
+        case OpKind::synchronize_magnetic_fields:
+        case OpKind::finite_value_check: break;
+
+        case OpKind::phase_material:
+        case OpKind::evaluate_source_scalars:
+        case OpKind::zero_boundary:
+        case OpKind::pack_halo:
+        case OpKind::exchange_local:
+        case OpKind::unpack_halo:
+        case OpKind::update_flux_half:
+        case OpKind::update_flux:
+        case OpKind::update_dft:
+        case OpKind::reduction:
+        case OpKind::host_callback:
+        case OpKind::pack_state:
+        case OpKind::unpack_state:
+        case OpKind::num_kinds: set_reason(local_error, oi, op_kind_name(op.kind)); break;
+      }
+      if (!local_error.empty()) break;
+      operations.push_back(compiled);
+    }
+
+    if (local_error.empty())
+      executable.reset(new NvidiaExecutable(this, plan.signature, state.fingerprint_,
+                                            state.state_token_, operations, curl_updates,
+                                            constitutive_updates, zero_updates));
   }
-  return new NvidiaExecutable(this, plan.signature, state.fingerprint_, 0, state.state_token_);
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown NVIDIA PR2 compilation failure";
+  }
+
+  if (or_to_all(!local_error.empty())) {
+    executable.reset();
+    if (local_error.empty()) local_error = "NVIDIA PR2 compilation was rejected on another rank";
+    throw std::runtime_error(local_error);
+  }
+  return executable.release();
 }
 
 void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state, int num_steps) {
@@ -477,11 +826,39 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   if (!state.initialized_) throw std::logic_error("cannot advance uninitialized NVIDIA storage");
   if (executable.storage_fingerprint_ != state.fingerprint_)
     throw std::logic_error("NVIDIA executable was compiled for a different storage layout");
-  std::ostringstream message;
-  message << "NVIDIA PR1 cannot advance " << num_steps
-          << " timestep(s): no physics kernels were compiled for plan signature "
-          << executable.signature_;
-  throw std::runtime_error(message.str());
+  if (state.transfer_failed_)
+    throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
+
+  try {
+    nvidia::device_scope scope(state.device_);
+    for (int step = 0; step < num_steps; ++step) {
+      for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
+        const NvidiaCompiledOperation &op = executable.operations_[oi];
+        switch (op.kind) {
+          case OpKind::update_db:
+            for (size_t i = op.first; i < op.first + op.count; ++i)
+              nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
+            break;
+          case OpKind::update_eh:
+            for (size_t i = op.first; i < op.first + op.count; ++i)
+              nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
+            break;
+          case OpKind::transfer_halo:
+            for (size_t i = op.first; i < op.first + op.count; ++i)
+              nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
+            break;
+          case OpKind::increment_time: ++f_.t; break;
+          default: break; // capability validation proved these operations are no-ops
+        }
+      }
+      state.transfer_->synchronize();
+    }
+  }
+  catch (...) {
+    state.transfer_failed_ = true;
+    throw;
+  }
+  state.device_authoritative_ = true;
 }
 
 void NvidiaBackend::read(ArrayRef ref, void *host_buffer, size_t bytes) {
@@ -556,9 +933,6 @@ void NvidiaBackend::synchronize() {
 }
 
 void NvidiaBackend::prepare_state_rebuild(BackendState &raw_state, DirtyMask) {
-  /* PR1 launches transfers only: host values remain authoritative after every
-     explicit write. Drain the stream before releasing the arena. PR2 will
-     tighten this boundary when timestep kernels make device values authoritative. */
   NvidiaBackendState &state = checked_state(raw_state);
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
@@ -569,6 +943,29 @@ void NvidiaBackend::prepare_state_rebuild(BackendState &raw_state, DirtyMask) {
     state.transfer_failed_ = true;
     throw;
   }
+  if (!state.device_authoritative_) return;
+  if (!f_.array_catalog || f_.array_catalog->size() != state.plan_.arrays.size())
+    throw std::logic_error("cannot migrate NVIDIA state into a changed host catalog");
+
+  try {
+    for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
+      const ArraySpec &spec = state.plan_.arrays[i];
+      if (is_valid(spec.alias_of)) continue;
+      const size_t bytes = storage_bytes(spec);
+      state.ensure_staging(bytes);
+      state.arenas_->copy_to_host_async(state.staging_.data(), spec.id.value, 0, bytes,
+                                        *state.transfer_);
+      state.transfer_->synchronize();
+      void *destination = f_.array_catalog->resolve_untyped(spec.id);
+      if (!destination) throw std::logic_error("NVIDIA migration found a null host allocation");
+      storage_to_host(destination, state.staging_.data(), spec, spec.elements);
+    }
+  }
+  catch (...) {
+    state.transfer_failed_ = true;
+    throw;
+  }
+  state.device_authoritative_ = false;
 }
 
 backend_capabilities NvidiaBackend::capabilities() const {
