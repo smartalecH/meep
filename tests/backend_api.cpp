@@ -64,11 +64,12 @@ struct lifetime_counts {
   int finalized;
   int advanced;
   size_t arrays_at_create;
+  bool connections_current_at_create;
 
   lifetime_counts()
       : states_created(0), states_destroyed(0), executables_created(0),
         executables_destroyed(0), initialized(0), classified(0), finalized(0), advanced(0),
-        arrays_at_create(0) {}
+        arrays_at_create(0), connections_current_at_create(false) {}
 };
 
 struct tracking_state : BackendState {
@@ -91,6 +92,7 @@ public:
 
   BackendState *create_state(const StoragePlan &plan) override {
     counts.arrays_at_create = plan.arrays.size();
+    counts.connections_current_at_create = connections_are_current(f);
     return new tracking_state(counts);
   }
   void initialize(const InitializationPlan &, BackendState &) override { ++counts.initialized; }
@@ -416,6 +418,8 @@ static void test_backend_lifecycle_epoch() {
   f->advance(1);
   BackendState *first_state = f->backend_state;
   CHECK(counts.arrays_at_create > 0, "resident backend state was created from an empty plan");
+  CHECK(counts.connections_current_at_create,
+        "resident backend state was created before halo topology was finalized");
   CHECK(counts.states_created == 1 && counts.initialized == 1 && counts.classified == 1 &&
             counts.finalized == 1 && counts.executables_created == 1 && counts.advanced == 1,
         "initial resident lifecycle counts are wrong");
