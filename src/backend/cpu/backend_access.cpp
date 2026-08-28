@@ -1596,6 +1596,16 @@ void fields::init_backend() {
     return;
   }
 
+  /* Resident lifecycle decisions guard collective preparation. Reconcile the
+     relevant causes before any rank branches into classification or rebuild. */
+  const DirtyMask relevant = dirty_source_plan | dirty_monitor_plan | dirty_storage |
+                             dirty_regions | dirty_initialization | dirty_classification |
+                             dirty_executable;
+  const size_t local_dirty = size_t(dirty_mask & relevant);
+  size_t global_dirty = 0;
+  bw_or_to_all(&local_dirty, &global_dirty, 1);
+  dirty_mask |= DirtyMask(global_dirty);
+
   /* Capability policy is intentionally checked from the live exact dynamic
      types before any resident material preparation, polarization allocation,
      descriptor callback, or backend-state creation. PR6 will attach validated
