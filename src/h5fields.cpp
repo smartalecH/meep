@@ -24,6 +24,7 @@
 #include <math.h>
 
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 
 using namespace std;
 
@@ -239,6 +240,8 @@ void fields::output_hdf5(h5file *file, const char *dataname, int num_fields,
   loop_in_chunks(h5_findsize_chunkloop, (void *)&data, where, Centered, true, true);
 
   file->prevent_deadlock(); // can't hold a lock since *_to_all is collective
+  backend_refresh_host_fields(*this, num_fields, components, where, Centered, true, true,
+                              "fields::output_hdf5");
   am_now_working_on(MpiAllTime);
   data.max_corner = max_to_all(data.max_corner);
   data.min_corner = -max_to_all(-data.min_corner); // i.e., min_to_all
