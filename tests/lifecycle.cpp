@@ -444,7 +444,7 @@ static void test_dirty_state_is_collective() {
      and false on others -- which is precisely the asymmetry that used to
      deadlock. A symmetric configuration (PML all round, every chunk allocating)
      does not reproduce it, which is why this one is spelled out.
-     
+
      Dispersive as well, so update_pols() also allocates polarization internals
      lazily and per chunk. */
   structure s(gv, eps_slab, pml(1.0, X, High), identity(), 2);
