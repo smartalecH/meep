@@ -128,6 +128,9 @@ void fields::init_backend() {
        it allocates. This is intentionally gated by the backend capability so
        default CPU preparation remains lazy and checkpoint-bitwise identical. */
     prepare_storage();
+    /* Boundary construction is also lazy on CPU. Resident compilation needs
+       the finalized metal-zero and halo schedules before it snapshots state. */
+    connect_chunks();
     backend_state = backend->create_state(*storage_plan);
     dirty_mask |= dirty_initialization | dirty_classification;
   }
