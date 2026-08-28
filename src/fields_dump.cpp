@@ -142,15 +142,6 @@ void fields::dump(const char *filename, bool single_parallel_file) {
       &file, single_parallel_file, "f_w_prev",
       [](fields_chunk *chunk, int c, int d) { return &(chunk->f_w_prev[c][d]); });
 
-  std::string local_error;
-  if (backend_host_refresh_required(*this)) {
-    for (int i = 0; i < num_chunks; ++i)
-      if (chunks[i]->is_mine())
-        for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
-          backend_read_host_range(*this, cur->dft, cur->N * cur->omega.size(), local_error);
-    backend_reconcile_host_access(local_error, "fields::dump DFT storage");
-  }
-
   // Dump DFT chunks.
   for (int i = 0; i < num_chunks; i++) {
     if (single_parallel_file || chunks[i]->is_mine()) {
