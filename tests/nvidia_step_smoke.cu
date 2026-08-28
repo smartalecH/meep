@@ -16,6 +16,7 @@
 #include <vector>
 
 using meep::nvidia::constitutive_launch;
+using meep::nvidia::array_copy_launch;
 using meep::nvidia::copy_device_to_host_async;
 using meep::nvidia::copy_host_to_device_async;
 using meep::nvidia::curl_launch;
@@ -30,6 +31,7 @@ using meep::nvidia::halo_gather_entry;
 using meep::nvidia::halo_launch;
 using meep::nvidia::halo_scatter_entry;
 using meep::nvidia::launch_constitutive;
+using meep::nvidia::launch_array_copy;
 using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
@@ -580,6 +582,32 @@ template <typename T> static void check_device(int device) {
                 source_tolerance * (1.0 + std::fabs(double(source_imag_expected[i]))),
             "point-source imaginary result or sentinel differs");
   }
+
+  std::vector<T> integrated_target(source_real.size(), T(-3.0));
+  copy_host_to_device_async(d_source_real, 0, integrated_target.data(),
+                            integrated_target.size() * sizeof(T), execution);
+  array_copy_launch source_copy = {};
+  source_copy.target = d_source_real.opaque_handle();
+  source_copy.source = d_source_imag.opaque_handle();
+  source_copy.elements = source_real.size();
+  source_copy.precision = precision;
+  launch_array_copy(source_copy, execution);
+  point.target_real = d_source_real.opaque_handle();
+  point.target_imag = NULL;
+  point.conductivity_inverse = NULL;
+  point.integrated = true;
+  launch_point_source(point, d_source_scalar.opaque_handle(), execution);
+  copy_device_to_host_async(source_observed.data(), d_source_real, 0,
+                            source_observed.size() * sizeof(T), execution);
+  execution.synchronize();
+  std::vector<T> integrated_expected = source_imag_observed;
+  const double dipole_real =
+      point.amplitude_real * scalar.dipole_real - point.amplitude_imag * scalar.dipole_imag;
+  integrated_expected[point.index] -= T(dipole_real);
+  for (size_t i = 0; i < source_observed.size(); ++i)
+    require(std::fabs(double(source_observed[i] - integrated_expected[i])) <=
+                source_tolerance * (1.0 + std::fabs(double(integrated_expected[i]))),
+            "integrated-source copy/application result or sentinel differs");
 }
 
 int main() {
