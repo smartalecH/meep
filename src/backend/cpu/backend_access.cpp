@@ -36,6 +36,17 @@ std::vector<std::vector<point_sampler> > &sampler_registry() {
   return registry;
 }
 
+/* The hook runs before either object is destroyed, so a resident backend can
+   synchronize/migrate authoritative values or reject the rebuild without
+   losing its live state. */
+void release_backend_state_for_rebuild(fields &f, DirtyMask reasons) {
+  if (f.backend_state) f.backend->prepare_state_rebuild(*f.backend_state, reasons);
+  delete f.executable;
+  f.executable = NULL;
+  delete f.backend_state;
+  f.backend_state = NULL;
+}
+
 } // namespace
 
 backend_capabilities fields::backend_caps() const {
@@ -54,9 +65,6 @@ backend_capabilities fields::backend_caps() const {
  * options against the same capabilities. A rank that accepted while its peers
  * rejected would hang at the next reduction rather than fail. */
 void fields::select_backend(const execution_options &opts) {
-  if (backend_state)
-    meep::abort("meep: cannot change backend after backend state has been initialized");
-
   options = opts;
   apply_execution_environment(options);
 
@@ -74,10 +82,19 @@ void fields::select_backend(const execution_options &opts) {
     b = make_backend(*this, options, why);
     if (!b) meep::abort("meep: no usable backend: %s", why.c_str());
   }
-  delete executable;
-  executable = NULL;
-  delete backend_state;
-  backend_state = NULL;
+
+  /* Selecting another backend replaces the storage representation even when no
+     simulation mutation happened. Keep the old state alive until its
+     replacement has been selected, and do not leak the replacement if the old
+     backend refuses or fails migration. */
+  try {
+    release_backend_state_for_rebuild(
+        *this, DirtyMask(dirty_mask | dirty_storage | dirty_executable));
+  }
+  catch (...) {
+    delete b;
+    throw;
+  }
   delete backend;
   backend = b;
   delete initialization_plan;
@@ -105,10 +122,7 @@ void fields::init_backend() {
 
   const bool rebuild_state = !backend_state || is_dirty(*this, dirty_storage);
   if (rebuild_state) {
-    delete executable;
-    executable = NULL;
-    delete backend_state;
-    backend_state = NULL;
+    if (backend_state) release_backend_state_for_rebuild(*this, DirtyMask(dirty_mask));
 
     /* Unlike the CPU path, a resident backend needs the complete catalog before
        it allocates. This is intentionally gated by the backend capability so
