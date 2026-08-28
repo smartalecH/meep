@@ -24,6 +24,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include <meep.hpp>
@@ -668,6 +669,26 @@ static void test_backend_lifecycle_epoch() {
   delete s;
 }
 
+static void test_classification_change_recompiles() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+
+  CHECK(f->prepared_classification_hash != 0, "classification did not publish a hash");
+  ++f->prepared_classification_hash;
+  invalidate(*f, MutationKind::material_values,
+             "backend_api:changed_classification_hash");
+  f->advance(1);
+  CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
+        "a changed classification hash did not recompile the executable");
+
+  delete f;
+  delete s;
+}
+
 /* restrict_to has no Phase-1 consumer -- the in-place design update that would
    use it is deferred -- so it is built and unit-tested here rather than wired
    in. */
@@ -987,8 +1008,9 @@ static void test_backend_safe_host_access() {
   CHECK(symmetric_failure, "rank-local backend read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
 
-  char filename[128];
-  snprintf(filename, sizeof(filename), "/tmp/meep-backend-access-%d.h5", my_rank());
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-backend-access-%ld-%d.h5", long(getpid()),
+           my_rank());
   accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
   f->dump(filename, false);
   CHECK(sum_to_all(int(accesses.field_reads)) > 0 && sum_to_all(int(accesses.dft_reads)) > 0,
@@ -1116,9 +1138,38 @@ static void test_compact_dft_reduction_boundary() {
   try { delete[] flux.flux(); }
   catch (const std::runtime_error &) { failed = true; }
   CHECK(sum_to_all(int(failed)) == count_processors(),
-        "rank-asymmetric compact reduction failure was not reconciled");
+        "rank-asymmetric compact flux failure was not reconciled");
+
+  compact.fail_call = int(compact.calls);
+  failed = false;
+  try { delete[] energy.electric(); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(sum_to_all(int(failed)) == count_processors(),
+        "rank-asymmetric compact electric-energy failure was not reconciled");
+
+  compact.fail_call = int(compact.calls);
+  failed = false;
+  try { delete[] energy.magnetic(); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(sum_to_all(int(failed)) == count_processors(),
+        "rank-asymmetric compact magnetic-energy failure was not reconciled");
+
+  compact.fail_call = int(compact.calls);
+  failed = false;
+  try { delete[] force.force(); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(sum_to_all(int(failed)) == count_processors(),
+        "rank-asymmetric compact force failure was not reconciled");
+
+  compact.fail_call = int(compact.calls + 1);
+  failed = false;
+  try { delete[] energy.total(); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(sum_to_all(int(failed)) == count_processors(),
+        "rank-asymmetric compact total-energy second-call failure was not reconciled");
   all_wait();
 
+  monitor.remove();
   delete f;
   delete s;
 }
@@ -1134,6 +1185,7 @@ int main(int argc, char **argv) {
   test_dft_access_boundaries();
   test_detached_dft_access();
   test_backend_lifecycle_epoch();
+  test_classification_change_recompiles();
   test_initialization_plan();
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();
