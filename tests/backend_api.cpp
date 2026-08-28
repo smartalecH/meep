@@ -1415,6 +1415,24 @@ static void test_classification_change_recompiles() {
   delete s;
 }
 
+static void test_collective_resident_invalidation() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+
+  if (my_rank() == 0)
+    invalidate(*f, MutationKind::field_values, "backend_api:asymmetric_field_values");
+  f->advance(1);
+  CHECK(counts.initialized == 2,
+        "rank %d did not join a resident refresh requested on rank 0", my_rank());
+
+  delete f;
+  delete s;
+}
+
 /* restrict_to has no Phase-1 consumer -- the in-place design update that would
    use it is deferred -- so it is built and unit-tested here rather than wired
    in. */
@@ -2107,6 +2125,7 @@ int main(int argc, char **argv) {
   test_resident_bfast_fingerprint();
   test_resident_cylindrical_fingerprint();
   test_classification_change_recompiles();
+  test_collective_resident_invalidation();
   test_initialization_plan();
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();
