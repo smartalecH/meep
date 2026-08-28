@@ -975,6 +975,15 @@ void split_by_binarytree(grid_volume gvol, std::vector<grid_volume> &result_gvs,
                          std::vector<int> &result_ids, const binary_partition *bp);
 class src_vol;
 class fields;
+/* Shared by DFT wrapper copies so monitor removal can invalidate the owning
+   fields object on every rank, while persistent adjoint monitors can safely
+   outlive that object. fields::~fields clears owner before destroying chunks. */
+struct dft_monitor_lifetime {
+  explicit dft_monitor_lifetime(fields *owner_) : owner(owner_) {}
+  fields *owner;
+};
+void begin_dft_monitor_removal(const std::shared_ptr<dft_monitor_lifetime> &lifetime,
+                               bool locally_attached, const char *site);
 class fields_chunk;
 class flux_vol;
 class source_descriptor_builder;
@@ -1155,6 +1164,8 @@ public:
   double maxomega() const;
 
   void scale_dft(std::complex<double> scale);
+  void sync_dft_to_host() const;
+  void publish_dft_from_host();
 
   // chunk-by-chunk helper routine called by
   // fields::process_dft_component
@@ -1180,6 +1191,8 @@ public:
 
   size_t N;                   // number of spatial points (on epsilon grid)
   std::complex<realnum> *dft; // N x Nomega array of DFT values.
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
+  bool attached_to_fields;
 
   class dft_chunk *next_in_chunk; // per-fields_chunk list of DFT chunks
   class dft_chunk *next_in_dft;   // next for this particular DFT vol./component
@@ -1295,6 +1308,7 @@ public:
   void *eigenmode_cache;            // opaque pointer to cached maxwell_data (NULL if none)
   bool eigenmode_cache_dispersive;  // whether the cached medium is frequency-dependent
   double eigenmode_cache_frequency; // frequency at which the cache was built
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
 };
 
 // dft.cpp (normally created with fields::add_dft_energy)
@@ -1332,6 +1346,7 @@ public:
   std::vector<double> freq;
   dft_chunk *E, *H, *D, *B;
   volume where;
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
 };
 
 // stress.cpp (normally created with fields::add_dft_force)
@@ -1362,6 +1377,7 @@ public:
   std::vector<double> freq;
   dft_chunk *offdiag1, *offdiag2, *diag;
   volume where;
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
 };
 
 struct sourcedata {
@@ -1426,6 +1442,7 @@ public:
   direction periodic_d[2];
   int periodic_n[2];
   double periodic_k[2], period[2];
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
 
   std::vector<sourcedata> near_sourcedata(const vec &x_0, double *farpt_list, size_t nfar_pts,
                                           const std::complex<double> *dJ, double greencyl_tol);
@@ -1476,6 +1493,7 @@ public:
   std::vector<double> freq;
   dft_chunk *chunks;
   volume where;
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
 };
 
 // data for each susceptibility
@@ -2512,6 +2530,7 @@ public:
   void reset_timers();
 
 private:
+  std::shared_ptr<dft_monitor_lifetime> dft_monitor_lifetime_;
   timing_scope with_timing_scope(time_sink sink);
 
   // The following is an array that is num_chunks by num_chunks.  Actually

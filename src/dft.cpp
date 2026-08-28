@@ -23,6 +23,10 @@
 #include <assert.h>
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
+#include "backend/lifecycle.hpp"
+#include "backend/precision.hpp"
+#include "backend/storage_plan.hpp"
 
 using namespace std;
 
@@ -52,6 +56,7 @@ struct dft_chunk_data { // for passing to field::loop_in_chunks as void*
   dft_chunk *dft_chunks;
   int decimation_factor;
   bool persist;
+  std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
 };
 
 dft_chunk::dft_chunk(fields_chunk *fc_, ivec is_, ivec ie_, vec s0_, vec s1_, vec e0_, vec e1_,
@@ -72,6 +77,8 @@ dft_chunk::dft_chunk(fields_chunk *fc_, ivec is_, ivec ie_, vec s0_, vec s1_, ve
   dV1 = dV1_;
 
   persist = data->persist;
+  monitor_lifetime = data->monitor_lifetime;
+  attached_to_fields = true;
 
   c = c_;
 
@@ -142,6 +149,10 @@ dft_chunk::~dft_chunk() {
   delete[] dft;
   delete[] dft_phase;
 
+  /* Persistent adjoint monitors are intentionally detached by
+     fields_chunk::~fields_chunk and may be destroyed after fields itself. */
+  if (!fc || !attached_to_fields) return;
+
   // delete from fields_chunk list
   dft_chunk *cur = fc->dft_chunks;
   if (cur == this)
@@ -153,7 +164,78 @@ dft_chunk::~dft_chunk() {
   }
 }
 
+void dft_chunk::sync_dft_to_host() const {
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  if (!owner || !owner->backend || !owner->backend_state ||
+      !owner->backend->requires_full_storage_preparation())
+    return;
+
+  ArrayId id = invalid_array();
+  ptrdiff_t offset = 0;
+  if (!owner->array_catalog || !owner->array_catalog->locate(dft, id, offset)) {
+    if (!attached_to_fields) return;
+    if (is_dirty(*owner, dirty_storage)) return;
+    meep::abort("DFT accumulator is absent from the current backend storage catalog");
+  }
+  if (offset < 0) meep::abort("DFT accumulator has a negative catalog offset");
+  const size_t elements = N * omega.size();
+  owner->backend->read(ArrayRef{id, size_t(offset), elements}, dft,
+                       elements * host_element_bytes(ElementType::complex_realnum));
+}
+
+void dft_chunk::publish_dft_from_host() {
+  fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
+  if (!owner || !owner->backend || !owner->backend_state ||
+      !owner->backend->requires_full_storage_preparation())
+    return;
+
+  ArrayId id = invalid_array();
+  ptrdiff_t offset = 0;
+  if (!owner->array_catalog || !owner->array_catalog->locate(dft, id, offset)) {
+    if (!attached_to_fields) return;
+    if (is_dirty(*owner, dirty_storage)) return;
+    meep::abort("DFT accumulator is absent from the current backend storage catalog");
+  }
+  if (offset < 0) meep::abort("DFT accumulator has a negative catalog offset");
+  const size_t elements = N * omega.size();
+  owner->backend->write(ArrayRef{id, size_t(offset), elements}, dft,
+                        elements * host_element_bytes(ElementType::complex_realnum));
+}
+
+void begin_dft_monitor_removal(const std::shared_ptr<dft_monitor_lifetime> &lifetime,
+                               bool locally_attached, const char *site) {
+  fields *owner = lifetime ? lifetime->owner : NULL;
+  if (!owner || !or_to_all(locally_attached)) return;
+
+  /* Device state still names the old catalog and may hold the authoritative
+     accumulator values. Migrate and retire it while every DFT allocation is
+     alive; invalidating first and freeing first would make the rebuild's
+     migration write through dangling host destinations. */
+  if (owner->backend_state)
+    owner->backend->prepare_state_rebuild(
+        *owner->backend_state,
+        DirtyMask(owner->dirty_mask | invalidation_closure(MutationKind::monitor_definition)));
+  delete owner->executable;
+  owner->executable = NULL;
+  delete owner->backend_state;
+  owner->backend_state = NULL;
+  invalidate(*owner, MutationKind::monitor_definition, site);
+}
+
+static void sync_dft_chain(dft_chunk *chunks) {
+  for (dft_chunk *cur = chunks; cur; cur = cur->next_in_dft)
+    cur->sync_dft_to_host();
+}
+
+static bool attached_dft_chain(const dft_chunk *chunks) {
+  for (const dft_chunk *cur = chunks; cur; cur = cur->next_in_dft)
+    if (cur->attached_to_fields) return true;
+  return false;
+}
+
 void dft_flux::remove() {
+  begin_dft_monitor_removal(monitor_lifetime, attached_dft_chain(E) || attached_dft_chain(H),
+                            "dft_flux::remove");
   invalidate_eigenmode_cache();
   while (E) {
     dft_chunk *nxt = E->next_in_dft;
@@ -200,6 +282,7 @@ dft_chunk *fields::add_dft(component c, const volume &where, const double *freq,
 
   dft_chunk_data data;
   data.persist = persist;
+  data.monitor_lifetime = dft_monitor_lifetime_;
   data.c = c;
   data.vc = vc;
 
@@ -240,6 +323,9 @@ dft_chunk *fields::add_dft(component c, const volume &where, const double *freq,
   LOOP_OVER_DIRECTIONS(where.dim, d) { data.empty_dim[d] = where.in_direction(d) == 0; }
   data.dft_chunks = chunk_next;
   loop_in_chunks(add_dft_chunkloop, (void *)&data, where, use_centered_grid ? Centered : c);
+
+  invalidate_collectively(*this, MutationKind::monitor_definition,
+                          data.dft_chunks != chunk_next, "fields::add_dft");
 
   return data.dft_chunks;
 }
@@ -339,6 +425,7 @@ double fields_chunk::dft_norm2(grid_volume fgv) const {
 static double sqr(std::complex<realnum> x) { return (x * std::conj(x)).real(); }
 
 double dft_chunk::norm2(grid_volume fgv) const {
+  sync_dft_to_host();
   if (!fc->f[c][0]) return 0.0;
   double sum = 0.0;
   size_t idx_dft;
@@ -419,8 +506,10 @@ double dft_chunk::maxomega() const {
 }
 
 void dft_chunk::scale_dft(complex<double> scale) {
+  sync_dft_to_host();
   for (size_t i = 0; i < N * omega.size(); ++i)
     dft[i] *= scale;
+  publish_dft_from_host();
   if (next_in_dft) next_in_dft->scale_dft(scale);
 }
 
@@ -428,8 +517,11 @@ void dft_chunk::operator-=(const dft_chunk &chunk) {
   if (c != chunk.c || N * omega.size() != chunk.N * chunk.omega.size())
     meep::abort("Mismatched chunks in dft_chunk::operator-=");
 
+  sync_dft_to_host();
+  chunk.sync_dft_to_host();
   for (size_t i = 0; i < N * omega.size(); ++i)
     dft[i] -= chunk.dft[i];
+  publish_dft_from_host();
 
   if (next_in_dft) {
     if (!chunk.next_in_dft) meep::abort("Mismatched chunk lists in dft_chunk::operator-=");
@@ -474,6 +566,7 @@ void save_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const 
   file->create_data(dataname, 1, &n);
 
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
+    cur->sync_dft_to_host();
     size_t Nchunk = cur->N * cur->omega.size() * 2;
     file->write_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
     istart += Nchunk;
@@ -506,6 +599,7 @@ void load_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const 
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
     size_t Nchunk = cur->N * cur->omega.size() * 2;
     file->read_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
+    cur->publish_dft_from_host();
     istart += Nchunk;
   }
 }
@@ -554,11 +648,14 @@ dft_flux::dft_flux(const dft_flux &f) : where(f.where) {
   eigenmode_cache = NULL; // don't share cache across copies
   eigenmode_cache_dispersive = false;
   eigenmode_cache_frequency = 0;
+  monitor_lifetime = f.monitor_lifetime;
 }
 
 dft_flux::~dft_flux() { invalidate_eigenmode_cache(); }
 
 double *dft_flux::flux() {
+  sync_dft_chain(E);
+  sync_dft_chain(H);
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
@@ -575,6 +672,8 @@ double *dft_flux::flux() {
 }
 
 std::vector<std::complex<double> > dft_flux::complexflux() {
+  sync_dft_chain(E);
+  sync_dft_chain(H);
   const size_t Nfreq = freq.size();
   std::vector<std::complex<double> > F(Nfreq);
   for (size_t i = 0; i < Nfreq; ++i)
@@ -620,8 +719,11 @@ void dft_flux::scale_dfts(complex<double> scale) {
 
 dft_flux fields::add_dft_flux(const volume_list *where_, const double *freq, size_t Nfreq,
                               bool use_symmetry, bool centered_grid, int decimation_factor) {
-  if (!where_) // handle empty list of volumes
-    return dft_flux(Ex, Hy, NULL, NULL, freq, Nfreq, v, NO_DIRECTION, use_symmetry);
+  if (!where_) { // handle empty list of volumes
+    dft_flux result(Ex, Hy, NULL, NULL, freq, Nfreq, v, NO_DIRECTION, use_symmetry);
+    result.monitor_lifetime = dft_monitor_lifetime_;
+    return result;
+  }
 
   dft_chunk *E = 0, *H = 0;
   component cE[2] = {Ex, Ey}, cH[2] = {Hy, Hx};
@@ -667,7 +769,9 @@ dft_flux fields::add_dft_flux(const volume_list *where_, const double *freq, siz
   // if the volume list has only one entry, store its component's direction.
   // if the volume list has > 1 entry, store NO_DIRECTION.
   direction flux_dir = (where_->next ? NO_DIRECTION : component_direction(where_->c));
-  return dft_flux(cE[0], cH[0], E, H, freq, Nfreq, firstvol, flux_dir, use_symmetry);
+  dft_flux result(cE[0], cH[0], E, H, freq, Nfreq, firstvol, flux_dir, use_symmetry);
+  result.monitor_lifetime = dft_monitor_lifetime_;
+  return result;
 }
 
 dft_energy::dft_energy(dft_chunk *E_, dft_chunk *H_, dft_chunk *D_, dft_chunk *B_, double fmin,
@@ -695,9 +799,12 @@ dft_energy::dft_energy(const dft_energy &f) : where(f.where) {
   H = f.H;
   D = f.D;
   B = f.B;
+  monitor_lifetime = f.monitor_lifetime;
 }
 
 double *dft_energy::electric() {
+  sync_dft_chain(E);
+  sync_dft_chain(D);
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
@@ -714,6 +821,8 @@ double *dft_energy::electric() {
 }
 
 double *dft_energy::magnetic() {
+  sync_dft_chain(H);
+  sync_dft_chain(B);
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
@@ -744,8 +853,11 @@ double *dft_energy::total() {
 dft_energy fields::add_dft_energy(const volume_list *where_, const double *freq, size_t Nfreq,
                                   int decimation_factor) {
 
-  if (!where_) // handle empty list of volumes
-    return dft_energy(NULL, NULL, NULL, NULL, freq, Nfreq, v);
+  if (!where_) { // handle empty list of volumes
+    dft_energy result(NULL, NULL, NULL, NULL, freq, Nfreq, v);
+    result.monitor_lifetime = dft_monitor_lifetime_;
+    return result;
+  }
 
   dft_chunk *E = 0, *D = 0, *H = 0, *B = 0;
   volume firstvol(where_->v);
@@ -766,7 +878,9 @@ dft_energy fields::add_dft_energy(const volume_list *where_, const double *freq,
   }
   delete where_save;
 
-  return dft_energy(E, H, D, B, freq, Nfreq, firstvol);
+  dft_energy result(E, H, D, B, freq, Nfreq, firstvol);
+  result.monitor_lifetime = dft_monitor_lifetime_;
+  return result;
 }
 
 void dft_energy::save_hdf5(h5file *file, const char *dprefix) {
@@ -809,6 +923,10 @@ void dft_energy::scale_dfts(complex<double> scale) {
 }
 
 void dft_energy::remove() {
+  begin_dft_monitor_removal(monitor_lifetime,
+                            attached_dft_chain(E) || attached_dft_chain(D) ||
+                                attached_dft_chain(H) || attached_dft_chain(B),
+                            "dft_energy::remove");
   while (E) {
     dft_chunk *nxt = E->next_in_dft;
     delete E;
@@ -922,6 +1040,7 @@ dft_fields::dft_fields(dft_chunk *chunks_, const double *freq_, size_t Nfreq, co
 void dft_fields::scale_dfts(complex<double> scale) { chunks->scale_dft(scale); }
 
 void dft_fields::remove() {
+  begin_dft_monitor_removal(monitor_lifetime, attached_dft_chain(chunks), "dft_fields::remove");
   while (chunks) {
     dft_chunk *nxt = chunks->next_in_dft;
     delete chunks;
@@ -942,7 +1061,9 @@ dft_fields fields::add_dft_fields(component *components, int num_components, con
                      stored_weight, chunks, sqrt_dV_and_interp_weights, extra_weight,
                      use_centered_grid, 0, decimation_factor, persist);
 
-  return dft_fields(chunks, freq, Nfreq, where);
+  dft_fields result(chunks, freq, Nfreq, where);
+  result.monitor_lifetime = dft_monitor_lifetime_;
+  return result;
 }
 
 /***************************************************************/
@@ -954,6 +1075,7 @@ complex<double> dft_chunk::process_dft_component(int rank, direction *ds, ivec m
                                                  complex<realnum> *field_array, void *mode1_data,
                                                  void *mode2_data, int ic_conjugate,
                                                  bool retain_interp_weights, fields *parent) {
+  sync_dft_to_host();
 
   if ((num_freq < 0) || (num_freq > static_cast<int>(omega.size()) - 1))
     meep::abort("process_dft_component: frequency index %d is outside the range of the frequency "
@@ -1485,8 +1607,16 @@ delete the underlying dft_chunks! (useful for
 adjoint calculations, where we want to keep
 the chunk data around) */
 void fields::clear_dft_monitors() {
+  bool local_monitor = false;
+  for (int i = 0; i < num_chunks && !local_monitor; ++i)
+    local_monitor = chunks[i]->is_mine() && chunks[i]->dft_chunks;
+  begin_dft_monitor_removal(dft_monitor_lifetime_, local_monitor, "fields::clear_dft_monitors");
   for (int i = 0; i < num_chunks; i++)
-    if (chunks[i]->is_mine() && chunks[i]->dft_chunks) chunks[i]->dft_chunks = NULL;
+    if (chunks[i]->is_mine() && chunks[i]->dft_chunks) {
+      for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
+        cur->attached_to_fields = false;
+      chunks[i]->dft_chunks = NULL;
+    }
 }
 
 // return the size of the dft monitor
