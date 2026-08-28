@@ -9,6 +9,7 @@
 #include <math.h>
 #include <stdio.h>
 
+#include <algorithm>
 #include <vector>
 
 #include <meep.hpp>
@@ -64,6 +65,68 @@ static bool has_access(const Operation &op, ArrayId id, AccessMode mode) {
   for (size_t i = 0; i < op.accesses.size(); ++i)
     if (op.accesses[i].array.id == id && op.accesses[i].mode == mode) return true;
   return false;
+}
+
+static void check_finite_value_accesses(const fields &f, const StepPlan &plan) {
+  const Operation *finite = NULL;
+  for (size_t i = 0; i < plan.operations.size(); ++i)
+    if (plan.operations[i].kind == OpKind::finite_value_check) {
+      CHECK(!finite, "plan contains more than one finite-value check");
+      finite = &plan.operations[i];
+    }
+  CHECK(finite, "plan has no finite-value check");
+  if (!finite) return;
+  CHECK(f.storage_plan && f.storage_plan->arrays.size() == f.storage_plan->keys.size(),
+        "storage arrays and keys are not available in parallel");
+  if (!f.storage_plan || f.storage_plan->arrays.size() != f.storage_plan->keys.size()) return;
+
+  std::vector<ArrayId> expected;
+  for (size_t i = 0; i < f.storage_plan->arrays.size(); ++i) {
+    const ArraySpec &spec = f.storage_plan->arrays[i];
+    const StorageKey &key = f.storage_plan->keys[i];
+    if (key.kind == int(array_kind::f) && spec.element_type == ElementType::realnum_value &&
+        spec.elements && !is_valid(spec.alias_of))
+      expected.push_back(spec.id);
+  }
+
+  CHECK(finite->accesses.size() == expected.size(), "finite check has %zu accesses, expected %zu",
+        finite->accesses.size(), expected.size());
+  const size_t compared = std::min(finite->accesses.size(), expected.size());
+  for (size_t i = 0; i < compared; ++i) {
+    const BufferAccess &access = finite->accesses[i];
+    CHECK(is_valid(access.array.id) && access.array.id.value < f.storage_plan->arrays.size(),
+          "finite-check access %zu has an invalid ArrayId", i);
+    if (!is_valid(access.array.id) || access.array.id.value >= f.storage_plan->arrays.size())
+      continue;
+    const ArraySpec &spec = f.storage_plan->arrays[access.array.id.value];
+    const StorageKey &key = f.storage_plan->keys[access.array.id.value];
+    CHECK(access.array.id == expected[i], "finite-check access %zu is out of stable ArrayId order",
+          i);
+    if (i)
+      CHECK(finite->accesses[i - 1].array.id.value < access.array.id.value,
+            "finite-check accesses are not in ascending ArrayId order");
+    CHECK(access.mode == AccessMode::read, "finite-check access %zu is not read-only", i);
+    CHECK(access.array.offset == 0 && access.array.elements == spec.elements,
+          "finite-check access %zu does not cover its full allocation", i);
+    CHECK(!is_valid(spec.alias_of), "finite-check access %zu names an alias", i);
+    CHECK(key.kind == int(array_kind::f) && spec.element_type == ElementType::realnum_value,
+          "finite-check access %zu names a non-physical-field allocation", i);
+    CHECK(key.chunk >= 0 && key.component_ >= 0 && key.component_ < NUM_FIELD_COMPONENTS &&
+              (key.cmp == 0 || key.cmp == 1),
+          "finite-check access %zu lacks deterministic chunk/component/cmp attribution", i);
+  }
+  CHECK(!finite->accesses.empty(), "prepared finite check has no field accesses");
+
+  if (!finite->accesses.empty()) {
+    StepPlan changed = plan;
+    for (size_t i = 0; i < changed.operations.size(); ++i)
+      if (changed.operations[i].kind == OpKind::finite_value_check) {
+        --changed.operations[i].accesses[0].array.elements;
+        break;
+      }
+    CHECK(compute_step_plan_signature(changed) != plan.signature,
+          "signature ignored a finite-check access-span change");
+  }
 }
 
 static void check_region(const fields &f, const UpdateRegion &region) {
@@ -149,6 +212,7 @@ static void check_prepared_updates() {
     }
   }
   CHECK(update_ops == 4, "expected four Maxwell update operations, got %zu", update_ops);
+  check_finite_value_accesses(f, plan);
 
   CHECK(compute_step_plan_signature(plan) == plan.signature,
         "stored signature differs from structural signature");
@@ -245,13 +309,27 @@ static void check_alias_elision() {
   f.advance(1);
   const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
 
+  const Operation *finite = NULL;
+  for (size_t i = 0; i < plan.operations.size(); ++i)
+    if (plan.operations[i].kind == OpKind::finite_value_check) finite = &plan.operations[i];
+  CHECK(finite, "plan has no finite-value check");
+
+  size_t field_aliases = 0;
   for (size_t i = 0; i < f.array_catalog->size(); ++i) {
-    const ArraySpec &spec = f.array_catalog->spec(ArrayId{uint32_t(i)});
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = f.array_catalog->spec(id);
     if (!is_valid(spec.alias_of)) continue;
     for (size_t j = 0; j < plan.eh_updates.size(); ++j)
       CHECK(plan.eh_updates[j].target != spec.id,
             "H/B alias was emitted as a constitutive write descriptor");
+    const StorageKey &key = f.array_catalog->key(id);
+    if (key.kind == int(array_kind::f) && spec.element_type == ElementType::realnum_value) {
+      ++field_aliases;
+      if (finite)
+        CHECK(!has_access(*finite, spec.id), "field alias was emitted as a finite-check access");
+    }
   }
+  CHECK(field_aliases > 0, "alias-elision test prepared no physical-field aliases");
 }
 
 int main(int argc, char **argv) {
