@@ -11,6 +11,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <unistd.h>
 
 #include "backend/backend.hpp"
 #include "backend/storage_plan.hpp"
@@ -69,16 +70,24 @@ static void poison_host_fields(fields &gpu) {
 
 static void compare_hdf5_field_access(fields &cpu, fields &gpu, const volume &where,
                                       double tolerance) {
-  h5file *cpu_file = new h5file("nvidia-access-cpu.h5", h5file::WRITE, true);
-  h5file *gpu_file = new h5file("nvidia-access-gpu.h5", h5file::WRITE, true);
+  static unsigned int invocation = 0;
+  char cpu_filename[128], gpu_filename[128];
+  snprintf(cpu_filename, sizeof(cpu_filename), "/tmp/meep-nvidia-access-%ld-%u-cpu.h5",
+           static_cast<long>(getpid()), invocation);
+  snprintf(gpu_filename, sizeof(gpu_filename), "/tmp/meep-nvidia-access-%ld-%u-gpu.h5",
+           static_cast<long>(getpid()), invocation);
+  ++invocation;
+
+  h5file *cpu_file = new h5file(cpu_filename, h5file::WRITE, true);
+  h5file *gpu_file = new h5file(gpu_filename, h5file::WRITE, true);
   cpu.output_hdf5(Ez, where, cpu_file);
   poison_host_fields(gpu);
   gpu.output_hdf5(Ez, where, gpu_file);
   delete cpu_file;
   delete gpu_file;
 
-  cpu_file = new h5file("nvidia-access-cpu.h5", h5file::READONLY, true);
-  gpu_file = new h5file("nvidia-access-gpu.h5", h5file::READONLY, true);
+  cpu_file = new h5file(cpu_filename, h5file::READONLY, true);
+  gpu_file = new h5file(gpu_filename, h5file::READONLY, true);
   int cpu_rank = 0, gpu_rank = 0;
   size_t cpu_dims[3] = {0, 0, 0}, gpu_dims[3] = {0, 0, 0};
   std::unique_ptr<double[]> expected(
