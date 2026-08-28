@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <cmath>
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
@@ -165,10 +166,29 @@ void fields::step_once() {
    * contraction can change the result. These values are now the same on every
    * compiler and at every optimization level. See the exception note in
    * ~/meep-phase1-pr5.md. */
-  const double tnow = time();
-  step_source_times[0] = tnow;
-  step_source_times[1] = tnow + 0.5 * dt;
-  step_source_times[2] = tnow + dt;
+  /* The three times the plan's evaluate_source_scalars operations use.
+   *
+   * The explicit fma is deliberate and must not be "simplified" to
+   * time() + 0.5*dt. That expression is (double)t * dt + 0.5 * dt, and GCC
+   * contracts the t*dt multiply into the add at its default
+   * -ffp-contract=fast. Whether it does so depends on the surrounding code, so
+   * merely moving the expression -- which this refactor does, out of
+   * fields::step_once and into a plan -- silently flips the last bit of every
+   * source evaluation.
+   *
+   * That is not academic. It changed three of the harness's twenty-seven
+   * configurations, including d3_isotropic_pml, which is nothing more exotic
+   * than a 3D run with a Gaussian point source. Writing the contraction out
+   * makes the value independent of where the expression lives.
+   *
+   * Caveat worth knowing: this reproduces the pre-refactor value wherever the
+   * compiler contracts, which is the default for GCC and clang. Under
+   * -ffp-contract=off the old code produced the un-fused value instead, so
+   * there is no single form that matches every build. This form matches the
+   * one everybody actually compiles. */
+  step_source_times[0] = time(); // a bare product; nothing to contract with
+  step_source_times[1] = std::fma(double(t), dt, 0.5 * dt);
+  step_source_times[2] = std::fma(double(t), dt, dt);
 
   const bool cw = num_chunks && chunks[0]->is_solving_cw();
   execute_step_plan(step_plan_for(cw ? StepProgram::solve_cw : StepProgram::ordinary),
