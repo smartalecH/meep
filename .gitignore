@@ -103,6 +103,9 @@ tests/h5test
 tests/harmonics
 tests/integrate
 tests/known_results
+tests/backend_api
+tests/backend_api.log
+tests/backend_api.trs
 tests/classification
 tests/classification.log
 tests/classification.trs
