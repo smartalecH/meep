@@ -2022,7 +2022,6 @@ public:
   void collect_samples(); // called once per step by the executor
   void select_backend(const execution_options &opts);
   void init_backend();
-  void classify_and_finalize(); // backend lifecycle pass 2; exercised by backend tests
 
   /* --- Lifecycle bookkeeping (src/backend/lifecycle.{hpp,cpp}) ------------
      These are POD counters only. The MutationKind / DirtyMask types that give
@@ -2496,6 +2495,7 @@ private:
   void prepare_storage();                        // all four field types
   void prepare_storage_for(field_type ft);       // one field type
   void prepare_storage_if_stale(field_type ft);  // no-op if already prepared
+  void classify_and_finalize();                  // preparation pass 2
   void step_once(); // one timestep; advance(n) calls this n times
   const StepPlan &step_plan_for(StepProgram program);
   void execute_step_plan(const StepPlan &plan, int save_synchronized_magnetic_fields);
