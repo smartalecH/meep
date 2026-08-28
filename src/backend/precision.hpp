@@ -29,6 +29,9 @@
 #ifndef MEEP_BACKEND_PRECISION_HPP
 #define MEEP_BACKEND_PRECISION_HPP
 
+#include <stddef.h>
+#include <string>
+
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
 
@@ -64,10 +67,24 @@ inline PrecisionPolicy precision_f32() {
 PrecisionPolicy policy_for(precision_policy_kind kind);
 const char *precision_policy_name(precision_policy_kind kind);
 
+struct StoragePlan;
+
+/* Host size is the CPU representation. Storage size applies ArraySpec::storage
+   to realnum-valued arrays and leaves fixed-width element types fixed. The
+   multiplication in storage_bytes is overflow checked. */
+size_t host_element_bytes(ElementType type);
+size_t storage_element_bytes(ElementType type, Precision storage);
+size_t storage_bytes(const ArraySpec &spec);
+
+/* Apply the selected policy to backend storage. Communication and scratch
+   arrays retain their producer-specified precision. */
+void apply_precision_policy(StoragePlan &plan, const PrecisionPolicy &policy);
+
 /* Arrays joined by an alias (H == B) must have identical storage precision.
    Validated even though the CPU backend only supports `native`, because the
    check is cheap and the failure mode in Phase 2 is silent corruption. */
 bool validate_alias_precisions(const class CpuArrayCatalog &cat, std::string &why);
+bool validate_alias_precisions(const StoragePlan &plan, std::string &why);
 
 } // namespace meep
 
