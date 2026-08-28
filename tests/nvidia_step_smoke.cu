@@ -7,6 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_step.hpp"
+#include "backend/nvidia/nvidia_sources.hpp"
 
 #include <cmath>
 #include <iostream>
@@ -33,8 +34,11 @@ using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
 using meep::nvidia::launch_halo_scatter;
+using meep::nvidia::launch_point_source;
 using meep::nvidia::launch_zero;
+using meep::nvidia::point_source_launch;
 using meep::nvidia::scalar_precision;
+using meep::nvidia::source_scalar;
 using meep::nvidia::stream;
 using meep::nvidia::zero_launch;
 
@@ -519,6 +523,63 @@ template <typename T> static void check_device(int device) {
               std::fabs(double(halo_observed[5] - phase_imag)) <=
                   phase_tolerance * (1.0 + std::fabs(double(phase_imag))),
           "halo PHASE result differs");
+
+  std::vector<T> source_real(8), source_imag(8), source_condinv(8), source_observed(8),
+      source_imag_observed(8);
+  for (size_t i = 0; i < source_real.size(); ++i) {
+    source_real[i] = T(0.25 + 0.01 * double(i));
+    source_imag[i] = T(-0.4 + 0.02 * double(i));
+    source_condinv[i] = T(0.8 + 0.01 * double(i));
+  }
+  const source_scalar scalar = {0.7, -0.2, 1.3, 0.4};
+  device_buffer d_source_real(source_real.size() * sizeof(T), device);
+  device_buffer d_source_imag(source_imag.size() * sizeof(T), device);
+  device_buffer d_source_condinv(source_condinv.size() * sizeof(T), device);
+  device_buffer d_source_scalar(sizeof(scalar), device);
+  copy_host_to_device_async(d_source_real, 0, source_real.data(),
+                            source_real.size() * sizeof(T), execution);
+  copy_host_to_device_async(d_source_imag, 0, source_imag.data(),
+                            source_imag.size() * sizeof(T), execution);
+  copy_host_to_device_async(d_source_condinv, 0, source_condinv.data(),
+                            source_condinv.size() * sizeof(T), execution);
+  copy_host_to_device_async(d_source_scalar, 0, &scalar, sizeof(scalar), execution);
+  point_source_launch point = {};
+  point.target_real = d_source_real.opaque_handle();
+  point.target_imag = d_source_imag.opaque_handle();
+  point.conductivity_inverse = d_source_condinv.opaque_handle();
+  point.index = 3;
+  point.scalar_slot = 0;
+  point.amplitude_real = 0.3;
+  point.amplitude_imag = 0.4;
+  point.dt = 0.125;
+  point.precision = precision;
+  launch_point_source(point, d_source_scalar.opaque_handle(), execution);
+  copy_device_to_host_async(source_observed.data(), d_source_real, 0,
+                            source_observed.size() * sizeof(T), execution);
+  copy_device_to_host_async(source_imag_observed.data(), d_source_imag, 0,
+                            source_imag_observed.size() * sizeof(T), execution);
+  execution.synchronize();
+  double source_value_real =
+      point.amplitude_real * scalar.current_real - point.amplitude_imag * scalar.current_imag;
+  double source_value_imag =
+      point.amplitude_real * scalar.current_imag + point.amplitude_imag * scalar.current_real;
+  source_value_real *= point.dt;
+  source_value_imag *= point.dt;
+  source_value_real *= double(source_condinv[point.index]);
+  source_value_imag *= double(source_condinv[point.index]);
+  std::vector<T> source_expected = source_real;
+  std::vector<T> source_imag_expected = source_imag;
+  source_expected[point.index] -= T(source_value_real);
+  source_imag_expected[point.index] -= T(source_value_imag);
+  const double source_tolerance = 4.0 * std::numeric_limits<T>::epsilon();
+  for (size_t i = 0; i < source_observed.size(); ++i) {
+    require(std::fabs(double(source_observed[i] - source_expected[i])) <=
+                source_tolerance * (1.0 + std::fabs(double(source_expected[i]))),
+            "point-source real result or sentinel differs");
+    require(std::fabs(double(source_imag_observed[i] - source_imag_expected[i])) <=
+                source_tolerance * (1.0 + std::fabs(double(source_imag_expected[i]))),
+            "point-source imaginary result or sentinel differs");
+  }
 }
 
 int main() {
