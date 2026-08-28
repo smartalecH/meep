@@ -18,6 +18,9 @@
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
+#include <limits>
+#include <stdexcept>
+
 namespace meep {
 
 const char *array_kind_name(array_kind k) {
@@ -63,10 +66,20 @@ static size_t element_bytes(ElementType t) {
   return 0;
 }
 
+static void add_array_bytes(size_t &total, const ArraySpec &spec) {
+  const size_t element_size = element_bytes(spec.element_type);
+  if (element_size && spec.elements > std::numeric_limits<size_t>::max() / element_size)
+    throw std::overflow_error("backend storage plan array byte count overflow");
+  const size_t bytes = spec.elements * element_size;
+  if (bytes > std::numeric_limits<size_t>::max() - total)
+    throw std::overflow_error("backend storage plan total byte count overflow");
+  total += bytes;
+}
+
 size_t StoragePlan::provisional_peak_bytes() const {
   size_t n = 0;
   for (const ArraySpec &s : arrays)
-    n += s.elements * element_bytes(s.element_type);
+    if (!is_valid(s.alias_of)) add_array_bytes(n, s);
   return n;
 }
 
@@ -77,7 +90,7 @@ size_t StoragePlan::steady_state_bytes() const {
      would understate it later. */
   size_t n = 0;
   for (const ArraySpec &s : arrays)
-    if (!s.classification_provisional) n += s.elements * element_bytes(s.element_type);
+    if (!is_valid(s.alias_of) && !s.classification_provisional) add_array_bytes(n, s);
   return n;
 }
 
@@ -112,7 +125,7 @@ ArrayId CpuArrayCatalog::register_array(const StorageKey &key, void *address, si
 size_t CpuArrayCatalog::total_bytes() const {
   size_t n = 0;
   for (const ArraySpec &s : specs_)
-    n += s.elements * element_bytes(s.element_type);
+    if (!is_valid(s.alias_of)) add_array_bytes(n, s);
   return n;
 }
 
@@ -231,6 +244,11 @@ size_t build_storage_catalog(fields &f, CpuArrayCatalog &cat, StoragePlan &plan)
       r.add(i, array_kind::dft, int(cur->c), -1, di, cur->dft, cur->N * cur->omega.size(),
             array_role::dft, ElementType::complex_realnum);
   }
+  /* H/B and D/E aliases are discovered after field specs enter the plan.
+     Refresh the frozen descriptors so every consumer sees the catalog's
+     canonical alias graph. */
+  for (size_t i = 0; i < plan.arrays.size(); ++i)
+    plan.arrays[i] = cat.spec(ArrayId{uint32_t(i)});
   return r.count;
 }
 
