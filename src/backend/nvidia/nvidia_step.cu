@@ -73,6 +73,35 @@ template <typename T> __global__ void zero_kernel(zero_launch update, size_t poi
   static_cast<T *>(update.target)[region_index(update.region, linear)] = T(0);
 }
 
+template <typename T>
+__global__ void halo_gather_kernel(const halo_gather_entry *entries, size_t first, size_t count,
+                                   T *buffer) {
+  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= count) return;
+  const halo_gather_entry entry = entries[first + linear];
+  buffer[entry.buffer_index] = static_cast<const T *>(entry.source)[entry.source_index];
+}
+
+template <typename T>
+__global__ void halo_scatter_kernel(const halo_scatter_entry *entries, size_t first, size_t count,
+                                    const T *buffer) {
+  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= count) return;
+  const halo_scatter_entry entry = entries[first + linear];
+  const T input_real = buffer[entry.buffer_index];
+  const T phase_real = T(entry.phase_real);
+  if (!entry.target_imag) {
+    static_cast<T *>(entry.target_real)[entry.target_real_index] = phase_real * input_real;
+    return;
+  }
+  const T input_imag = buffer[entry.buffer_index + 1];
+  const T phase_imag = T(entry.phase_imag);
+  static_cast<T *>(entry.target_real)[entry.target_real_index] =
+      phase_real * input_real - phase_imag * input_imag;
+  static_cast<T *>(entry.target_imag)[entry.target_imag_index] =
+      phase_real * input_imag + phase_imag * input_real;
+}
+
 void launch_geometry(const flat_region &region, unsigned int &blocks, unsigned int &threads) {
   const size_t points = checked_points(region);
   threads = 256;
@@ -113,6 +142,39 @@ void launch_zero_t(const zero_launch &update, const stream &execution_stream) {
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA zero");
 }
 
+void linear_launch_geometry(size_t count, unsigned int &blocks, unsigned int &threads) {
+  if (!count) throw std::invalid_argument("NVIDIA halo launch is empty");
+  threads = 256;
+  const size_t block_count = (count + threads - 1) / threads;
+  if (block_count > std::numeric_limits<unsigned int>::max())
+    throw std::overflow_error("NVIDIA halo launch grid overflow");
+  blocks = static_cast<unsigned int>(block_count);
+}
+
+template <typename T>
+void launch_halo_gather_t(const halo_launch &launch, const void *device_entries,
+                          void *device_buffer, const stream &execution_stream) {
+  unsigned int blocks = 0, threads = 0;
+  linear_launch_geometry(launch.count, blocks, threads);
+  halo_gather_kernel<T><<<blocks, threads, 0,
+                          static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+      static_cast<const halo_gather_entry *>(device_entries), launch.first, launch.count,
+      static_cast<T *>(device_buffer));
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA halo gather");
+}
+
+template <typename T>
+void launch_halo_scatter_t(const halo_launch &launch, const void *device_entries,
+                           const void *device_buffer, const stream &execution_stream) {
+  unsigned int blocks = 0, threads = 0;
+  linear_launch_geometry(launch.count, blocks, threads);
+  halo_scatter_kernel<T><<<blocks, threads, 0,
+                           static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+      static_cast<const halo_scatter_entry *>(device_entries), launch.first, launch.count,
+      static_cast<const T *>(device_buffer));
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA halo scatter");
+}
+
 } // namespace
 
 void launch_curl(const curl_launch &update, const stream &execution_stream) {
@@ -139,6 +201,26 @@ void launch_zero(const zero_launch &update, const stream &execution_stream) {
     launch_zero_t<float>(update, execution_stream);
   else
     launch_zero_t<double>(update, execution_stream);
+}
+
+void launch_halo_gather(const halo_launch &launch, const void *device_entries,
+                        void *device_buffer, const stream &execution_stream) {
+  if (!device_entries || !device_buffer)
+    throw std::invalid_argument("NVIDIA halo gather has incomplete storage");
+  if (launch.precision == scalar_precision::f32)
+    launch_halo_gather_t<float>(launch, device_entries, device_buffer, execution_stream);
+  else
+    launch_halo_gather_t<double>(launch, device_entries, device_buffer, execution_stream);
+}
+
+void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
+                         const void *device_buffer, const stream &execution_stream) {
+  if (!device_entries || !device_buffer)
+    throw std::invalid_argument("NVIDIA halo scatter has incomplete storage");
+  if (launch.precision == scalar_precision::f32)
+    launch_halo_scatter_t<float>(launch, device_entries, device_buffer, execution_stream);
+  else
+    launch_halo_scatter_t<double>(launch, device_entries, device_buffer, execution_stream);
 }
 
 } // namespace nvidia
