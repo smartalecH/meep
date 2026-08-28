@@ -212,6 +212,15 @@ memory_accounting current_memory_accounting();
 /* Failure injection for the standalone runtime tests. These hooks are private
    to the backend prototype and are not part of Meep's public API. */
 namespace testing {
+struct transfer_accounting {
+  size_t host_to_device_calls;
+  size_t host_to_device_bytes;
+  size_t device_to_host_calls;
+  size_t device_to_host_bytes;
+  size_t device_to_device_calls;
+  size_t device_to_device_bytes;
+};
+
 enum class failure_point {
   none,
   device_allocate,
@@ -222,6 +231,8 @@ enum class failure_point {
 };
 void fail_next(failure_point point);
 void clear_failure();
+transfer_accounting current_transfer_accounting();
+void reset_transfer_accounting();
 } // namespace testing
 
 } // namespace nvidia
