@@ -17,6 +17,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 
 /* integration routine similar to those in integrate.cpp, but
    integrating a combination of two fields from two different
@@ -276,6 +277,10 @@ complex<double> fields::integrate2(const fields &fields2, int num_fvals1,
   for (int i = 0; i < 2 * (num_fvals1 + num_fvals2); ++i)
     data.offsets[i] = 0;
 
+  backend_refresh_host_fields(*this, num_fvals1, components1, where, cgrid, true, false,
+                              "fields::integrate2 first fields");
+  backend_refresh_host_fields(const_cast<fields &>(fields2), num_fvals2, components2, where, cgrid,
+                              true, false, "fields::integrate2 second fields");
   loop_in_chunks(integrate_chunkloop, (void *)&data, where, cgrid);
 
   delete[] data.offsets;
