@@ -120,6 +120,11 @@ struct Operation {
   uint32_t magnetic_state_count;
   uint32_t legacy_flux_index;
   uint32_t legacy_flux_count;
+  /* Spatial source descriptors consumed by apply_sources or by update_eh's
+     integrated-source preparation. The primary descriptor span remains
+     available for the operation's ordinary update descriptors. */
+  uint32_t source_descriptor_index;
+  uint32_t source_descriptor_count;
   Guard guard;
   /* CPU execution keeps using the coarse field_type entry point. Device
      executors consume the half-open descriptor span. For finite_value_check,
@@ -629,11 +634,12 @@ struct StepPlan {
   /* Structural identity of the host-only phase target.  Values are excluded:
      changing them is the purpose of material phasing. */
   uint64_t material_phase_target_signature;
+  uint64_t source_signature;
   uint64_t signature;
 
   StepPlan()
       : program(StepProgram::ordinary), coordinate_generation(0), beta(0), cylindrical_m(0),
-        material_phase_target_signature(0), signature(0) {}
+        material_phase_target_signature(0), source_signature(0), signature(0) {}
   void clear() {
     coordinate_generation = 0;
     beta = 0;
@@ -660,6 +666,7 @@ struct StepPlan {
     cw_state_layout.clear();
     magnetic_half_step = MagneticHalfStep();
     material_phase_target_signature = 0;
+    source_signature = 0;
     signature = 0;
   }
 };
