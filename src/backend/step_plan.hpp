@@ -173,6 +173,12 @@ enum ConstitutiveVariant : uint32_t {
 struct ConstitutiveUpdate {
   UpdateRegion region;
   ArrayId target;
+  /* Original D/B inputs, retained even when primary/cross* select f_minus_p.
+     Preparing f_minus_p is a copy/subtract phase, so a lowering needs both
+     sides rather than only the post-subtraction input. */
+  ArrayId base_primary;
+  ArrayId base_cross1;
+  ArrayId base_cross2;
   ArrayId primary;
   ArrayId cross1;
   ArrayId cross2;

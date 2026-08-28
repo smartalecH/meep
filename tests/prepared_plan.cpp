@@ -34,10 +34,35 @@ static int failures = 0;
 
 static double eps_slab(const vec &p) { return fabs(p.y()) < 0.4 ? 12.0 : 1.0; }
 
+class one_cross_material : public material_function {
+public:
+  virtual void eff_chi1inv_row(component c, double row[3], const volume &v,
+                               double tol = DEFAULT_SUBPIXEL_TOL,
+                               int maxeval = DEFAULT_SUBPIXEL_MAXEVAL) {
+    (void)v;
+    (void)tol;
+    (void)maxeval;
+    row[0] = row[1] = row[2] = 0.0;
+    const direction d = component_direction(c);
+    row[int(d)] = 1.0;
+    /* For the Ez row, cycle(Z,1)=X and cycle(Z,2)=Y. Populate only the
+       second cross term so normalization must move the Y pair into slot 1. */
+    if (d == Z) row[int(Y)] = 0.125;
+    if (d == Y) row[int(Z)] = 0.125;
+  }
+};
+
 static bool has_access(const Operation &op, ArrayId id) {
   if (!is_valid(id)) return true;
   for (size_t i = 0; i < op.accesses.size(); ++i)
     if (op.accesses[i].array.id == id) return true;
+  return false;
+}
+
+static bool has_access(const Operation &op, ArrayId id, AccessMode mode) {
+  if (!is_valid(id)) return true;
+  for (size_t i = 0; i < op.accesses.size(); ++i)
+    if (op.accesses[i].array.id == id && op.accesses[i].mode == mode) return true;
   return false;
 }
 
@@ -110,7 +135,9 @@ static void check_prepared_updates() {
                                         constitutive_has_nonlinearity | constitutive_has_minus_p |
                                         constitutive_copy_w_previous)) == 0,
               "constitutive descriptor has an unbounded variant bit");
-        CHECK(has_access(op, d.target) && has_access(op, d.primary) && has_access(op, d.cross1) &&
+        CHECK(has_access(op, d.target) && has_access(op, d.base_primary) &&
+                  has_access(op, d.base_cross1) && has_access(op, d.base_cross2) &&
+                  has_access(op, d.primary) && has_access(op, d.cross1) &&
                   has_access(op, d.cross2) && has_access(op, d.diagonal) &&
                   has_access(op, d.offdiagonal1) && has_access(op, d.offdiagonal2) &&
                   has_access(op, d.chi2) && has_access(op, d.chi3) &&
@@ -131,6 +158,81 @@ static void check_prepared_updates() {
     CHECK(compute_step_plan_signature(plan) != original,
           "signature ignored a structural curl descriptor change");
   }
+}
+
+static void check_integrated_source_inputs() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, no_pml());
+  fields f(&s);
+  gaussian_src_time src(0.3, 0.1);
+  src.is_integrated = true;
+  f.add_point_source(Ez, src, vec(0.11, 0.13));
+  f.advance(2);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t prepared = 0;
+  for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
+    const Operation &op = plan.operations[oi];
+    if (op.kind != OpKind::update_eh || op.ft != E_stuff) continue;
+    for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
+         ++i) {
+      const ConstitutiveUpdate &d = plan.eh_updates[i];
+      if (!(d.region.variant_key & constitutive_has_minus_p)) continue;
+      ++prepared;
+      CHECK(is_valid(d.base_primary), "f_minus_p descriptor lost its original D/B input");
+      if (d.primary != d.base_primary) {
+        CHECK(has_access(op, d.base_primary, AccessMode::read),
+              "f_minus_p preparation does not read the original D/B field");
+        CHECK(has_access(op, d.primary, AccessMode::read_write),
+              "f_minus_p preparation does not publish its write access");
+      }
+    }
+  }
+  CHECK(or_to_all(prepared > 0), "integrated source produced no prepared f_minus_p inputs");
+}
+
+static void check_one_cross_normalization() {
+  grid_volume gv = vol3d(2.0, 2.0, 2.0, 6.0);
+  one_cross_material material;
+  structure s(gv, material, no_pml());
+  fields f(&s);
+  gaussian_src_time src(0.3, 0.1);
+  src.is_integrated = true;
+  f.add_point_source(Ez, src, vec(0.11, 0.13, 0.17));
+  f.advance(1);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t normalized = 0;
+  for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
+    const Operation &op = plan.operations[oi];
+    if (op.kind != OpKind::update_eh || op.ft != E_stuff) continue;
+    for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
+         ++i) {
+      const ConstitutiveUpdate &d = plan.eh_updates[i];
+      if (d.region.c != Ez || !is_valid(d.offdiagonal1) || is_valid(d.offdiagonal2)) continue;
+      const direction selected_direction =
+          cycle_direction(f.chunks[d.region.chunk]->gv.dim, component_direction(d.region.c), 2);
+      const component selected_component =
+          direction_component(first_field_component(D_stuff), selected_direction);
+      const ArrayId expected_base = f.array_catalog->find(
+          {d.region.chunk, int(array_kind::f), int(selected_component), d.region.cmp, 0});
+      const ArrayId expected_minus_p = f.array_catalog->find(
+          {d.region.chunk, int(array_kind::f_minus_p), int(selected_component), d.region.cmp, 0});
+      const ArrayId expected_selected =
+          is_valid(expected_minus_p) ? expected_minus_p : expected_base;
+      CHECK(d.base_cross1 == expected_base,
+            "normalized cross slot lost its matching base D/B input");
+      CHECK(d.cross1 == expected_selected,
+            "normalized cross slot does not select its matching effective input");
+      CHECK(has_access(op, d.base_cross1, AccessMode::read),
+            "normalized cross base is not recorded read-only");
+      CHECK(has_access(op, d.cross1, is_valid(expected_minus_p) ? AccessMode::read_write
+                                                               : AccessMode::read),
+            "normalized cross has the wrong access mode");
+      ++normalized;
+    }
+  }
+  CHECK(or_to_all(normalized > 0), "test did not exercise one-cross normalization");
 }
 
 static void check_alias_elision() {
@@ -156,6 +258,8 @@ int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
   check_prepared_updates();
+  check_integrated_source_inputs();
+  check_one_cross_normalization();
   check_alias_elision();
   if (failures) {
     master_printf("prepared_plan: %d FAILURE(S)\n", failures);
