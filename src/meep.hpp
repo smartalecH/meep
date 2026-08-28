@@ -979,6 +979,7 @@ class src_vol;
 class fields;
 class fields_chunk;
 class flux_vol;
+class source_descriptor_builder;
 
 // Time-dependence of a current source, intended to be overridden by
 // subclasses.  current() and dipole() are be related by
@@ -1080,6 +1081,7 @@ public:
   std::complex<double> fourier_transform(const double f);
 
 private:
+  friend class source_descriptor_builder;
   double freq, fwidth, width, peak_time, cutoff;
 };
 
@@ -1100,6 +1102,7 @@ public:
   virtual void set_frequency(std::complex<double> f) { freq = f; }
 
 private:
+  friend class source_descriptor_builder;
   std::complex<double> freq;
   double width, start_time, end_time, slowness;
 };
