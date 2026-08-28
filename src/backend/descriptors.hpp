@@ -43,7 +43,12 @@ namespace meep {
    time-dependent scalar produced by a src_time object. */
 
 struct SourceDescriptor {
-  ArrayId destination;
+  ArrayId destination;      // cmp 0 D/B destination for ordinary sources
+  ArrayId destination_imag; // cmp 1, invalid for real fields
+  /* Integrated sources subtract their dipole from f_minus_p during the
+     following E/H constitutive update rather than modifying D/B directly. */
+  ArrayId integrated_destination;
+  ArrayId integrated_destination_imag;
   int chunk;
   component c;
   std::vector<ptrdiff_t> indices;
@@ -61,7 +66,12 @@ const char *source_time_kind_name(SourceTimeKind k);
 struct SourceTimeDescriptor {
   uint32_t source_time_id;
   SourceTimeKind kind;
-  std::vector<double> parameters; // closed form for the built-ins
+  /* Exact closed form for the built-ins:
+       gaussian   = [frequency, width, peak_time, cutoff]
+       continuous = [frequency.real, frequency.imag, width,
+                     start_time, end_time, slowness]
+     host_custom has no parameters and remains host-polymorphic. */
+  std::vector<double> parameters;
   uint32_t scalar_slot;
   uint32_t host_callback_id; // valid only for host_custom
   bool is_integrated;
@@ -149,6 +159,14 @@ struct DescriptorSet {
 
 /* Built from the live objects; the CPU path continues to use those objects. */
 void build_source_descriptors(fields &f, SourcePlan &out);
+/* Evaluate a built-in descriptor without consulting the live src_time object.
+   host_custom descriptors are rejected. */
+SourceStepScalar evaluate_source_time_descriptor(const SourceTimeDescriptor &d, double time,
+                                                 double dt);
+/* Copy the already-evaluated live src_time values into the canonical scalar
+   block. A stale/unprepared plan is left untouched; lifecycle refreshes it
+   before a resident backend compiles or executes. */
+void populate_source_scalars(fields &f, SourcePlan &out);
 void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
 
