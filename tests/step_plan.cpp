@@ -157,15 +157,17 @@ static void test_full_plan() {
   const StepPlan p = build_step_plan(f, StepProgram::ordinary);
   std::vector<std::string> got;
   format_step_plan(p, got);
-  /* Only ranks that actually own a monitor chunk emit update_dft; see the note
-     in build_step_plan about why that is deliberately not reduced. Compare the
-     full sequence only where the full sequence is expected. */
-  bool owns_dft = false;
+  /* The plan shape is rank-independent: build_step_plan reduces has_dfts, so a
+     rank owning no monitor chunk still emits update_dft. That is the point of
+     reducing it -- a compiled device graph cannot have a per-rank shape -- and
+     asserting the full sequence on *every* rank is what pins it down. */
+  bool owns_dft_local = false;
   for (int i = 0; i < f.num_chunks; ++i)
-    if (f.chunks[i]->is_mine() && f.chunks[i]->dft_chunks) owns_dft = true;
-  if (owns_dft)
-    compare("ordinary/full", got, expected_full,
-            sizeof(expected_full) / sizeof(expected_full[0]));
+    if (f.chunks[i]->is_mine() && f.chunks[i]->dft_chunks) owns_dft_local = true;
+  const bool any_dft = or_to_all(owns_dft_local);
+  CHECK(any_dft, "the monitor produced no dft_chunks on any rank");
+  compare("ordinary/full", got, expected_full,
+          sizeof(expected_full) / sizeof(expected_full[0]));
 
   /* Guard kinds are load-bearing for Phase 2 even though the CPU executor
      treats them all the same. */
@@ -187,8 +189,7 @@ static void test_full_plan() {
     }
   }
   CHECK(variants == 2, "expected 2 magnetic-sync variant guards, got %zu", variants);
-  CHECK(devices == (owns_dft ? 1u : 0u), "expected %d decimation guards, got %zu",
-        owns_dft ? 1 : 0, devices);
+  CHECK(devices == 1, "expected 1 decimation guard on every rank, got %zu", devices);
 
   /* Rebuilding without touching anything gives the same plan. */
   const StepPlan again = build_step_plan(f, StepProgram::ordinary);
