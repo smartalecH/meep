@@ -105,9 +105,10 @@ inline Guard guard_segment(uint32_t slot) { return Guard{GuardKind::segment_boun
 struct Operation {
   OpKind kind;
   uint32_t descriptor_index;
+  uint32_t descriptor_count;
   Guard guard;
-  /* PR 5 keeps the coarse (field_type, chunk span) argument the existing CPU
-     entry points take. PR 6 replaces it with real descriptors. */
+  /* CPU execution keeps using the coarse field_type entry point. Device
+     executors consume the half-open descriptor span. */
   field_type ft;
   double source_time_offset; // for evaluate_source_scalars: 0, 0.5*dt or dt
   std::vector<BufferAccess> accesses;
@@ -119,9 +120,73 @@ struct UpdateRegion {
   int cmp;
   ivec begin;
   ivec end;
+  size_t base;
+  size_t counts[3];
+  ptrdiff_t strides[3];
   /* PML, conductivity, anisotropy, precision, coordinate and stride cases.
      Does not encode a backend. */
   uint32_t variant_key;
+};
+
+enum CurlVariant : uint32_t {
+  curl_has_second_derivative = 1u << 0,
+  curl_has_pml = 1u << 1,
+  curl_has_pml_aux = 1u << 2,
+  curl_has_conductivity = 1u << 3,
+  curl_has_bfast = 1u << 4
+};
+
+struct PmlProfile {
+  ArrayId sig;
+  ArrayId kap;
+  ArrayId siginv;
+  int base;
+  int strides[3];
+};
+
+struct CurlUpdate {
+  UpdateRegion region;
+  ArrayId target;
+  ArrayId plus_source;
+  ArrayId minus_source;
+  ptrdiff_t plus_stride;
+  ptrdiff_t minus_stride;
+  ArrayId target_u;
+  ArrayId conductivity;
+  ArrayId condinv;
+  ArrayId target_cond;
+  PmlProfile pml;
+  PmlProfile pml_u;
+  double dtdx;
+  double dt;
+};
+
+enum ConstitutiveVariant : uint32_t {
+  constitutive_one_offdiagonal = 1u << 0,
+  constitutive_two_offdiagonals = 1u << 1,
+  constitutive_has_pml = 1u << 2,
+  constitutive_has_nonlinearity = 1u << 3,
+  constitutive_has_minus_p = 1u << 4,
+  constitutive_copy_w_previous = 1u << 5
+};
+
+struct ConstitutiveUpdate {
+  UpdateRegion region;
+  ArrayId target;
+  ArrayId primary;
+  ArrayId cross1;
+  ArrayId cross2;
+  ArrayId diagonal;
+  ArrayId offdiagonal1;
+  ArrayId offdiagonal2;
+  ptrdiff_t primary_stride;
+  ptrdiff_t cross1_stride;
+  ptrdiff_t cross2_stride;
+  ArrayId chi2;
+  ArrayId chi3;
+  ArrayId target_w;
+  ArrayId previous_w;
+  PmlProfile pml;
 };
 
 /* Which timestep program a plan describes. solve_cw is a genuinely different
@@ -134,8 +199,8 @@ enum class StepProgram { ordinary, solve_cw };
 struct StepPlan {
   StepProgram program;
   std::vector<Operation> operations;
-  std::vector<UpdateRegion> db_updates;
-  std::vector<UpdateRegion> eh_updates;
+  std::vector<CurlUpdate> db_updates;
+  std::vector<ConstitutiveUpdate> eh_updates;
   uint64_t signature;
 
   StepPlan() : program(StepProgram::ordinary), signature(0) {}
@@ -152,6 +217,9 @@ struct StepPlan {
    equations from array dependencies: if a reviewer cannot line this up against
    fields::step_once by eye, it is wrong. */
 StepPlan build_step_plan(fields &f, StepProgram program);
+
+/* Structural identity used by device executables and tests. */
+uint64_t compute_step_plan_signature(const StepPlan &plan);
 
 /* Human-readable operation sequence, for the trace test and for debugging. */
 void format_step_plan(const StepPlan &p, std::vector<std::string> &out);
