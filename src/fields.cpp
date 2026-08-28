@@ -58,6 +58,7 @@ fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylori
   t = 0;
   sources = NULL;
   fluxes = NULL;
+  dft_monitor_lifetime_.reset(new dft_monitor_lifetime(this));
   // Time stuff:
   reset_timers();
   last_step_output_wall_time = -1;
@@ -141,6 +142,7 @@ fields::fields(const fields &thef)
   t = thef.t;
   sources = NULL;
   fluxes = NULL;
+  dft_monitor_lifetime_.reset(new dft_monitor_lifetime(this));
   // Time stuff:
   reset_timers();
   last_step_output_wall_time = -1;
@@ -179,6 +181,15 @@ fields::fields(const fields &thef)
 }
 
 fields::~fields() {
+  /* Persistent DFT chunks survive their fields object for adjoint workflows.
+     Materialize their last resident values before severing the owner token. */
+  for (int i = 0; i < num_chunks; ++i)
+    if (chunks[i]->is_mine())
+      for (dft_chunk *cur = chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk)
+        if (cur->persist) cur->sync_dft_to_host();
+  /* Persistent adjoint monitors may outlive fields. Keep their shared token
+     valid but sever its non-owning pointer before any chunk is detached. */
+  if (dft_monitor_lifetime_) dft_monitor_lifetime_->owner = NULL;
   /* Backend objects may refer to every prepared artifact below, and device
      state needs a complete type-erased destructor to release its resources. */
   delete executable;
@@ -250,8 +261,10 @@ fields_chunk::~fields_chunk() {
   while (dft_chunks) {
     dft_chunk *nxt = dft_chunks->next_in_chunk;
     // keep the dft chunk in memory for adjoint calculations
-    if (dft_chunks->persist)
+    if (dft_chunks->persist) {
+      dft_chunks->attached_to_fields = false;
       dft_chunks->fc = NULL;
+    }
     else
       delete dft_chunks;
     dft_chunks = nxt;
