@@ -8,6 +8,7 @@
 
 /* Backend selection, lifecycle, and the backend-safe access points. */
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -24,6 +25,47 @@
 namespace meep {
 
 namespace {
+
+struct field_refresh_data {
+  fields *owner;
+  int count;
+  const component *components;
+  std::string local_error;
+};
+
+void refresh_field_chunk(fields_chunk *fc, int, component cgrid, ivec is, ivec ie, vec, vec, vec,
+                         vec, double, double, ivec, std::complex<double>, const symmetry &S, int sn,
+                         void *data_) {
+  field_refresh_data *data = static_cast<field_refresh_data *>(data_);
+  if (!data->local_error.empty()) return;
+
+  for (int i = 0; i < data->count; ++i) {
+    const component c = S.transform(data->components[i], -sn);
+    if (c == Dielectric || c == Permeability || c == NO_COMPONENT) continue;
+
+    ptrdiff_t offset1 = 0, offset2 = 0;
+    if (cgrid == Centered) fc->gv.yee2cent_offsets(c, offset1, offset2);
+    ptrdiff_t minimum = std::numeric_limits<ptrdiff_t>::max();
+    ptrdiff_t maximum = std::numeric_limits<ptrdiff_t>::min();
+    LOOP_OVER_IVECS(fc->gv, is, ie, idx) {
+      const ptrdiff_t candidates[4] = {idx, idx + offset1, idx + offset2,
+                                       idx + offset1 + offset2};
+      for (int k = 0; k < 4; ++k) {
+        minimum = std::min(minimum, candidates[k]);
+        maximum = std::max(maximum, candidates[k]);
+      }
+    }
+    if (minimum < 0 || maximum < minimum) {
+      data->local_error = "invalid field range during resident host refresh";
+      return;
+    }
+    for (int cmp = 0; cmp < 2; ++cmp)
+      if (fc->f[c][cmp] &&
+          !backend_read_host_range(*data->owner, fc->f[c][cmp] + minimum,
+                                   size_t(maximum - minimum) + 1, data->local_error))
+        return;
+  }
+}
 
 struct point_sampler {
   component c;
@@ -102,6 +144,16 @@ void backend_reconcile_host_access(const std::string &local_error, const char *s
   if (local_error.empty())
     throw std::runtime_error(std::string(site) + ": backend host access failed on another MPI rank");
   throw std::runtime_error(std::string(site) + ": " + local_error);
+}
+
+void backend_refresh_host_fields(fields &owner, int count, const component *components,
+                                 const volume &where, component cgrid, bool use_symmetry,
+                                 bool snap_empty_dimensions, const char *site) {
+  if (!backend_host_refresh_required(owner)) return;
+  field_refresh_data data = {&owner, count, components, std::string()};
+  owner.loop_in_chunks(refresh_field_chunk, &data, where, cgrid, use_symmetry,
+                       snap_empty_dimensions);
+  backend_reconcile_host_access(data.local_error, site);
 }
 
 void backend_prepare_checkpoint_load(fields &f) {
