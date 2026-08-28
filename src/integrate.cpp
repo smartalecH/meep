@@ -143,6 +143,9 @@ complex<double> fields::integrate(int num_fvals, const component *components,
   component cgrid = Centered;
   if (same_grid && num_fvals > 0) cgrid = components[0];
 
+  backend_refresh_host_fields(*this, num_fvals, components, where, cgrid, true, false,
+                              "fields::integrate");
+
   integrate_data data;
   data.num_fvals = num_fvals;
   data.components = components;
@@ -188,8 +191,6 @@ complex<double> fields::integrate(int num_fvals, const component *components,
   for (int i = 0; i < 2 * num_fvals; ++i)
     data.offsets[i] = 0;
 
-  backend_refresh_host_fields(*this, num_fvals, components, where, cgrid, true, false,
-                              "fields::integrate");
   loop_in_chunks(integrate_chunkloop, (void *)&data, where, cgrid);
 
   delete[] data.offsets;
