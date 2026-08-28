@@ -17,6 +17,7 @@
 
 #include "backend/storage_plan.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/precision.hpp"
 #include "meep_internals.hpp"
 
 #include <limits>
@@ -57,25 +58,10 @@ const char *array_kind_name(array_kind k) {
   return "?";
 }
 
-static size_t element_bytes(ElementType t) {
-  switch (t) {
-    case ElementType::realnum_value: return sizeof(realnum);
-    case ElementType::complex_realnum: return 2 * sizeof(realnum);
-    case ElementType::float64: return sizeof(double);
-    case ElementType::complex_float64: return 2 * sizeof(double);
-    case ElementType::int32: return 4;
-    case ElementType::index: return sizeof(size_t);
-  }
-  return 0;
-}
-
 static void add_array_bytes(size_t &total, const ArraySpec &spec) {
-  const size_t element_size = element_bytes(spec.element_type);
-  if (element_size && spec.elements > std::numeric_limits<size_t>::max() / element_size)
-    throw std::overflow_error("backend storage plan array byte count overflow");
-  const size_t bytes = spec.elements * element_size;
+  const size_t bytes = storage_bytes(spec);
   if (bytes > std::numeric_limits<size_t>::max() - total)
-    throw std::overflow_error("backend storage plan total byte count overflow");
+    throw std::overflow_error("backend storage plan byte count overflow");
   total += bytes;
 }
 

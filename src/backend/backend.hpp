@@ -39,10 +39,16 @@
 
 namespace meep {
 
-/* PIMPLs. On CPU they wrap the objects `fields` already owns; on a device they
-   would own resident state and a compiled graph. */
-struct BackendState;
-struct Executable;
+/* Type-erased backend ownership. Concrete CPU/device implementations derive
+   from these private bases so fields can destroy them without knowing their
+   representation. */
+struct BackendState {
+  virtual ~BackendState() {}
+};
+
+struct Executable {
+  virtual ~Executable() {}
+};
 
 struct InitializationPlan; // src/backend/initialization_plan.hpp
 
@@ -64,6 +70,10 @@ public:
   virtual void write(ArrayRef, const void *host_buffer, size_t bytes) = 0; // converts to storage
   virtual void synchronize() = 0;
   virtual backend_capabilities capabilities() const = 0;
+
+  /* Device-resident backends need one collective, complete storage snapshot
+     before create_state; the CPU backend must preserve its lazy preparation. */
+  virtual bool requires_full_storage_preparation() const = 0;
 
   /* Reject an unsupported request clearly and *collectively*: every rank has to
      reach the same verdict, or the ones that accept will wait forever on the
