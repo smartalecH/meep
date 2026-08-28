@@ -122,6 +122,8 @@ dft_chunk::dft_chunk(fields_chunk *fc_, ivec is_, ivec ie_, vec s0_, vec s1_, ve
   const int Nomega = data->omega.size();
   omega = data->omega;
   dft_phase = new complex<realnum>[Nomega];
+  for (int i = 0; i < Nomega; ++i)
+    dft_phase[i] = 0.0;
 
   N = 1;
   LOOP_OVER_DIRECTIONS(is.dim, d) { N *= (ie.in_direction(d) - is.in_direction(d)) / 2 + 1; }

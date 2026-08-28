@@ -235,9 +235,45 @@ static void test_dfts() {
   CHECK(!dfts.empty() || f.num_chunks > 1, "no DFT descriptors were built");
 
   size_t persistent = 0, padded = 0;
+  size_t live_count = 0;
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine())
+      for (dft_chunk *cur = f.chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk) ++live_count;
+  CHECK(dfts.size() == live_count, "%zu DFT descriptors for %zu live chunks", dfts.size(),
+        live_count);
+
+  size_t descriptor_index = 0;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    int di = 0;
+    for (dft_chunk *cur = f.chunks[chunk]->dft_chunks; cur;
+         cur = cur->next_in_chunk, ++di, ++descriptor_index) {
+      const DftDescriptor &d = dfts[descriptor_index];
+      const ArrayId phase =
+          f.array_catalog->find({chunk, int(array_kind::dft_phase), int(cur->c), -1, di});
+      CHECK(d.phase_scratch == phase && is_valid(phase),
+            "DFT descriptor has no cataloged phase scratch");
+      CHECK(d.omega == cur->omega, "DFT descriptor frequencies differ from the live chunk");
+      CHECK(d.scale == cur->scale, "DFT descriptor scale differs from the live chunk");
+      CHECK(d.source_field.id ==
+                f.array_catalog->find({chunk, int(array_kind::f), int(cur->c), 0, 0}),
+            "DFT descriptor has the wrong real source array");
+      CHECK(d.source_field.elements == size_t(f.chunks[chunk]->gv.ntot()),
+            "DFT real source span has the wrong size");
+      const ArrayId imag =
+          f.array_catalog->find({chunk, int(array_kind::f), int(cur->c), 1, 0});
+      CHECK(d.source_field_imag.id == imag, "DFT descriptor has the wrong imaginary source array");
+      CHECK(d.source_field_imag.elements ==
+                (is_valid(imag) ? size_t(f.chunks[chunk]->gv.ntot()) : 0),
+            "DFT imaginary source span has the wrong size");
+    }
+  }
+
   for (const DftDescriptor &d : dfts) {
     CHECK(is_valid(d.accumulator), "DFT descriptor has no accumulator array");
+    CHECK(is_valid(d.phase_scratch), "DFT descriptor has no phase scratch array");
     CHECK(d.Nomega == 3, "expected 3 frequencies, got %zu", d.Nomega);
+    CHECK(d.omega.size() == d.Nomega, "DFT omega table length differs from Nomega");
     CHECK(d.decimation_factor >= 1, "decimation factor %d is not positive", d.decimation_factor);
     if (d.persist) {
       ++persistent;
