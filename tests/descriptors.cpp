@@ -114,6 +114,18 @@ static void test_sources() {
   }
   CHECK(saw_gaussian && saw_continuous, "built-in source kinds were not both classified");
 
+  const uint64_t source_signature = source_plan_signature(plan);
+  SourcePlan changed = plan;
+  changed.source_times[0].parameters[0] += 1e-6;
+  CHECK(source_plan_signature(changed) != source_signature,
+        "source signature ignored a built-in parameter change");
+  changed = plan;
+  if (!changed.sources.empty() && !changed.sources[0].complex_amplitudes.empty()) {
+    changed.sources[0].complex_amplitudes[0] += complex<double>(0.0, 1e-6);
+    CHECK(source_plan_signature(changed) != source_signature,
+          "source signature ignored a spatial amplitude change");
+  }
+
   /* Closed descriptors reproduce the live built-ins, including cutoff and
      finite-difference current semantics. */
   const src_time *live = f.sources;
