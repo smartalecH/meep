@@ -75,6 +75,7 @@ dft_near2far::dft_near2far(dft_chunk *F_, const double *freq_, size_t Nfreq, dou
 
 dft_near2far::dft_near2far(const dft_near2far &f) : F(f.F), eps(f.eps), mu(f.mu), where(f.where) {
   freq = f.freq;
+  monitor_lifetime = f.monitor_lifetime;
   for (int i = 0; i < 2; ++i) {
     periodic_d[i] = f.periodic_d[i];
     periodic_n[i] = f.periodic_n[i];
@@ -84,6 +85,8 @@ dft_near2far::dft_near2far(const dft_near2far &f) : F(f.F), eps(f.eps), mu(f.mu)
 }
 
 void dft_near2far::remove() {
+  begin_dft_monitor_removal(monitor_lifetime, F && F->attached_to_fields,
+                            "dft_near2far::remove");
   while (F) {
     dft_chunk *nxt = F->next_in_dft;
     delete F;
@@ -358,6 +361,7 @@ void dft_near2far::farfield_lowlevel(std::complex<double> *EH, const vec &x, dou
     EH[i] = 0.0;
 
   for (dft_chunk *f = F; f; f = f->next_in_dft) {
+    f->sync_dft_to_host();
     assert(Nfreq == f->omega.size());
 
     component c0 = component(f->vc); /* equivalent source component */
@@ -648,8 +652,10 @@ dft_near2far fields::add_dft_near2far(const volume_list *where, const double *fr
     }
   }
 
-  return dft_near2far(F, freq, Nfreq, eps, mu, everywhere, periodic_d, periodic_n, periodic_k,
+  dft_near2far result(F, freq, Nfreq, eps, mu, everywhere, periodic_d, periodic_n, periodic_k,
                       period);
+  result.monitor_lifetime = dft_monitor_lifetime_;
+  return result;
 }
 
 // Modified from farfield_lowlevel
