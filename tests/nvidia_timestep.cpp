@@ -22,8 +22,10 @@
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/precision.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
+#include "backend/nvidia/runtime.hpp"
 #include "meep_internals.hpp"
 
 using namespace meep;
@@ -222,11 +224,11 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   require_physics_variants(prepared, required_curl_combinations,
                            required_constitutive_combinations);
 
-  const bool f32 = policy == precision_policy_kind::f32;
-  if (f32) round_real_arrays(*cpu.array_catalog);
-  initialize_fields(cpu, gpu, f32);
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
 
-  const double tolerance = f32 ? 2e-5 : 2e-13;
+  const double tolerance = narrowed ? 2e-5 : 2e-13;
   const int checkpoints[] = {1, 2, 100};
   int previous = 0;
   for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
@@ -260,7 +262,7 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
     require(rejected_stale_refresh,
             "NVIDIA initialization accepted a stale host mirror after stepping");
   }
-  master_printf("nvidia_timestep: %s/%s PASS\n", name, f32 ? "f32" : "native");
+  master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
 }
 
 static void require_advance_rejected(fields &f, const char *expected) {
@@ -321,8 +323,7 @@ static void run_finite_diagnostic_case(const char *name, precision_policy_kind p
     require(f.first_bad_step == expected_step, "NVIDIA first-bad step differs");
     require(f.first_bad_component == expected_component, "NVIDIA first-bad component differs");
   }
-  master_printf("nvidia_timestep: finite-%s/%s PASS\n", name,
-                policy == precision_policy_kind::f32 ? "f32" : "native");
+  master_printf("nvidia_timestep: finite-%s/%s PASS\n", name, precision_policy_name(policy));
 }
 
 static void test_finite_diagnostics(precision_policy_kind policy) {
@@ -365,19 +366,57 @@ static void test_rejections() {
     f.require_component(Ez);
     require_advance_rejected(f, "dispersion");
   }
-  {
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    options.precision = precision_policy_kind::mixed;
-    fields f(&s, options);
-    f.use_real_fields();
-    f.require_component(Ez);
-    require_advance_rejected(f, "precision=native and precision=f32 only");
-  }
+}
+
+static void test_compile_allocation_retry() {
+  const grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  structure s(gv, isotropic_eps, pml(0.5), identity(), 2);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.advance(1);
+  BackendState *const live_state = f.backend_state;
+  Executable *const live_executable = f.executable;
+  const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  const auto inject = [&](nvidia::testing::failure_point point, const char *operation) {
+    nvidia::testing::fail_next(point);
+    bool rejected = false;
+    std::string reason;
+    try {
+      std::unique_ptr<Executable> unexpected(f.backend->compile(plan, *f.backend_state));
+    }
+    catch (const std::exception &error) {
+      rejected = true;
+      reason = error.what();
+    }
+    nvidia::testing::clear_failure();
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    require(rejected && reason.find(operation) != std::string::npos &&
+                f.backend_state == live_state && f.executable == live_executable &&
+                !f.backend->is_poisoned() &&
+                before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current,
+            "failed NVIDIA executable compilation changed the live epoch");
+  };
+  inject(nvidia::testing::failure_point::device_allocate, "cudaMalloc");
+  inject(nvidia::testing::failure_point::host_to_device_copy,
+         "cudaMemcpyAsync(host-to-device)");
+  f.advance(1);
+  require(f.backend_state == live_state && f.executable == live_executable,
+          "ordinary advance did not reuse the epoch after compile failure");
 }
 
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
+  if (getenv("MEEP_NVIDIA_COMPILE_RETRY_ONLY")) {
+    test_compile_allocation_retry();
+    master_printf("nvidia_timestep: compile retry checks PASS\n");
+    return 0;
+  }
   set_finite_check_mode(FiniteCheckMode::off);
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
   const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
@@ -386,8 +425,8 @@ int main(int argc, char **argv) {
   const boundary_region xy_pml = pml(0.4, X) + pml(0.4, Y);
   linear_anisotropic_material one_offdiagonal(false);
   linear_anisotropic_material two_offdiagonals(true);
-  const precision_policy_kind policies[] = {precision_policy_kind::native,
-                                            precision_policy_kind::f32};
+  const precision_policy_kind policies[] = {
+      precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
              1u << 0, 1u << 0, false, true);
@@ -410,6 +449,7 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   set_finite_check_mode(FiniteCheckMode::off);
+  test_compile_allocation_retry();
   test_rejections();
   master_printf("nvidia_timestep: PASS\n");
   return 0;
