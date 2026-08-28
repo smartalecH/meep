@@ -108,7 +108,11 @@ struct Operation {
   uint32_t descriptor_count;
   Guard guard;
   /* CPU execution keeps using the coarse field_type entry point. Device
-     executors consume the half-open descriptor span. */
+     executors consume the half-open descriptor span. For finite_value_check,
+     accesses are full canonical physical-field allocations in stable ArrayId
+     order. A device diagnostic attributes the first failure by lowest access
+     order, then lowest element index; StoragePlan::keys supplies its
+     chunk/component/cmp identity. */
   field_type ft;
   double source_time_offset; // for evaluate_source_scalars: 0, 0.5*dt or dt
   std::vector<BufferAccess> accesses;

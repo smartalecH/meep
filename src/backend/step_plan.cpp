@@ -212,6 +212,25 @@ public:
   void add_db(field_type ft);
   void add_eh(field_type ft, Guard guard = guard_always());
 
+  void add_finite_value_check() {
+    Operation &op = add(OpKind::finite_value_check);
+    if (!f_.storage_plan) return;
+
+    /* Device diagnostics scan physical field arrays only. Preserve catalog
+       order so the first failing access is deterministic, and skip aliases so
+       one allocation cannot be attributed twice. StorageKey supplies the
+       chunk/component/cmp identity used by device backends for diagnostics. */
+    const StoragePlan &storage = *f_.storage_plan;
+    for (size_t i = 0; i < storage.arrays.size(); ++i) {
+      const ArraySpec &spec = storage.arrays[i];
+      const StorageKey &key = storage.keys[i];
+      if (key.kind != int(array_kind::f) || spec.element_type != ElementType::realnum_value ||
+          !spec.elements || is_valid(spec.alias_of))
+        continue;
+      add_access(f_, op, spec.id, AccessMode::read);
+    }
+  }
+
   void add_if(bool present, OpKind k, field_type ft = field_type(NUM_FIELD_TYPES),
               double src_offset = 0.0) {
     if (present) add(k, ft, guard_static(true), src_offset);
@@ -616,7 +635,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
      graph and the kernel returns early when the step is not due. */
   if (has_dfts && !cw) p.add(OpKind::update_dft, field_type(NUM_FIELD_TYPES), guard_device(0));
   p.add(OpKind::synchronize_magnetic_fields, field_type(NUM_FIELD_TYPES), guard_variant(0));
-  p.add(OpKind::finite_value_check);
+  p.add_finite_value_check();
 
   return p.finish();
 }
