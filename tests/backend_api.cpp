@@ -28,6 +28,7 @@
 
 #include <meep.hpp>
 
+#include "config.h"
 #include "backend/backend.hpp"
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/initialization_plan.hpp"
@@ -206,8 +207,11 @@ public:
 class access_tracking_backend : public rebuild_backend_base {
 public:
   access_tracking_backend(fields &f, rebuild_trace &rebuilds, access_trace &accesses_)
-      : rebuild_backend_base(f, rebuilds), accesses(accesses_) {}
+      : rebuild_backend_base(rebuilds), f(f), accesses(accesses_) {}
 
+  MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
+    return classify(f, plan);
+  }
   void advance(Executable &, BackendState &, int num_steps) override { f.t += num_steps; }
 
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override {
@@ -239,6 +243,7 @@ public:
   }
 
 private:
+  fields &f;
   access_trace &accesses;
 };
 
@@ -724,6 +729,48 @@ static void test_backend_safe_host_access() {
   }
   CHECK(!accesses.field_reads || accesses.max_elements < largest_field_allocation,
         "small array slice refreshed a complete unrelated field allocation");
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  const volume access_region(vec(0.45, 0.45), vec(1.15, 1.05));
+  const double field_max = f->max_abs(Ez, access_region);
+  CHECK(fabs(field_max - sqrt(12.5)) < 1e-12,
+        "integration did not consume backend-refreshed field values: %.17g", field_max);
+  CHECK(sum_to_all(int(accesses.field_reads)) > 0,
+        "integration did not issue explicit backend field reads");
+  CHECK(!accesses.field_reads || accesses.max_elements < largest_field_allocation,
+        "small integration refreshed a complete unrelated field allocation");
+
+  accesses.fail_read_rank = 0;
+  bool integration_failure = false;
+  try { (void)f->max_abs(Ez, access_region); }
+  catch (const std::runtime_error &) { integration_failure = true; }
+  CHECK(sum_to_all(int(integration_failure)) == count_processors(),
+        "integration read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
+
+#ifdef HAVE_HDF5
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  h5file *field_file = new h5file("backend-api-field-access.h5", h5file::WRITE, true);
+  f->output_hdf5(Ez, access_region, field_file);
+  CHECK(sum_to_all(int(accesses.field_reads)) > 0,
+        "ordinary HDF5 output did not issue explicit backend field reads");
+  CHECK(!accesses.field_reads || accesses.max_elements < largest_field_allocation,
+        "small HDF5 output refreshed a complete unrelated field allocation");
+  field_file->remove();
+  delete field_file;
+
+  accesses.fail_read_rank = 0;
+  bool hdf5_failure = false;
+  field_file = new h5file("backend-api-field-failure.h5", h5file::WRITE, true);
+  try { f->output_hdf5(Ez, access_region, field_file); }
+  catch (const std::runtime_error &) { hdf5_failure = true; }
+  CHECK(sum_to_all(int(hdf5_failure)) == count_processors(),
+        "ordinary HDF5 read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
+  delete field_file;
+  if (am_master()) std::remove("backend-api-field-failure.h5");
+  all_wait();
+#endif
 
   accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
   int rank = 0;
