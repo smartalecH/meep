@@ -345,6 +345,9 @@ void build_legacy_flux_descriptors(fields &f, std::vector<LegacyFluxDescriptor> 
    PR7/8 use this at their collective transactional refresh boundary. */
 void refresh_legacy_flux_descriptors(fields &f);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
+/* Rebuild dirty descriptor families after the storage catalog is stable.
+   rebuild_all is used by storage preparation because ArrayIds may have moved. */
+void refresh_operation_descriptors(fields &f, bool rebuild_all = false);
 
 } // namespace meep
 
