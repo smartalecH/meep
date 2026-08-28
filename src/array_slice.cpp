@@ -21,11 +21,13 @@
 */
 
 #include <algorithm>
+#include <limits>
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
 
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 #include "config.h"
 
 #define UNUSED(x) (void)x // silence compiler warnings
@@ -79,6 +81,10 @@ std::complex<double> cdouble(std::complex<float> z) {
 std::complex<double> cdouble(std::complex<double> z) { return z; }
 
 typedef struct {
+
+  const meep::fields *owner;
+  bool refresh_backend;
+  std::string access_error;
 
   // information related to the volume covered by the
   // array slice (its size, etcetera)
@@ -350,6 +356,35 @@ static void get_array_slice_chunkloop(fields_chunk *fc, int ichnk, component cgr
   for (int k = 0; k < data->ninvmu; ++k)
     fc->gv.yee2cent_offsets(imcs[k], imos[2 * k], imos[2 * k + 1]);
 
+  if (data->refresh_backend) {
+    /* The legacy interpolation below deliberately remains unchanged. Before
+       it touches a field, refresh only the contiguous index envelope requested
+       for that component in this chunk. CPU execution skips this prepass. */
+    for (int cidx = 0; cidx < num_components; ++cidx) {
+      if (cS[cidx] == Dielectric || cS[cidx] == Permeability || cS[cidx] == NO_COMPONENT) continue;
+      ptrdiff_t minimum = std::numeric_limits<ptrdiff_t>::max();
+      ptrdiff_t maximum = std::numeric_limits<ptrdiff_t>::min();
+      LOOP_OVER_IVECS(fc->gv, is, ie, access_index) {
+        const ptrdiff_t candidates[4] = {access_index, access_index + off[2 * cidx],
+                                         access_index + off[2 * cidx + 1],
+                                         access_index + off[2 * cidx] + off[2 * cidx + 1]};
+        for (int k = 0; k < 4; ++k) {
+          minimum = std::min(minimum, candidates[k]);
+          maximum = std::max(maximum, candidates[k]);
+        }
+      }
+      if (minimum < 0 || maximum < minimum) {
+        data->access_error = "invalid backend access range while preparing an array slice";
+        return;
+      }
+      for (int cmp = 0; cmp < 2; ++cmp)
+        if (fc->f[cS[cidx]][cmp] &&
+            !backend_read_host_range(*data->owner, fc->f[cS[cidx]][cmp] + minimum,
+                                     size_t(maximum - minimum) + 1, data->access_error))
+          return;
+    }
+  }
+
   /*****************************************************************/
   /* For collapsing empty dimensions, we want to retain interpolation
      weights for empty dimensions, but not interpolation weights for
@@ -616,6 +651,8 @@ void *fields::do_get_array_slice(const volume &where, std::vector<component> com
   size_t dims[3];
   direction dirs[3];
   array_slice_data data;
+  data.owner = this;
+  data.refresh_backend = backend_host_refresh_required(*this);
   int rank = get_array_slice_dimensions(where, dims, dirs, false, snap, 0, &data);
   size_t slice_size = data.slice_size;
   bool complex_data = (rfun == 0);
@@ -673,6 +710,8 @@ void *fields::do_get_array_slice(const volume &where, std::vector<component> com
     }
 
   loop_in_chunks(get_array_slice_chunkloop, (void *)&data, where, Centered, true, snap);
+  if (data.refresh_backend)
+    backend_reconcile_host_access(data.access_error, "fields::get_array_slice");
 
   if (!snap) {
     realnum *slice =
