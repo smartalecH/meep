@@ -7,6 +7,7 @@
 #include <complex>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -46,6 +47,57 @@ static void compare_complex_value(std::complex<double> expected, std::complex<do
                  tolerance * (1.0 + std::abs(expected)));
     meep::abort("NVIDIA DFT query differs from CPU");
   }
+}
+
+static std::complex<double> access_integrand(const std::complex<realnum> *values, const vec &,
+                                             void *) {
+  return std::norm(values[0]) + 0.25 * values[1];
+}
+
+static void poison_host_fields(fields &gpu) {
+  require(gpu.array_catalog != NULL, "NVIDIA access test has no storage catalog");
+  const realnum poison = std::numeric_limits<realnum>::quiet_NaN();
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = gpu.array_catalog->spec(id);
+    if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value) continue;
+    realnum *host = gpu.array_catalog->resolve<realnum>(id);
+    for (size_t j = 0; j < spec.elements; ++j)
+      host[j] = poison;
+  }
+}
+
+static void compare_hdf5_field_access(fields &cpu, fields &gpu, const volume &where,
+                                      double tolerance) {
+  h5file *cpu_file = new h5file("nvidia-access-cpu.h5", h5file::WRITE, true);
+  h5file *gpu_file = new h5file("nvidia-access-gpu.h5", h5file::WRITE, true);
+  cpu.output_hdf5(Ez, where, cpu_file);
+  poison_host_fields(gpu);
+  gpu.output_hdf5(Ez, where, gpu_file);
+  delete cpu_file;
+  delete gpu_file;
+
+  cpu_file = new h5file("nvidia-access-cpu.h5", h5file::READONLY, true);
+  gpu_file = new h5file("nvidia-access-gpu.h5", h5file::READONLY, true);
+  int cpu_rank = 0, gpu_rank = 0;
+  size_t cpu_dims[3] = {0, 0, 0}, gpu_dims[3] = {0, 0, 0};
+  std::unique_ptr<double[]> expected(
+      static_cast<double *>(cpu_file->read("ez", &cpu_rank, cpu_dims, 3, false)));
+  std::unique_ptr<double[]> observed(
+      static_cast<double *>(gpu_file->read("ez", &gpu_rank, gpu_dims, 3, false)));
+  require(expected.get() && observed.get(), "ordinary HDF5 field readback failed");
+  require(cpu_rank == gpu_rank, "ordinary HDF5 field ranks differ");
+  size_t elements = 1;
+  for (int axis = 0; axis < cpu_rank; ++axis) {
+    require(cpu_dims[axis] == gpu_dims[axis], "ordinary HDF5 field dimensions differ");
+    elements *= cpu_dims[axis];
+  }
+  for (size_t i = 0; i < elements; ++i)
+    compare_scalar(expected[i], observed[i], tolerance, "ordinary HDF5 field");
+  cpu_file->remove();
+  gpu_file->remove();
+  delete cpu_file;
+  delete gpu_file;
 }
 
 static void compare_monitor_storage(fields &cpu, fields &gpu, double tolerance) {
@@ -225,6 +277,17 @@ static void run_real_monitor_families(precision_policy_kind policy) {
   for (size_t i = 0; i < farfield_values; ++i)
     compare_complex_value(expected_far[i], observed_far[i], 5 * tolerance, "near2far field");
 
+  const volume access_region(vec(-0.7, -0.6), vec(0.8, 0.7));
+  component access_components[2] = {Ez, Hx};
+  poison_host_fields(gpu);
+  compare_scalar(cpu.max_abs(Ez, access_region), gpu.max_abs(Ez, access_region), tolerance,
+                 "max_abs resident access");
+  poison_host_fields(gpu);
+  compare_complex_value(cpu.integrate(2, access_components, access_integrand, NULL, access_region),
+                        gpu.integrate(2, access_components, access_integrand, NULL, access_region),
+                        3 * tolerance, "integrate resident access");
+  compare_hdf5_field_access(cpu, gpu, access_region, tolerance);
+
   master_printf("nvidia_dft: monitor-families/%s PASS\n", precision_policy_name(policy));
 }
 
@@ -253,6 +316,10 @@ static void run_complex_dft_fields(precision_policy_kind policy) {
   const double tolerance = policy == precision_policy_kind::native ? 5e-12 : 3e-4;
   compare_monitor_storage(cpu, gpu, tolerance);
   compare_dft_array(cpu, gpu, cpu_fields, gpu_fields, Ez, 1, tolerance);
+  const volume access_region(vec(-0.7, -0.6), vec(0.8, 0.7));
+  poison_host_fields(gpu);
+  compare_scalar(cpu.max_abs(Ez, access_region), gpu.max_abs(Ez, access_region), tolerance,
+                 "complex max_abs resident access");
   master_printf("nvidia_dft: complex-fields/%s PASS\n", precision_policy_name(policy));
 }
 
