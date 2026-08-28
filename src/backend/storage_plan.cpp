@@ -160,7 +160,7 @@ bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offs
   for (size_t i = 0; i < specs_.size(); ++i) {
     const ArraySpec &spec = specs_[i];
     if (!bases_[i]) continue;
-    const size_t bytes_per_element = element_bytes(spec.element_type);
+    const size_t bytes_per_element = host_element_bytes(spec.element_type);
     const uintptr_t begin = reinterpret_cast<uintptr_t>(bases_[i]);
     const size_t bytes = spec.elements * bytes_per_element;
     if (address < begin || address - begin >= bytes) continue;
