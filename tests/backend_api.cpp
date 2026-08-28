@@ -820,6 +820,15 @@ static void test_backend_safe_host_access() {
                         periodic_n, periodic_k, period);
   near2far.monitor_lifetime = monitor.monitor_lifetime;
 
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  if (am_master()) {
+    std::vector<std::complex<double> > local_farfield(6 * (sizeof(frequencies) / sizeof(*frequencies)));
+    near2far.farfield_lowlevel(local_farfield.data(), vec(2.0, 2.0));
+  }
+  all_wait();
+  CHECK(sum_to_all(int(accesses.dft_reads)) > 0,
+        "rank-local far-field query did not refresh its accumulator storage");
+
   accesses.fail_read_rank = 0;
   bool dft_norm_failure = false;
   try { (void)f->dft_norm(); }
