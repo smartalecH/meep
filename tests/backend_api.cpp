@@ -146,6 +146,16 @@ struct access_trace {
         fail_read_rank(-1) {}
 };
 
+struct compact_trace {
+  size_t calls;
+  size_t returned_bytes;
+  int fail_rank;
+  int fail_call;
+  std::vector<DftReductionRequest> requests;
+
+  compact_trace() : calls(0), returned_bytes(0), fail_rank(-1), fail_call(-1) {}
+};
+
 struct rebuild_state : BackendState {
   explicit rebuild_state(rebuild_trace &trace_) : trace(trace_) {}
   ~rebuild_state() override { trace.events.push_back("destroy-state"); }
@@ -241,6 +251,81 @@ public:
 
 private:
   access_trace &accesses;
+};
+
+class compact_access_backend : public access_tracking_backend {
+public:
+  compact_access_backend(fields &f_, rebuild_trace &rebuilds, access_trace &accesses,
+                         compact_trace &compact_)
+      : access_tracking_backend(f_, rebuilds, accesses), compact(compact_) {}
+
+  bool supports_compact_dft_reductions() const override { return true; }
+
+  void reduce_dft(const DftReductionRequest &request, std::complex<double> *result,
+                  size_t result_count) override {
+    const size_t call = compact.calls++;
+    if (my_rank() == compact.fail_rank && int(call) == compact.fail_call)
+      throw std::runtime_error("injected rank-local compact DFT reduction failure");
+    if (request.result_count != result_count)
+      throw std::invalid_argument("compact result-count mismatch");
+    if ((request.kind == DftReductionKind::norm2) != (result_count == 1) ||
+        (request.kind != DftReductionKind::norm2 && result_count == 0))
+      throw std::invalid_argument("compact kind/result-count mismatch");
+    if (request.accumulation_precision != policy_for(f.options.precision).reduction)
+      throw std::invalid_argument("compact reduction precision mismatch");
+
+    for (size_t ti = 0; ti < request.terms.size(); ++ti) {
+      const DftReductionTerm &term = request.terms[ti];
+      if (!is_valid(term.left) || term.left.value >= f.array_catalog->size())
+        throw std::out_of_range("invalid compact left array");
+      const ArraySpec &left = f.array_catalog->spec(term.left);
+      if (left.role != array_role::dft || left.element_type != ElementType::complex_realnum ||
+          is_valid(left.alias_of))
+        throw std::invalid_argument("compact left array has the wrong storage kind");
+      if (!term.storage_points || !term.frequencies ||
+          term.storage_points > std::numeric_limits<size_t>::max() / term.frequencies ||
+          term.storage_points * term.frequencies > left.elements)
+        throw std::out_of_range("compact left array is too small");
+      if (request.kind == DftReductionKind::norm2) {
+        if (is_valid(term.right)) throw std::invalid_argument("norm request has a right array");
+      }
+      else {
+        if (!is_valid(term.right) || term.right.value >= f.array_catalog->size())
+          throw std::out_of_range("invalid compact right array");
+        const ArraySpec &right = f.array_catalog->spec(term.right);
+        if (right.role != array_role::dft || right.element_type != ElementType::complex_realnum ||
+            is_valid(right.alias_of) || right.storage != left.storage ||
+            term.storage_points * term.frequencies > right.elements)
+          throw std::invalid_argument("compact DFT pair has incompatible storage");
+        if (term.frequencies != result_count)
+          throw std::invalid_argument("compact product frequency mismatch");
+      }
+      size_t maximum = term.region.base;
+      for (int axis = 0; axis < 3; ++axis) {
+        if (!term.region.counts[axis])
+          throw std::invalid_argument("compact region has a zero count");
+        const size_t extent = term.region.counts[axis] - 1;
+        if (term.region.strides[axis] &&
+            extent > (std::numeric_limits<size_t>::max() - maximum) /
+                         term.region.strides[axis])
+          throw std::overflow_error("compact region overflows");
+        maximum += extent * term.region.strides[axis];
+      }
+      if (maximum >= term.storage_points) throw std::out_of_range("compact region exceeds storage");
+    }
+
+    compact.requests.push_back(request);
+    compact.returned_bytes += result_count * sizeof(std::complex<double>);
+    for (size_t i = 0; i < result_count; ++i) {
+      const double value = double((my_rank() + 1) * (i + 1));
+      result[i] += request.kind == DftReductionKind::complex_weighted_product
+                       ? std::complex<double>(value, -0.25 * value)
+                       : std::complex<double>(value, 0.0);
+    }
+  }
+
+private:
+  compact_trace &compact;
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL) {
@@ -923,6 +1008,121 @@ static void test_backend_safe_host_access() {
   delete s;
 }
 
+static void test_compact_dft_reduction_boundary() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->require_component(Ez);
+  component component_ez = Ez;
+  const double frequencies[2] = {0.2, 0.3};
+  dft_fields monitor = f->add_dft_fields(&component_ez, 1,
+                                         volume(vec(0.4, 0.4), vec(1.2, 1.2)), frequencies, 2,
+                                         /*use_centered_grid=*/true,
+                                         /*decimation_factor=*/1,
+                                         /*persist=*/true);
+
+  rebuild_trace rebuilds;
+  access_trace accesses;
+  compact_trace compact;
+  f->backend = new compact_access_backend(*f, rebuilds, accesses, compact);
+  f->advance(1);
+
+  dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where,
+                NO_DIRECTION, true);
+  flux.monitor_lifetime = monitor.monitor_lifetime;
+  dft_energy energy(monitor.chunks, monitor.chunks, monitor.chunks, monitor.chunks, frequencies, 2,
+                    monitor.where);
+  energy.monitor_lifetime = monitor.monitor_lifetime;
+  dft_force force(monitor.chunks, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where);
+  force.monitor_lifetime = monitor.monitor_lifetime;
+
+  accesses.reads = accesses.dft_reads = 0;
+  (void)f->dft_norm();
+  delete[] flux.flux();
+  (void)flux.complexflux();
+  delete[] energy.electric();
+  delete[] energy.magnetic();
+  delete[] energy.total();
+  delete[] force.force();
+
+  CHECK(compact.calls == 8, "public compact queries issued %zu calls, expected 8", compact.calls);
+  CHECK(sum_to_all(int(accesses.dft_reads)) == 0,
+        "compact DFT query unexpectedly read a complete accumulator");
+  CHECK(compact.requests.size() == compact.calls,
+        "compact mock did not capture every successful request");
+  if (compact.requests.size() >= 8) {
+    CHECK(compact.requests[0].kind == DftReductionKind::norm2 &&
+              compact.requests[0].result_count == 1,
+          "DFT norm constructed the wrong compact request");
+    CHECK(compact.requests[1].kind == DftReductionKind::real_weighted_product &&
+              compact.requests[1].result_count == 2,
+          "flux constructed the wrong compact request");
+    CHECK(compact.requests[2].kind == DftReductionKind::complex_weighted_product,
+          "complex flux constructed the wrong compact request");
+    CHECK(compact.requests[3].terms.empty() ||
+              fabs(compact.requests[3].terms[0].weight.real() - 0.5) < 1e-15,
+          "electric energy lost its one-half weight");
+    CHECK(compact.requests[4].terms.empty() ||
+              fabs(compact.requests[4].terms[0].weight.real() - 0.5) < 1e-15,
+          "magnetic energy lost its one-half weight");
+    CHECK(compact.requests[7].kind == DftReductionKind::real_weighted_product,
+          "force constructed the wrong compact request");
+  }
+
+  bool saw_persistent_subset = false;
+  if (!compact.requests.empty())
+    for (size_t i = 0; i < compact.requests[0].terms.size(); ++i) {
+      const DftReductionTerm &term = compact.requests[0].terms[i];
+      size_t selected = 1;
+      size_t maximum = term.region.base;
+      for (int axis = 0; axis < 3; ++axis) {
+        selected *= term.region.counts[axis];
+        maximum += (term.region.counts[axis] - 1) * term.region.strides[axis];
+      }
+      CHECK(maximum < term.storage_points, "persistent compact region exceeds its allocation");
+      saw_persistent_subset = saw_persistent_subset || selected < term.storage_points;
+    }
+  CHECK(or_to_all(saw_persistent_subset),
+        "persistent DFT fixture did not produce an unpadded-in-padded compact region");
+
+  if (!compact.requests.empty() && !compact.requests[0].terms.empty()) {
+    DftReductionRequest malformed = compact.requests[0];
+    std::complex<double> result;
+    bool rejected = false;
+    malformed.terms[0].left = invalid_array();
+    try { f->backend->reduce_dft(malformed, &result, 1); }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "compact mock accepted an invalid array id");
+
+    malformed = compact.requests[0];
+    malformed.terms[0].region.counts[0] = 3;
+    malformed.terms[0].region.strides[0] = std::numeric_limits<size_t>::max();
+    rejected = false;
+    try { f->backend->reduce_dft(malformed, &result, 1); }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "compact mock accepted an overflowing region");
+
+    malformed = compact.requests[0];
+    malformed.terms[0].right = malformed.terms[0].left;
+    rejected = false;
+    try { f->backend->reduce_dft(malformed, &result, 1); }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "compact mock accepted a norm request with a right operand");
+  }
+
+  compact.fail_rank = 0;
+  compact.fail_call = int(compact.calls);
+  bool failed = false;
+  try { delete[] flux.flux(); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(sum_to_all(int(failed)) == count_processors(),
+        "rank-asymmetric compact reduction failure was not reconciled");
+  all_wait();
+
+  delete f;
+  delete s;
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -938,6 +1138,7 @@ int main(int argc, char **argv) {
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();
   test_backend_safe_host_access();
+  test_compact_dft_reduction_boundary();
 
   if (failures) {
     master_printf("backend_api: %d FAILURE(S)\n", failures);

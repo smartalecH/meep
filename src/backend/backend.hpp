@@ -28,8 +28,10 @@
 #ifndef MEEP_BACKEND_BACKEND_HPP
 #define MEEP_BACKEND_BACKEND_HPP
 
+#include <complex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
@@ -54,6 +56,30 @@ struct Executable {
 
 struct InitializationPlan; // src/backend/initialization_plan.hpp
 
+enum class DftReductionKind { norm2, real_weighted_product, complex_weighted_product };
+
+struct DftReductionRegion {
+  size_t base;
+  size_t counts[3];
+  size_t strides[3];
+};
+
+struct DftReductionTerm {
+  ArrayId left;
+  ArrayId right;
+  size_t storage_points;
+  size_t frequencies;
+  DftReductionRegion region;
+  std::complex<double> weight;
+};
+
+struct DftReductionRequest {
+  DftReductionKind kind;
+  Precision accumulation_precision;
+  size_t result_count;
+  std::vector<DftReductionTerm> terms;
+};
+
 class ExecutionBackend {
 public:
   virtual ~ExecutionBackend() {}
@@ -70,6 +96,10 @@ public:
 
   virtual void read(ArrayRef, void *host_buffer, size_t bytes) = 0;  // converts from storage
   virtual void write(ArrayRef, const void *host_buffer, size_t bytes) = 0; // converts to storage
+  virtual bool supports_compact_dft_reductions() const { return false; }
+  virtual void reduce_dft(const DftReductionRequest &, std::complex<double> *, size_t) {
+    throw std::logic_error("backend does not support compact DFT reductions");
+  }
   virtual void synchronize() = 0;
   virtual backend_capabilities capabilities() const = 0;
 
@@ -124,6 +154,13 @@ bool backend_read_dft_chunk(const dft_chunk *chunk, std::string &local_error);
 bool backend_read_dft_chain(const dft_chunk *head, std::string &local_error);
 void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *heads,
                                 const char *site);
+
+/* Execute one synchronous, rank-local compact DFT reduction, then reconcile
+   construction or backend failures before the caller enters its numeric MPI
+   reduction. Returns false only when compact reductions are unsupported. */
+bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
+                            std::complex<double> *local_result, size_t result_count,
+                            std::string &local_error, const char *site);
 
 /* A checkpoint load may replace array allocations. Preserve authoritative
    resident state before those host pointers change, then retire the stale
