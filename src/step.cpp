@@ -24,6 +24,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/diagnostics.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/prepare.hpp"
@@ -401,6 +402,7 @@ void fields_chunk::step_source(field_type ft, bool including_integrated) {
  * dispatch loop instead. */
 void fields::evaluate_source_scalars(double offset_in_dt) {
   calc_sources(step_source_times[offset_in_dt == 0.0 ? 0 : offset_in_dt == 0.5 ? 1 : 2]);
+  populate_source_scalars(*this, descriptors->sources);
 }
 
 void fields::calc_sources(double tim) {
