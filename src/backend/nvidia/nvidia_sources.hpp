@@ -35,6 +35,14 @@ struct point_source_launch {
   double amplitude_real;
   double amplitude_imag;
   double dt;
+  bool integrated;
+  scalar_precision precision;
+};
+
+struct array_copy_launch {
+  void *target;
+  const void *source;
+  size_t elements;
   scalar_precision precision;
 };
 
@@ -42,6 +50,7 @@ struct point_source_launch {
    on one stream preserves the legacy ordering when points alias. */
 void launch_point_source(const point_source_launch &source, const void *device_scalars,
                          const stream &execution_stream);
+void launch_array_copy(const array_copy_launch &copy, const stream &execution_stream);
 
 } // namespace nvidia
 } // namespace meep
