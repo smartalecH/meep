@@ -108,6 +108,11 @@ struct Operation {
   uint32_t descriptor_count;
   uint32_t polarization_subtraction_index;
   uint32_t polarization_subtraction_count;
+  /* Spatial source descriptors consumed by apply_sources or by update_eh's
+     integrated-source preparation. The primary descriptor span remains
+     available for the operation's ordinary update descriptors. */
+  uint32_t source_descriptor_index;
+  uint32_t source_descriptor_count;
   Guard guard;
   /* CPU execution keeps using the coarse field_type entry point. Device
      executors consume the half-open descriptor span. For finite_value_check,
@@ -260,15 +265,17 @@ struct StepPlan {
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
+  uint64_t source_signature;
   uint64_t signature;
 
-  StepPlan() : program(StepProgram::ordinary), signature(0) {}
+  StepPlan() : program(StepProgram::ordinary), source_signature(0), signature(0) {}
   void clear() {
     operations.clear();
     db_updates.clear();
     eh_updates.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
+    source_signature = 0;
     signature = 0;
   }
 };
