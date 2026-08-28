@@ -61,10 +61,30 @@ def main():
 
     if problems:
         print(f"BITWISE NEUTRALITY VIOLATED: {len(problems)} problem(s)", file=sys.stderr)
+
+        # The affected-cell summary is printed FIRST and is never truncated.
+        #
+        # This exists because truncation caused a real misdiagnosis: a run
+        # reported 82 problems, printed the first 25, and those 25 all named one
+        # configuration -- so the conclusion drawn was "one configuration
+        # differs" when in fact three did. "... and 57 more" is easy to skim
+        # past. Which *configurations* are affected is the thing you actually
+        # act on, it is small, and it is now always complete.
+        affected = {}
+        for p in problems:
+            cell = p.split(":", 1)[0].strip()
+            affected[cell] = affected.get(cell, 0) + 1
+        print(f"  affected cells ({len(affected)}):", file=sys.stderr)
+        for cell in sorted(affected):
+            print(f"    {cell}  ({affected[cell]} array(s))", file=sys.stderr)
+
+        print("  detail:", file=sys.stderr)
         for p in problems[: args.max_report]:
-            print(f"  {p}", file=sys.stderr)
+            print(f"    {p}", file=sys.stderr)
         if len(problems) > args.max_report:
-            print(f"  ... and {len(problems) - args.max_report} more", file=sys.stderr)
+            print(f"    ... and {len(problems) - args.max_report} more array(s); "
+                  f"pass --max-report to see them. The cell list above is complete.",
+                  file=sys.stderr)
         return 1
 
     print(f"bitwise neutral: {n_cells} cells, {n_arrays} arrays identical")
