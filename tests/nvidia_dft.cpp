@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "backend/backend.hpp"
+#include "backend/nvidia/runtime.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -66,6 +67,47 @@ static void poison_host_fields(fields &gpu) {
     for (size_t j = 0; j < spec.elements; ++j)
       host[j] = poison;
   }
+}
+
+static void poison_host_dft(fields &gpu) {
+  require(gpu.array_catalog != NULL, "NVIDIA DFT poison test has no storage catalog");
+  const realnum poison = std::numeric_limits<realnum>::quiet_NaN();
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = gpu.array_catalog->spec(id);
+    if (spec.role != array_role::dft || spec.element_type != ElementType::complex_realnum) continue;
+    std::complex<realnum> *host = gpu.array_catalog->resolve<std::complex<realnum> >(id);
+    for (size_t j = 0; j < spec.elements; ++j)
+      host[j] = std::complex<realnum>(poison, poison);
+  }
+}
+
+static void require_host_dft_poisoned(fields &gpu) {
+  bool saw_poison = false;
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = gpu.array_catalog->spec(id);
+    if (spec.role != array_role::dft || spec.element_type != ElementType::complex_realnum) continue;
+    const std::complex<realnum> *host =
+        gpu.array_catalog->resolve<std::complex<realnum> >(id);
+    for (size_t j = 0; j < spec.elements; ++j) {
+      saw_poison = saw_poison || (std::isnan(host[j].real()) && std::isnan(host[j].imag()));
+      if (!std::isnan(host[j].real()) || !std::isnan(host[j].imag()))
+        meep::abort("compact DFT query refreshed a poisoned host accumulator");
+    }
+  }
+  require(saw_poison, "DFT poison check found no monitor storage");
+}
+
+static void require_compact_transfer(size_t result_count, size_t expected_calls = 1) {
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(transfers.host_to_device_calls == 0 && transfers.host_to_device_bytes == 0,
+          "compact DFT query performed a host-to-device transfer");
+  require(transfers.device_to_host_calls == expected_calls,
+          "compact DFT query used the wrong D2H call count");
+  require(transfers.device_to_host_bytes == result_count * sizeof(std::complex<double>),
+          "compact DFT query transferred the wrong byte count");
 }
 
 static void compare_hdf5_field_access(fields &cpu, fields &gpu, const volume &where,
@@ -193,6 +235,68 @@ static void check_malformed_dft_rejections(fields &gpu) {
   expect_dft_compile_rejected(gpu, malformed, "DFT real source index range exceeds");
 }
 
+static void expect_reduction_rejected(fields &gpu, const DftReductionRequest &request,
+                                      size_t result_count, const char *message) {
+  std::vector<std::complex<double> > result(result_count ? result_count : 1);
+  bool rejected = false;
+  try { gpu.backend->reduce_dft(request, result.data(), result_count); }
+  catch (const std::exception &) { rejected = true; }
+  require(rejected, message);
+}
+
+static void check_malformed_dft_reduction_rejections(fields &gpu, size_t frequencies) {
+  ArrayId dft_id = invalid_array(), field_id = invalid_array();
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = gpu.array_catalog->spec(id);
+    if (!is_valid(dft_id) && spec.role == array_role::dft &&
+        spec.element_type == ElementType::complex_realnum &&
+        gpu.array_catalog->key(id).kind == int(array_kind::dft))
+      dft_id = id;
+    if (!is_valid(field_id) && spec.role == array_role::field) field_id = id;
+  }
+  require(is_valid(dft_id) && is_valid(field_id), "reduction rejection test lacks arrays");
+  const ArraySpec &spec = gpu.array_catalog->spec(dft_id);
+  require(spec.elements % frequencies == 0, "DFT test array has an unexpected shape");
+  DftReductionTerm term;
+  term.left = dft_id;
+  term.right = dft_id;
+  term.storage_points = spec.elements / frequencies;
+  term.frequencies = frequencies;
+  term.region = DftReductionRegion{0, {term.storage_points, 1, 1}, {1, 0, 0}};
+  term.weight = 1.0;
+  DftReductionRequest request;
+  request.kind = DftReductionKind::real_weighted_product;
+  request.accumulation_precision = policy_for(gpu.options.precision).reduction;
+  request.result_count = frequencies;
+  request.terms.push_back(term);
+
+  DftReductionRequest empty;
+  empty.kind = DftReductionKind::norm2;
+  empty.accumulation_precision = policy_for(gpu.options.precision).reduction;
+  empty.result_count = 1;
+  std::complex<double> empty_result(1.0, 1.0);
+  gpu.backend->reduce_dft(empty, &empty_result, 1);
+  require(empty_result == std::complex<double>(0.0, 0.0),
+          "empty compact reduction did not return zero");
+
+  DftReductionRequest malformed = request;
+  malformed.terms[0].left = invalid_array();
+  expect_reduction_rejected(gpu, malformed, frequencies, "invalid reduction ArrayId was accepted");
+  malformed = request;
+  malformed.terms[0].left = field_id;
+  expect_reduction_rejected(gpu, malformed, frequencies, "non-DFT reduction array was accepted");
+  malformed = request;
+  ++malformed.terms[0].storage_points;
+  expect_reduction_rejected(gpu, malformed, frequencies, "bad reduction array shape was accepted");
+  malformed = request;
+  ++malformed.terms[0].frequencies;
+  expect_reduction_rejected(gpu, malformed, frequencies, "bad reduction frequency was accepted");
+  malformed = request;
+  ++malformed.result_count;
+  expect_reduction_rejected(gpu, malformed, frequencies, "bad reduction result count was accepted");
+}
+
 static void run_real_monitor_families(precision_policy_kind policy) {
   const grid_volume gv = vol2d(3.0, 3.0, 7.0);
   structure cpu_structure(gv, vacuum, no_pml(), identity(), 1);
@@ -248,7 +352,10 @@ static void run_real_monitor_families(precision_policy_kind policy) {
 
   cpu.init_backend();
   gpu.init_backend();
-  if (policy == precision_policy_kind::native) check_malformed_dft_rejections(gpu);
+  if (policy == precision_policy_kind::native) {
+    check_malformed_dft_rejections(gpu);
+    check_malformed_dft_reduction_rejections(gpu, frequencies.size());
+  }
   const double tolerance = policy == precision_policy_kind::native ? 5e-12 : 3e-4;
   const int checkpoints[] = {1, 2, 6, 12};
   int previous = 0;
@@ -268,16 +375,71 @@ static void run_real_monitor_families(precision_policy_kind policy) {
 
   compare_dft_array(cpu, gpu, cpu_fields, gpu_fields, Ez, 0, tolerance);
   compare_dft_array(cpu, gpu, cpu_fields, gpu_fields, Hx, 2, tolerance);
-  std::unique_ptr<double[]> expected_flux(cpu_flux.flux()), observed_flux(gpu_flux.flux());
-  std::unique_ptr<double[]> expected_energy(cpu_energy.total()),
-      observed_energy(gpu_energy.total());
-  std::unique_ptr<double[]> expected_force(cpu_force.force()), observed_force(gpu_force.force());
+  std::unique_ptr<double[]> expected_flux(cpu_flux.flux());
+  const std::vector<std::complex<double> > expected_complex_flux = cpu_flux.complexflux();
+  std::unique_ptr<double[]> expected_energy(cpu_energy.total());
+  std::unique_ptr<double[]> expected_force(cpu_force.force());
+
+  poison_host_dft(gpu);
+  nvidia::testing::reset_transfer_accounting();
+  std::unique_ptr<double[]> observed_flux(gpu_flux.flux());
+  require_compact_transfer(frequencies.size());
+  require_host_dft_poisoned(gpu);
+  const nvidia::memory_accounting memory_before_repeat = nvidia::current_memory_accounting();
+  nvidia::testing::reset_transfer_accounting();
+  std::unique_ptr<double[]> repeated_flux(gpu_flux.flux());
+  require_compact_transfer(frequencies.size());
+  require_host_dft_poisoned(gpu);
+  const nvidia::memory_accounting memory_after_repeat = nvidia::current_memory_accounting();
+  require(memory_after_repeat.device_bytes_current == memory_before_repeat.device_bytes_current &&
+              memory_after_repeat.pinned_bytes_current == memory_before_repeat.pinned_bytes_current,
+          "repeated compact DFT query allocated new scratch storage");
+
+  nvidia::testing::reset_transfer_accounting();
+  const std::vector<std::complex<double> > observed_complex_flux = gpu_flux.complexflux();
+  require_compact_transfer(frequencies.size());
+  require_host_dft_poisoned(gpu);
+
+  nvidia::testing::reset_transfer_accounting();
+  std::unique_ptr<double[]> observed_energy(gpu_energy.total());
+  require_compact_transfer(2 * frequencies.size(), 2);
+  require_host_dft_poisoned(gpu);
+
+  nvidia::testing::reset_transfer_accounting();
+  std::unique_ptr<double[]> observed_force(gpu_force.force());
+  require_compact_transfer(frequencies.size());
+  require_host_dft_poisoned(gpu);
+
   for (size_t i = 0; i < frequencies.size(); ++i) {
     compare_scalar(expected_flux[i], observed_flux[i], 3 * tolerance, "DFT flux");
+    compare_scalar(observed_flux[i], repeated_flux[i], 5e-13, "repeated DFT flux");
+    compare_complex_value(expected_complex_flux[i], observed_complex_flux[i], 3 * tolerance,
+                          "complex DFT flux");
     compare_scalar(expected_energy[i], observed_energy[i], 3 * tolerance, "DFT energy");
     compare_scalar(expected_force[i], observed_force[i], 3 * tolerance, "DFT force");
   }
-  compare_scalar(cpu.dft_norm(), gpu.dft_norm(), 3 * tolerance, "DFT norm");
+  const double expected_norm = cpu.dft_norm();
+  nvidia::testing::reset_transfer_accounting();
+  const double observed_norm = gpu.dft_norm();
+  require_compact_transfer(1);
+  require_host_dft_poisoned(gpu);
+  compare_scalar(expected_norm, observed_norm, 3 * tolerance, "DFT norm");
+
+  const std::complex<double> query_scale(0.61, 0.17);
+  cpu_flux.scale_dfts(query_scale);
+  gpu_flux.scale_dfts(query_scale);
+  std::unique_ptr<double[]> expected_scaled_flux(cpu_flux.flux());
+  poison_host_dft(gpu);
+  nvidia::testing::reset_transfer_accounting();
+  std::unique_ptr<double[]> observed_scaled_flux(gpu_flux.flux());
+  require_compact_transfer(frequencies.size());
+  require_host_dft_poisoned(gpu);
+  for (size_t i = 0; i < frequencies.size(); ++i) {
+    compare_scalar(expected_scaled_flux[i], observed_scaled_flux[i], 3 * tolerance,
+                   "post-scale DFT flux");
+    compare_scalar(expected_flux[i] * std::norm(query_scale), expected_scaled_flux[i],
+                   3 * tolerance, "DFT flux scale relation");
+  }
   const size_t farfield_values = 6 * frequencies.size();
   std::vector<std::complex<double> > expected_far(farfield_values),
       observed_far(farfield_values);
