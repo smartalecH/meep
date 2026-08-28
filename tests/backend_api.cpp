@@ -55,6 +55,7 @@ static int failures = 0;
   } while (0)
 
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+static double finite_conductivity(const vec &) { return 0.17; }
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
 
 struct lifetime_counts {
@@ -1396,6 +1397,32 @@ static void test_resident_cylindrical_fingerprint() {
   refused_counts.fail_rebuild = false;
 }
 
+static void test_resident_conductivity_preparation() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure *s = new structure(gv, eps_slab, no_pml());
+  FOR_D_AND_B(c) { s->set_conductivity(c, finite_conductivity); }
+  fields *f = new fields(s);
+  f->require_component(Ez);
+
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+
+  size_t conductivity_arrays = 0, inverse_arrays = 0;
+  for (size_t i = 0; i < f->array_catalog->size(); ++i) {
+    const array_kind kind = array_kind(f->array_catalog->key(ArrayId{uint32_t(i)}).kind);
+    conductivity_arrays += kind == array_kind::conductivity;
+    inverse_arrays += kind == array_kind::condinv;
+  }
+  CHECK(conductivity_arrays > 0, "conductive resident test prepared no conductivity arrays");
+  CHECK(inverse_arrays == conductivity_arrays,
+        "resident preparation cataloged %zu conductivity arrays but %zu inverses",
+        conductivity_arrays, inverse_arrays);
+
+  delete f;
+  delete s;
+}
+
 static void test_classification_change_recompiles() {
   structure *s;
   fields *f;
@@ -2124,6 +2151,7 @@ int main(int argc, char **argv) {
   test_resident_beta_fingerprint();
   test_resident_bfast_fingerprint();
   test_resident_cylindrical_fingerprint();
+  test_resident_conductivity_preparation();
   test_classification_change_recompiles();
   test_collective_resident_invalidation();
   test_initialization_plan();
