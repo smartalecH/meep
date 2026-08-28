@@ -1028,8 +1028,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 received a stale StepPlan signature");
     if (plan.program != StepProgram::ordinary)
       throw std::invalid_argument("NVIDIA PR2 does not support solve_cw");
-    if (options_.precision == precision_policy_kind::mixed)
-      throw std::invalid_argument("NVIDIA PR2 supports precision=native and precision=f32 only");
     if (count_processors() != 1)
       throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
     if (f_.gv.dim == Dcyl || f_.m != 0.0 || f_.beta != 0.0)
