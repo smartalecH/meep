@@ -215,6 +215,9 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
    are descriptor metadata and are included. */
 uint64_t dft_plan_signature(const std::vector<DftDescriptor> &plan);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
+/* Rebuild dirty descriptor families after the storage catalog is stable.
+   rebuild_all is used by storage preparation because ArrayIds may have moved. */
+void refresh_operation_descriptors(fields &f, bool rebuild_all = false);
 
 } // namespace meep
 

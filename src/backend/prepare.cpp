@@ -362,9 +362,7 @@ void fields::prepare_storage_for(field_type ft) {
      reads them, but a descriptor that cannot be built from the live objects is
      a descriptor that is wrong, and this way the bitwise harness covers their
      construction too. */
-  build_source_descriptors(*this, descriptors->sources);
-  build_dft_descriptors(*this, descriptors->dfts);
-  build_polarization_descriptors(*this, descriptors->polarizations);
+  refresh_operation_descriptors(*this, true);
 }
 
 void fields::prepare_storage() {
