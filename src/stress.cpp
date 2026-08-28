@@ -19,6 +19,7 @@
    stress tensor of the Fourier-transformed fields */
 
 #include <meep.hpp>
+#include "backend/backend.hpp"
 
 using namespace std;
 
@@ -95,8 +96,6 @@ void dft_force::operator-=(const dft_force &st) {
 static void stress_sum(size_t Nfreq, double *F, const dft_chunk *F1, const dft_chunk *F2) {
   for (const dft_chunk *curF1 = F1, *curF2 = F2; curF1 && curF2;
        curF1 = curF1->next_in_dft, curF2 = curF2->next_in_dft) {
-    curF1->sync_dft_to_host();
-    if (curF2 != curF1) curF2->sync_dft_to_host();
     complex<double> extra_weight(real(curF1->extra_weight), imag(curF1->extra_weight));
     for (size_t k = 0; k < curF1->N; ++k)
       for (size_t i = 0; i < Nfreq; ++i)
@@ -106,6 +105,10 @@ static void stress_sum(size_t Nfreq, double *F, const dft_chunk *F1, const dft_c
 }
 
 double *dft_force::force() {
+  dft_chunk *chains[3] = {offdiag1, offdiag2, diag};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 3, chains, "dft_force::force");
+
   const size_t Nfreq = freq.size();
   double *F = new double[Nfreq];
   for (size_t i = 0; i < Nfreq; ++i)
