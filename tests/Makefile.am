@@ -8,7 +8,7 @@ lifecycle.cpp halo_plan.cpp storage_plan.cpp classification.cpp step_plan.cpp re
 # The bitwise-neutrality harness (plan section 4) is Python, and is driven by
 # CI rather than by `make check`: it needs two builds to compare.
 EXTRA_DIST = $(SRC) bitwise nvidia_runtime_smoke.cu nvidia_arena_smoke.cu \
-nvidia_mpi_runtime_smoke.cu nvidia_backend_state.cpp
+nvidia_mpi_runtime_smoke.cu nvidia_step_smoke.cu nvidia_backend_state.cpp
 
 OBJ = $(SRC:.cpp=.o)
 DAC = $(SRC:.cpp=.dac)
@@ -150,7 +150,7 @@ endif
 if HAVE_NVIDIA_BACKEND
 NVIDIA_CUDA_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
 NVIDIA_CUDA_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
-NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke
+NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke nvidia_step_smoke
 if WITH_MPI
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
 endif
@@ -168,6 +168,7 @@ check-local: check-TESTS
 nvidia-runtime-check: $(NVIDIA_RUNTIME_TESTS)
 	./nvidia_runtime_smoke
 	./nvidia_arena_smoke
+	./nvidia_step_smoke
 if WITH_MPI
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=staged
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=auto
@@ -185,6 +186,11 @@ nvidia_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
 	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
 
 nvidia_arena_smoke: $(srcdir)/nvidia_arena_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
+	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
+	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+
+nvidia_step_smoke: $(srcdir)/nvidia_step_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
 	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
 	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
 	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
