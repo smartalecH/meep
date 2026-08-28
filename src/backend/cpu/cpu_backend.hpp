@@ -32,6 +32,7 @@ public:
   void synchronize() override {}
   backend_capabilities capabilities() const override;
   bool requires_full_storage_preparation() const override { return false; }
+  void prepare_state_rebuild(BackendState &, DirtyMask) override {}
   bool accepts(const execution_options &opts, std::string &why) const override;
 
 private:
