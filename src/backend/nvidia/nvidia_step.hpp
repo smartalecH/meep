@@ -51,11 +51,41 @@ struct zero_launch {
   scalar_precision precision;
 };
 
+/* Relocatable same-device halo metadata. The descriptors themselves are
+   uploaded once when an executable is compiled. `buffer_index` is measured in
+   scalar elements, not bytes. A null imaginary target denotes COPY/NEGATE;
+   otherwise the entry applies a complex phase to two adjacent buffer values. */
+struct halo_gather_entry {
+  const void *source;
+  ptrdiff_t source_index;
+  size_t buffer_index;
+};
+
+struct halo_scatter_entry {
+  void *target_real;
+  ptrdiff_t target_real_index;
+  void *target_imag;
+  ptrdiff_t target_imag_index;
+  size_t buffer_index;
+  double phase_real;
+  double phase_imag;
+};
+
+struct halo_launch {
+  size_t first;
+  size_t count;
+  scalar_precision precision;
+};
+
 /* All launches are asynchronous on `stream`. Invalid geometry or a CUDA launch
    failure throws before returning. */
 void launch_curl(const curl_launch &update, const stream &stream);
 void launch_constitutive(const constitutive_launch &update, const stream &stream);
 void launch_zero(const zero_launch &update, const stream &stream);
+void launch_halo_gather(const halo_launch &launch, const void *device_entries, void *device_buffer,
+                        const stream &stream);
+void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
+                         const void *device_buffer, const stream &stream);
 
 } // namespace nvidia
 } // namespace meep
