@@ -50,6 +50,7 @@ const char *array_kind_name(array_kind k) {
     case array_kind::pml_kap: return "pml_kap";
     case array_kind::pml_siginv: return "pml_siginv";
     case array_kind::dft: return "dft";
+    case array_kind::dft_phase: return "dft_phase";
     case array_kind::polarization_internal: return "polarization_internal";
     case array_kind::num_kinds: break;
   }
@@ -286,9 +287,12 @@ size_t build_storage_catalog(fields &f, CpuArrayCatalog &cat, StoragePlan &plan)
 
     // ---- dft_chunk ------------------------------------------------------
     int di = 0;
-    for (dft_chunk *cur = fc.dft_chunks; cur; cur = cur->next_in_chunk, ++di)
+    for (dft_chunk *cur = fc.dft_chunks; cur; cur = cur->next_in_chunk, ++di) {
       r.add(i, array_kind::dft, int(cur->c), -1, di, cur->dft, cur->N * cur->omega.size(),
             array_role::dft, ElementType::complex_realnum);
+      r.add(i, array_kind::dft_phase, int(cur->c), -1, di, cur->dft_phase, cur->omega.size(),
+            array_role::dft, ElementType::complex_realnum);
+    }
   }
   /* H/B and D/E aliases are discovered after field specs enter the plan.
      Refresh the frozen descriptors so every consumer sees the catalog's
@@ -346,8 +350,10 @@ size_t audit_storage_catalog(fields &f, const CpuArrayCatalog &cat, bool report)
       for (susceptibility *sus = sc.chiP[ft]; sus; sus = sus->next)
         FOR_COMPONENTS(c) FOR_DIRECTIONS(d) { check(sus->sigma[c][d], "sigma", i); }
     }
-    for (dft_chunk *cur = fc.dft_chunks; cur; cur = cur->next_in_chunk)
+    for (dft_chunk *cur = fc.dft_chunks; cur; cur = cur->next_in_chunk) {
       check(cur->dft, "dft", i);
+      check(cur->dft_phase, "dft_phase", i);
+    }
 
     FOR_FIELD_TYPES(ft) {
       for (polarization_state *p = fc.pol[ft]; p; p = p->next) {

@@ -290,10 +290,21 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out) {
       d.chunk = i;
       d.c = cur->c;
       d.accumulator = f.array_catalog->find({i, int(array_kind::dft), int(cur->c), -1, di});
-      d.phase_scratch = invalid_array(); // dft_phase is owned by dft_chunk; see the note below
+      d.phase_scratch =
+          f.array_catalog->find({i, int(array_kind::dft_phase), int(cur->c), -1, di});
       d.source_field.id = f.array_catalog->find({i, int(array_kind::f), int(cur->c), 0, 0});
       d.source_field.offset = 0;
-      d.source_field.elements = size_t(f.chunks[i]->gv.ntot());
+      d.source_field.elements = is_valid(d.source_field.id)
+                                    ? f.array_catalog->spec(d.source_field.id).elements
+                                    : 0;
+      d.source_field_imag.id =
+          f.array_catalog->find({i, int(array_kind::f), int(cur->c), 1, 0});
+      d.source_field_imag.offset = 0;
+      d.source_field_imag.elements = is_valid(d.source_field_imag.id)
+                                         ? f.array_catalog->spec(d.source_field_imag.id).elements
+                                         : 0;
+      d.omega = cur->omega;
+      d.scale = cur->scale;
       d.avg1 = cur->avg1;
       d.avg2 = cur->avg2;
       d.is = cur->is;
