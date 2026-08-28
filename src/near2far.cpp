@@ -407,19 +407,22 @@ static void farfield_lowlevel_from_host(dft_chunk *chunks, const std::vector<dou
 }
 
 void dft_near2far::farfield_lowlevel(std::complex<double> *EH, const vec &x, double greencyl_tol) {
-  dft_chunk *chains[1] = {F};
-  if (monitor_lifetime && monitor_lifetime->owner)
-    backend_refresh_dft_chains(*monitor_lifetime->owner, 1, chains,
-                               "dft_near2far::farfield_lowlevel");
+  for (dft_chunk *f = F; f; f = f->next_in_dft)
+    f->sync_dft_to_host();
   farfield_lowlevel_from_host(F, freq, eps, mu, periodic_d, periodic_n, periodic_k, period, EH, x,
                               greencyl_tol);
 }
 
 std::complex<double> *dft_near2far::farfield(const vec &x, double greencyl_tol) {
+  dft_chunk *chains[1] = {F};
+  if (monitor_lifetime && monitor_lifetime->owner)
+    backend_refresh_dft_chains(*monitor_lifetime->owner, 1, chains, "dft_near2far::farfield");
+
   std::complex<double> *EH, *EH_local;
   const size_t Nfreq = freq.size();
   EH_local = new std::complex<double>[6 * Nfreq];
-  farfield_lowlevel(EH_local, x, greencyl_tol);
+  farfield_lowlevel_from_host(F, freq, eps, mu, periodic_d, periodic_n, periodic_k, period, EH_local,
+                              x, greencyl_tol);
   EH = new std::complex<double>[6 * Nfreq];
   sum_to_all(EH_local, EH, 6 * Nfreq);
   delete[] EH_local;
