@@ -25,9 +25,9 @@ static_assert(fields::num_mutation_kinds == mutation_kind_count,
 
 DirtyMask invalidation_closure(MutationKind cause) {
   switch (cause) {
-    /* Values only: the plan and every prepared artifact still describe the
-       right work, so nothing is invalidated. */
-    case MutationKind::field_values: return dirty_none;
+    /* Values only: storage and executable layout remain valid, but a resident
+       backend must refresh the authoritative values from the host mutation. */
+    case MutationKind::field_values: return dirty_initialization;
 
     /* Amplitudes changed but the index tables did not, so only the values that
        get pushed to the backend are stale. */
@@ -51,6 +51,9 @@ DirtyMask invalidation_closure(MutationKind cause) {
     /* Same as material_values, but preparation may restrict the initialization
        delta to the changed region. */
     case MutationKind::material_region: return dirty_initialization | dirty_classification;
+
+    case MutationKind::material_phase:
+      return dirty_initialization | dirty_classification | dirty_executable;
 
     /* A different recipe or susceptibility set changes which arrays exist,
        which polarization internals need halo exchange, and the op list. */
@@ -79,6 +82,7 @@ const char *mutation_kind_name(MutationKind cause) {
     case MutationKind::monitor_definition: return "monitor_definition";
     case MutationKind::material_values: return "material_values";
     case MutationKind::material_region: return "material_region";
+    case MutationKind::material_phase: return "material_phase";
     case MutationKind::material_definition: return "material_definition";
     case MutationKind::field_layout: return "field_layout";
     case MutationKind::boundary_topology: return "boundary_topology";

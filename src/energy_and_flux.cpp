@@ -22,6 +22,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 
 using namespace std;
 
@@ -164,6 +165,7 @@ void fields::synchronize_magnetic_fields() {
       FOR_B_COMPONENTS(c) { chunks[i]->average_with_backup(c); }
       FOR_MAGNETIC_COMPONENTS(c) { chunks[i]->average_with_backup(c); }
     }
+  invalidate(*this, MutationKind::field_values);
 }
 
 void fields::restore_magnetic_fields() {
@@ -175,6 +177,7 @@ void fields::restore_magnetic_fields() {
       FOR_B_COMPONENTS(c) { chunks[i]->restore_component(c); }
       FOR_MAGNETIC_COMPONENTS(c) { chunks[i]->restore_component(c); }
     }
+  invalidate(*this, MutationKind::field_values);
 }
 
 double fields::thermo_energy_in_box(const volume &where) {

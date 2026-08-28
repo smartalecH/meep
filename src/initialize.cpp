@@ -23,6 +23,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "config.h"
+#include "backend/lifecycle.hpp"
 
 // Cylindrical coordinates:
 
@@ -145,6 +146,7 @@ void fields::initialize_field(component c, complex<double> func(const vec &)) {
     update_eh(H_stuff);
     step_boundaries(H_stuff);
   }
+  invalidate(*this, MutationKind::field_values);
 }
 
 void fields_chunk::initialize_field(component c, complex<double> func(const vec &)) {

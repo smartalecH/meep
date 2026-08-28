@@ -672,6 +672,7 @@ void fields_chunk::zero_fields() {
 void fields::zero_fields() {
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->zero_fields();
+  invalidate(*this, MutationKind::field_values);
 }
 
 void fields::reset() {
@@ -717,7 +718,7 @@ int fields::phase_in_material(const structure *snew, double time) {
     if (chunks[i]->is_mine()) chunks[i]->phase_in_material(snew->chunks[i]);
   phasein_time = (int)(time / dt);
   /* Only owned chunks were touched above, so this is rank-local. */
-  invalidate(*this, MutationKind::material_values);
+  invalidate(*this, MutationKind::material_phase);
   mark_local_invalidation(*this);
   changed_materials = true;
   // FIXME: how to handle changes in susceptibilities?

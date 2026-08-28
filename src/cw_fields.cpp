@@ -17,6 +17,7 @@
 
 #include "meep_internals.hpp"
 #include "bicgstab.hpp"
+#include "backend/lifecycle.hpp"
 
 using namespace std;
 
@@ -70,6 +71,7 @@ static void array_to_fields(const complex<realnum> *x, fields &f) {
   f.step_boundaries(D_stuff);
   f.update_eh(E_stuff, true);
   f.step_boundaries(E_stuff);
+  invalidate(f, MutationKind::field_values);
 
   /* done in f.step before updating D:
   f.step_boundaries(B_stuff);

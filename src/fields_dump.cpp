@@ -27,6 +27,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/lifecycle.hpp"
 
 namespace meep {
 
@@ -275,6 +276,7 @@ void fields::load(const char *filename, bool single_parallel_file) {
       load_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file);
     }
   }
+  invalidate(*this, MutationKind::field_values);
 }
 
 } // namespace meep

@@ -40,12 +40,13 @@ class fields;
    invalidation_closure() maps a cause onto the set of prepared artifacts that
    the cause can invalidate. */
 enum class MutationKind {
-  field_values,        // zero/restart or compatible checkpoint load
+  field_values,        // zero/restart or compatible checkpoint load; refresh resident values
   source_values,       // amplitudes changed, same indices/components
   source_definition,   // add/remove/replace source
   monitor_definition,  // add/remove/change monitor region
   material_values,     // coefficients changed, same represented layout
   material_region,     // coefficients changed inside a bounded region only
+  material_phase,      // phase-in state changes coefficients and the operation schedule
   material_definition, // recipe or susceptibility set changed
   field_layout,        // component, real/complex mode, or optional array changed
   boundary_topology,   // boundary, Bloch phase, symmetry, or user volume changed
@@ -55,7 +56,7 @@ enum class MutationKind {
 
 /* Keep in sync with fields::num_mutation_kinds in meep.hpp; lifecycle.cpp
    static_asserts that they agree. */
-const int mutation_kind_count = 11;
+const int mutation_kind_count = 12;
 
 typedef uint32_t DirtyMask;
 enum DirtyBit : DirtyMask {

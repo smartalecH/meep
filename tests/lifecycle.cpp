@@ -56,13 +56,15 @@ static void test_closure_table() {
     DirtyMask expected;
   };
   const row table[] = {
-      {MutationKind::field_values, dirty_none},
+      {MutationKind::field_values, dirty_initialization},
       {MutationKind::source_values, dirty_initialization},
       {MutationKind::source_definition, dirty_source_plan | dirty_regions | dirty_executable},
       {MutationKind::monitor_definition,
        dirty_monitor_plan | dirty_regions | dirty_storage | dirty_executable},
       {MutationKind::material_values, dirty_initialization | dirty_classification},
       {MutationKind::material_region, dirty_initialization | dirty_classification},
+      {MutationKind::material_phase,
+       dirty_initialization | dirty_classification | dirty_executable},
       {MutationKind::material_definition, dirty_initialization | dirty_storage | dirty_halos |
                                               dirty_classification | dirty_executable},
       {MutationKind::field_layout, dirty_storage | dirty_halos | dirty_executable},
