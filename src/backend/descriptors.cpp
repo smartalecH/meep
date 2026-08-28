@@ -20,6 +20,7 @@
 #include "meep_internals.hpp"
 
 #include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <typeinfo>
 
@@ -223,6 +224,58 @@ void populate_source_scalars(fields &f, SourcePlan &out) {
     scalar.current = st->current();
     scalar.dipole = st->dipole();
   }
+}
+
+namespace {
+
+void source_hash_mix(uint64_t &hash, uint64_t value) {
+  hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2);
+}
+
+void source_hash_double(uint64_t &hash, double value) {
+  uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value), "double is not 64-bit");
+  std::memcpy(&bits, &value, sizeof(bits));
+  source_hash_mix(hash, bits);
+}
+
+} // namespace
+
+uint64_t source_plan_signature(const SourcePlan &plan) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  source_hash_mix(hash, plan.source_times.size());
+  for (const SourceTimeDescriptor &d : plan.source_times) {
+    source_hash_mix(hash, d.source_time_id);
+    source_hash_mix(hash, uint64_t(d.kind));
+    source_hash_mix(hash, d.scalar_slot);
+    source_hash_mix(hash, d.host_callback_id);
+    source_hash_mix(hash, d.is_integrated);
+    source_hash_mix(hash, d.parameters.size());
+    for (double value : d.parameters)
+      source_hash_double(hash, value);
+  }
+  source_hash_mix(hash, plan.sources.size());
+  for (const SourceDescriptor &d : plan.sources) {
+    source_hash_mix(hash, d.destination.value);
+    source_hash_mix(hash, d.destination_imag.value);
+    source_hash_mix(hash, d.integrated_destination.value);
+    source_hash_mix(hash, d.integrated_destination_imag.value);
+    source_hash_mix(hash, uint64_t(d.chunk));
+    source_hash_mix(hash, uint64_t(d.c));
+    source_hash_mix(hash, d.condinv.value);
+    source_hash_mix(hash, d.source_time_id);
+    source_hash_mix(hash, d.integrated);
+    source_hash_mix(hash, uint64_t(d.ft));
+    source_hash_mix(hash, d.indices.size());
+    for (ptrdiff_t index : d.indices)
+      source_hash_mix(hash, uint64_t(index));
+    source_hash_mix(hash, d.complex_amplitudes.size());
+    for (std::complex<double> amplitude : d.complex_amplitudes) {
+      source_hash_double(hash, amplitude.real());
+      source_hash_double(hash, amplitude.imag());
+    }
+  }
+  return hash;
 }
 
 /* --- DFT monitors --------------------------------------------------------- */
