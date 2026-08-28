@@ -495,6 +495,28 @@ void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum
     throw std::out_of_range(std::string(what) + " index range exceeds its array");
 }
 
+ptrdiff_t checked_shift(ptrdiff_t value, ptrdiff_t offset, const char *what) {
+  if ((offset > 0 && value > std::numeric_limits<ptrdiff_t>::max() - offset) ||
+      (offset < 0 && value < std::numeric_limits<ptrdiff_t>::min() - offset))
+    throw std::overflow_error(std::string(what) + " index range overflow");
+  return value + offset;
+}
+
+ptrdiff_t checked_negate(ptrdiff_t value, const char *what) {
+  if (value == std::numeric_limits<ptrdiff_t>::min())
+    throw std::overflow_error(std::string(what) + " index offset overflow");
+  return -value;
+}
+
+void validate_shifted_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t region_min,
+                                  ptrdiff_t region_max, ptrdiff_t offset0, ptrdiff_t offset1,
+                                  ptrdiff_t offset2, ptrdiff_t offset3, const char *what) {
+  const ptrdiff_t minimum_offset = std::min(std::min(offset0, offset1), std::min(offset2, offset3));
+  const ptrdiff_t maximum_offset = std::max(std::max(offset0, offset1), std::max(offset2, offset3));
+  validate_index_range(plan, id, checked_shift(region_min, minimum_offset, what),
+                       checked_shift(region_max, maximum_offset, what), what);
+}
+
 nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &state) {
   const uint32_t supported_variants =
       curl_has_second_derivative | curl_has_pml | curl_has_pml_aux | curl_has_conductivity;
@@ -568,15 +590,24 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
 
 nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &source,
                                                  NvidiaBackendState &state) {
-  const uint32_t supported_variants = constitutive_has_pml;
+  const uint32_t supported_variants =
+      constitutive_has_pml | constitutive_one_offdiagonal | constitutive_two_offdiagonals;
   if (source.region.variant_key & ~supported_variants)
-    throw std::invalid_argument(
-        "constitutive descriptor requires anisotropy, nonlinearity, or polarization");
-  if (is_valid(source.offdiagonal1) || is_valid(source.offdiagonal2) || is_valid(source.chi2) ||
-      is_valid(source.chi3) || is_valid(source.previous_w))
+    throw std::invalid_argument("constitutive descriptor requires nonlinearity or polarization");
+  if (is_valid(source.chi2) || is_valid(source.chi3) || is_valid(source.previous_w))
     throw std::invalid_argument("constitutive descriptor contains unsupported auxiliary arrays");
 
   const bool have_pml = (source.region.variant_key & constitutive_has_pml) != 0;
+  const bool have_offdiagonal1 = (source.region.variant_key & constitutive_one_offdiagonal) != 0;
+  const bool have_offdiagonal2 = (source.region.variant_key & constitutive_two_offdiagonals) != 0;
+  if (have_offdiagonal2 && !have_offdiagonal1)
+    throw std::invalid_argument("constitutive descriptor has a second off-diagonal without first");
+  if (have_offdiagonal1 != is_valid(source.offdiagonal1) ||
+      have_offdiagonal2 != is_valid(source.offdiagonal2) ||
+      (have_offdiagonal1 && (!is_valid(source.cross1) || !is_valid(source.diagonal))) ||
+      (have_offdiagonal2 && !is_valid(source.cross2)))
+    throw std::invalid_argument(
+        "constitutive descriptor anisotropy bits and operand arrays disagree");
   if (have_pml != is_valid(source.pml.sig) || have_pml != is_valid(source.target_w))
     throw std::invalid_argument("constitutive descriptor PML bit and auxiliary arrays disagree");
   if (!have_pml && (is_valid(source.pml.kap) || is_valid(source.pml.siginv)))
@@ -588,8 +619,23 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
   result.target = device_address(state, source.target, "constitutive target");
   result.primary =
       optional_device_address(state, source.primary, result.precision, "constitutive primary");
+  result.cross1 =
+      have_offdiagonal1
+          ? optional_device_address(state, source.cross1, result.precision, "constitutive cross1")
+          : NULL;
+  result.cross2 =
+      have_offdiagonal2
+          ? optional_device_address(state, source.cross2, result.precision, "constitutive cross2")
+          : NULL;
   result.diagonal =
       optional_device_address(state, source.diagonal, result.precision, "constitutive diagonal");
+  result.offdiagonal1 = optional_device_address(state, source.offdiagonal1, result.precision,
+                                                "constitutive off-diagonal1");
+  result.offdiagonal2 = optional_device_address(state, source.offdiagonal2, result.precision,
+                                                "constitutive off-diagonal2");
+  result.primary_stride = source.primary_stride;
+  result.cross1_stride = source.cross1_stride;
+  result.cross2_stride = source.cross2_stride;
   result.target_w = optional_mutable_device_address(state, source.target_w, result.precision,
                                                     "constitutive PML target");
   result.pml =
@@ -604,6 +650,30 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
   if (is_valid(source.diagonal))
     validate_index_range(state.plan_, source.diagonal, ptrdiff_t(result.region.base), region_max,
                          "constitutive diagonal");
+  if (have_offdiagonal1) {
+    const ptrdiff_t negative_cross_stride =
+        checked_negate(source.cross1_stride, "constitutive cross1");
+    const ptrdiff_t combined_stride =
+        checked_shift(source.primary_stride, negative_cross_stride, "constitutive cross1");
+    validate_shifted_index_range(state.plan_, source.cross1, ptrdiff_t(result.region.base),
+                                 region_max, 0, negative_cross_stride, source.primary_stride,
+                                 combined_stride, "constitutive cross1");
+    validate_shifted_index_range(state.plan_, source.offdiagonal1, ptrdiff_t(result.region.base),
+                                 region_max, 0, source.primary_stride, 0, source.primary_stride,
+                                 "constitutive off-diagonal1");
+  }
+  if (have_offdiagonal2) {
+    const ptrdiff_t negative_cross_stride =
+        checked_negate(source.cross2_stride, "constitutive cross2");
+    const ptrdiff_t combined_stride =
+        checked_shift(source.primary_stride, negative_cross_stride, "constitutive cross2");
+    validate_shifted_index_range(state.plan_, source.cross2, ptrdiff_t(result.region.base),
+                                 region_max, 0, negative_cross_stride, source.primary_stride,
+                                 combined_stride, "constitutive cross2");
+    validate_shifted_index_range(state.plan_, source.offdiagonal2, ptrdiff_t(result.region.base),
+                                 region_max, 0, source.primary_stride, 0, source.primary_stride,
+                                 "constitutive off-diagonal2");
+  }
   if (is_valid(source.target_w))
     validate_index_range(state.plan_, source.target_w, ptrdiff_t(result.region.base), region_max,
                          "constitutive PML target");
