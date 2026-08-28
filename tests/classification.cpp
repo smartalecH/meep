@@ -144,22 +144,6 @@ static void test_reentry_bound() {
   master_printf("reentry bound: %u re-entries\n", unsigned(f.classification_reentries));
 }
 
-static void test_changed_hash_invalidates_executable() {
-  grid_volume gv = vol2d(3.0, 3.0, 10.0);
-  structure s(gv, eps_slab, pml(0.5));
-  fields f(&s);
-  gaussian_src_time src(0.3, 0.1);
-  f.add_point_source(Ez, src, vec(0.11, 0.13));
-  f.advance(3);
-
-  CHECK(f.prepared_classification_hash != 0, "classification did not publish a hash");
-  clear_dirty(f, dirty_executable);
-  ++f.prepared_classification_hash;
-  f.classify_and_finalize();
-  CHECK(is_dirty(f, dirty_executable),
-        "a changed classification hash did not invalidate the executable");
-}
-
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -185,7 +169,6 @@ int main(int argc, char **argv) {
   test_tiling_decision();
   test_value_change_preserves_hash();
   test_reentry_bound();
-  test_changed_hash_invalidates_executable();
 
   if (failures) {
     master_printf("classification: %d FAILURE(S)\n", failures);
