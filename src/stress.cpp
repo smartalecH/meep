@@ -19,6 +19,7 @@
    stress tensor of the Fourier-transformed fields */
 
 #include <meep.hpp>
+#include <memory>
 #include "backend/backend.hpp"
 #include "backend/precision.hpp"
 #include "backend/storage_plan.hpp"
@@ -145,9 +146,7 @@ static void stress_sum(size_t Nfreq, double *F, const dft_chunk *F1, const dft_c
 
 double *dft_force::force() {
   const size_t Nfreq = freq.size();
-  double *F = new double[Nfreq];
-  for (size_t i = 0; i < Nfreq; ++i)
-    F[i] = 0;
+  std::vector<double> F(Nfreq, 0.0);
 
   fields *owner = monitor_lifetime ? monitor_lifetime->owner : NULL;
   const bool compact_supported =
@@ -170,14 +169,13 @@ double *dft_force::force() {
   else {
     dft_chunk *chains[3] = {offdiag1, offdiag2, diag};
     if (owner) backend_refresh_dft_chains(*owner, 3, chains, "dft_force::force");
-    stress_sum(Nfreq, F, offdiag1, offdiag2);
-    stress_sum(Nfreq, F, diag, diag);
+    stress_sum(Nfreq, F.data(), offdiag1, offdiag2);
+    stress_sum(Nfreq, F.data(), diag, diag);
   }
 
-  double *Fsum = new double[Nfreq];
-  sum_to_all(F, Fsum, int(Nfreq));
-  delete[] F;
-  return Fsum;
+  std::unique_ptr<double[]> Fsum(new double[Nfreq]);
+  sum_to_all(F.data(), Fsum.get(), int(Nfreq));
+  return Fsum.release();
 }
 
 void dft_force::save_hdf5(h5file *file, const char *dprefix) {
