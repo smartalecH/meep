@@ -778,6 +778,11 @@ static void test_backend_safe_host_access() {
   std::unique_ptr<std::complex<realnum>[]> dft(f->get_dft_array(monitor, Ez, 0, &rank, dims));
   CHECK(dft.get() != NULL && sum_to_all(int(accesses.dft_reads)) > 0,
         "DFT array query did not refresh its accumulator storage");
+  int local_dft_chunks = 0;
+  for (dft_chunk *cur = monitor.chunks; cur; cur = cur->next_in_dft)
+    ++local_dft_chunks;
+  CHECK(sum_to_all(int(accesses.dft_reads)) == sum_to_all(local_dft_chunks),
+        "DFT array query redundantly refreshed accumulator storage");
 
   accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
   dft_chunk *chunklists[1] = {monitor.chunks};
@@ -788,6 +793,73 @@ static void test_backend_safe_host_access() {
   encoded_dft.reset(encoded_array);
   CHECK(encoded_dft.get() != NULL && sum_to_all(int(accesses.dft_reads)) > 0,
         "encoded DFT component did not refresh its normalized accumulator storage");
+  CHECK(sum_to_all(int(accesses.dft_reads)) == sum_to_all(local_dft_chunks),
+        "encoded DFT component redundantly refreshed accumulator storage");
+
+  accesses.fail_read_rank = 0;
+  bool dft_array_failure = false;
+  try {
+    std::unique_ptr<std::complex<realnum>[]> failed(
+        f->get_dft_array(monitor, Ez, 0, &rank, dims));
+  }
+  catch (const std::runtime_error &) { dft_array_failure = true; }
+  CHECK(sum_to_all(int(dft_array_failure)) == count_processors(),
+        "DFT array read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
+
+  dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where,
+                NO_DIRECTION, true);
+  flux.monitor_lifetime = monitor.monitor_lifetime;
+  dft_energy energy(monitor.chunks, monitor.chunks, monitor.chunks, monitor.chunks, frequencies, 2,
+                    monitor.where);
+  energy.monitor_lifetime = monitor.monitor_lifetime;
+  dft_force force(monitor.chunks, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where);
+  force.monitor_lifetime = monitor.monitor_lifetime;
+  const direction periodic_d[2] = {NO_DIRECTION, NO_DIRECTION};
+  const int periodic_n[2] = {0, 0};
+  const double periodic_k[2] = {0.0, 0.0};
+  const double period[2] = {0.0, 0.0};
+  dft_near2far near2far(monitor.chunks, frequencies, 2, 1.0, 1.0, monitor.where, periodic_d,
+                        periodic_n, periodic_k, period);
+  near2far.monitor_lifetime = monitor.monitor_lifetime;
+
+  accesses.fail_read_rank = 0;
+  bool dft_norm_failure = false;
+  try { (void)f->dft_norm(); }
+  catch (const std::runtime_error &) { dft_norm_failure = true; }
+  CHECK(sum_to_all(int(dft_norm_failure)) == count_processors(),
+        "DFT norm read failure was not reconciled on every rank");
+
+  bool flux_failure = false;
+  try { delete[] flux.flux(); }
+  catch (const std::runtime_error &) { flux_failure = true; }
+  CHECK(sum_to_all(int(flux_failure)) == count_processors(),
+        "flux read failure was not reconciled on every rank");
+
+  bool electric_failure = false;
+  try { delete[] energy.electric(); }
+  catch (const std::runtime_error &) { electric_failure = true; }
+  CHECK(sum_to_all(int(electric_failure)) == count_processors(),
+        "electric-energy read failure was not reconciled on every rank");
+
+  bool magnetic_failure = false;
+  try { delete[] energy.magnetic(); }
+  catch (const std::runtime_error &) { magnetic_failure = true; }
+  CHECK(sum_to_all(int(magnetic_failure)) == count_processors(),
+        "magnetic-energy read failure was not reconciled on every rank");
+
+  bool force_failure = false;
+  try { delete[] force.force(); }
+  catch (const std::runtime_error &) { force_failure = true; }
+  CHECK(sum_to_all(int(force_failure)) == count_processors(),
+        "force read failure was not reconciled on every rank");
+
+  bool farfield_failure = false;
+  try { delete[] near2far.farfield(vec(2.0, 2.0)); }
+  catch (const std::runtime_error &) { farfield_failure = true; }
+  CHECK(sum_to_all(int(farfield_failure)) == count_processors(),
+        "far-field read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
 
   accesses.fail_read_rank = 0;
   bool symmetric_failure = false;
