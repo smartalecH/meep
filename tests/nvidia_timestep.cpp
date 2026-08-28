@@ -22,6 +22,7 @@
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/precision.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
@@ -222,11 +223,11 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   require_physics_variants(prepared, required_curl_combinations,
                            required_constitutive_combinations);
 
-  const bool f32 = policy == precision_policy_kind::f32;
-  if (f32) round_real_arrays(*cpu.array_catalog);
-  initialize_fields(cpu, gpu, f32);
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
 
-  const double tolerance = f32 ? 2e-5 : 2e-13;
+  const double tolerance = narrowed ? 2e-5 : 2e-13;
   const int checkpoints[] = {1, 2, 100};
   int previous = 0;
   for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
@@ -260,7 +261,7 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
     require(rejected_stale_refresh,
             "NVIDIA initialization accepted a stale host mirror after stepping");
   }
-  master_printf("nvidia_timestep: %s/%s PASS\n", name, f32 ? "f32" : "native");
+  master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
 }
 
 static void require_advance_rejected(fields &f, const char *expected) {
@@ -321,8 +322,7 @@ static void run_finite_diagnostic_case(const char *name, precision_policy_kind p
     require(f.first_bad_step == expected_step, "NVIDIA first-bad step differs");
     require(f.first_bad_component == expected_component, "NVIDIA first-bad component differs");
   }
-  master_printf("nvidia_timestep: finite-%s/%s PASS\n", name,
-                policy == precision_policy_kind::f32 ? "f32" : "native");
+  master_printf("nvidia_timestep: finite-%s/%s PASS\n", name, precision_policy_name(policy));
 }
 
 static void test_finite_diagnostics(precision_policy_kind policy) {
@@ -365,14 +365,6 @@ static void test_rejections() {
     f.require_component(Ez);
     require_advance_rejected(f, "dispersion");
   }
-  {
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    options.precision = precision_policy_kind::mixed;
-    fields f(&s, options);
-    f.use_real_fields();
-    f.require_component(Ez);
-    require_advance_rejected(f, "precision=native and precision=f32 only");
-  }
 }
 
 int main(int argc, char **argv) {
@@ -386,8 +378,8 @@ int main(int argc, char **argv) {
   const boundary_region xy_pml = pml(0.4, X) + pml(0.4, Y);
   linear_anisotropic_material one_offdiagonal(false);
   linear_anisotropic_material two_offdiagonals(true);
-  const precision_policy_kind policies[] = {precision_policy_kind::native,
-                                            precision_policy_kind::f32};
+  const precision_policy_kind policies[] = {
+      precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
              1u << 0, 1u << 0, false, true);
