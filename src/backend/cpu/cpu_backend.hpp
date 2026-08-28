@@ -31,6 +31,7 @@ public:
   void write(ArrayRef, const void *host_buffer, size_t bytes) override;
   void synchronize() override {}
   backend_capabilities capabilities() const override;
+  bool requires_full_storage_preparation() const override { return false; }
   bool accepts(const execution_options &opts, std::string &why) const override;
 
 private:

@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <stdexcept>
+
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/initialization_plan.hpp"
 #include "meep_internals.hpp"
@@ -27,18 +29,40 @@ namespace meep {
 /* On CPU these are thin: the state is the catalog `fields` already owns, and
    the executable is the StepPlan it already built. They exist so the boundary
    has the shape a device backend needs. */
-struct BackendState {
+struct CpuBackendState : BackendState {
+  explicit CpuBackendState(CpuArrayCatalog *catalog_) : catalog(catalog_) {}
   CpuArrayCatalog *catalog;
 };
 
-struct Executable {
+struct CpuExecutable : Executable {
+  explicit CpuExecutable(const StepPlan *plan_) : plan(plan_) {}
   const StepPlan *plan;
 };
 
+static const ArraySpec &checked_access(const CpuArrayCatalog &catalog, ArrayRef ref,
+                                       const void *host_buffer, size_t bytes) {
+  if (!is_valid(ref.id) || ref.id.value >= catalog.size())
+    throw std::out_of_range("backend array access uses an invalid ArrayId");
+  const ArraySpec &spec = catalog.spec(ref.id);
+  if (ref.offset > spec.elements || ref.elements > spec.elements - ref.offset)
+    throw std::out_of_range("backend array access exceeds the registered array");
+  const size_t element_size = host_element_bytes(spec.element_type);
+  if (ref.offset && element_size > size_t(-1) / ref.offset)
+    throw std::overflow_error("backend host byte offset overflow");
+  if (ref.elements && element_size > size_t(-1) / ref.elements)
+    throw std::overflow_error("backend host byte count overflow");
+  const size_t expected = ref.elements * element_size;
+  if (bytes != expected)
+    throw std::invalid_argument("backend array access byte count does not match ArrayRef");
+  if (bytes && !host_buffer)
+    throw std::invalid_argument("backend array access has a null host buffer");
+  if (bytes && !catalog.resolve_untyped(ref.id))
+    throw std::invalid_argument("backend array access has a null storage address");
+  return spec;
+}
+
 BackendState *CpuBackend::create_state(const StoragePlan &) {
-  BackendState *st = new BackendState;
-  st->catalog = f_.array_catalog;
-  return st;
+  return new CpuBackendState(f_.array_catalog);
 }
 
 void CpuBackend::initialize(const InitializationPlan &, BackendState &) {
@@ -61,9 +85,7 @@ void CpuBackend::finalize_storage(const StoragePlan &, BackendState &) {
 }
 
 Executable *CpuBackend::compile(const StepPlan &plan, BackendState &) {
-  Executable *e = new Executable;
-  e->plan = &plan;
-  return e;
+  return new CpuExecutable(&plan);
 }
 
 void CpuBackend::advance(Executable &, BackendState &, int num_steps) {
@@ -71,13 +93,19 @@ void CpuBackend::advance(Executable &, BackendState &, int num_steps) {
 }
 
 void CpuBackend::read(ArrayRef ref, void *host_buffer, size_t bytes) {
-  const realnum *src = f_.array_catalog->resolve<realnum>(ref.id);
-  memcpy(host_buffer, src + ref.offset, bytes);
+  const ArraySpec &spec = checked_access(*f_.array_catalog, ref, host_buffer, bytes);
+  if (!bytes) return;
+  const size_t element_size = host_element_bytes(spec.element_type);
+  const char *src = static_cast<const char *>(f_.array_catalog->resolve_untyped(ref.id));
+  memcpy(host_buffer, src + ref.offset * element_size, bytes);
 }
 
 void CpuBackend::write(ArrayRef ref, const void *host_buffer, size_t bytes) {
-  realnum *dst = f_.array_catalog->resolve<realnum>(ref.id);
-  memcpy(dst + ref.offset, host_buffer, bytes);
+  const ArraySpec &spec = checked_access(*f_.array_catalog, ref, host_buffer, bytes);
+  if (!bytes) return;
+  const size_t element_size = host_element_bytes(spec.element_type);
+  char *dst = static_cast<char *>(f_.array_catalog->resolve_untyped(ref.id));
+  memcpy(dst + ref.offset * element_size, host_buffer, bytes);
 }
 
 backend_capabilities CpuBackend::capabilities() const {
