@@ -37,6 +37,7 @@
 
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
+#include "backend/descriptors.hpp"
 
 namespace meep {
 
@@ -468,6 +469,7 @@ struct StepPlan {
   std::vector<MagneticStateArray> magnetic_state_arrays;
   std::vector<MaterialRefreshArray> material_refresh_arrays;
   MagneticHalfStep magnetic_half_step;
+  std::vector<DftDescriptor> dft_updates;
   /* Structural identity of the host-only phase target.  Values are excluded:
      changing them is the purpose of material phasing. */
   uint64_t material_phase_target_signature;
@@ -499,6 +501,7 @@ struct StepPlan {
     magnetic_state_arrays.clear();
     material_refresh_arrays.clear();
     magnetic_half_step = MagneticHalfStep();
+    dft_updates.clear();
     material_phase_target_signature = 0;
     source_signature = 0;
     signature = 0;
