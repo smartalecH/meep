@@ -131,6 +131,35 @@ __global__ void curl_kernel(curl_launch update, size_t points) {
               (((kappa_u[ku] - sigma_u[ku]) * target[i] + target_u[i]) - previous_u);
 }
 
+template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
+__global__ void beta_kernel(beta_launch update, size_t points) {
+  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= points) return;
+  size_t i0, i1, i2;
+  region_coordinates(update.region, linear, i0, i1, i2);
+  const ptrdiff_t i = region_index(update.region, i0, i1, i2);
+  T *target = static_cast<T *>(update.target);
+  const T *source = static_cast<const T *>(update.source);
+  T *target_u = static_cast<T *>(update.target_u);
+  const T *conductivity_inverse = static_cast<const T *>(update.conductivity_inverse);
+  T *target_conductivity = static_cast<T *>(update.target_conductivity);
+  const T betadt = T(update.betadt);
+
+  T delta = betadt * source[i];
+  if (Conductivity) delta *= conductivity_inverse[i];
+  if (MainPml) {
+    if (Conductivity) target_conductivity[i] += delta;
+    const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
+    delta *= static_cast<const T *>(update.pml.inverse)[k];
+  }
+  if (AuxiliaryPml) {
+    target_u[i] += delta;
+    const ptrdiff_t ku = profile_index(update.pml_u, i0, i1, i2);
+    delta *= static_cast<const T *>(update.pml_u.inverse)[ku];
+  }
+  target[i] += delta;
+}
+
 template <typename T>
 __device__ T offdiagonal_value(const T *coefficient, const T *field, ptrdiff_t i,
                                ptrdiff_t primary_stride, ptrdiff_t cross_stride) {
@@ -271,6 +300,17 @@ void launch_curl_t(const curl_launch &update, const stream &execution_stream) {
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA curl");
 }
 
+template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
+void launch_beta_t(const beta_launch &update, const stream &execution_stream) {
+  const size_t points = checked_points(update.region);
+  unsigned int blocks = 0, threads = 0;
+  launch_geometry(update.region, blocks, threads);
+  beta_kernel<T, MainPml, AuxiliaryPml, Conductivity>
+      <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+          update, points);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA beta update");
+}
+
 template <typename T, bool Pml, unsigned int Offdiagonals, bool Nonlinear>
 void launch_constitutive_t(const constitutive_launch &update, const stream &execution_stream) {
   const size_t points = checked_points(update.region);
@@ -377,6 +417,49 @@ void launch_curl(const curl_launch &update, const stream &execution_stream) {
   }
 #undef DISPATCH_CURL
 #undef LAUNCH_CURL_VARIANT
+}
+
+void launch_beta(const beta_launch &update, const stream &execution_stream) {
+  if (!update.target || !update.source)
+    throw std::invalid_argument("NVIDIA beta launch has incomplete operands");
+  const bool main_pml = update.pml.inverse != NULL;
+  const bool auxiliary_pml = update.pml_u.inverse != NULL;
+  const bool conductivity = update.conductivity_inverse != NULL;
+  if (auxiliary_pml != (update.target_u != NULL))
+    throw std::invalid_argument("NVIDIA beta auxiliary PML state is incomplete");
+  if ((main_pml && conductivity) != (update.target_conductivity != NULL))
+    throw std::invalid_argument("NVIDIA beta conductivity target is inconsistent");
+  if (update.target == update.source || update.target == update.target_u ||
+      update.target == update.target_conductivity ||
+      (update.target_u && update.target_u == update.target_conductivity) ||
+      (update.target_u && update.target_u == update.source) ||
+      (update.target_conductivity && update.target_conductivity == update.source))
+    throw std::invalid_argument("NVIDIA beta launch aliases mutable and input state");
+
+#define LAUNCH_BETA_VARIANT(T, MP, AP, C) launch_beta_t<T, MP, AP, C>(update, execution_stream)
+#define DISPATCH_BETA(T)                                                                            \
+  do {                                                                                              \
+    const unsigned int key = unsigned(main_pml) | (unsigned(auxiliary_pml) << 1) |                  \
+                             (unsigned(conductivity) << 2);                                         \
+    switch (key) {                                                                                  \
+      case 0: LAUNCH_BETA_VARIANT(T, false, false, false); break;                                   \
+      case 1: LAUNCH_BETA_VARIANT(T, true, false, false); break;                                    \
+      case 2: LAUNCH_BETA_VARIANT(T, false, true, false); break;                                    \
+      case 3: LAUNCH_BETA_VARIANT(T, true, true, false); break;                                     \
+      case 4: LAUNCH_BETA_VARIANT(T, false, false, true); break;                                    \
+      case 5: LAUNCH_BETA_VARIANT(T, true, false, true); break;                                     \
+      case 6: LAUNCH_BETA_VARIANT(T, false, true, true); break;                                     \
+      case 7: LAUNCH_BETA_VARIANT(T, true, true, true); break;                                      \
+    }                                                                                               \
+  } while (0)
+  if (update.precision == scalar_precision::f32)
+    DISPATCH_BETA(float);
+  else if (update.precision == scalar_precision::f64)
+    DISPATCH_BETA(double);
+  else
+    throw std::invalid_argument("NVIDIA beta launch has an invalid precision");
+#undef DISPATCH_BETA
+#undef LAUNCH_BETA_VARIANT
 }
 
 void launch_constitutive(const constitutive_launch &update, const stream &execution_stream) {
