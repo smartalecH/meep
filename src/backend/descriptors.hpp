@@ -134,15 +134,30 @@ enum class SusceptibilityKind { lorentzian, noisy_lorentzian, gyrotropic, multil
 
 const char *susceptibility_kind_name(SusceptibilityKind k);
 
+struct LorentzianParameters {
+  double omega_0;
+  double gamma;
+  bool drude;
+};
+
+struct LorentzianStateArrays {
+  component c;
+  int cmp;
+  ArrayId p;
+  ArrayId p_prev;
+  size_t elements;
+};
+
 struct PolarizationDescriptor {
   SusceptibilityKind kind;
   int chunk;
   field_type ft;
   int state_index;
-  std::vector<double> parameters;
+  LorentzianParameters lorentzian;
+  std::vector<LorentzianStateArrays> lorentzian_states;
   std::vector<InternalArrayLayout> internal_arrays;
   size_t per_thread_scratch_elements;
-  uint64_t required_w;      // bit per component
+  uint64_t required_w;      // bit per (component, cmp)
   uint64_t required_w_prev;
   bool needs_halo;
 };
