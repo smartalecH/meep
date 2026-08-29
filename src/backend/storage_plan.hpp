@@ -64,6 +64,7 @@ enum class array_kind {
 };
 
 const char *array_kind_name(array_kind k);
+int polarization_storage_aux(int state_index, size_t layout_ordinal);
 
 struct StorageKey {
   int chunk;

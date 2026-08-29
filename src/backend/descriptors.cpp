@@ -45,6 +45,17 @@ public:
   }
 };
 
+class susceptibility_descriptor_builder {
+public:
+  static LorentzianParameters lorentzian_parameters(const lorentzian_susceptibility &s) {
+    LorentzianParameters p;
+    p.omega_0 = s.omega_0;
+    p.gamma = s.gamma;
+    p.drude = s.no_omega_0_denominator;
+    return p;
+  }
+};
+
 const char *source_time_kind_name(SourceTimeKind k) {
   switch (k) {
     case SourceTimeKind::gaussian: return "gaussian";
@@ -336,13 +347,72 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out) {
 namespace {
 
 SusceptibilityKind classify_susceptibility(const susceptibility *s) {
-  /* Order matters: noisy and gyrotropic derive from lorentzian. */
-  if (dynamic_cast<const noisy_lorentzian_susceptibility *>(s))
+  if (typeid(*s) == typeid(noisy_lorentzian_susceptibility))
     return SusceptibilityKind::noisy_lorentzian;
-  if (dynamic_cast<const gyrotropic_susceptibility *>(s)) return SusceptibilityKind::gyrotropic;
-  if (dynamic_cast<const multilevel_susceptibility *>(s)) return SusceptibilityKind::multilevel;
-  if (dynamic_cast<const lorentzian_susceptibility *>(s)) return SusceptibilityKind::lorentzian;
+  if (typeid(*s) == typeid(gyrotropic_susceptibility)) return SusceptibilityKind::gyrotropic;
+  if (typeid(*s) == typeid(multilevel_susceptibility)) return SusceptibilityKind::multilevel;
+  if (typeid(*s) == typeid(lorentzian_susceptibility)) return SusceptibilityKind::lorentzian;
   return SusceptibilityKind::host_custom;
+}
+
+uint64_t polarization_component_bit(component c, int cmp) {
+  static_assert(2 * NUM_FIELD_COMPONENTS <= 64,
+                "polarization component/cmp mask does not fit in uint64_t");
+  return uint64_t(1) << (2 * int(c) + cmp);
+}
+
+void build_lorentzian_state_arrays(fields &f, fields_chunk &fc, polarization_state *state,
+                                   PolarizationDescriptor &d) {
+  const size_t ntot = size_t(fc.gv.ntot());
+  if (!state->data) return;
+  if (!f.array_catalog)
+    throw std::runtime_error("Lorentzian descriptor requires a prepared array catalog");
+  if (d.internal_arrays.size() % 2)
+    throw std::runtime_error("Lorentzian internal layout has an unpaired state array");
+
+  bool seen[NUM_FIELD_COMPONENTS][2] = {};
+  realnum *base = static_cast<realnum *>(state->data);
+  for (size_t i = 0; i < d.internal_arrays.size(); i += 2) {
+    const InternalArrayLayout &p = d.internal_arrays[i];
+    const InternalArrayLayout &p_prev = d.internal_arrays[i + 1];
+    if (!p.name || !p_prev.name || strcmp(p.name, "P") || strcmp(p_prev.name, "P_prev") ||
+        p.c != p_prev.c || int(p.c) < 0 || int(p.c) >= NUM_FIELD_COMPONENTS ||
+        p.cmp != p_prev.cmp || p.cmp < 0 || p.cmp > 1 || p.elements != ntot ||
+        p_prev.elements != ntot || p.element_type != InternalArrayLayout::realnum_value ||
+        p_prev.element_type != InternalArrayLayout::realnum_value ||
+        p_prev.offset_elements != p.offset_elements + ntot || seen[int(p.c)][p.cmp])
+      throw std::runtime_error("invalid Lorentzian P/P_prev internal layout");
+
+    ArrayId p_id = invalid_array(), p_prev_id = invalid_array();
+    ptrdiff_t p_offset = 0, p_prev_offset = 0;
+    if (!f.array_catalog->locate(base + p.offset_elements, p_id, p_offset) ||
+        !f.array_catalog->locate(base + p_prev.offset_elements, p_prev_id, p_prev_offset) ||
+        p_offset != 0 || p_prev_offset != 0 || !is_valid(p_id) || !is_valid(p_prev_id) ||
+        p_id == p_prev_id)
+      throw std::runtime_error("Lorentzian state arrays do not resolve to stable ArrayIds");
+
+    const ArraySpec &p_spec = f.array_catalog->spec(p_id);
+    const ArraySpec &p_prev_spec = f.array_catalog->spec(p_prev_id);
+    if (p_spec.role != array_role::polarization || p_prev_spec.role != array_role::polarization ||
+        p_spec.element_type != ElementType::realnum_value ||
+        p_prev_spec.element_type != ElementType::realnum_value || p_spec.elements != ntot ||
+        p_prev_spec.elements != ntot)
+      throw std::runtime_error("Lorentzian state ArrayIds have incompatible storage metadata");
+
+    LorentzianStateArrays arrays;
+    arrays.c = p.c;
+    arrays.cmp = p.cmp;
+    arrays.p = p_id;
+    arrays.p_prev = p_prev_id;
+    arrays.elements = ntot;
+    d.lorentzian_states.push_back(arrays);
+    seen[int(p.c)][p.cmp] = true;
+  }
+
+  FOR_COMPONENTS(c) DOCMP2 {
+    if (state->s->needs_P(c, cmp, fc.f) != seen[int(c)][cmp])
+      throw std::runtime_error("Lorentzian state layout does not match needs_P");
+  }
 }
 
 } // namespace
@@ -360,6 +430,7 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         d.ft = ft;
         d.state_index = si;
         d.kind = classify_susceptibility(p->s);
+        d.lorentzian = LorentzianParameters{0.0, 0.0, false};
         d.per_thread_scratch_elements = 0;
         d.required_w = 0;
         d.required_w_prev = 0;
@@ -371,11 +442,19 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         if (!p->s->internal_layout(d.internal_arrays, fc.gv, p->data))
           d.kind = SusceptibilityKind::host_custom;
 
+        if (d.kind == SusceptibilityKind::lorentzian) {
+          const lorentzian_susceptibility &lorentz =
+              static_cast<const lorentzian_susceptibility &>(*p->s);
+          d.lorentzian = susceptibility_descriptor_builder::lorentzian_parameters(lorentz);
+          build_lorentzian_state_arrays(f, fc, p, d);
+        }
+
         FOR_COMPONENTS(c) {
           DOCMP2 {
-            if (p->s->needs_P(c, cmp, fc.f)) d.required_w |= (uint64_t(1) << int(c));
+            if (p->s->needs_P(c, cmp, fc.f))
+              d.required_w |= polarization_component_bit(c, cmp);
           }
-          if (fc.needs_W_notowned(c)) d.needs_halo = true;
+          if (p->s->needs_W_notowned(c, fc.f)) d.needs_halo = true;
         }
         if (p->s->needs_W_prev()) d.required_w_prev = d.required_w;
 
