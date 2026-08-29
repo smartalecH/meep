@@ -30,6 +30,37 @@ struct polarization_update_launch {
   scalar_precision precision;
 };
 
+enum class gyrotropic_kernel_model : unsigned int { lorentzian, drude, saturated };
+
+struct gyrotropic_update_launch {
+  flat_region region;
+  void *p[3];
+  void *p_prev[3];
+  const void *w[3];
+  const void *sigma;
+  ptrdiff_t primary_stride;
+  ptrdiff_t cross_stride1;
+  ptrdiff_t cross_stride2;
+  double omega0dtsqr;
+  double gamma1;
+  double diagonal;
+  double pt;
+  double omega;
+  double gamma;
+  double alpha;
+  double dt2pi;
+  double gyro[3][3];
+  double inverse[3][3];
+  gyrotropic_kernel_model model;
+  scalar_precision precision;
+};
+
+struct compiled_polarization_update {
+  enum class kind_type : unsigned int { lorentzian, gyrotropic } kind;
+  polarization_update_launch lorentzian;
+  gyrotropic_update_launch gyrotropic;
+};
+
 struct polarization_subtract_launch {
   void *target;
   const void *p;
@@ -38,6 +69,9 @@ struct polarization_subtract_launch {
 };
 
 void launch_polarization_update(const polarization_update_launch &update, const stream &stream);
+void launch_gyrotropic_update(const gyrotropic_update_launch &update, const stream &stream);
+void launch_polarization_update(const compiled_polarization_update &update,
+                                const stream &stream);
 void launch_polarization_subtract(const polarization_subtract_launch &update,
                                   const stream &stream);
 

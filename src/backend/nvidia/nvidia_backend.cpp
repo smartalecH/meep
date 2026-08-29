@@ -47,6 +47,57 @@ polarization_coefficients derive_polarization_coefficients(double omega_0, doubl
   return result;
 }
 
+gyrotropic_coefficients derive_gyrotropic_coefficients(double omega_0, double gamma,
+                                                       double alpha,
+                                                       const double gyro_tensor[3][3],
+                                                       double dt_value, gyrotropy_model model,
+                                                       const direction order[3]) {
+  const realnum omega_0_r = omega_0, gamma_r = gamma, alpha_r = alpha, dt = dt_value;
+  realnum gyro[3][3];
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) gyro[i][j] = gyro_tensor[i][j];
+  const realnum omega = 2 * pi * omega_0_r * dt;
+  const realnum gamma_dt = 2 * pi * gamma_r * dt;
+  const realnum dt2pi = 2 * pi * dt;
+  realnum gd, gx, gy, gz;
+  gyrotropic_coefficients result = {};
+  result.omega = omega;
+  result.gamma = gamma_dt;
+  result.alpha = alpha_r;
+  result.dt2pi = dt2pi;
+  if (model == GYROTROPIC_SATURATED) {
+    gd = 0.5;
+    gx = -0.5 * alpha_r * gyro[Y][Z];
+    gy = -0.5 * alpha_r * gyro[Z][X];
+    gz = -0.5 * alpha_r * gyro[X][Y];
+  }
+  else {
+    result.omega0dtsqr = omega * omega;
+    result.gamma1 = 1 - gamma_dt / 2;
+    result.diagonal = 2 - (model == GYROTROPIC_DRUDE ? 0 : realnum(result.omega0dtsqr));
+    const realnum pt = pi * dt;
+    result.pt = pt;
+    gd = 1 + gamma_dt / 2;
+    gx = pt * gyro[Y][Z];
+    gy = pt * gyro[Z][X];
+    gz = pt * gyro[X][Y];
+  }
+  const realnum invdet = 1.0 / gd / (gd * gd + gx * gx + gy * gy + gz * gz);
+  const realnum inverse[3][3] = {
+      {invdet * (gd * gd + gx * gx), invdet * (gx * gy + gd * gz),
+       invdet * (gx * gz - gd * gy)},
+      {invdet * (gy * gx - gd * gz), invdet * (gd * gd + gy * gy),
+       invdet * (gy * gz + gd * gx)},
+      {invdet * (gz * gx + gd * gy), invdet * (gz * gy - gd * gx),
+       invdet * (gd * gd + gz * gz)}};
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j) {
+      result.gyro[i][j] = gyro[int(order[i])][int(order[j])];
+      result.inverse[i][j] = inverse[int(order[i])][int(order[j])];
+    }
+  return result;
+}
+
 } // namespace nvidia
 
 namespace {
@@ -386,7 +437,8 @@ public:
                    const std::vector<nvidia::source_batch_launch> &source_batches,
                    const std::vector<nvidia::source_point> &source_points,
                    const std::vector<nvidia::array_copy_launch> &source_copies,
-                   const std::vector<nvidia::polarization_update_launch> &polarization_updates,
+                   const std::vector<nvidia::compiled_polarization_update>
+                       &polarization_updates,
                    const std::vector<nvidia::polarization_subtract_launch>
                        &polarization_subtractions,
                    const std::vector<nvidia::dft_launch> &dft_updates,
@@ -476,7 +528,7 @@ public:
   std::vector<NvidiaFiniteCheck> finite_checks_;
   std::vector<nvidia::source_batch_launch> source_batches_;
   std::vector<nvidia::array_copy_launch> source_copies_;
-  std::vector<nvidia::polarization_update_launch> polarization_updates_;
+  std::vector<nvidia::compiled_polarization_update> polarization_updates_;
   std::vector<nvidia::polarization_subtract_launch> polarization_subtractions_;
   std::vector<nvidia::dft_launch> dft_updates_;
   size_t source_scalar_count_;
@@ -780,7 +832,7 @@ void validate_shifted_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t
                        checked_shift(region_max, maximum_offset, what), what);
 }
 
-nvidia::polarization_update_launch compile_polarization_update(
+nvidia::polarization_update_launch compile_lorentzian_update(
     const PolarizationUpdate &source, NvidiaBackendState &state) {
   const uint32_t supported = polarization_one_offdiagonal | polarization_two_offdiagonals |
                              polarization_drude;
@@ -867,6 +919,129 @@ nvidia::polarization_update_launch compile_polarization_update(
     validate_shifted_index_range(state.plan_, source.offdiagonal_sigma2, region_min, region_max, 0,
                                  source.primary_stride, 0, source.primary_stride,
                                  "polarization off-diagonal sigma2");
+  }
+  return result;
+}
+
+nvidia::gyrotropic_update_launch compile_gyrotropic_update(
+    const PolarizationUpdate &source, NvidiaBackendState &state) {
+  if (source.region.variant_key)
+    throw std::invalid_argument("gyrotropic descriptor has Lorentzian variant bits");
+  if ((!is_electric(source.region.c) && !is_magnetic(source.region.c)) ||
+      component_direction(source.region.c) < X || component_direction(source.region.c) > Z)
+    throw std::invalid_argument("gyrotropic descriptor requires a Cartesian E/H component");
+  if (source.gyro_model != GYROTROPIC_LORENTZIAN && source.gyro_model != GYROTROPIC_DRUDE &&
+      source.gyro_model != GYROTROPIC_SATURATED)
+    throw std::invalid_argument("gyrotropic descriptor has an invalid model");
+  const ArrayId state_ids[6] = {source.p,          source.p_prev,  source.p_cross1,
+                                source.p_prev_cross1, source.p_cross2, source.p_prev_cross2};
+  for (int i = 0; i < 6; ++i) {
+    if (!is_valid(state_ids[i]) || state_ids[i].value >= state.plan_.arrays.size())
+      throw std::invalid_argument("gyrotropic descriptor has incomplete state");
+    for (int j = i + 1; j < 6; ++j)
+      if (state_ids[i] == state_ids[j])
+        throw std::invalid_argument("gyrotropic descriptor state arrays alias");
+  }
+  if (!is_valid(source.primary_w) || !is_valid(source.diagonal_sigma))
+    throw std::invalid_argument("gyrotropic descriptor has incomplete driving operands");
+  if (is_valid(source.offdiagonal_sigma1) || is_valid(source.offdiagonal_sigma2))
+    throw std::invalid_argument("gyrotropic media do not support anisotropic sigma");
+
+  nvidia::gyrotropic_update_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.p, "gyrotropic P0");
+  const size_t state_elements = state.plan_.arrays[source.p.value].elements;
+  for (int i = 0; i < 6; ++i) {
+    const ArraySpec &spec = state.plan_.arrays[state_ids[i].value];
+    if (spec.role != array_role::polarization)
+      throw std::invalid_argument("gyrotropic state is not polarization storage");
+    if (spec.elements != state_elements)
+      throw std::invalid_argument("gyrotropic state arrays have incompatible extents");
+    require_same_precision(state.plan_, state_ids[i], result.precision,
+                           "gyrotropic polarization state");
+  }
+  require_same_precision(state.plan_, source.primary_w, result.precision, "gyrotropic W0");
+  require_same_precision(state.plan_, source.cross_w1, result.precision, "gyrotropic W1");
+  require_same_precision(state.plan_, source.cross_w2, result.precision, "gyrotropic W2");
+  require_same_precision(state.plan_, source.diagonal_sigma, result.precision,
+                         "gyrotropic diagonal sigma");
+  result.p[0] = device_address(state, source.p, "gyrotropic P0");
+  result.p_prev[0] = device_address(state, source.p_prev, "gyrotropic P0 previous");
+  result.p[1] = device_address(state, source.p_cross1, "gyrotropic P1");
+  result.p_prev[1] = device_address(state, source.p_prev_cross1, "gyrotropic P1 previous");
+  result.p[2] = device_address(state, source.p_cross2, "gyrotropic P2");
+  result.p_prev[2] = device_address(state, source.p_prev_cross2, "gyrotropic P2 previous");
+  result.w[0] = device_address(state, source.primary_w, "gyrotropic W0");
+  result.w[1] = optional_device_address(state, source.cross_w1, result.precision, "gyrotropic W1");
+  result.w[2] = optional_device_address(state, source.cross_w2, result.precision, "gyrotropic W2");
+  result.sigma = device_address(state, source.diagonal_sigma, "gyrotropic diagonal sigma");
+  result.primary_stride = source.primary_stride;
+  result.cross_stride1 = source.cross_stride1;
+  result.cross_stride2 = source.cross_stride2;
+
+  const direction order[3] = {
+      component_direction(source.region.c),
+      cycle_direction(source.region.begin.dim, component_direction(source.region.c), 1),
+      cycle_direction(source.region.begin.dim, component_direction(source.region.c), 2)};
+  const nvidia::gyrotropic_coefficients coefficients = nvidia::derive_gyrotropic_coefficients(
+      source.omega_0, source.gamma, source.alpha, source.gyro_tensor, source.dt,
+      source.gyro_model, order);
+  result.omega0dtsqr = coefficients.omega0dtsqr;
+  result.gamma1 = coefficients.gamma1;
+  result.diagonal = coefficients.diagonal;
+  result.pt = coefficients.pt;
+  result.omega = coefficients.omega;
+  result.gamma = coefficients.gamma;
+  result.alpha = coefficients.alpha;
+  result.dt2pi = coefficients.dt2pi;
+  memcpy(result.gyro, coefficients.gyro, sizeof(result.gyro));
+  memcpy(result.inverse, coefficients.inverse, sizeof(result.inverse));
+  result.model = source.gyro_model == GYROTROPIC_LORENTZIAN
+                     ? nvidia::gyrotropic_kernel_model::lorentzian
+                 : source.gyro_model == GYROTROPIC_DRUDE
+                     ? nvidia::gyrotropic_kernel_model::drude
+                     : nvidia::gyrotropic_kernel_model::saturated;
+
+  const ptrdiff_t region_min = ptrdiff_t(result.region.base);
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  for (int i = 0; i < 6; ++i)
+    validate_index_range(state.plan_, state_ids[i], region_min, region_max,
+                         "gyrotropic polarization state");
+  validate_index_range(state.plan_, source.primary_w, region_min, region_max, "gyrotropic W0");
+  validate_index_range(state.plan_, source.diagonal_sigma, region_min, region_max,
+                       "gyrotropic diagonal sigma");
+  if (is_valid(source.cross_w1)) {
+    const ptrdiff_t negative_cross = checked_negate(source.cross_stride1, "gyrotropic W1");
+    const ptrdiff_t combined =
+        checked_shift(source.primary_stride, negative_cross, "gyrotropic W1");
+    validate_shifted_index_range(state.plan_, source.cross_w1, region_min, region_max, 0,
+                                 negative_cross, source.primary_stride, combined,
+                                 "gyrotropic W1");
+  }
+  if (is_valid(source.cross_w2)) {
+    const ptrdiff_t negative_cross = checked_negate(source.cross_stride2, "gyrotropic W2");
+    const ptrdiff_t combined =
+        checked_shift(source.primary_stride, negative_cross, "gyrotropic W2");
+    validate_shifted_index_range(state.plan_, source.cross_w2, region_min, region_max, 0,
+                                 negative_cross, source.primary_stride, combined,
+                                 "gyrotropic W2");
+  }
+  return result;
+}
+
+nvidia::compiled_polarization_update compile_polarization_update(
+    const PolarizationUpdate &source, NvidiaBackendState &state) {
+  nvidia::compiled_polarization_update result = {};
+  switch (source.kind) {
+    case PolarizationUpdateKind::lorentzian:
+      result.kind = nvidia::compiled_polarization_update::kind_type::lorentzian;
+      result.lorentzian = compile_lorentzian_update(source, state);
+      break;
+    case PolarizationUpdateKind::gyrotropic:
+      result.kind = nvidia::compiled_polarization_update::kind_type::gyrotropic;
+      result.gyrotropic = compile_gyrotropic_update(source, state);
+      break;
+    default: throw std::invalid_argument("polarization descriptor has an invalid update kind");
   }
   return result;
 }
@@ -1614,11 +1789,14 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         throw std::invalid_argument("NVIDIA dispersion descriptors are stale");
       for (size_t i = 0; i < f_.descriptors->polarizations.size(); ++i) {
         const PolarizationDescriptor &d = f_.descriptors->polarizations[i];
-        if (d.kind != SusceptibilityKind::lorentzian)
+        if (d.kind != SusceptibilityKind::lorentzian &&
+            d.kind != SusceptibilityKind::gyrotropic)
           throw std::invalid_argument(std::string("NVIDIA does not support polarization kind ") +
                                       susceptibility_kind_name(d.kind));
-        if (d.lorentzian_states.empty())
+        if (d.kind == SusceptibilityKind::lorentzian && d.lorentzian_states.empty())
           throw std::invalid_argument("NVIDIA Lorentzian descriptor has no resident state");
+        if (d.kind == SusceptibilityKind::gyrotropic && d.gyrotropic_states.empty())
+          throw std::invalid_argument("NVIDIA gyrotropic descriptor has no resident state");
       }
     }
     if (has_magnetic_backups(state.plan_))
@@ -1661,7 +1839,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::source_batch_launch> source_batches;
     std::vector<nvidia::source_point> source_points;
     std::vector<nvidia::array_copy_launch> source_copies;
-    std::vector<nvidia::polarization_update_launch> polarization_updates;
+    std::vector<nvidia::compiled_polarization_update> polarization_updates;
     std::vector<nvidia::polarization_subtract_launch> polarization_subtractions;
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
