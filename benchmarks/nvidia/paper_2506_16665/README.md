@@ -1,10 +1,17 @@
-# arXiv 2506.16665 benchmark manifest prototype
+# arXiv 2506.16665 benchmark runner
 
-This directory contains a standard-library-only prototype for the six-device
+This directory contains an authenticated manifest and smoke/throughput runner for the six-device
 benchmark corpus described in [arXiv:2506.16665](https://arxiv.org/html/2506.16665).
-It does not import Meep, initialize CUDA, or run a simulation. It validates the
-external geometry inputs and emits a versioned JSON run specification plus a
-typed result/provenance template for a later runner.
+`benchmark_manifest.py` remains standard-library-only. `run_benchmark.py`
+imports a branch-matched Meep build and `gdstk`, constructs the selected GDS
+cell, runs a single rank on CPU or NVIDIA, and writes an authenticated
+diagnostic result with raw finite DFT flux and mode-power arrays.
+
+The executable scope is deliberately narrower than the paper: it uses fixed,
+nondispersive performance-adaptation media and does not claim paper-equivalent
+physics, two-GPU MPI scaling, or a speedup from a ten-step/profiled smoke run.
+The PSR case is rejected because the paper-derived inputs do not define the
+Si3N4 top-cladding footprint and z bounds precisely enough to reproduce it.
 
 ## Provenance boundary
 
@@ -32,17 +39,21 @@ single-case `manifest` invocation validates only that case's GDS/YAML plus the
 shared layer stack; `validate` audits the entire six-case corpus.
 
 `runner_cases.json` is the machine-readable adapter from those external assets
-to a future Meep runner. It fixes the GDS transform, layer/datatype and z-range
+to the Meep runner. It fixes the GDS transform, layer/datatype and z-range
 mappings, ports, source and monitor definitions, padding, all six PML faces,
-and the field-energy decay region. The ring case separately identifies its
+the exact nondispersive material constants, and the field-energy decay region.
+The 0.25 um transverse padding is total added span (0.125 um per side); the
+earlier 4 um value could not fit several source planes inside the paper cells'
+non-PML regions. The ring case separately identifies its
 mode monitor and resonance observable. Every transmission/conversion monitor
 is normalized by the forward source mode at the case's explicit
 `input_incident` monitor. The emitted manifest also records the exact
 reciprocal-endpoint conversion from the centered wavelength interval to Meep's
 Gaussian center frequency and `fwidth`. These values are versioned benchmark
-inputs rather than hidden runner defaults.
+inputs rather than hidden runner defaults. Each manifest also contains the
+expanded wavelength/frequency arrays and the resolved DFT decimation factor.
 
-`benchmark_manifest.schema.json` defines the complete version-2 run document.
+`benchmark_manifest.schema.json` defines the complete version-3 run document.
 Result validation rechecks that schema and the bundled manifest-schema,
 paper-reference, case-definition, result-schema, pinned-commit, GDS, YAML, and
 layer-stack identities; a result cannot authenticate a handwritten partial
@@ -89,9 +100,10 @@ python3 benchmark_manifest.py manifest \
   --steps 10000 \
   --cells-per-material-wavelength 25 \
   --n-max 3.48 \
+  --backend nvidia \
   --precision f32 \
-  --ranks 2 \
-  --mpi-transport staged \
+  --ranks 1 \
+  --mpi-transport none \
   --output ring-fixed.json
 ```
 
@@ -119,6 +131,10 @@ The execution vocabulary is shared with the planned backend API:
 are not silently relabeled as CPU precision. Rank counts are positive integers,
 while transport is checked against backend and rank count.
 
+The manifest vocabulary includes future multi-rank configurations, but the PR3
+runner rejects them. Two GPUs may be exercised as independent rank-1 jobs; do
+not use `mpirun -np 2` or describe two concurrent jobs as multi-GPU scaling.
+
 `performance-adaptation` is the default material mode. `--material-mode paper`
 is rejected unless `--material-validation PATH` names a passing, hashed JSON
 artifact. That artifact must state the pole equation, Fourier time convention,
@@ -140,6 +156,102 @@ the paper alone.
 - `end-to-end`: field-energy decay threshold `1e-5`, explicit check interval,
   and mandatory `--max-steps`. This is a documented Meep adaptation because the
   commercial solvers' auto-shutoff algorithms are not fully specified.
+
+`run_benchmark.py` currently accepts `smoke` and `fixed-step`. A fixed-step
+repetition constructs a fresh simulation, performs the manifest's 100 untimed
+warmup steps on that simulation, times exactly the requested step batch, and
+queries monitors after the timing window. Smoke mode runs ten steps once with
+no warmup. Ten steps occur well before the 20 nm Gaussian pulse peak and prove
+only construction, stepping, and finite monitor access.
+
+## Build and execute
+
+Use a fresh Python-enabled build. Do not preload a new library beneath an old
+installed SWIG extension. On aarch64, building `gdstk` may need the environment's
+Qhull CMake package:
+
+```sh
+/path/to/meep-python -m venv --system-site-packages /tmp/meep-benchmark-venv
+env CMAKE_PREFIX_PATH=/path/to/meep-env \
+  /tmp/meep-benchmark-venv/bin/python -m pip install gdstk==1.0.1
+
+mkdir -p /tmp/meep-benchmark-build /tmp/meep-benchmark-prefix
+cd /tmp/meep-benchmark-build
+/path/to/meep/configure \
+  --prefix=/tmp/meep-benchmark-prefix --enable-maintainer-mode \
+  --enable-shared --with-mpi --without-scheme \
+  --with-libctl=/path/to/meep-env/share/libctl \
+  --with-accelerator=nvidia --with-cuda=/usr/local/cuda \
+  --with-cuda-host-compiler=/usr/bin/g++ --with-cuda-architectures=sm_100 \
+  CC=/path/to/meep-env/bin/mpicc CXX=/path/to/meep-env/bin/mpicxx \
+  F77=/path/to/meep-env/bin/aarch64-conda-linux-gnu-gfortran \
+  PYTHON=/path/to/meep-env/bin/python3 \
+  CFLAGS='-O3 -DNDEBUG -fPIC' CXXFLAGS='-O3 -DNDEBUG -fPIC' \
+  NVCCFLAGS='-O3 -lineinfo' LDFLAGS='-L/path/to/meep-env/lib' \
+  CPPFLAGS='-I/path/to/meep-env/include'
+make -j16 && make install
+```
+
+Generate and run the smallest smoke case:
+
+```sh
+python3 benchmark_manifest.py manifest \
+  --fdtd-pipeline ./fdtd-pipeline --device crossing --mode smoke \
+  --cells-per-material-wavelength 6 --n-max 3.48 --bandwidth-nm 20 \
+  --material-mode performance-adaptation --backend nvidia \
+  --precision native --ranks 1 --mpi-transport none \
+  --output /tmp/crossing-gpu-smoke.json
+
+env CUDA_VISIBLE_DEVICES=0 MEEP_FINITE_CHECK=step \
+  MEEP_SOURCE_TREE=/path/to/meep MEEP_BUILD_DIR=/tmp/meep-benchmark-build \
+  PYTHONPATH=/tmp/meep-benchmark-prefix/lib/python3.11/site-packages \
+  LD_LIBRARY_PATH=/tmp/meep-benchmark-prefix/lib:/path/to/meep-env/lib \
+  /tmp/meep-benchmark-venv/bin/python run_benchmark.py \
+  --manifest /tmp/crossing-gpu-smoke.json --device-id 0 \
+  --output /tmp/crossing-gpu-smoke.result.json
+
+/tmp/meep-benchmark-venv/bin/python run_benchmark.py \
+  --manifest /tmp/crossing-gpu-smoke.json \
+  --output /tmp/crossing-gpu-smoke.result.json --validate-only
+```
+
+Use `MEEP_FINITE_CHECK=step` for smoke/sanitizer validation and
+`MEEP_FINITE_CHECK=off` only for measured throughput. The diagnostic result
+records the actual `gv.nx()/ny()/nz()`, timestep, raw timings, explicit sampling,
+geometry transform, exact media, module/build provenance, and finite DFT/mode
+arrays. It is separate from the PR7 result document below because a ten-step
+smoke cannot honestly satisfy the CPU-reference physics policy or the runtime
+counters that PR3 does not expose to Python.
+
+## Profiler window
+
+`--profile-steps N` performs one untimed step to compile and initialize the
+resident execution plan, then brackets exactly `fields.advance(N)` with
+`cudaProfilerStart/Stop`. MPB setup and mode decomposition stay outside the
+capture.
+
+```sh
+env CUDA_VISIBLE_DEVICES=0 MEEP_FINITE_CHECK=off \
+  nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt \
+  --sample=none --cpuctxsw=none --capture-range=cudaProfilerApi \
+  --capture-range-end=stop --output=/tmp/meep-crossing \
+  /tmp/meep-benchmark-venv/bin/python run_benchmark.py \
+  --manifest /tmp/crossing-gpu-smoke.json --device-id 0 \
+  --profile-steps 20 --output /tmp/meep-crossing-profile.json
+
+env CUDA_VISIBLE_DEVICES=0 MEEP_FINITE_CHECK=off \
+  ncu --force-overwrite --export /tmp/meep-crossing-kernels \
+  --profile-from-start off --target-processes all --clock-control=base \
+  --cache-control=none --kernel-name-base=demangled \
+  --kernel-name 'regex:.*(curl_kernel|constitutive_kernel|dft_accumulate_kernel).*' \
+  --launch-count 3 --section SpeedOfLight \
+  --section MemoryWorkloadAnalysis --section LaunchStats --section Occupancy \
+  /tmp/meep-benchmark-venv/bin/python run_benchmark.py \
+  --manifest /tmp/crossing-gpu-smoke.json --device-id 0 \
+  --profile-steps 1 --output /tmp/meep-crossing-ncu.json
+```
+
+Nsight captures are diagnostics, not unprofiled wall-time or speedup evidence.
 
 ## Result and provenance document
 
