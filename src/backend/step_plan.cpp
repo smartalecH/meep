@@ -197,6 +197,7 @@ public:
   explicit StepPlanBuilder(fields &f, StepProgram program) : f_(f) {
     plan_.program = program;
     plan_.beta = f.beta;
+    plan_.bfast_scaled_k = f.bfast_scaled_k;
   }
 
   Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
@@ -269,6 +270,7 @@ public:
     uint64_t sig = 0xcbf29ce484222325ull;
     mix(sig, uint64_t(plan.program));
     mix_double(sig, plan.beta);
+    for (double k : plan.bfast_scaled_k) mix_double(sig, k);
     for (const Operation &op : plan.operations) {
       sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.ft) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
@@ -297,6 +299,7 @@ public:
       }
     }
     for (const CurlUpdate &d : plan.db_updates) hash_curl(sig, d);
+    for (const BfastUpdate &d : plan.bfast_updates) hash_bfast(sig, d);
     for (const BetaUpdate &d : plan.beta_updates) hash_beta(sig, d);
     for (const ConstitutiveUpdate &d : plan.eh_updates) hash_constitutive(sig, d);
     for (const PolarizationUpdate &d : plan.polarization_updates) hash_polarization(sig, d);
@@ -352,6 +355,23 @@ private:
     hash_pml(sig, d.pml_u);
     mix_double(sig, d.dtdx);
     mix_double(sig, d.dt);
+    mix(sig, uint64_t(d.bfast_update_index));
+  }
+  static void hash_bfast(uint64_t &sig, const BfastUpdate &d) {
+    hash_region(sig, d.region);
+    hash_id(sig, d.target);
+    hash_id(sig, d.source1);
+    hash_id(sig, d.source2);
+    mix(sig, uint64_t(d.stride1));
+    mix(sig, uint64_t(d.stride2));
+    hash_id(sig, d.f_bfast);
+    hash_id(sig, d.target_u);
+    hash_id(sig, d.condinv);
+    hash_id(sig, d.target_cond);
+    hash_pml(sig, d.pml);
+    hash_pml(sig, d.pml_u);
+    mix_double(sig, d.k1);
+    mix_double(sig, d.k2);
   }
   static void hash_beta(uint64_t &sig, const BetaUpdate &d) {
     hash_region(sig, d.region);
@@ -475,13 +495,57 @@ void StepPlanBuilder::add_db(field_type ft) {
           d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
           d.dtdx = fc.Courant;
           d.dt = fc.dt;
+          d.bfast_update_index = UINT32_MAX;
           if (is_valid(d.plus_source) && is_valid(d.minus_source))
             d.region.variant_key |= curl_has_second_derivative;
           if (dsig != NO_DIRECTION) d.region.variant_key |= curl_has_pml;
           if (dsigu != NO_DIRECTION) d.region.variant_key |= curl_has_pml_aux;
           if (is_valid(d.conductivity)) d.region.variant_key |= curl_has_conductivity;
-          if (fc.bfast_scaled_k[0] || fc.bfast_scaled_k[1] || fc.bfast_scaled_k[2])
+          if (fc.bfast_scaled_k[0] || fc.bfast_scaled_k[1] || fc.bfast_scaled_k[2]) {
             d.region.variant_key |= curl_has_bfast;
+
+            BfastUpdate b;
+            b.region = d.region;
+            b.region.variant_key = 0;
+            b.target = d.target;
+            b.source1 = d.plus_source;
+            b.source2 = d.minus_source;
+            b.stride1 = d.plus_stride;
+            b.stride2 = d.minus_stride;
+            b.f_bfast = find_array(f_, chunk, array_kind::f_bfast, int(cc), cmp, 0);
+            b.target_u = d.target_u;
+            b.condinv = d.condinv;
+            b.target_cond = d.target_cond;
+            b.pml = d.pml;
+            b.pml_u = d.pml_u;
+            realnum k1 = sources.have_minus
+                             ? fc.bfast_scaled_k[component_index(sources.minus_component)]
+                             : 0;
+            realnum k2 = sources.have_plus
+                             ? fc.bfast_scaled_k[component_index(sources.plus_component)]
+                             : 0;
+            if (ft == D_stuff) {
+              k1 = -k1;
+              k2 = -k2;
+            }
+            b.k1 = k1;
+            b.k2 = k2;
+            if (dsig != NO_DIRECTION) b.region.variant_key |= bfast_has_pml;
+            if (dsigu != NO_DIRECTION) b.region.variant_key |= bfast_has_pml_aux;
+            if (is_valid(b.condinv)) b.region.variant_key |= bfast_has_conductivity;
+            d.bfast_update_index = uint32_t(plan_.bfast_updates.size());
+            plan_.bfast_updates.push_back(b);
+
+            add_access(f_, op, b.target, AccessMode::read_write);
+            add_access(f_, op, b.source1, AccessMode::read);
+            add_access(f_, op, b.source2, AccessMode::read);
+            add_access(f_, op, b.f_bfast, AccessMode::read_write);
+            add_access(f_, op, b.target_u, AccessMode::read_write);
+            add_access(f_, op, b.condinv, AccessMode::read);
+            add_access(f_, op, b.target_cond, AccessMode::read_write);
+            add_access(f_, op, b.pml.siginv, AccessMode::read);
+            add_access(f_, op, b.pml_u.siginv, AccessMode::read);
+          }
 
           plan_.db_updates.push_back(d);
           add_access(f_, op, d.target, AccessMode::read_write);
