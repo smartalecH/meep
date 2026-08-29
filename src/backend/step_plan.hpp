@@ -106,6 +106,8 @@ struct Operation {
   OpKind kind;
   uint32_t descriptor_index;
   uint32_t descriptor_count;
+  uint32_t polarization_subtraction_index;
+  uint32_t polarization_subtraction_count;
   Guard guard;
   /* CPU execution keeps using the coarse field_type entry point. Device
      executors consume the half-open descriptor span. For finite_value_check,
@@ -199,6 +201,41 @@ struct ConstitutiveUpdate {
   PmlProfile pml;
 };
 
+enum PolarizationVariant : uint32_t {
+  polarization_one_offdiagonal = 1u << 0,
+  polarization_two_offdiagonals = 1u << 1,
+  polarization_drude = 1u << 2
+};
+
+struct PolarizationUpdate {
+  UpdateRegion region;
+  int state_index;
+  ArrayId p;
+  ArrayId p_prev;
+  ArrayId primary_w;
+  ArrayId cross_w1;
+  ArrayId cross_w2;
+  ArrayId diagonal_sigma;
+  ArrayId offdiagonal_sigma1;
+  ArrayId offdiagonal_sigma2;
+  ptrdiff_t primary_stride;
+  ptrdiff_t cross_stride1;
+  ptrdiff_t cross_stride2;
+  double omega_0;
+  double gamma;
+  double dt;
+};
+
+struct PolarizationSubtraction {
+  int chunk;
+  component c;
+  int cmp;
+  int state_index;
+  ArrayId target;
+  ArrayId p;
+  size_t elements;
+};
+
 /* Which timestep program a plan describes. solve_cw is a genuinely different
    program, not a variant: step_source skips non-integrated sources, update_eh
    runs with skip_w_components, and update_dfts is disabled. If step() begins
@@ -211,6 +248,8 @@ struct StepPlan {
   std::vector<Operation> operations;
   std::vector<CurlUpdate> db_updates;
   std::vector<ConstitutiveUpdate> eh_updates;
+  std::vector<PolarizationUpdate> polarization_updates;
+  std::vector<PolarizationSubtraction> polarization_subtractions;
   uint64_t signature;
 
   StepPlan() : program(StepProgram::ordinary), signature(0) {}
@@ -218,6 +257,8 @@ struct StepPlan {
     operations.clear();
     db_updates.clear();
     eh_updates.clear();
+    polarization_updates.clear();
+    polarization_subtractions.clear();
     signature = 0;
   }
 };
