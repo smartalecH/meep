@@ -410,6 +410,7 @@ static void test_lorentzian_contract() {
             "magnetic Drude parameters are not exact");
     }
     bool seen[NUM_FIELD_COMPONENTS][2] = {};
+    uint64_t state_mask = 0;
     for (const LorentzianStateArrays &state : d.lorentzian_states) {
       ++state_count;
       CHECK(!seen[int(state.c)][state.cmp], "duplicate Lorentzian component/cmp row");
@@ -425,12 +426,67 @@ static void test_lorentzian_contract() {
                 p_prev.element_type == ElementType::realnum_value,
             "Lorentzian state storage metadata is wrong");
       const uint64_t bit = uint64_t(1) << (2 * int(state.c) + state.cmp);
+      state_mask |= bit;
       CHECK(d.required_w & bit, "Lorentzian required-W mask collapsed a component/cmp row");
     }
+    CHECK(d.required_w == state_mask,
+          "Lorentzian required-W mask advertises fields without state arrays");
   }
   CHECK(or_to_all(lorentz_count > 0 && drude_count > 0),
         "Lorentzian/Drude descriptors were not both emitted");
   CHECK(or_to_all(state_count > 0), "Lorentzian descriptors contained no bound state arrays");
+}
+
+/* Polarization state is a snapshot of the field layout at allocation time.
+   Growing the live fields later must not make its descriptor advertise state
+   arrays that do not exist.  Two chunks leave idle ranks at np=4, while the
+   one-sided PML keeps ownership and auxiliary allocation asymmetric. */
+static void test_lorentzian_layout_after_field_growth() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(1.0, X, High), identity(), 2);
+  lorentzian_susceptibility lorentz(1.1, 1e-5);
+  s.add_susceptibility(one, E_stuff, lorentz);
+  fields f(&s);
+
+  gaussian_src_time first(0.3, 0.1);
+  f.add_point_source(Ez, first, vec(0.13, 0.11));
+  f.advance(1);
+  f.require_component(Hz);
+  gaussian_src_time second(0.25, 0.1, 0.0, 6.0);
+  second.is_integrated = true;
+  f.add_point_source(Ez, second, vec(-0.4, 0.3));
+  f.advance(1);
+
+  size_t descriptors = 0, live_supersets = 0;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::lorentzian) continue;
+    ++descriptors;
+    CHECK(d.chunk >= 0 && d.chunk < f.num_chunks && f.chunks[d.chunk]->is_mine(),
+          "polarization descriptor was emitted for a non-owned chunk");
+
+    uint64_t state_mask = 0;
+    for (const LorentzianStateArrays &state : d.lorentzian_states)
+      state_mask |= uint64_t(1) << (2 * int(state.c) + state.cmp);
+    CHECK(d.required_w == state_mask,
+          "grown field layout leaked nonexistent Lorentzian state into required-W mask");
+
+    polarization_state *p = f.chunks[d.chunk]->pol[d.ft];
+    for (int i = 0; p && i < d.state_index; ++i)
+      p = p->next;
+    CHECK(p != NULL, "descriptor state index does not resolve to a live susceptibility");
+    if (!p) continue;
+
+    uint64_t live_mask = 0;
+    FOR_COMPONENTS(c) DOCMP2 {
+      if (p->s->needs_P(c, cmp, f.chunks[d.chunk]->f))
+        live_mask |= uint64_t(1) << (2 * int(c) + cmp);
+    }
+    if (live_mask & ~state_mask) ++live_supersets;
+  }
+
+  CHECK(sum_to_all(descriptors) > 0, "field-growth case produced no Lorentzian descriptors");
+  CHECK(or_to_all(live_supersets > 0),
+        "field-growth case did not exercise a needs_P superset of allocated state");
 }
 
 int main(int argc, char **argv) {
@@ -450,6 +506,7 @@ int main(int argc, char **argv) {
                      SusceptibilityKind::host_custom, true);
   test_layout_matches_pointers();
   test_lorentzian_contract();
+  test_lorentzian_layout_after_field_growth();
 
   if (failures) {
     master_printf("descriptors: %d FAILURE(S)\n", failures);
