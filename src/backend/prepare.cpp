@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <string.h>
 
+#include "backend/backend.hpp"
 #include "backend/prepare.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/storage_plan.hpp"
@@ -204,15 +205,21 @@ void assert_update_eh_prepared(const fields_chunk &fc, field_type ft, bool skip_
 }
 
 bool prepare_polarizations(fields_chunk &fc, field_type ft, StoragePlan &) {
-  /* update_pols allocates through fields_chunk::alloc_f when a polarization
-     needs a field component that does not exist yet; that path already runs
-     through require_component and PR 1's invalidation. Nothing else in
-     update_pols allocates, so there is nothing to hoist here today. The hook
-     exists because PR 6 gives polarization internals a published layout and
-     this is where their storage will be realized. */
-  (void)fc;
-  (void)ft;
-  return false;
+  bool allocated = false;
+  for (polarization_state *p = fc.pol[ft]; p; p = p->next) {
+    if (p->data) continue;
+    void *data = p->s->new_internal_data(fc.f, fc.gv);
+    if (!data) continue;
+    p->data = data;
+    try { p->s->init_internal_data(fc.f, fc.dt, fc.gv, p->data); }
+    catch (...) {
+      p->s->delete_internal_data(p->data);
+      p->data = NULL;
+      throw;
+    }
+    allocated = true;
+  }
+  return allocated;
 }
 
 /* --- the fields-level entry point --------------------------------------- */
@@ -246,7 +253,8 @@ void fields::prepare_storage_for(field_type ft) {
     }
     else if (ft == E_stuff || ft == H_stuff) {
       reconnect |= prepare_update_eh(fc, ft, skip_w, *storage_plan);
-      reconnect |= prepare_polarizations(fc, ft, *storage_plan);
+      if (backend && backend->requires_full_storage_preparation())
+        reconnect |= prepare_polarizations(fc, ft, *storage_plan);
     }
   }
   prepare_dfts(*this, *storage_plan);
