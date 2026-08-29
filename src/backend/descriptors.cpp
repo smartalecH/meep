@@ -407,11 +407,17 @@ void build_lorentzian_state_arrays(fields &f, fields_chunk &fc, polarization_sta
     arrays.elements = ntot;
     d.lorentzian_states.push_back(arrays);
     seen[int(p.c)][p.cmp] = true;
+    d.required_w |= polarization_component_bit(p.c, p.cmp);
   }
 
+  /* Polarization state is allocated from the field layout that existed at
+     creation time and is not expanded when a later require_component() grows
+     fc.f.  The published internal layout is therefore authoritative: a fresh
+     needs_P() query may be a strict superset, but it must never reject a state
+     row that actually exists. */
   FOR_COMPONENTS(c) DOCMP2 {
-    if (state->s->needs_P(c, cmp, fc.f) != seen[int(c)][cmp])
-      throw std::runtime_error("Lorentzian state layout does not match needs_P");
+    if (seen[int(c)][cmp] && !state->s->needs_P(c, cmp, fc.f))
+      throw std::runtime_error("Lorentzian state layout contains an unexpected component");
   }
 }
 
@@ -450,9 +456,13 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         }
 
         FOR_COMPONENTS(c) {
-          DOCMP2 {
-            if (p->s->needs_P(c, cmp, fc.f))
-              d.required_w |= polarization_component_bit(c, cmp);
+          /* Exact built-in Lorentzian descriptors bind the state arrays that
+             exist, rather than a later grow-only field-layout snapshot. */
+          if (d.kind != SusceptibilityKind::lorentzian) {
+            DOCMP2 {
+              if (p->s->needs_P(c, cmp, fc.f))
+                d.required_w |= polarization_component_bit(c, cmp);
+            }
           }
           if (p->s->needs_W_notowned(c, fc.f)) d.needs_halo = true;
         }
