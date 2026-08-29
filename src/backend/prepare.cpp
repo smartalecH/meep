@@ -16,7 +16,10 @@
 */
 
 #include <assert.h>
+#include <algorithm>
+#include <memory>
 #include <string.h>
+#include <vector>
 
 #include "backend/prepare.hpp"
 #include "backend/lifecycle.hpp"
@@ -24,6 +27,93 @@
 #include "meep_internals.hpp"
 
 namespace meep {
+
+namespace {
+
+bool material_phase_storage_needs_update(const structure_chunk &current,
+                                         const structure_chunk &target) {
+  if (current.refcount > 1 || current.condinv_stale) return true;
+  FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+    if (target.chi1inv[c][d] &&
+        (!current.chi1inv[c][d] ||
+         (current.trivial_chi1inv[c][d] && !target.trivial_chi1inv[c][d])))
+      return true;
+    if (target.conductivity[c][d] && !current.conductivity[c][d]) return true;
+    if (d == component_direction(c) && current.conductivity[c][d] && !current.condinv[c][d])
+      return true;
+  }
+  return false;
+}
+
+void realize_material_phase_union(structure_chunk &current, const structure_chunk &target) {
+  bool condinv_refresh_required = false;
+  FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+    if (target.chi1inv[c][d]) {
+      if (!current.chi1inv[c][d]) {
+        current.chi1inv[c][d] = new realnum[current.gv.ntot()];
+        const realnum initial = component_direction(c) == d ? realnum(1) : realnum(0);
+        std::fill(current.chi1inv[c][d], current.chi1inv[c][d] + current.gv.ntot(), initial);
+      }
+      current.trivial_chi1inv[c][d] =
+          current.trivial_chi1inv[c][d] && target.trivial_chi1inv[c][d];
+    }
+    if (target.conductivity[c][d] && !current.conductivity[c][d]) {
+      current.conductivity[c][d] = new realnum[current.gv.ntot()];
+      std::fill(current.conductivity[c][d],
+                current.conductivity[c][d] + current.gv.ntot(), realnum(0));
+      condinv_refresh_required = true;
+    }
+    if (d == component_direction(c) && current.conductivity[c][d] && !current.condinv[c][d])
+      condinv_refresh_required = true;
+  }
+  if (condinv_refresh_required) current.condinv_stale = true;
+  current.update_condinv();
+}
+
+} // namespace
+
+PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f, const structure &target)
+    : PreparedMaterialPhaseStorage(f, &target) {}
+
+PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f)
+    : PreparedMaterialPhaseStorage(f, NULL) {}
+
+PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f, const structure *target)
+    : owner_(f), chunks_(size_t(f.num_chunks)), committed_(false) {
+  for (int i = 0; i < owner_.num_chunks; ++i) {
+    if (!owner_.chunks[i]->is_mine()) continue;
+    const structure_chunk *target_chunk =
+        target ? target->chunks[i] : owner_.chunks[i]->new_s;
+    if (!target_chunk)
+      throw std::logic_error("active material phase has no retained target chunk");
+    if (!material_phase_storage_needs_update(*owner_.chunks[i]->s, *target_chunk)) continue;
+    chunks_[size_t(i)].reset(new structure_chunk(owner_.chunks[i]->s));
+    realize_material_phase_union(*chunks_[size_t(i)], *target_chunk);
+  }
+}
+
+PreparedMaterialPhaseStorage::~PreparedMaterialPhaseStorage() {}
+
+void PreparedMaterialPhaseStorage::commit() {
+  if (committed_) return;
+  for (int i = 0; i < owner_.num_chunks; ++i) {
+    if (!chunks_[size_t(i)]) continue;
+    structure_chunk *old = owner_.chunks[i]->s;
+    owner_.chunks[i]->s = chunks_[size_t(i)].release();
+    if (old->refcount-- <= 1) delete old;
+  }
+  committed_ = true;
+}
+
+std::unique_ptr<PreparedMaterialPhaseStorage> prepare_material_phase_storage(
+    fields &f, const structure &target) {
+  return std::unique_ptr<PreparedMaterialPhaseStorage>(
+      new PreparedMaterialPhaseStorage(f, target));
+}
+
+std::unique_ptr<PreparedMaterialPhaseStorage> prepare_material_phase_storage(fields &f) {
+  return std::unique_ptr<PreparedMaterialPhaseStorage>(new PreparedMaterialPhaseStorage(f));
+}
 
 /* Every condition below is copied verbatim from the lazy site it replaces.
    They are transcriptions, not reinterpretations: if one of them drifts, the
