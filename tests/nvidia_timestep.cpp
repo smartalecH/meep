@@ -259,6 +259,36 @@ static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
   }
 }
 
+static double max_field_difference(fields &cpu, fields &gpu, size_t &array, size_t &element,
+                                   double &absolute) {
+  double maximum = 0.0;
+  absolute = 0.0;
+  array = element = 0;
+  for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = cpu.array_catalog->spec(id);
+    if (is_valid(spec.alias_of) ||
+        (spec.role != array_role::field && spec.role != array_role::polarization) ||
+        spec.element_type != ElementType::realnum_value)
+      continue;
+    const realnum *expected = cpu.array_catalog->resolve<realnum>(id);
+    std::vector<realnum> observed(spec.elements);
+    gpu.backend->read(ArrayRef{id, 0, spec.elements}, observed.data(),
+                      observed.size() * sizeof(realnum));
+    for (size_t j = 0; j < observed.size(); ++j) {
+      const double error = fabs(double(observed[j]) - double(expected[j]));
+      const double relative = error / (1.0 + fabs(double(expected[j])));
+      if (relative > maximum) {
+        maximum = relative;
+        absolute = error;
+        array = i;
+        element = j;
+      }
+    }
+  }
+  return maximum;
+}
+
 static void require_polarization_plan(fields &f, field_type ft, bool drude,
                                       bool anisotropic, unsigned int required_halo_phases,
                                       size_t minimum_states) {
@@ -585,6 +615,201 @@ static void run_bfast_case(const char *name, const grid_volume &gv,
     previous = checkpoints[i];
   }
   master_printf("nvidia_timestep: bfast-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void require_cylindrical_components(fields &f) {
+  f.require_component(Er);
+  f.require_component(Ep);
+  f.require_component(Ez);
+  f.require_component(Hr);
+  f.require_component(Hp);
+  f.require_component(Hz);
+}
+
+static void run_cylindrical_case(const char *name, precision_policy_kind policy, double m,
+                                 bool real_fields, bool use_pml, bool conductivity,
+                                 bool zero_near_origin, bool annular, bool use_bfast,
+                                 double courant = 0.5) {
+  grid_volume gv = volcyl(2.5, 3.0, 6.0);
+  if (annular) gv.shift_origin(R, 8);
+  const boundary_region boundaries = use_pml ? pml(0.35) : no_pml();
+  linear_anisotropic_material cpu_material(true), gpu_material(true);
+  structure cpu_structure(gv, cpu_material, boundaries, identity(), 2, courant);
+  structure gpu_structure(gv, gpu_material, boundaries, identity(), 2, courant);
+  if (conductivity) {
+    set_uniform_conductivity(cpu_structure);
+    set_uniform_conductivity(gpu_structure);
+  }
+  const std::vector<double> scaled_k =
+      use_bfast ? std::vector<double>{0.17, -0.11, 0.07} : std::vector<double>{0, 0, 0};
+  fields cpu(&cpu_structure, m, 0, zero_near_origin, 64, 64, scaled_k);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options, m, 0, zero_near_origin, 64, 64, scaled_k);
+  if (real_fields) {
+    require(m == 0.0, "nonzero cylindrical m cannot use real fields");
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  require_cylindrical_components(cpu);
+  require_cylindrical_components(gpu);
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+
+  const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
+  require(prepared.cylindrical_m == m && !prepared.cylindrical_radial_prefixes.empty(),
+          "NVIDIA cylindrical plan lacks its coordinate fingerprint or radial prefixes");
+  require((m != 0.0) == !prepared.cylindrical_m_updates.empty(),
+          "NVIDIA cylindrical plan has incorrect m/r descriptor presence");
+  const bool has_origin = !annular;
+  require(has_origin == !prepared.cylindrical_origin_actions.empty(),
+          "NVIDIA cylindrical plan has incorrect origin-action presence");
+  require(use_bfast == !prepared.bfast_updates.empty(),
+          "NVIDIA cylindrical plan has incorrect BFAST descriptor presence");
+  bool saw_axis_replay = false, saw_prefix_pair = false, saw_m_r = false, saw_m_z = false;
+  for (const CurlUpdate &curl : prepared.db_updates)
+    if (component_direction(curl.region.c) == Z) {
+      require(curl.radial_prefix_index < prepared.cylindrical_radial_prefixes.size(),
+              "NVIDIA cylindrical Z curl is not paired with a radial prefix");
+      saw_prefix_pair = true;
+    }
+  for (const CylindricalMOverRUpdate &update : prepared.cylindrical_m_updates) {
+    saw_m_r |= component_direction(update.region.c) == R;
+    saw_m_z |= component_direction(update.region.c) == Z;
+#if MEEP_SINGLE
+    const uint32_t magnitude = float_bits(realnum(fabs(update.numerator)));
+    if (fabs(m) == 0.5)
+      require(magnitude == 0x3f000000u,
+              "native-single half-m cylindrical coefficient bits regressed");
+    else if (fabs(m) == 1.0)
+      require(magnitude == 0x3f800000u,
+              "native-single unit-m cylindrical coefficient bits regressed");
+    else if (fabs(m) == 3.0)
+      require(magnitude == (courant == 0.25 ? 0x3fc00000u : 0x40400000u),
+              "native-single high-m cylindrical coefficient bits regressed");
+#endif
+  }
+  for (const CylindricalAxisUpdate &update : prepared.cylindrical_axis_updates) {
+#if MEEP_SINGLE
+    require(float_bits(realnum(update.dt)) == 0x3daaaaabu,
+            "native-single cylindrical axis dt bits regressed");
+    if (update.kind == CylindricalAxisKind::m0_dz)
+      require(float_bits(realnum(fabs(update.scale))) == 0x40000000u,
+              "native-single m=0 cylindrical axis scale bits regressed");
+    else
+      require(float_bits(realnum(fabs(update.scale))) == 0x3f000000u &&
+                  (float_bits(realnum(fabs(update.source2_multiplier))) == 0x3f800000u ||
+                   float_bits(realnum(fabs(update.source2_multiplier))) == 0x40000000u),
+              "native-single |m|=1 cylindrical axis coefficient bits regressed");
+#endif
+  }
+  for (const ConstitutiveUpdate &update : prepared.eh_updates)
+    saw_axis_replay |= (update.region.variant_key & constitutive_axis_override) != 0;
+  require(saw_prefix_pair && (m == 0.0 || (saw_m_r && saw_m_z)),
+          "NVIDIA cylindrical plan lacks prefix or R/Z m-tail coverage");
+  require(has_origin == saw_axis_replay,
+          "NVIDIA cylindrical plan has incorrect constitutive axis replay presence");
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.2);
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 8e-5 : 8e-13;
+  const int checkpoints[] = {1, 2, 100};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA cylindrical timestep did not advance host time");
+    if (getenv("MEEP_NVIDIA_CYLINDRICAL_TRACE"))
+    {
+      size_t array = 0, element = 0;
+      double absolute = 0.0;
+      const double maximum = max_field_difference(cpu, gpu, array, element, absolute);
+      const StorageKey &key = cpu.array_catalog->key(ArrayId{uint32_t(array)});
+      master_printf("nvidia_timestep: cylindrical-%s/%s checkpoint %d max-relative %.9g "
+                    "absolute %.9g array %zu (%s,c=%d,cmp=%d) element %zu\n",
+                    name, precision_policy_name(policy), checkpoints[i], maximum, absolute, array,
+                    array_kind_name(array_kind(key.kind)), key.component_, key.cmp, element);
+    }
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoints[i];
+  }
+  master_printf("nvidia_timestep: cylindrical-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void test_nvidia_cylindrical_change_m(precision_policy_kind policy) {
+  const grid_volume gv = volcyl(2.5, 3.0, 6.0);
+  linear_anisotropic_material cpu_material(true), gpu_material(true);
+  structure cpu_structure(gv, cpu_material, no_pml(), identity(), 2);
+  structure gpu_structure(gv, gpu_material, no_pml(), identity(), 2);
+  fields cpu(&cpu_structure, +1.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options, +1.0);
+  require_cylindrical_components(cpu);
+  require_cylindrical_components(gpu);
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.2);
+  cpu.advance(2);
+  gpu.advance(2);
+  compare_fields(cpu, gpu, (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13);
+
+  struct surviving_snapshot {
+    int chunk;
+    component c;
+    std::vector<realnum> values;
+  };
+  std::vector<surviving_snapshot> snapshots;
+  for (int chunk = 0; chunk < gpu.num_chunks; ++chunk)
+    FOR_COMPONENTS(c) {
+      const ArrayId id = gpu.array_catalog->find(
+          StorageKey{chunk, int(array_kind::f), int(c), 0, 0});
+      if (!is_valid(id)) continue;
+      surviving_snapshot snapshot;
+      snapshot.chunk = chunk;
+      snapshot.c = c;
+      snapshot.values.resize(gpu.storage_plan->arrays[id.value].elements);
+      gpu.backend->read(ArrayRef{id, 0, snapshot.values.size()}, snapshot.values.data(),
+                        snapshot.values.size() * sizeof(realnum));
+      snapshots.push_back(snapshot);
+      realnum *host_mirror = gpu.chunks[chunk]->f[c][0];
+      std::fill(host_mirror, host_mirror + snapshots.back().values.size(), realnum(-91.25));
+    }
+
+  cpu.change_m(0.0);
+  gpu.change_m(0.0);
+  require(!gpu.backend_state && !gpu.executable && gpu.is_real,
+          "NVIDIA +1-to-0 change_m did not retire resident complex state");
+  for (int chunk = 0; chunk < gpu.num_chunks; ++chunk)
+    require(!gpu.chunks[chunk]->f[Er][1] && !gpu.chunks[chunk]->f[Ep][1] &&
+                !gpu.chunks[chunk]->f[Ez][1] && !gpu.chunks[chunk]->f[Hr][1] &&
+                !gpu.chunks[chunk]->f[Hp][1] && !gpu.chunks[chunk]->f[Hz][1],
+            "NVIDIA +1-to-0 change_m retained imaginary field arrays");
+  for (const surviving_snapshot &snapshot : snapshots) {
+    const realnum *observed = gpu.chunks[snapshot.chunk]->f[snapshot.c][0];
+    require(observed &&
+                memcmp(snapshot.values.data(), observed,
+                       snapshot.values.size() * sizeof(realnum)) == 0,
+            "NVIDIA change_m did not migrate a surviving real field exactly");
+  }
+
+  cpu.advance(1);
+  gpu.advance(1);
+  require(gpu.backend_state && gpu.executable && gpu.is_real,
+          "NVIDIA +1-to-0 change_m did not rebuild real resident state");
+  compare_fields(cpu, gpu, (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13);
+  master_printf("nvidia_timestep: cylindrical-change-m/%s PASS\n",
                 precision_policy_name(policy));
 }
 
@@ -1335,6 +1560,197 @@ static void test_bfast_compile_rejections() {
   require(before == after, "rejected BFAST descriptors mutated device storage");
 }
 
+static void test_cylindrical_compile_rejections() {
+  const grid_volume gv = volcyl(2.5, 3.0, 6.0);
+  linear_anisotropic_material material(true);
+  structure s(gv, material, pml(0.35), identity(), 1);
+  set_uniform_conductivity(s);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields gpu(&s, options, +1.0, 0, true, 64, 64, scaled_k);
+  require_cylindrical_components(gpu);
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(!baseline.cylindrical_radial_prefixes.empty() &&
+              !baseline.cylindrical_m_updates.empty() &&
+              !baseline.cylindrical_axis_updates.empty() &&
+              !baseline.cylindrical_origin_actions.empty(),
+          "cylindrical rejection fixture lacks required descriptors");
+  size_t update_db_op = baseline.operations.size(), z_curl = baseline.db_updates.size();
+  for (size_t oi = 0; oi < baseline.operations.size(); ++oi) {
+    const Operation &op = baseline.operations[oi];
+    if (op.kind != OpKind::update_db || !op.descriptor_count) continue;
+    if (update_db_op == baseline.operations.size()) update_db_op = oi;
+    for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
+      if (baseline.db_updates[i].radial_prefix_index != UINT32_MAX) {
+        z_curl = i;
+        update_db_op = oi;
+        break;
+      }
+    if (z_curl < baseline.db_updates.size()) break;
+  }
+  require(update_db_op < baseline.operations.size() && z_curl < baseline.db_updates.size(),
+          "cylindrical rejection fixture lacks a paired Z curl");
+  const ArrayId target = baseline.db_updates[z_curl].target;
+  const size_t elements = gpu.storage_plan->arrays[target.value].elements;
+  std::vector<realnum> before(elements), after(elements);
+  gpu.backend->read(ArrayRef{target, 0, elements}, before.data(), before.size() * sizeof(realnum));
+
+  StepPlan malformed = baseline;
+  malformed.db_updates[z_curl].radial_prefix_index = UINT32_MAX;
+  expect_compile_rejected(gpu, malformed, "lacks a valid radial-prefix descriptor");
+  malformed = baseline;
+  malformed.cylindrical_radial_prefixes[0].scratch =
+      malformed.cylindrical_radial_prefixes[0].source;
+  expect_compile_rejected(gpu, malformed, "storage identity is invalid");
+  malformed = baseline;
+  malformed.db_updates[z_curl].radial_prefix_index =
+      uint32_t(malformed.cylindrical_radial_prefixes.size());
+  expect_compile_rejected(gpu, malformed, "lacks a valid radial-prefix descriptor");
+  malformed = baseline;
+  malformed.cylindrical_radial_prefixes.push_back(malformed.cylindrical_radial_prefixes[0]);
+  expect_compile_rejected(gpu, malformed, "not referenced exactly once");
+  malformed = baseline;
+  ++malformed.cylindrical_radial_prefixes[0].nr;
+  expect_compile_rejected(gpu, malformed, "shape does not match its chunk");
+  malformed = baseline;
+  ++malformed.cylindrical_m_updates[0].raw_radial_start;
+  expect_compile_rejected(gpu, malformed, "raw radial coordinate is stale");
+  malformed = baseline;
+  malformed.cylindrical_m_updates[0].source = malformed.cylindrical_m_updates[0].target;
+  expect_compile_rejected(gpu, malformed, "target or source identity is invalid");
+  malformed = baseline;
+  malformed.cylindrical_m_updates[0].numerator =
+      std::numeric_limits<double>::infinity();
+  expect_compile_rejected(gpu, malformed, "coefficient is stale");
+  malformed = baseline;
+  malformed.cylindrical_m_updates[0].region.variant_key ^= cylindrical_m_has_pml_aux;
+  expect_compile_rejected(gpu, malformed, "variant bits and auxiliary arrays disagree");
+  malformed = baseline;
+  malformed.cylindrical_axis_updates[0].region.c = Dr;
+  expect_compile_rejected(gpu, malformed, "target or first-source identity is invalid");
+  malformed = baseline;
+  malformed.cylindrical_axis_updates[0].kind = static_cast<CylindricalAxisKind>(99);
+  expect_compile_rejected(gpu, malformed, "kind is invalid");
+  malformed = baseline;
+  ++malformed.cylindrical_axis_updates[0].source1_neighbor_offset;
+  expect_compile_rejected(gpu, malformed, "coefficient or offset is stale");
+  malformed = baseline;
+  malformed.cylindrical_axis_updates[0].region.variant_key ^= cylindrical_axis_has_pml_aux;
+  expect_compile_rejected(gpu, malformed, "variant bits and auxiliary arrays disagree");
+  malformed = baseline;
+  malformed.cylindrical_axis_updates[0].target_u =
+      malformed.cylindrical_axis_updates[0].target;
+  expect_compile_rejected(gpu, malformed, "auxiliary storage identity is invalid");
+  malformed = baseline;
+  malformed.cylindrical_origin_actions.clear();
+  malformed.cylindrical_axis_updates.clear();
+  malformed.cylindrical_zero_slabs.clear();
+  for (Operation &op : malformed.operations)
+    if (op.kind == OpKind::update_db) {
+      op.cylindrical_origin_action_index = 0;
+      op.cylindrical_origin_action_count = 0;
+    }
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+  malformed = baseline;
+  malformed.cylindrical_origin_actions[0].kind =
+      static_cast<CylindricalOriginActionKind>(99);
+  expect_compile_rejected(gpu, malformed, "origin action kind is invalid");
+  size_t zero_action = baseline.cylindrical_origin_actions.size();
+  for (size_t i = 0; i < baseline.cylindrical_origin_actions.size(); ++i)
+    if (baseline.cylindrical_origin_actions[i].kind ==
+        CylindricalOriginActionKind::zero_slab) {
+      zero_action = i;
+      break;
+    }
+  require(zero_action < baseline.cylindrical_origin_actions.size(),
+          "cylindrical rejection fixture lacks a zero action");
+  malformed = baseline;
+  malformed.cylindrical_origin_actions[zero_action].index =
+      uint32_t(malformed.cylindrical_zero_slabs.size());
+  expect_compile_rejected(gpu, malformed, "zero action index is out of range");
+  malformed = baseline;
+  ++malformed.cylindrical_zero_slabs[baseline.cylindrical_origin_actions[zero_action].index].base;
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+  malformed = baseline;
+  malformed.cylindrical_m_updates.clear();
+  for (Operation &op : malformed.operations)
+    if (op.kind == OpKind::update_db) {
+      op.cylindrical_m_descriptor_index = 0;
+      op.cylindrical_m_descriptor_count = 0;
+    }
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+  malformed = baseline;
+  malformed.cylindrical_origin_r[0] += 1.0;
+  expect_compile_rejected(gpu, malformed, "chunk fingerprint is stale");
+  malformed = baseline;
+  malformed.cylindrical_m = -malformed.cylindrical_m;
+  expect_compile_rejected(gpu, malformed, "coordinate fingerprint is stale");
+  malformed = baseline;
+  malformed.cylindrical_zero_near_origin[0] ^= 1;
+  expect_compile_rejected(gpu, malformed, "chunk fingerprint is stale");
+
+  const double saved_chunk_m = gpu.chunks[0]->m;
+  gpu.chunks[0]->m = -saved_chunk_m;
+  expect_compile_rejected(gpu, baseline, "chunk fingerprint is stale");
+  gpu.chunks[0]->m = saved_chunk_m;
+
+  const uint32_t bfast_index = baseline.db_updates[z_curl].bfast_update_index;
+  require(bfast_index < baseline.bfast_updates.size(),
+          "cylindrical rejection fixture lacks transformed-Z BFAST pairing");
+  malformed = baseline;
+  const component target_component = malformed.db_updates[z_curl].region.c;
+  const component raw_source = is_D(target_component) ? Hp : Ep;
+  malformed.bfast_updates[bfast_index].source1 = gpu.array_catalog->find(
+      StorageKey{malformed.db_updates[z_curl].region.chunk, int(array_kind::f), int(raw_source),
+                 malformed.db_updates[z_curl].region.cmp, 0});
+  expect_compile_rejected(gpu, malformed, "source identity");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].k1 = -malformed.bfast_updates[bfast_index].k1;
+  expect_compile_rejected(gpu, malformed, "coefficients do not match live coordinate routing");
+
+  size_t axis_replay = baseline.eh_updates.size();
+  for (size_t i = 0; i < baseline.eh_updates.size(); ++i)
+    if (baseline.eh_updates[i].region.variant_key & constitutive_axis_override) {
+      axis_replay = i;
+      break;
+    }
+  require(axis_replay > 0 && axis_replay < baseline.eh_updates.size(),
+          "cylindrical rejection fixture lacks constitutive axis replay");
+  size_t axis_operation = baseline.operations.size();
+  for (size_t i = 0; i < baseline.operations.size(); ++i) {
+    const Operation &op = baseline.operations[i];
+    if (op.kind == OpKind::update_eh && axis_replay >= op.descriptor_index &&
+        axis_replay < size_t(op.descriptor_index) + op.descriptor_count) {
+      axis_operation = i;
+      break;
+    }
+  }
+  require(axis_operation < baseline.operations.size(),
+          "cylindrical rejection fixture lacks axis replay operation");
+  malformed = baseline;
+  malformed.eh_updates[axis_replay].region.variant_key &= ~constitutive_axis_override;
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+  malformed = baseline;
+  malformed.operations[axis_operation].descriptor_count =
+      uint32_t(size_t(malformed.operations[axis_operation].descriptor_index) +
+               malformed.operations[axis_operation].descriptor_count - axis_replay);
+  malformed.operations[axis_operation].descriptor_index = uint32_t(axis_replay);
+  expect_compile_rejected(gpu, malformed, "lacks an adjacent ordinary row");
+  malformed = baseline;
+  malformed.eh_updates[axis_replay].cross1 = malformed.eh_updates[axis_replay - 1].cross1;
+  expect_compile_rejected(gpu, malformed, "does not match its ordinary row");
+  malformed = baseline;
+  malformed.eh_updates[axis_replay].previous_w = malformed.eh_updates[axis_replay].target;
+  expect_compile_rejected(gpu, malformed, "does not match its ordinary row");
+
+  gpu.backend->read(ArrayRef{target, 0, elements}, after.data(), after.size() * sizeof(realnum));
+  require(before == after, "rejected cylindrical descriptors mutated device storage");
+}
+
 static void run_dispersion_case(const char *name, precision_policy_kind policy, bool real_fields,
                                 bool drude, bool anisotropic_sigma, bool magnetic,
                                 bool use_pml, int chunks, const vec *bloch,
@@ -1629,6 +2045,8 @@ int main(int argc, char **argv) {
   const bool gyro_only = getenv("MEEP_NVIDIA_TIMESTEP_GYRO_ONLY") != NULL;
   const bool beta_only = getenv("MEEP_NVIDIA_TIMESTEP_BETA_ONLY") != NULL;
   const bool bfast_only = getenv("MEEP_NVIDIA_TIMESTEP_BFAST_ONLY") != NULL;
+  const bool cylindrical_only = getenv("MEEP_NVIDIA_TIMESTEP_CYLINDRICAL_ONLY") != NULL;
+  const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
     master_printf("nvidia_timestep: coefficient checks PASS\n");
@@ -1638,6 +2056,16 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_BFAST_REJECTIONS_ONLY")) {
     test_bfast_compile_rejections();
     master_printf("nvidia_timestep: BFAST rejection checks PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_CYLINDRICAL_REJECTIONS_ONLY")) {
+    test_cylindrical_compile_rejections();
+    master_printf("nvidia_timestep: cylindrical rejection checks PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_CYLINDRICAL_CHANGE_M_ONLY")) {
+    test_nvidia_cylindrical_change_m(precision_policy_kind::native);
+    master_printf("nvidia_timestep: cylindrical change_m checks PASS\n");
     return 0;
   }
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
@@ -1651,6 +2079,39 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (cylindrical_only) {
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m0-real-pml-conductive"))
+        run_cylindrical_case("m0-real-pml-conductive", policies[p], 0.0, true, true, true, true,
+                             false, false);
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m0-complex"))
+        run_cylindrical_case("m0-complex", policies[p], 0.0, false, false, false, true, false,
+                             false);
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m-plus1-pml-conductive"))
+        run_cylindrical_case("m-plus1-pml-conductive", policies[p], +1.0, false, true, true,
+                             true, false, false);
+      if (cylindrical_case && !strcmp(cylindrical_case, "m-plus1-pml-bfast"))
+        run_cylindrical_case("m-plus1-pml-bfast", policies[p], +1.0, false, true, false, true,
+                             false, true);
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m-minus1"))
+        run_cylindrical_case("m-minus1", policies[p], -1.0, false, false, false, true, false,
+                             false);
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m-half-annular-conductive"))
+        run_cylindrical_case("m-half-annular-conductive", policies[p], +0.5, false, false, true,
+                             true, true, false);
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m-plus3-default-zero"))
+        run_cylindrical_case("m-plus3-default-zero", policies[p], +3.0, false, false, false,
+                             true, false, false);
+      if (!cylindrical_case || !strcmp(cylindrical_case, "m-minus3-accurate-bfast"))
+        run_cylindrical_case("m-minus3-accurate-bfast", policies[p], -3.0, false, true, false,
+                             false, false, true, 0.25);
+      if (cylindrical_case && !strcmp(cylindrical_case, "m-minus3-accurate-pml"))
+        run_cylindrical_case("m-minus3-accurate-pml", policies[p], -3.0, false, true, false,
+                             false, false, false, 0.25);
+      if (cylindrical_case && !strcmp(cylindrical_case, "m-minus3-accurate-bfast-nopml"))
+        run_cylindrical_case("m-minus3-accurate-bfast-nopml", policies[p], -3.0, false, false,
+                             false, false, false, true, 0.25);
+      continue;
+    }
     if (!beta_only && !bfast_only) {
       run_gyrotropic_case("lorentz-real-e-copy", policies[p], true, GYROTROPIC_LORENTZIAN,
                           false, false, NULL, false, 1u << CONNECT_COPY);
@@ -1752,10 +2213,16 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   set_finite_check_mode(FiniteCheckMode::off);
-  if (!beta_only && !bfast_only) test_gyrotropic_compile_rejections();
-  if (!gyro_only && !bfast_only) test_beta_compile_rejections();
-  if (!gyro_only && !beta_only) test_bfast_compile_rejections();
-  if (!gyro_only && !beta_only && !bfast_only) {
+  if (cylindrical_only && !cylindrical_case) {
+    test_nvidia_cylindrical_change_m(precision_policy_kind::native);
+    test_cylindrical_compile_rejections();
+  }
+  else {
+    if (!beta_only && !bfast_only) test_gyrotropic_compile_rejections();
+    if (!gyro_only && !bfast_only) test_beta_compile_rejections();
+    if (!gyro_only && !beta_only) test_bfast_compile_rejections();
+  }
+  if (!gyro_only && !beta_only && !bfast_only && !cylindrical_only) {
     test_compile_allocation_retry();
     test_rejections();
     test_nonlinear_compile_rejections();
