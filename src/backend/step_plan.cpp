@@ -202,6 +202,8 @@ public:
     op.kind = k;
     op.descriptor_index = 0;
     op.descriptor_count = 0;
+    op.polarization_subtraction_index = 0;
+    op.polarization_subtraction_count = 0;
     op.guard = g;
     op.ft = ft;
     op.source_time_offset = src_offset;
@@ -269,6 +271,10 @@ public:
       sig ^= uint64_t(op.guard.variant_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.polarization_subtraction_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
+             (sig >> 2);
+      sig ^= uint64_t(op.polarization_subtraction_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
+             (sig >> 2);
       uint64_t source_bits = 0;
       static_assert(sizeof(source_bits) == sizeof(op.source_time_offset), "double is not 64-bit");
       memcpy(&source_bits, &op.source_time_offset, sizeof(source_bits));
@@ -282,6 +288,9 @@ public:
     }
     for (const CurlUpdate &d : plan.db_updates) hash_curl(sig, d);
     for (const ConstitutiveUpdate &d : plan.eh_updates) hash_constitutive(sig, d);
+    for (const PolarizationUpdate &d : plan.polarization_updates) hash_polarization(sig, d);
+    for (const PolarizationSubtraction &d : plan.polarization_subtractions)
+      hash_polarization_subtraction(sig, d);
     return sig;
   }
 
@@ -298,6 +307,10 @@ private:
     mix(sig, uint64_t(r.chunk));
     mix(sig, uint64_t(r.c));
     mix(sig, uint64_t(r.cmp));
+    for (int i = 0; i < 3; ++i) {
+      mix(sig, uint64_t(r.begin.yucky_val(i)));
+      mix(sig, uint64_t(r.end.yucky_val(i)));
+    }
     mix(sig, uint64_t(r.base));
     for (int i = 0; i < 3; ++i) {
       mix(sig, uint64_t(r.counts[i]));
@@ -349,6 +362,34 @@ private:
     hash_id(sig, d.target_w);
     hash_id(sig, d.previous_w);
     hash_pml(sig, d.pml);
+  }
+  static void hash_polarization(uint64_t &sig, const PolarizationUpdate &d) {
+    hash_region(sig, d.region);
+    mix(sig, uint64_t(d.state_index));
+    hash_id(sig, d.p);
+    hash_id(sig, d.p_prev);
+    hash_id(sig, d.primary_w);
+    hash_id(sig, d.cross_w1);
+    hash_id(sig, d.cross_w2);
+    hash_id(sig, d.diagonal_sigma);
+    hash_id(sig, d.offdiagonal_sigma1);
+    hash_id(sig, d.offdiagonal_sigma2);
+    mix(sig, uint64_t(d.primary_stride));
+    mix(sig, uint64_t(d.cross_stride1));
+    mix(sig, uint64_t(d.cross_stride2));
+    mix_double(sig, d.omega_0);
+    mix_double(sig, d.gamma);
+    mix_double(sig, d.dt);
+  }
+  static void hash_polarization_subtraction(uint64_t &sig,
+                                            const PolarizationSubtraction &d) {
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.c));
+    mix(sig, uint64_t(d.cmp));
+    mix(sig, uint64_t(d.state_index));
+    hash_id(sig, d.target);
+    hash_id(sig, d.p);
+    mix(sig, uint64_t(d.elements));
   }
 
   fields &f_;
