@@ -1020,6 +1020,10 @@ bool resolve_host_halo_plan(fields &f, const HostHaloPlanDescriptor &descriptor,
 /* Recomputed by resident preflight so externally-mutated target topology is
    rejected before phase_material_mix changes current coefficients. */
 uint64_t compute_material_phase_target_signature(const fields &f);
+/* Public fields::beta assignment cannot update the per-chunk coefficient that
+   the CPU and descriptor builders consume. Resident execution therefore
+   rejects any outer/chunk/prepared mismatch instead of reusing stale code. */
+bool beta_coordinate_state_matches(const fields &f, const StepPlan *prepared);
 
 /* Human-readable operation sequence, for the trace test and for debugging. */
 void format_step_plan(const StepPlan &p, std::vector<std::string> &out);
