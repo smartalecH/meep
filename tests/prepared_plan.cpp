@@ -174,6 +174,11 @@ static void check_prepared_updates() {
   f.advance(2);
 
   StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t live_dft_rows = 0;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine())
+      for (dft_chunk *d = f.chunks[chunk]->dft_chunks; d; d = d->next_in_chunk)
+        ++live_dft_rows;
   size_t update_ops = 0;
   size_t source_evaluations = 0, source_applications = 0;
   size_t dft_operations = 0;
@@ -345,7 +350,13 @@ static void check_prepared_updates() {
     }
   }
   CHECK(update_ops == 4, "expected four Maxwell update operations, got %zu", update_ops);
-  CHECK(dft_operations == 1, "expected one DFT update operation, got %zu", dft_operations);
+  CHECK(plan.dft_updates.size() == live_dft_rows,
+        "prepared plan has %zu DFT rows for %zu owned live rows", plan.dft_updates.size(),
+        live_dft_rows);
+  CHECK(dft_operations == (live_dft_rows ? 1 : 0),
+        "local DFT operation count %zu does not match %zu owned live rows", dft_operations,
+        live_dft_rows);
+  CHECK(or_to_all(live_dft_rows > 0), "fixture contains no owned DFT row on any rank");
   CHECK(polarization_operations == 2, "expected two polarization operations, got %zu",
         polarization_operations);
   CHECK(or_to_all(polarization_rows > 0), "prepared plan contains no polarization updates");

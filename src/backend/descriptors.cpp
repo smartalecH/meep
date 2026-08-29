@@ -21,6 +21,7 @@
 
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <typeinfo>
 
@@ -121,6 +122,8 @@ void build_source_descriptors(fields &f, SourcePlan &out) {
      stable and meaningful. */
   std::vector<const src_time *> times;
   for (const src_time *st = f.sources; st; st = st->next) {
+    if (times.size() > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("source-time descriptor index overflow");
     SourceTimeDescriptor d;
     d.source_time_id = uint32_t(times.size());
     d.kind = classify_src_time(st);
@@ -146,7 +149,11 @@ void build_source_descriptors(fields &f, SourcePlan &out) {
       for (int i = 0; i < f.num_chunks; ++i) {
         if (!f.chunks[i]->is_mine()) continue;
         fields_chunk &fc = *f.chunks[i];
+        size_t source_ordinal = 0;
         for (const src_vol &sv : fc.get_sources(ft)) {
+          if (source_ordinal > std::numeric_limits<uint32_t>::max())
+            throw std::overflow_error("source descriptor ordinal overflow");
+          const uint32_t ordinal = uint32_t(source_ordinal++);
           if (int(sv.t()->is_integrated) != integrated) continue;
           SourceDescriptor d;
           d.chunk = i;
@@ -169,6 +176,7 @@ void build_source_descriptors(fields &f, SourcePlan &out) {
           d.condinv = f.array_catalog->find(
               {i, int(array_kind::condinv), int(d.c), -1, int(component_direction(sv.c))});
           d.source_time_id = 0xffffffffu;
+          d.source_ordinal = ordinal;
           for (size_t k = 0; k < times.size(); ++k)
             if (times[k] == sv.t()) d.source_time_id = uint32_t(k);
           d.indices.reserve(sv.num_points());
@@ -286,6 +294,7 @@ uint64_t source_plan_signature(const SourcePlan &plan) {
     source_hash_mix(hash, uint64_t(d.c));
     source_hash_mix(hash, d.condinv.value);
     source_hash_mix(hash, d.source_time_id);
+    source_hash_mix(hash, d.source_ordinal);
     source_hash_mix(hash, d.integrated);
     source_hash_mix(hash, uint64_t(d.ft));
     source_hash_mix(hash, d.indices.size());
@@ -351,6 +360,64 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out) {
       out.push_back(d);
     }
   }
+}
+
+namespace {
+
+void dft_hash_ivec(uint64_t &hash, const ivec &v) {
+  source_hash_mix(hash, uint64_t(v.dim));
+  LOOP_OVER_DIRECTIONS(v.dim, d) { source_hash_mix(hash, uint64_t(v.in_direction(d))); }
+}
+
+void dft_hash_vec(uint64_t &hash, const vec &v) {
+  source_hash_mix(hash, uint64_t(v.dim));
+  LOOP_OVER_DIRECTIONS(v.dim, d) { source_hash_double(hash, v.in_direction(d)); }
+}
+
+void dft_hash_ref(uint64_t &hash, const ArrayRef &ref) {
+  source_hash_mix(hash, ref.id.value);
+  source_hash_mix(hash, ref.offset);
+  source_hash_mix(hash, ref.elements);
+}
+
+} // namespace
+
+uint64_t dft_plan_signature(const std::vector<DftDescriptor> &plan) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  source_hash_mix(hash, plan.size());
+  for (const DftDescriptor &d : plan) {
+    source_hash_mix(hash, d.accumulator.value);
+    source_hash_mix(hash, d.phase_scratch.value);
+    dft_hash_ref(hash, d.source_field);
+    dft_hash_ref(hash, d.source_field_imag);
+    source_hash_mix(hash, d.omega.size());
+    for (double omega : d.omega)
+      source_hash_double(hash, omega);
+    source_hash_double(hash, d.scale.real());
+    source_hash_double(hash, d.scale.imag());
+    source_hash_mix(hash, uint64_t(d.chunk));
+    source_hash_mix(hash, uint64_t(d.c));
+    source_hash_mix(hash, uint64_t(d.avg1));
+    source_hash_mix(hash, uint64_t(d.avg2));
+    dft_hash_ivec(hash, d.is);
+    dft_hash_ivec(hash, d.ie);
+    dft_hash_ivec(hash, d.is_old);
+    dft_hash_ivec(hash, d.ie_old);
+    source_hash_mix(hash, d.persist);
+    source_hash_mix(hash, uint64_t(d.decimation_factor));
+    source_hash_mix(hash, d.due_scalar_slot);
+    dft_hash_vec(hash, d.weights.s0);
+    dft_hash_vec(hash, d.weights.s1);
+    dft_hash_vec(hash, d.weights.e0);
+    dft_hash_vec(hash, d.weights.e1);
+    source_hash_double(hash, d.dV0);
+    source_hash_double(hash, d.dV1);
+    source_hash_mix(hash, d.include_dV_and_interp_weights);
+    source_hash_mix(hash, d.sqrt_dV_and_interp_weights);
+    source_hash_mix(hash, d.N);
+    source_hash_mix(hash, d.Nomega);
+  }
+  return hash;
 }
 
 /* --- Susceptibilities ----------------------------------------------------- */

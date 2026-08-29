@@ -102,6 +102,107 @@ public:
   }
 };
 
+class ordered_custom_source : public continuous_src_time {
+public:
+  ordered_custom_source(double frequency) : continuous_src_time(frequency) {}
+  virtual src_time *clone() const { return new ordered_custom_source(*this); }
+  virtual complex<double> current(double time, double dt) const {
+    return continuous_src_time::current(time, dt) + complex<double>(0.03125, -0.0625);
+  }
+};
+
+static void test_source_ordinals() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  fields f(&s);
+  continuous_src_time m0(0.21), mi(0.22), m2(0.23), e0(0.31), ei(0.32);
+  ordered_custom_source e2(0.33);
+  m0.is_integrated = false;
+  mi.is_integrated = true;
+  m2.is_integrated = false;
+  e0.is_integrated = false;
+  ei.is_integrated = true;
+  e2.is_integrated = false;
+  const vec p(0.17, 0.19);
+  f.add_point_source(Hz, m0, p);
+  f.add_point_source(Hz, mi, p);
+  f.add_point_source(Hz, m2, p);
+  f.add_point_source(Ez, e0, p);
+  f.add_point_source(Ez, ei, p);
+  f.add_point_source(Ez, e2, p);
+  f.advance(1);
+
+  SourcePlan plan;
+  build_source_descriptors(f, plan);
+  bool saw_interleaved = false, saw_custom = false;
+  struct ExpectedSource {
+    field_type ft;
+    int chunk;
+    uint32_t ordinal;
+    bool integrated;
+  };
+  std::vector<ExpectedSource> expected;
+  FOR_FIELD_TYPES(ft) for (int integrated = 0; integrated < 2; ++integrated)
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk]->is_mine()) continue;
+      const std::vector<src_vol> &live = f.chunks[chunk]->get_sources(ft);
+      for (size_t ordinal = 0; ordinal < live.size(); ++ordinal)
+        if (int(live[ordinal].t()->is_integrated) == integrated)
+          expected.push_back(ExpectedSource{ft, chunk, uint32_t(ordinal), bool(integrated)});
+    }
+  CHECK(plan.sources.size() == expected.size(),
+        "source descriptor grouping has %zu rows, expected %zu", plan.sources.size(),
+        expected.size());
+  for (size_t i = 0; i < plan.sources.size() && i < expected.size(); ++i)
+    CHECK(plan.sources[i].ft == expected[i].ft && plan.sources[i].chunk == expected[i].chunk &&
+              plan.sources[i].source_ordinal == expected[i].ordinal &&
+              plan.sources[i].integrated == expected[i].integrated,
+          "source descriptor %zu changed grouped order or original ordinal", i);
+  FOR_FIELD_TYPES(ft) for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk]->is_mine()) continue;
+      const std::vector<src_vol> &live = f.chunks[chunk]->get_sources(ft);
+      if (live.size() >= 3 && !live[0].t()->is_integrated && live[1].t()->is_integrated &&
+          !live[2].t()->is_integrated)
+        saw_interleaved = true;
+      std::vector<uint32_t> ordinary, integrated;
+      for (const SourceDescriptor &d : plan.sources) {
+        if (d.chunk != chunk || d.ft != ft) continue;
+        (d.integrated ? integrated : ordinary).push_back(d.source_ordinal);
+        CHECK(d.source_ordinal < live.size(), "source ordinal %u is out of range",
+              d.source_ordinal);
+        if (d.source_ordinal < live.size()) {
+          const src_vol &sv = live[d.source_ordinal];
+          CHECK(d.integrated == sv.t()->is_integrated,
+                "source ordinal does not reconstruct integration kind");
+          CHECK(d.indices.size() == sv.num_points(),
+                "source ordinal reconstructs the wrong spatial row");
+        }
+      }
+      CHECK(std::is_sorted(ordinary.begin(), ordinary.end()),
+            "ordinary source subgroup changed original ordinal order");
+      CHECK(std::is_sorted(integrated.begin(), integrated.end()),
+            "integrated source subgroup changed original ordinal order");
+    }
+  for (const SourceTimeDescriptor &d : plan.source_times)
+    saw_custom = saw_custom || d.kind == SourceTimeKind::host_custom;
+  CHECK(or_to_all(saw_interleaved), "fixture produced no interleaved local source vector");
+  CHECK(saw_custom, "ordered-source fixture did not retain its custom source time");
+
+  if (!plan.sources.empty()) {
+    const uint64_t signature = source_plan_signature(plan);
+    SourcePlan changed = plan;
+    ++changed.sources[0].source_ordinal;
+    CHECK(source_plan_signature(changed) != signature,
+          "source signature ignored the original source ordinal");
+    changed = plan;
+    if (changed.sources.size() > 1) {
+      std::swap(changed.sources[0].source_ordinal, changed.sources[1].source_ordinal);
+      CHECK(source_plan_signature(changed) != signature,
+            "source signature ignored exchanged source ordinals");
+    }
+  }
+}
+
 static void test_sources() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
@@ -260,6 +361,23 @@ static void test_dfts() {
       for (dft_chunk *cur = f.chunks[i]->dft_chunks; cur; cur = cur->next_in_chunk) ++live_count;
   CHECK(dfts.size() == live_count, "%zu DFT descriptors for %zu live chunks", dfts.size(),
         live_count);
+
+  if (!dfts.empty()) {
+    const uint64_t signature = dft_plan_signature(dfts);
+    std::vector<DftDescriptor> changed = dfts;
+    ++changed[0].decimation_factor;
+    CHECK(dft_plan_signature(changed) != signature,
+          "DFT signature ignored the decimation factor");
+    changed = dfts;
+    ++changed[0].due_scalar_slot;
+    CHECK(dft_plan_signature(changed) != signature, "DFT signature ignored the due slot");
+    changed = dfts;
+    changed[0].omega[0] += 1e-6;
+    CHECK(dft_plan_signature(changed) != signature, "DFT signature ignored the frequency table");
+    changed = dfts;
+    ++changed[0].source_field.id.value;
+    CHECK(dft_plan_signature(changed) != signature, "DFT signature ignored a source reference");
+  }
 
   size_t descriptor_index = 0;
   for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
@@ -671,6 +789,7 @@ int main(int argc, char **argv) {
   verbosity = 0;
 
   test_sources();
+  test_source_ordinals();
   test_derived_source_times_remain_host_custom();
   test_dfts();
   test_polarizations("lorentzian", new lorentzian_susceptibility(1.1, 1e-5),
