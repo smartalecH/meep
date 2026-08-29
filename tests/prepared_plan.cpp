@@ -152,6 +152,8 @@ static void check_region(const fields &f, const UpdateRegion &region) {
 static void check_prepared_updates() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  lorentzian_susceptibility susceptibility(1.1, 0.05);
+  s.add_susceptibility(eps_slab, E_stuff, susceptibility);
   fields f(&s);
   gaussian_src_time src(0.3, 0.1);
   src.is_integrated = false;
@@ -164,6 +166,7 @@ static void check_prepared_updates() {
   size_t update_ops = 0;
   size_t source_evaluations = 0, source_applications = 0;
   size_t dft_operations = 0;
+  size_t polarization_operations = 0, polarization_rows = 0, subtraction_rows = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
     if (op.kind == OpKind::evaluate_source_scalars) {
@@ -212,6 +215,26 @@ static void check_prepared_updates() {
               "DFT imaginary source is not read-only");
       }
     }
+    if (op.kind == OpKind::update_polarization) {
+      ++polarization_operations;
+      CHECK(size_t(op.descriptor_index) + op.descriptor_count <=
+                plan.polarization_updates.size(),
+            "polarization update span is out of range");
+      for (size_t i = op.descriptor_index;
+           i < size_t(op.descriptor_index) + op.descriptor_count; ++i) {
+        const PolarizationUpdate &d = plan.polarization_updates[i];
+        ++polarization_rows;
+        check_region(f, d.region);
+        CHECK(is_valid(d.p) && is_valid(d.p_prev) && is_valid(d.primary_w) &&
+                  is_valid(d.diagonal_sigma),
+              "polarization update lacks a required operand");
+        CHECK(has_access(op, d.p, AccessMode::read_write) &&
+                  has_access(op, d.p_prev, AccessMode::read_write) &&
+                  has_access(op, d.primary_w, AccessMode::read) &&
+                  has_access(op, d.diagonal_sigma, AccessMode::read),
+              "polarization update access set is incomplete");
+      }
+    }
     if (op.kind != OpKind::update_db && op.kind != OpKind::update_eh) continue;
     ++update_ops;
     CHECK(or_to_all(op.descriptor_count > 0), "%s has an empty descriptor span on every rank",
@@ -239,6 +262,20 @@ static void check_prepared_updates() {
       }
     }
     else {
+      CHECK(size_t(op.polarization_subtraction_index) + op.polarization_subtraction_count <=
+                plan.polarization_subtractions.size(),
+            "polarization subtraction span is out of range");
+      for (size_t i = op.polarization_subtraction_index;
+           i < size_t(op.polarization_subtraction_index) + op.polarization_subtraction_count;
+           ++i) {
+        const PolarizationSubtraction &d = plan.polarization_subtractions[i];
+        ++subtraction_rows;
+        CHECK(is_valid(d.target) && is_valid(d.p) && d.elements > 0,
+              "polarization subtraction lacks a required operand");
+        CHECK(has_access(op, d.target, AccessMode::read_write) &&
+                  has_access(op, d.p, AccessMode::read),
+              "polarization subtraction access set is incomplete");
+      }
       CHECK(size_t(op.descriptor_index) + op.descriptor_count <= plan.eh_updates.size(),
             "update_eh descriptor span is out of range");
       for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
@@ -267,6 +304,10 @@ static void check_prepared_updates() {
   }
   CHECK(update_ops == 4, "expected four Maxwell update operations, got %zu", update_ops);
   CHECK(dft_operations == 1, "expected one DFT update operation, got %zu", dft_operations);
+  CHECK(polarization_operations == 2, "expected two polarization operations, got %zu",
+        polarization_operations);
+  CHECK(or_to_all(polarization_rows > 0), "prepared plan contains no polarization updates");
+  CHECK(or_to_all(subtraction_rows > 0), "prepared plan contains no P subtractions");
   check_finite_value_accesses(f, plan);
   CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",
         source_evaluations);
@@ -292,6 +333,22 @@ static void check_prepared_updates() {
     changed.dft_updates[0].scale += std::complex<double>(0.0, 1e-6);
     CHECK(compute_step_plan_signature(changed) != plan.signature,
           "signature ignored a DFT complex-scale change");
+  }
+  if (!plan.polarization_updates.empty()) {
+    StepPlan changed = plan;
+    changed.polarization_updates[0].gamma += 1e-6;
+    CHECK(compute_step_plan_signature(changed) != plan.signature,
+          "signature ignored a polarization coefficient change");
+    changed = plan;
+    ++changed.polarization_updates[0].p.value;
+    CHECK(compute_step_plan_signature(changed) != plan.signature,
+          "signature ignored a polarization ArrayId change");
+  }
+  if (!plan.polarization_subtractions.empty()) {
+    StepPlan changed = plan;
+    ++changed.polarization_subtractions[0].elements;
+    CHECK(compute_step_plan_signature(changed) != plan.signature,
+          "signature ignored a polarization subtraction extent change");
   }
 }
 
