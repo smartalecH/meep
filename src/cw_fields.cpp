@@ -17,6 +17,7 @@
 
 #include "meep_internals.hpp"
 #include "bicgstab.hpp"
+#include "backend/backend.hpp"
 #include "backend/lifecycle.hpp"
 
 using namespace std;
@@ -143,6 +144,25 @@ static complex<double> estimate_eigfreq(complex<realnum> *b, complex<realnum> *x
    or until the estimated eigenfreq stops changing by <= eigtol (relative). */
 bool fields::solve_cw(double tol, int maxiters, complex<double> frequency, int L,
                       complex<double> *eigfreq, double eigtol, int eigiters) {
+  CwSolveRequest request;
+  request.tolerance = tol;
+  request.maxiters = maxiters;
+  request.frequency = frequency;
+  request.L = L;
+  request.eigfrequency = eigfreq != NULL;
+  request.entry_t = t;
+  request.entry_time = cw_source_time(t, dt, 0.0);
+  CwSolveResult result;
+  if (backend_try_solve_cw(*this, request, result)) {
+    if (verbosity > 0) {
+      master_printf("Finished resident solve_cw after %d iterations (%zu operator applications).\n",
+                    result.iterations, result.operator_applications);
+      if (result.status != CwSolveStatus::converged)
+        master_printf(" -- CONVERGENCE FAILURE in resident solve_cw!\n");
+    }
+    return result.status == CwSolveStatus::converged;
+  }
+
   if (is_real) meep::abort("solve_cw is incompatible with use_real_fields()");
   if (L < 1) meep::abort("solve_cw called with L = %d < 1", L);
   int tsave = t; // save time (gets incremented by iterations)
@@ -185,7 +205,7 @@ bool fields::solve_cw(double tol, int maxiters, complex<double> frequency, int L
   step_source(B_stuff, true);
   step_boundaries(B_stuff);
   update_eh(H_stuff);
-  calc_sources(time() + 0.5 * dt);
+  calc_sources(cw_source_time(t, dt, 0.5));
   step_source(D_stuff, true);
   step_boundaries(D_stuff);
   update_eh(E_stuff);
@@ -257,13 +277,23 @@ bool fields::solve_cw(double tol, int maxiters, complex<double> frequency, int L
 bool fields::solve_cw(double tol, int maxiters, int L, complex<double> *eigfreq, double eigtol,
                       int eigiters) {
   complex<double> freq = 0.0;
+  std::string resident_error;
   for (src_time *s = sources; s; s = s->next) {
     complex<double> sf = s->frequency();
-    if (sf != freq && freq != 0.0 && sf != 0.0)
-      meep::abort("must pass frequency to solve_cw if sources do not agree");
+    if (sf != freq && freq != 0.0 && sf != 0.0) {
+      resident_error = "implicit solve_cw source frequencies do not agree";
+      break;
+    }
     if (sf != 0.0) freq = sf;
   }
-  if (freq == 0.0) meep::abort("must pass frequency to solve_cw if sources do not specify one");
+  if (resident_error.empty() && freq == 0.0)
+    resident_error = "implicit solve_cw sources do not specify a nonzero frequency";
+  if (backend && backend->requires_full_storage_preparation())
+    backend_reconcile_host_access(resident_error, "fields::solve_cw implicit frequency");
+  if (!resident_error.empty()) {
+    meep::abort("must pass frequency to solve_cw if sources do not %s",
+                freq == 0.0 ? "specify one" : "agree");
+  }
   return solve_cw(tol, maxiters, freq, L, eigfreq, eigtol, eigiters);
 }
 

@@ -9,7 +9,9 @@
 /* Backend selection, lifecycle, and the backend-safe access points. */
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <new>
 #include <stdexcept>
 #include <string>
 
@@ -18,6 +20,7 @@
 #include "backend/backend.hpp"
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/descriptors.hpp"
+#include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
@@ -26,7 +29,129 @@
 
 namespace meep {
 
+static int cw_clone_fail_after_for_testing = -1;
+static bool cw_plan_corruption_for_testing = false;
+
+void backend_set_cw_clone_fail_after_for_testing(int checkpoints) {
+  cw_clone_fail_after_for_testing = checkpoints;
+}
+
+void backend_cw_clone_checkpoint() {
+  if (cw_clone_fail_after_for_testing < 0) return;
+  if (cw_clone_fail_after_for_testing-- == 0) throw std::bad_alloc();
+}
+
+void backend_set_cw_plan_corruption_for_testing(bool enabled) {
+  cw_plan_corruption_for_testing = enabled;
+}
+
 namespace {
+
+bool has_cw_source_amplitude(const fields &f) {
+  bool present = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    const fields_chunk &fc = *f.chunks[chunk];
+    if (!fc.is_mine()) continue;
+    FOR_FIELD_TYPES(ft) for (const src_vol &source : fc.get_sources(ft))
+      for (size_t point = 0; point < source.num_points(); ++point)
+        present = present || source.amplitude_at(point) != std::complex<double>(0.0, 0.0);
+  }
+  return or_to_all(present);
+}
+
+bool has_cw_material_topology(const fields &f) {
+  bool unsupported = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    const structure_chunk *s = f.chunks[chunk]->s;
+    if (!s) continue;
+    unsupported = unsupported || s->has_nonlinearities();
+    FOR_FIELD_TYPES(ft) unsupported = unsupported || s->chiP[ft] != NULL;
+  }
+  return or_to_all(unsupported);
+}
+
+void audit_resident_cw_layout(const fields &f, const CwStateLayout &layout) {
+  if (is_dirty(f, dirty_storage))
+    throw std::logic_error("resident solve_cw requires clean prepared storage");
+  if (!f.array_catalog || audit_storage_catalog(const_cast<fields &>(f), *f.array_catalog, false))
+    throw std::logic_error("resident solve_cw requires a complete live storage catalog");
+
+  size_t row_index = 0;
+  auto require_pair = [&](int chunk, const fields_chunk &fc, component traversal, component storage,
+                          CwStateFamily family, realnum *real_array, realnum *imag_array,
+                          bool primary_present) {
+    if ((real_array != NULL) != (imag_array != NULL))
+      throw std::logic_error("resident solve_cw found a live half-pair");
+    if (!real_array) return;
+    if (!primary_present)
+      throw std::logic_error("resident solve_cw found optional state without its primary field");
+    if (row_index >= layout.rows.size())
+      throw std::logic_error("resident solve_cw layout omits live field state");
+    const CwStateRow &row = layout.rows[row_index++];
+    if (row.chunk != chunk || row.traversal_component != traversal ||
+        row.storage_component != storage || row.family != family ||
+        !is_valid(row.real_array) || !is_valid(row.imag_array) ||
+        f.array_catalog->resolve_untyped(row.real_array) != real_array ||
+        f.array_catalog->resolve_untyped(row.imag_array) != imag_array ||
+        row.complex_count != size_t(fc.gv.nowned(traversal)))
+      throw std::logic_error("resident solve_cw layout does not exactly cover live field state");
+  };
+
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    const fields_chunk &fc = *f.chunks[chunk];
+    FOR_COMPONENTS(c) {
+      if (!is_D(c) && !is_B(c)) continue;
+      const bool primary_present = fc.f[c][0] && fc.f[c][1];
+      require_pair(chunk, fc, c, c, CwStateFamily::primary, fc.f[c][0], fc.f[c][1],
+                   primary_present);
+      require_pair(chunk, fc, c, c, CwStateFamily::pml_u, fc.f_u[c][0], fc.f_u[c][1],
+                   primary_present);
+      require_pair(chunk, fc, c, c, CwStateFamily::conductivity, fc.f_cond[c][0],
+                   fc.f_cond[c][1], primary_present);
+      require_pair(chunk, fc, c, c, CwStateFamily::bfast, fc.f_bfast[c][0], fc.f_bfast[c][1],
+                   primary_present);
+      const component paired = field_type_component(is_D(c) ? E_stuff : H_stuff, c);
+      require_pair(chunk, fc, c, paired, CwStateFamily::constitutive_w, fc.f_w[paired][0],
+                   fc.f_w[paired][1], primary_present);
+      if (fc.f_w[paired][0])
+        require_pair(chunk, fc, c, paired, CwStateFamily::paired_primary, fc.f[paired][0],
+                     fc.f[paired][1], primary_present);
+    }
+  }
+  if (row_index != layout.rows.size())
+    throw std::logic_error("resident solve_cw layout contains a non-live field row");
+}
+
+std::string cheap_cw_rejection(const fields &f, const CwSolveRequest &request,
+                               bool live_magnetic_snapshot) {
+  if (f.backend->is_poisoned()) return "resident backend is poisoned";
+  if (!std::isfinite(request.tolerance) || request.tolerance <= 0.0)
+    return "solve_cw tolerance must be finite and positive";
+  if (!std::isfinite(real(request.frequency)) || !std::isfinite(imag(request.frequency)) ||
+      request.frequency == std::complex<double>(0.0, 0.0))
+    return "solve_cw frequency must be finite and nonzero";
+  if (request.L < 1) return "solve_cw requires L >= 1";
+  if (request.maxiters < 1) return "solve_cw requires maxiters >= 1";
+  if (request.eigfrequency)
+    return "resident solve_cw does not support eigfrequency/shift-invert requests";
+  if (f.is_real) return "resident solve_cw does not support real fields";
+  if (count_processors() != 1) return "resident solve_cw does not support MPI decomposition";
+  if (f.gv.dim == Dcyl) return "resident solve_cw supports only Cartesian coordinates";
+  if (f.beta != 0.0) return "resident solve_cw does not support beta coordinates";
+  for (double value : f.bfast_scaled_k)
+    if (value != 0.0) return "resident solve_cw does not support BFAST coordinates";
+  if (f.phasein_time > 0) return "resident solve_cw does not support active material phasing";
+  if (live_magnetic_snapshot)
+    return "resident solve_cw does not support a live magnetic snapshot";
+  if (f.fluxes) return "resident solve_cw does not support legacy flux accumulators";
+  if (has_cw_material_topology(f))
+    return "resident solve_cw does not support dispersion, polarization, or nonlinear media";
+  if (!has_cw_source_amplitude(f)) return "resident solve_cw requires a nonzero source amplitude";
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_solving_cw()) return "resident solve_cw is already active";
+  return std::string();
+}
 
 struct field_refresh_data {
   fields *owner;
@@ -89,12 +214,306 @@ void release_backend_state_for_rebuild(fields &f, DirtyMask reasons) {
   if (f.backend_state) f.backend->prepare_state_rebuild(*f.backend_state, reasons);
   delete f.executable;
   f.executable = NULL;
-  delete f.backend_state;
-  f.backend_state = NULL;
+  destroy_backend_state(f.backend_state);
 }
 
 } // namespace
 
+double cw_source_time(int t, double dt, double offset_in_dt) {
+  volatile double tnow = double(t) * dt;
+  return tnow + offset_in_dt * dt;
+}
+
+void destroy_backend_state(BackendState *&state) {
+  if (!state) return;
+  state->clear_cw_executable();
+  delete state;
+  state = NULL;
+}
+
+CwSolveSession::CwSolveSession(fields &owner, const CwSolveRequest &request)
+    : owner_(owner), entry_t_(request.entry_t), boundary_called_(false) {
+  for (int i = 0; i < owner_.num_chunks; ++i)
+    owner_.chunks[i]->set_solve_cw_omega(2.0 * pi * request.frequency);
+}
+
+CwSolveSession::~CwSolveSession() {
+  for (int i = 0; i < owner_.num_chunks; ++i)
+    owner_.chunks[i]->unset_solve_cw_omega();
+  owner_.t = entry_t_;
+}
+
+void CwSolveSession::restore_before_final_dft() noexcept {
+  for (int i = 0; i < owner_.num_chunks; ++i)
+    owner_.chunks[i]->unset_solve_cw_omega();
+  owner_.t = entry_t_;
+  boundary_called_ = true;
+}
+
+bool CwSolveSession::at_entry_state() const {
+  if (owner_.t != entry_t_) return false;
+  for (int i = 0; i < owner_.num_chunks; ++i)
+    if (owner_.chunks[i]->is_solving_cw()) return false;
+  return true;
+}
+
+class PreparedBackendEpoch {
+public:
+  explicit PreparedBackendEpoch(fields &owner)
+      : owner_(owner), committed_(false), old_chunks_(owner.chunks), old_halos_(owner.halos),
+        old_catalog_(owner.array_catalog), old_storage_(owner.storage_plan),
+        old_descriptors_(owner.descriptors), old_initialization_(owner.initialization_plan),
+        old_state_(owner.backend_state), old_executable_(owner.executable),
+        old_dirty_mask_(owner.dirty_mask), old_components_allocated_(owner.components_allocated),
+        old_connections_generation_(owner.connections_generation),
+        old_connections_built_generation_(owner.connections_built_generation),
+        old_local_invalidation_generation_(owner.local_invalidation_generation),
+        old_local_invalidation_synced_(owner.local_invalidation_synced),
+        old_storage_prepared_mask_(owner.storage_prepared_mask),
+        old_prepared_classification_hash_(owner.prepared_classification_hash),
+        old_classification_reentries_(owner.classification_reentries),
+        old_chunk_connections_valid_(owner.chunk_connections_valid),
+        old_changed_materials_(owner.changed_materials) {
+    old_step_plans_[0] = owner.step_plans[0];
+    old_step_plans_[1] = owner.step_plans[1];
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      old_mutation_generation_[i] = owner.mutation_generation[i];
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft) old_comm_blocks_[ft] = owner.comm_blocks[ft];
+
+    std::vector<std::unique_ptr<fields_chunk> > chunks(size_t(owner.num_chunks));
+    for (int i = 0; i < owner.num_chunks; ++i) {
+      chunks[size_t(i)].reset(new fields_chunk(*old_chunks_[i], i));
+      fields_chunk &staged = *chunks[size_t(i)];
+      const fields_chunk &old = *old_chunks_[i];
+      std::unique_ptr<structure_chunk> staged_structure(new structure_chunk(old.s));
+      staged_structure->update_condinv();
+      if (staged.s->refcount-- <= 1) delete staged.s;
+      staged.s = staged_structure.release();
+      FOR_FIELD_TYPES(ft) {
+        std::vector<src_vol> staged_sources(old.sources[ft]);
+        staged.sources[ft].swap(staged_sources);
+        staged.npol[ft] = old.npol[ft];
+      }
+      DOCMP2 FOR_COMPONENTS(c) {
+        const size_t n = size_t(old.gv.ntot());
+#define COPY_BACKUP(name)                                                                          \
+  if (old.name[c][cmp]) {                                                                          \
+    staged.name[c][cmp] = new realnum[n];                                                          \
+    memcpy(staged.name[c][cmp], old.name[c][cmp], n * sizeof(realnum));                            \
+    backend_cw_clone_checkpoint();                                                                 \
+  }
+        COPY_BACKUP(f_backup)
+        COPY_BACKUP(f_u_backup)
+        COPY_BACKUP(f_w_backup)
+        COPY_BACKUP(f_cond_backup)
+        COPY_BACKUP(f_bfast_backup)
+#undef COPY_BACKUP
+      }
+      if (old.f_rderiv_int) {
+        staged.f_rderiv_int = new realnum[old.gv.ntot()];
+        memcpy(staged.f_rderiv_int, old.f_rderiv_int, old.gv.ntot() * sizeof(realnum));
+        backend_cw_clone_checkpoint();
+      }
+      backend_cw_clone_checkpoint();
+    }
+
+    std::unique_ptr<fields_chunk *[]> chunk_array(new fields_chunk *[size_t(owner.num_chunks)]);
+    backend_cw_clone_checkpoint();
+    for (int i = 0; i < owner.num_chunks; ++i) chunk_array[size_t(i)] = chunks[size_t(i)].get();
+    std::unique_ptr<halo_plan_set> halos(new halo_plan_set);
+    backend_cw_clone_checkpoint();
+    std::unique_ptr<CpuArrayCatalog> catalog(new CpuArrayCatalog);
+    backend_cw_clone_checkpoint();
+    std::unique_ptr<StoragePlan> storage(new StoragePlan);
+    backend_cw_clone_checkpoint();
+    std::unique_ptr<DescriptorSet> descriptors(new DescriptorSet);
+    backend_cw_clone_checkpoint();
+    std::unique_ptr<realnum *[]> comm_blocks[NUM_FIELD_TYPES];
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft) {
+      comm_blocks[ft].reset(new realnum *[size_t(owner.num_chunks) * size_t(owner.num_chunks)]);
+      backend_cw_clone_checkpoint();
+      std::fill(comm_blocks[ft].get(),
+                comm_blocks[ft].get() + size_t(owner.num_chunks) * size_t(owner.num_chunks),
+                static_cast<realnum *>(NULL));
+    }
+
+    /* No operation below allocates or copies. DFT chains remain attached to
+       the live chunks until this final publication tail. */
+    for (int i = 0; i < owner.num_chunks; ++i) {
+      chunks[size_t(i)]->dft_chunks = old_chunks_[i]->dft_chunks;
+      old_chunks_[i]->dft_chunks = NULL;
+      for (dft_chunk *dft = chunks[size_t(i)]->dft_chunks; dft; dft = dft->next_in_chunk)
+        dft->fc = chunks[size_t(i)].get();
+    }
+    owner.chunks = chunk_array.release();
+    for (int i = 0; i < owner.num_chunks; ++i) chunks[size_t(i)].release();
+    owner.halos = halos.release();
+    owner.array_catalog = catalog.release();
+    owner.storage_plan = storage.release();
+    owner.descriptors = descriptors.release();
+    owner.initialization_plan = NULL;
+    owner.step_plans[0] = owner.step_plans[1] = NULL;
+    owner.backend_state = NULL;
+    owner.executable = NULL;
+    old_comm_sizes_.swap(owner.comm_sizes);
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft) {
+      owner.comm_blocks[ft] = comm_blocks[ft].release();
+      std::swap(old_comms_sequence_[ft], owner.comms_sequence_for_field[ft]);
+    }
+    owner.dirty_mask |= dirty_initialization | dirty_source_plan | dirty_monitor_plan |
+                        dirty_storage | dirty_regions | dirty_halos | dirty_executable |
+                        dirty_classification;
+    owner.storage_prepared_mask = 0;
+    owner.prepared_classification_hash = 0;
+    owner.classification_reentries = 0;
+    owner.connections_built_generation = 0;
+    note_connections_invalidated(owner);
+    mark_local_invalidation(owner);
+    owner.chunk_connections_valid = false;
+    owner.changed_materials = true;
+  }
+
+  ~PreparedBackendEpoch() {
+    if (!committed_) restore();
+  }
+
+  void commit() {
+    if (committed_) return;
+    fields_chunk **staged_chunks = owner_.chunks;
+    for (int i = 0; i < owner_.num_chunks; ++i) {
+      fields_chunk &live = *old_chunks_[i];
+      fields_chunk &staged = *staged_chunks[i];
+      live.swap_prepared_state(staged);
+      live.dft_chunks = staged.dft_chunks;
+      staged.dft_chunks = NULL;
+      for (dft_chunk *dft = live.dft_chunks; dft; dft = dft->next_in_chunk) dft->fc = &live;
+    }
+    owner_.chunks = old_chunks_;
+    if (old_state_) old_state_->clear_cw_executable();
+    delete old_executable_;
+    destroy_backend_state(old_state_);
+    delete old_initialization_;
+    delete old_step_plans_[0];
+    delete old_step_plans_[1];
+    delete old_descriptors_;
+    delete old_catalog_;
+    delete old_storage_;
+    delete old_halos_;
+    delete_comm_blocks(old_comm_blocks_);
+    for (int i = 0; i < owner_.num_chunks; ++i) delete staged_chunks[i];
+    delete[] staged_chunks;
+    committed_ = true;
+  }
+
+private:
+  PreparedBackendEpoch(const PreparedBackendEpoch &);
+  PreparedBackendEpoch &operator=(const PreparedBackendEpoch &);
+
+  void delete_comm_blocks(realnum **blocks[NUM_FIELD_TYPES]) {
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft) {
+      if (!blocks[ft]) continue;
+      for (int i = 0; i < owner_.num_chunks * owner_.num_chunks; ++i) delete[] blocks[ft][i];
+      delete[] blocks[ft];
+      blocks[ft] = NULL;
+    }
+  }
+
+  void restore() {
+    fields_chunk **staged_chunks = owner_.chunks;
+    halo_plan_set *staged_halos = owner_.halos;
+    CpuArrayCatalog *staged_catalog = owner_.array_catalog;
+    StoragePlan *staged_storage = owner_.storage_plan;
+    DescriptorSet *staged_descriptors = owner_.descriptors;
+    InitializationPlan *staged_initialization = owner_.initialization_plan;
+    StepPlan *staged_step_plans[2] = {owner_.step_plans[0], owner_.step_plans[1]};
+    Executable *staged_executable = owner_.executable;
+    BackendState *staged_state = owner_.backend_state;
+    realnum **staged_comm_blocks[NUM_FIELD_TYPES];
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft)
+      staged_comm_blocks[ft] = owner_.comm_blocks[ft];
+
+    if (staged_state) staged_state->clear_cw_executable();
+    delete staged_executable;
+    destroy_backend_state(staged_state);
+    for (int i = 0; i < owner_.num_chunks; ++i) {
+      old_chunks_[i]->dft_chunks = staged_chunks[i]->dft_chunks;
+      for (dft_chunk *dft = old_chunks_[i]->dft_chunks; dft; dft = dft->next_in_chunk)
+        dft->fc = old_chunks_[i];
+      staged_chunks[i]->dft_chunks = NULL;
+    }
+    owner_.chunks = old_chunks_;
+    owner_.halos = old_halos_;
+    owner_.array_catalog = old_catalog_;
+    owner_.storage_plan = old_storage_;
+    owner_.descriptors = old_descriptors_;
+    owner_.initialization_plan = old_initialization_;
+    owner_.step_plans[0] = old_step_plans_[0];
+    owner_.step_plans[1] = old_step_plans_[1];
+    owner_.backend_state = old_state_;
+    owner_.executable = old_executable_;
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft) {
+      owner_.comm_blocks[ft] = old_comm_blocks_[ft];
+      std::swap(owner_.comms_sequence_for_field[ft], old_comms_sequence_[ft]);
+    }
+    owner_.comm_sizes.swap(old_comm_sizes_);
+    owner_.dirty_mask = old_dirty_mask_;
+    owner_.components_allocated = old_components_allocated_;
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      owner_.mutation_generation[i] = old_mutation_generation_[i];
+    owner_.connections_generation = old_connections_generation_;
+    owner_.connections_built_generation = old_connections_built_generation_;
+    owner_.local_invalidation_generation = old_local_invalidation_generation_;
+    owner_.local_invalidation_synced = old_local_invalidation_synced_;
+    owner_.storage_prepared_mask = old_storage_prepared_mask_;
+    owner_.prepared_classification_hash = old_prepared_classification_hash_;
+    owner_.classification_reentries = old_classification_reentries_;
+    owner_.chunk_connections_valid = old_chunk_connections_valid_;
+    owner_.changed_materials = old_changed_materials_;
+
+    delete staged_initialization;
+    delete staged_step_plans[0];
+    delete staged_step_plans[1];
+    delete staged_descriptors;
+    delete staged_catalog;
+    delete staged_storage;
+    delete staged_halos;
+    delete_comm_blocks(staged_comm_blocks);
+    for (int i = 0; i < owner_.num_chunks; ++i) delete staged_chunks[i];
+    delete[] staged_chunks;
+  }
+
+  fields &owner_;
+  bool committed_;
+  fields_chunk **old_chunks_;
+  halo_plan_set *old_halos_;
+  CpuArrayCatalog *old_catalog_;
+  StoragePlan *old_storage_;
+  DescriptorSet *old_descriptors_;
+  InitializationPlan *old_initialization_;
+  StepPlan *old_step_plans_[2];
+  BackendState *old_state_;
+  Executable *old_executable_;
+  realnum **old_comm_blocks_[NUM_FIELD_TYPES];
+  std::unordered_map<comms_key, size_t, comms_key_hash_fn> old_comm_sizes_;
+  comms_sequence old_comms_sequence_[NUM_FIELD_TYPES];
+  DirtyMask old_dirty_mask_;
+  bool old_components_allocated_;
+  uint64_t old_mutation_generation_[fields::num_mutation_kinds];
+  uint64_t old_connections_generation_;
+  uint64_t old_connections_built_generation_;
+  uint64_t old_local_invalidation_generation_;
+  uint64_t old_local_invalidation_synced_;
+  uint32_t old_storage_prepared_mask_;
+  uint64_t old_prepared_classification_hash_;
+  uint32_t old_classification_reentries_;
+  bool old_chunk_connections_valid_;
+  bool old_changed_materials_;
+};
+
+/* Reversible storage/connection epoch used only by resident solve_cw
+   preparation. The supported PR7 slice has no polarization, BFAST,
+   cylindrical scratch, material phase, or magnetic backup topology, so the
+   existing storage preparation may only fill previously-null raw slots. */
 backend_capabilities fields::backend_caps() const {
   if (backend) return backend->capabilities();
   backend_capabilities c;
@@ -207,8 +626,7 @@ void backend_commit_field_layout_change(fields &f) {
   if (f.backend_state) {
     delete f.executable;
     f.executable = NULL;
-    delete f.backend_state;
-    f.backend_state = NULL;
+    destroy_backend_state(f.backend_state);
   }
 }
 
@@ -572,6 +990,204 @@ void fields::init_backend() {
     backend->finalize_storage(*storage_plan, *backend_state);
     clear_dirty(*this, dirty_classification);
   }
+}
+
+bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResult &result) {
+  /* A missing backend and the host-authoritative CPU backend retain the exact
+     legacy solve_cw path, including its lazy allocation and MPI behavior. */
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return false;
+
+  std::string local_error;
+  try {
+    std::string why;
+    if (!f.backend->supports_cw(request, why))
+      local_error = why.empty() ? "resident backend does not support solve_cw" : why;
+    if (local_error.empty())
+      local_error = cheap_cw_rejection(f, request, f.synchronized_magnetic_fields != 0);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident solve_cw capability failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::solve_cw cheap preflight");
+
+  const DirtyMask structural_dirty =
+      DirtyMask(dirty_source_plan | dirty_monitor_plan | dirty_storage | dirty_regions |
+                dirty_halos | dirty_executable | dirty_classification);
+  const bool stage_epoch = !f.backend_state || !f.executable || (f.dirty_mask & structural_dirty);
+  std::unique_ptr<PreparedBackendEpoch> prepared_epoch;
+  if (stage_epoch && f.backend_state) {
+    try {
+      f.backend->prepare_state_rebuild(*f.backend_state, DirtyMask(f.dirty_mask));
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown solve_cw state-migration failure";
+    }
+    backend_reconcile_host_access(local_error, "fields::solve_cw state migration");
+  }
+
+  if (stage_epoch) {
+    PreparedBackendEpoch *local_epoch = NULL;
+    try {
+      local_epoch = new PreparedBackendEpoch(f);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown solve_cw epoch preparation failure";
+    }
+    const bool failed = or_to_all(!local_error.empty());
+    if (failed) {
+      delete local_epoch;
+      if (local_error.empty())
+        throw std::runtime_error("fields::solve_cw epoch preparation failed on another MPI rank");
+      throw std::runtime_error(std::string("fields::solve_cw epoch preparation: ") + local_error);
+    }
+    prepared_epoch.reset(local_epoch);
+  }
+
+  Executable *ordinary_executable = NULL;
+  BackendState *state = NULL;
+  const StepPlan *cw_step_plan = NULL;
+  CwPlan cw_plan;
+  uint64_t storage_fingerprint = 0;
+  bool cache_matches = false;
+  Executable *old_cw_executable = NULL;
+  Executable *replacement = NULL;
+  Executable *rogue_cache_executable = NULL;
+  uint64_t old_cw_storage_fingerprint = 0;
+  uint64_t old_cw_step_plan_signature = 0;
+  uint64_t old_cw_plan_signature = 0;
+  bool captured_cw_cache = false;
+  try {
+    if (stage_epoch) {
+      /* Source promotion and boundary relocation belong to the staged epoch:
+         both may rewrite chunk-local source rows and realize new field slots. */
+      f.require_source_components();
+      f.init_backend();
+      f.ensure_backend_executable();
+    }
+    ordinary_executable = f.executable;
+    state = f.backend_state;
+    if (!ordinary_executable || !state)
+      throw std::logic_error("resident solve_cw has no prepared ordinary backend epoch");
+    cw_step_plan = &f.step_plan_for(StepProgram::solve_cw);
+    audit_resident_cw_layout(f, cw_step_plan->cw_state_layout);
+    cw_plan = build_cw_plan(f, *cw_step_plan);
+    if (cw_plan_corruption_for_testing) cw_plan.signature ^= 1;
+    std::string validation_error;
+    if (!validate_cw_plan(f, *cw_step_plan, cw_plan, &validation_error))
+      throw std::logic_error(validation_error.empty() ? "invalid canonical solve_cw plan"
+                                                       : validation_error);
+
+    storage_fingerprint = cw_step_plan->cw_state_layout.storage_fingerprint;
+    cache_matches = !stage_epoch && state->cw_executable &&
+                    state->cw_storage_fingerprint == storage_fingerprint &&
+                    state->cw_step_plan_signature == cw_step_plan->signature &&
+                    state->cw_plan_signature == cw_plan.signature;
+    old_cw_executable = state->cw_executable;
+    old_cw_storage_fingerprint = state->cw_storage_fingerprint;
+    old_cw_step_plan_signature = state->cw_step_plan_signature;
+    old_cw_plan_signature = state->cw_plan_signature;
+    captured_cw_cache = true;
+    replacement = f.backend->preflight_cw(request, *cw_step_plan, cw_plan,
+                                            cache_matches ? old_cw_executable : NULL, *state);
+    if (!replacement) throw std::runtime_error("backend returned no solve_cw executable");
+    if (replacement == ordinary_executable)
+      throw std::runtime_error("backend aliased the ordinary and solve_cw executables");
+    if (!cache_matches && replacement == old_cw_executable)
+      throw std::runtime_error("backend reused a solve_cw executable with a stale cache key");
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident solve_cw compiled preflight failure";
+  }
+
+  if (captured_cw_cache && state &&
+      (state->cw_executable != old_cw_executable ||
+                state->cw_storage_fingerprint != old_cw_storage_fingerprint ||
+                state->cw_step_plan_signature != old_cw_step_plan_signature ||
+       state->cw_plan_signature != old_cw_plan_signature)) {
+    rogue_cache_executable = state->cw_executable;
+    state->cw_executable = old_cw_executable;
+    state->cw_storage_fingerprint = old_cw_storage_fingerprint;
+    state->cw_step_plan_signature = old_cw_step_plan_signature;
+    state->cw_plan_signature = old_cw_plan_signature;
+    if (local_error.empty())
+      local_error = "backend mutated the solve_cw cache during preflight";
+  }
+
+  const bool preflight_failed = or_to_all(!local_error.empty());
+  if (preflight_failed) {
+    if (rogue_cache_executable && rogue_cache_executable != old_cw_executable &&
+        rogue_cache_executable != replacement && rogue_cache_executable != ordinary_executable)
+      delete rogue_cache_executable;
+    if (replacement && replacement != old_cw_executable && replacement != ordinary_executable)
+      delete replacement;
+    prepared_epoch.reset();
+    if (local_error.empty())
+      throw std::runtime_error("fields::solve_cw compiled preflight failed on another MPI rank");
+    throw std::runtime_error(std::string("fields::solve_cw compiled preflight: ") + local_error);
+  }
+
+  if (replacement != old_cw_executable) {
+    state->cw_executable = replacement;
+    delete old_cw_executable;
+  }
+  state->cw_storage_fingerprint = storage_fingerprint;
+  state->cw_step_plan_signature = cw_step_plan->signature;
+  state->cw_plan_signature = cw_plan.signature;
+  if (prepared_epoch) prepared_epoch->commit();
+
+  local_error.clear();
+  try {
+    /* A value-only refresh is deliberately beyond the retryable preflight
+       boundary: canonical plans and both executables remain reusable, but a
+       partially failed device upload cannot be rolled back. */
+    if (!stage_epoch && is_dirty(f, dirty_initialization)) f.init_backend();
+    {
+      CwSolveSession session(f, request);
+      result = f.backend->solve_cw(request, *cw_step_plan, cw_plan, *ordinary_executable,
+                                   *state->cw_executable, *state, session);
+      if (!session.boundary_called() || !session.at_entry_state())
+        throw std::runtime_error("backend did not restore solve_cw state before final DFT");
+      switch (result.status) {
+        case CwSolveStatus::converged:
+        case CwSolveStatus::not_converged:
+        case CwSolveStatus::breakdown: break;
+        default: throw std::runtime_error("backend returned an invalid solve_cw status");
+      }
+      if (result.iterations < 0 || result.iterations > request.maxiters ||
+          result.operator_applications == 0 ||
+          !std::isfinite(result.recursive_relative_residual) ||
+          result.recursive_relative_residual < 0.0 ||
+          !std::isfinite(result.true_relative_residual) || result.true_relative_residual < 0.0)
+        throw std::runtime_error("backend returned an invalid solve_cw result");
+    }
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident solve_cw dispatch failure";
+  }
+
+  if (or_to_all(!local_error.empty())) {
+    f.backend->poison();
+    if (local_error.empty())
+      throw std::runtime_error("fields::solve_cw dispatch failed on another MPI rank; backend poisoned");
+    throw std::runtime_error(std::string("fields::solve_cw dispatch failed; backend poisoned: ") +
+                             local_error);
+  }
+  return true;
 }
 
 /* --- Backend-safe access -------------------------------------------------- */

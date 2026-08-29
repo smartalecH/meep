@@ -259,7 +259,7 @@ fields::~fields() {
   /* Backend objects may refer to every prepared artifact below, and device
      state needs a complete type-erased destructor to release its resources. */
   delete executable;
-  delete backend_state;
+  destroy_backend_state(backend_state);
   delete backend;
   delete initialization_plan;
   delete halos;
@@ -307,7 +307,7 @@ bool fields::have_component(component c) {
   return false;
 }
 
-fields_chunk::~fields_chunk() {
+void fields_chunk::release_owned_data() noexcept {
   is_real = 0; // So that we can make sure to delete everything...
   // for mu=1 non-PML regions, H==B to save space/time - don't delete twice!
   DOCMP2 FOR_H_AND_B(hc, bc) {
@@ -347,9 +347,13 @@ fields_chunk::~fields_chunk() {
       delete p;
     }
   }
-  if (s->refcount-- <= 1) delete s;                  // delete if not shared
+  if (s && s->refcount-- <= 1) delete s;             // delete if not shared
+  s = NULL;
   if (new_s && new_s->refcount-- <= 1) delete new_s; // delete if not shared
+  new_s = NULL;
 }
+
+fields_chunk::~fields_chunk() { release_owned_data(); }
 
 void split_into_tiles(grid_volume gvol, std::vector<grid_volume> *result,
                       const size_t loop_tile_base) {
@@ -445,40 +449,13 @@ fields_chunk::fields_chunk(structure_chunk *the_s, const char *od, double m, dou
 
 fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv), v(thef.v) {
   chunk_idx = chunkidx;
-  s = thef.s;
-  s->refcount++;
-  outdir = thef.outdir;
-  m = thef.m;
-  bfast_scaled_k = thef.bfast_scaled_k;
-  zero_fields_near_cylorigin = thef.zero_fields_near_cylorigin;
-  beta = thef.beta;
-  new_s = thef.new_s;
-  if (new_s) new_s->refcount++;
-  is_real = thef.is_real;
-  a = thef.a;
-  Courant = thef.Courant;
-  dt = thef.dt;
+  s = new_s = NULL;
   dft_chunks = NULL;
-  gvs_tiled = thef.gvs_tiled;
-  FOR_FIELD_TYPES(ft) { gvs_eh[ft] = thef.gvs_eh[ft]; }
+  f_rderiv_int = NULL;
   FOR_FIELD_TYPES(ft) {
+    npol[ft] = 0;
     pol[ft] = NULL;
-    polarization_state *cur = NULL;
-    for (polarization_state *ocur = thef.pol[ft]; ocur; ocur = ocur->next) {
-      polarization_state *p = new polarization_state;
-      p->data = NULL;
-      p->s = ocur->s;
-      p->next = NULL;
-      if (ocur->data) p->data = p->s->copy_internal_data(ocur->data);
-      if (cur) {
-        cur->next = p;
-        cur = p;
-      }
-      else { pol[ft] = cur = p; }
-    }
   }
-  doing_solve_cw = thef.doing_solve_cw;
-  solve_cw_omega = thef.solve_cw_omega;
   FOR_COMPONENTS(c) DOCMP2 {
     f[c][cmp] = NULL;
     f_u[c][cmp] = NULL;
@@ -493,49 +470,129 @@ fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv)
     f_cond_backup[c][cmp] = NULL;
     f_bfast_backup[c][cmp] = NULL;
   }
-  FOR_COMPONENTS(c) DOCMP {
-    if (!is_magnetic(c) && thef.f[c][cmp]) {
-      f[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f[c][cmp], thef.f[c][cmp], sizeof(realnum) * gv.ntot());
+  try {
+    s = thef.s;
+    s->refcount++;
+    backend_cw_clone_checkpoint();
+    outdir = thef.outdir;
+    m = thef.m;
+    bfast_scaled_k = thef.bfast_scaled_k;
+    zero_fields_near_cylorigin = thef.zero_fields_near_cylorigin;
+    beta = thef.beta;
+    new_s = thef.new_s;
+    if (new_s) new_s->refcount++;
+    is_real = thef.is_real;
+    a = thef.a;
+    Courant = thef.Courant;
+    dt = thef.dt;
+    gvs_tiled = thef.gvs_tiled;
+    FOR_FIELD_TYPES(ft) { gvs_eh[ft] = thef.gvs_eh[ft]; }
+    FOR_FIELD_TYPES(ft) {
+      polarization_state *cur = NULL;
+      for (polarization_state *ocur = thef.pol[ft]; ocur; ocur = ocur->next) {
+        std::unique_ptr<polarization_state> p(new polarization_state);
+        p->data = NULL;
+        p->s = ocur->s;
+        p->next = NULL;
+        if (ocur->data) p->data = p->s->copy_internal_data(ocur->data);
+        if (cur) {
+          cur->next = p.release();
+          cur = cur->next;
+        }
+        else {
+          pol[ft] = p.release();
+          cur = pol[ft];
+        }
+        backend_cw_clone_checkpoint();
+      }
     }
-    if (thef.f_u[c][cmp]) {
-      f_u[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f_u[c][cmp], thef.f_u[c][cmp], sizeof(realnum) * gv.ntot());
+    doing_solve_cw = thef.doing_solve_cw;
+    solve_cw_omega = thef.solve_cw_omega;
+    FOR_COMPONENTS(c) DOCMP {
+      if (!is_magnetic(c) && thef.f[c][cmp]) {
+        f[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f[c][cmp], thef.f[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
+      if (thef.f_u[c][cmp]) {
+        f_u[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f_u[c][cmp], thef.f_u[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
+      if (thef.f_w[c][cmp]) {
+        f_w[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f_w[c][cmp], thef.f_w[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
+      if (thef.f_cond[c][cmp]) {
+        f_cond[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f_cond[c][cmp], thef.f_cond[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
+      if (thef.f_bfast[c][cmp]) {
+        f_bfast[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f_bfast[c][cmp], thef.f_bfast[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
     }
-    if (thef.f_w[c][cmp]) {
-      f_w[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f_w[c][cmp], thef.f_w[c][cmp], sizeof(realnum) * gv.ntot());
+    FOR_MAGNETIC_COMPONENTS(c) DOCMP {
+      if (thef.f[c][cmp] == thef.f[c - Hx + Bx][cmp])
+        f[c][cmp] = f[c - Hx + Bx][cmp];
+      else if (thef.f[c][cmp]) {
+        f[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f[c][cmp], thef.f[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
     }
-    if (thef.f_cond[c][cmp]) {
-      f_cond[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f_cond[c][cmp], thef.f_cond[c][cmp], sizeof(realnum) * gv.ntot());
+    FOR_COMPONENTS(c) DOCMP2 {
+      if (thef.f_minus_p[c][cmp]) {
+        f_minus_p[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f_minus_p[c][cmp], thef.f_minus_p[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
+      if (thef.f_w_prev[c][cmp]) {
+        f_w_prev[c][cmp] = new realnum[gv.ntot()];
+        memcpy(f_w_prev[c][cmp], thef.f_w_prev[c][cmp], sizeof(realnum) * gv.ntot());
+        backend_cw_clone_checkpoint();
+      }
     }
-    if (thef.f_bfast[c][cmp]) {
-      f_bfast[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f_bfast[c][cmp], thef.f_bfast[c][cmp], sizeof(realnum) * gv.ntot());
-    }
+    figure_out_step_plan();
   }
-  FOR_MAGNETIC_COMPONENTS(c) DOCMP {
-    if (thef.f[c][cmp] == thef.f[c - Hx + Bx][cmp])
-      f[c][cmp] = f[c - Hx + Bx][cmp];
-    else if (thef.f[c][cmp]) {
-      f[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f[c][cmp], thef.f[c][cmp], sizeof(realnum) * gv.ntot());
-    }
+  catch (...) {
+    release_owned_data();
+    throw;
   }
-  FOR_FIELD_TYPES(ft) {}
-  FOR_COMPONENTS(c) DOCMP2 {
-    if (thef.f_minus_p[c][cmp]) {
-      f_minus_p[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f_minus_p[c][cmp], thef.f_minus_p[c][cmp], sizeof(realnum) * gv.ntot());
-    }
-    if (thef.f_w_prev[c][cmp]) {
-      f_w_prev[c][cmp] = new realnum[gv.ntot()];
-      memcpy(f_w_prev[c][cmp], thef.f_w_prev[c][cmp], sizeof(realnum) * gv.ntot());
-    }
+}
+
+void fields_chunk::swap_prepared_state(fields_chunk &other) noexcept {
+  std::swap(s, other.s);
+  DOCMP2 FOR_COMPONENTS(c) {
+    std::swap(f[c][cmp], other.f[c][cmp]);
+    std::swap(f_u[c][cmp], other.f_u[c][cmp]);
+    std::swap(f_w[c][cmp], other.f_w[c][cmp]);
+    std::swap(f_cond[c][cmp], other.f_cond[c][cmp]);
+    std::swap(f_bfast[c][cmp], other.f_bfast[c][cmp]);
+    std::swap(f_minus_p[c][cmp], other.f_minus_p[c][cmp]);
+    std::swap(f_w_prev[c][cmp], other.f_w_prev[c][cmp]);
+    std::swap(f_backup[c][cmp], other.f_backup[c][cmp]);
+    std::swap(f_u_backup[c][cmp], other.f_u_backup[c][cmp]);
+    std::swap(f_w_backup[c][cmp], other.f_w_backup[c][cmp]);
+    std::swap(f_cond_backup[c][cmp], other.f_cond_backup[c][cmp]);
+    std::swap(f_bfast_backup[c][cmp], other.f_bfast_backup[c][cmp]);
   }
-  f_rderiv_int = NULL;
-  figure_out_step_plan();
+  std::swap(f_rderiv_int, other.f_rderiv_int);
+  FOR_FIELD_TYPES(ft) {
+    gvs_eh[ft].swap(other.gvs_eh[ft]);
+    sources[ft].swap(other.sources[ft]);
+  }
+  FOR_COMPONENTS(c) {
+    std::swap(have_plus_deriv[c], other.have_plus_deriv[c]);
+    std::swap(have_minus_deriv[c], other.have_minus_deriv[c]);
+    std::swap(plus_component[c], other.plus_component[c]);
+    std::swap(minus_component[c], other.minus_component[c]);
+    std::swap(plus_deriv_direction[c], other.plus_deriv_direction[c]);
+    std::swap(minus_deriv_direction[c], other.minus_deriv_direction[c]);
+  }
 }
 
 static inline bool cross_negative(direction a, direction b) {
