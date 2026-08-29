@@ -148,6 +148,22 @@ struct LorentzianStateArrays {
   size_t elements;
 };
 
+struct GyrotropicParameters {
+  double omega_0;
+  double gamma;
+  double alpha;
+  double gyro_tensor[3][3];
+  gyrotropy_model model;
+};
+
+struct GyrotropicStateArrays {
+  component c;
+  int cmp;
+  ArrayId p[3];
+  ArrayId p_prev[3];
+  size_t elements;
+};
+
 struct PolarizationDescriptor {
   SusceptibilityKind kind;
   int chunk;
@@ -155,6 +171,8 @@ struct PolarizationDescriptor {
   int state_index;
   LorentzianParameters lorentzian;
   std::vector<LorentzianStateArrays> lorentzian_states;
+  GyrotropicParameters gyrotropic;
+  std::vector<GyrotropicStateArrays> gyrotropic_states;
   std::vector<InternalArrayLayout> internal_arrays;
   size_t per_thread_scratch_elements;
   uint64_t required_w;      // bit per (component, cmp)
