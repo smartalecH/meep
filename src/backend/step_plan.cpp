@@ -22,6 +22,7 @@
 
 #include "backend/step_plan.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/lifecycle.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -141,8 +142,8 @@ struct CurlSources {
 
   CurlSources()
       : have_plus(false), have_minus(false), plus_component(NO_COMPONENT),
-        minus_component(NO_COMPONENT), plus_direction(NO_DIRECTION),
-        minus_direction(NO_DIRECTION) {}
+        minus_component(NO_COMPONENT), plus_direction(NO_DIRECTION), minus_direction(NO_DIRECTION) {
+  }
 };
 
 bool cross_is_negative(direction a, direction b) {
@@ -165,10 +166,8 @@ CurlSources curl_sources_for(const fields_chunk &fc, component target) {
   CurlSources result;
   const direction target_direction = component_direction(target);
   FOR_COMPONENTS(source) {
-    if (!((is_electric(target) && is_magnetic(source)) ||
-          (is_D(target) && is_magnetic(source)) ||
-          (is_magnetic(target) && is_electric(source)) ||
-          (is_B(target) && is_electric(source))))
+    if (!((is_electric(target) && is_magnetic(source)) || (is_D(target) && is_magnetic(source)) ||
+          (is_magnetic(target) && is_electric(source)) || (is_B(target) && is_electric(source))))
       continue;
     const direction source_direction = component_direction(source);
     if (target_direction == source_direction || !fc.gv.has_field(source) ||
@@ -196,8 +195,15 @@ class StepPlanBuilder {
 public:
   explicit StepPlanBuilder(fields &f, StepProgram program) : f_(f) {
     plan_.program = program;
+    plan_.coordinate_generation = generation(f, MutationKind::coordinate_definition);
     plan_.beta = f.beta;
+    plan_.cylindrical_m = f.m;
     plan_.bfast_scaled_k = f.bfast_scaled_k;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      const fields_chunk &fc = *f.chunks[chunk];
+      plan_.cylindrical_origin_r.push_back(fc.gv.origin_r());
+      plan_.cylindrical_zero_near_origin.push_back(fc.zero_fields_near_cylorigin ? 1 : 0);
+    }
   }
 
   Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
@@ -208,6 +214,10 @@ public:
     op.descriptor_count = 0;
     op.beta_descriptor_index = 0;
     op.beta_descriptor_count = 0;
+    op.cylindrical_m_descriptor_index = 0;
+    op.cylindrical_m_descriptor_count = 0;
+    op.cylindrical_origin_action_index = 0;
+    op.cylindrical_origin_action_count = 0;
     op.polarization_subtraction_index = 0;
     op.polarization_subtraction_count = 0;
     op.guard = g;
@@ -270,7 +280,13 @@ public:
     uint64_t sig = 0xcbf29ce484222325ull;
     mix(sig, uint64_t(plan.program));
     mix_double(sig, plan.beta);
-    for (double k : plan.bfast_scaled_k) mix_double(sig, k);
+    mix_double(sig, plan.cylindrical_m);
+    for (double k : plan.bfast_scaled_k)
+      mix_double(sig, k);
+    for (double origin : plan.cylindrical_origin_r)
+      mix_double(sig, origin);
+    for (uint8_t zero : plan.cylindrical_zero_near_origin)
+      mix(sig, uint64_t(zero));
     for (const Operation &op : plan.operations) {
       sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.ft) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
@@ -279,10 +295,12 @@ public:
       sig ^= uint64_t(op.guard.variant_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
-      sig ^= uint64_t(op.beta_descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
-             (sig >> 2);
-      sig ^= uint64_t(op.beta_descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
-             (sig >> 2);
+      sig ^= uint64_t(op.beta_descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.beta_descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      mix(sig, uint64_t(op.cylindrical_m_descriptor_index));
+      mix(sig, uint64_t(op.cylindrical_m_descriptor_count));
+      mix(sig, uint64_t(op.cylindrical_origin_action_index));
+      mix(sig, uint64_t(op.cylindrical_origin_action_count));
       sig ^= uint64_t(op.polarization_subtraction_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
              (sig >> 2);
       sig ^= uint64_t(op.polarization_subtraction_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
@@ -298,11 +316,28 @@ public:
         sig ^= uint64_t(access.mode) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       }
     }
-    for (const CurlUpdate &d : plan.db_updates) hash_curl(sig, d);
-    for (const BfastUpdate &d : plan.bfast_updates) hash_bfast(sig, d);
-    for (const BetaUpdate &d : plan.beta_updates) hash_beta(sig, d);
-    for (const ConstitutiveUpdate &d : plan.eh_updates) hash_constitutive(sig, d);
-    for (const PolarizationUpdate &d : plan.polarization_updates) hash_polarization(sig, d);
+    for (const CurlUpdate &d : plan.db_updates)
+      hash_curl(sig, d);
+    for (const CylindricalRadialPrefix &d : plan.cylindrical_radial_prefixes)
+      hash_cylindrical_radial_prefix(sig, d);
+    for (const BfastUpdate &d : plan.bfast_updates)
+      hash_bfast(sig, d);
+    for (const BetaUpdate &d : plan.beta_updates)
+      hash_beta(sig, d);
+    for (const CylindricalMOverRUpdate &d : plan.cylindrical_m_updates)
+      hash_cylindrical_m(sig, d);
+    for (const CylindricalAxisUpdate &d : plan.cylindrical_axis_updates)
+      hash_cylindrical_axis(sig, d);
+    for (const SlabRef &d : plan.cylindrical_zero_slabs)
+      hash_slab(sig, d);
+    for (const CylindricalOriginAction &d : plan.cylindrical_origin_actions) {
+      mix(sig, uint64_t(d.kind));
+      mix(sig, uint64_t(d.index));
+    }
+    for (const ConstitutiveUpdate &d : plan.eh_updates)
+      hash_constitutive(sig, d);
+    for (const PolarizationUpdate &d : plan.polarization_updates)
+      hash_polarization(sig, d);
     for (const PolarizationSubtraction &d : plan.polarization_subtractions)
       hash_polarization_subtraction(sig, d);
     return sig;
@@ -338,7 +373,8 @@ private:
     hash_id(sig, p.kap);
     hash_id(sig, p.siginv);
     mix(sig, uint64_t(p.base));
-    for (int i = 0; i < 3; ++i) mix(sig, uint64_t(p.strides[i]));
+    for (int i = 0; i < 3; ++i)
+      mix(sig, uint64_t(p.strides[i]));
   }
   static void hash_curl(uint64_t &sig, const CurlUpdate &d) {
     hash_region(sig, d.region);
@@ -355,7 +391,22 @@ private:
     hash_pml(sig, d.pml_u);
     mix_double(sig, d.dtdx);
     mix_double(sig, d.dt);
+    mix(sig, uint64_t(d.radial_prefix_index));
     mix(sig, uint64_t(d.bfast_update_index));
+  }
+  static void hash_cylindrical_radial_prefix(uint64_t &sig, const CylindricalRadialPrefix &d) {
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.target_component));
+    mix(sig, uint64_t(d.source_component));
+    mix(sig, uint64_t(d.cmp));
+    hash_id(sig, d.source);
+    hash_id(sig, d.scratch);
+    mix(sig, uint64_t(d.nr));
+    mix(sig, uint64_t(d.nz));
+    mix(sig, uint64_t(d.row_stride));
+    mix(sig, uint64_t(d.source_elements));
+    mix(sig, uint64_t(d.scratch_elements));
+    mix_double(sig, d.ir0);
   }
   static void hash_bfast(uint64_t &sig, const BfastUpdate &d) {
     hash_region(sig, d.region);
@@ -383,6 +434,44 @@ private:
     hash_pml(sig, d.pml);
     hash_pml(sig, d.pml_u);
     mix_double(sig, d.betadt);
+  }
+  static void hash_cylindrical_m(uint64_t &sig, const CylindricalMOverRUpdate &d) {
+    hash_region(sig, d.region);
+    hash_id(sig, d.target);
+    hash_id(sig, d.source);
+    hash_id(sig, d.target_u);
+    hash_id(sig, d.condinv);
+    hash_id(sig, d.target_cond);
+    hash_pml(sig, d.pml);
+    hash_pml(sig, d.pml_u);
+    mix_double(sig, d.numerator);
+    mix(sig, uint64_t(d.raw_radial_start));
+  }
+  static void hash_cylindrical_axis(uint64_t &sig, const CylindricalAxisUpdate &d) {
+    mix(sig, uint64_t(d.kind));
+    hash_region(sig, d.region);
+    hash_id(sig, d.target);
+    hash_id(sig, d.source1);
+    hash_id(sig, d.source2);
+    mix(sig, uint64_t(d.source1_neighbor_offset));
+    mix(sig, uint64_t(d.source2_offset));
+    hash_id(sig, d.target_u);
+    hash_id(sig, d.conductivity);
+    hash_id(sig, d.condinv);
+    hash_id(sig, d.target_cond);
+    hash_pml(sig, d.pml);
+    hash_pml(sig, d.pml_u);
+    mix_double(sig, d.scale);
+    mix_double(sig, d.source2_multiplier);
+    mix_double(sig, d.dt);
+  }
+  static void hash_slab(uint64_t &sig, const SlabRef &d) {
+    hash_id(sig, d.array);
+    mix(sig, uint64_t(d.base));
+    for (int i = 0; i < 3; ++i) {
+      mix(sig, uint64_t(d.counts[i]));
+      mix(sig, uint64_t(d.strides[i]));
+    }
   }
   static void hash_constitutive(uint64_t &sig, const ConstitutiveUpdate &d) {
     hash_region(sig, d.region);
@@ -428,12 +517,12 @@ private:
     mix_double(sig, d.gamma);
     mix_double(sig, d.alpha);
     for (int i = 0; i < 3; ++i)
-      for (int j = 0; j < 3; ++j) mix_double(sig, d.gyro_tensor[i][j]);
+      for (int j = 0; j < 3; ++j)
+        mix_double(sig, d.gyro_tensor[i][j]);
     mix(sig, uint64_t(d.gyro_model));
     mix_double(sig, d.dt);
   }
-  static void hash_polarization_subtraction(uint64_t &sig,
-                                            const PolarizationSubtraction &d) {
+  static void hash_polarization_subtraction(uint64_t &sig, const PolarizationSubtraction &d) {
     mix(sig, uint64_t(d.chunk));
     mix(sig, uint64_t(d.c));
     mix(sig, uint64_t(d.cmp));
@@ -451,6 +540,8 @@ void StepPlanBuilder::add_db(field_type ft) {
   Operation &op = add(OpKind::update_db, ft);
   op.descriptor_index = uint32_t(plan_.db_updates.size());
   op.beta_descriptor_index = uint32_t(plan_.beta_updates.size());
+  op.cylindrical_m_descriptor_index = uint32_t(plan_.cylindrical_m_updates.size());
+  op.cylindrical_origin_action_index = uint32_t(plan_.cylindrical_origin_actions.size());
 
   for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
     if (!f_.chunks[chunk]->is_mine()) continue;
@@ -458,7 +549,8 @@ void StepPlanBuilder::add_db(field_type ft) {
     const int components = fc.is_real ? 1 : 2;
     for (size_t tile = 0; tile < fc.gvs_tiled.size(); ++tile) {
       const grid_volume &sub = fc.gvs_tiled[tile];
-      for (int cmp = 0; cmp < components; ++cmp) FOR_FT_COMPONENTS(ft, cc) {
+      for (int cmp = 0; cmp < components; ++cmp)
+        FOR_FT_COMPONENTS(ft, cc) {
           const ArrayId target = find_array(f_, chunk, array_kind::f, int(cc), cmp, 0);
           if (!is_valid(target)) continue;
 
@@ -470,17 +562,15 @@ void StepPlanBuilder::add_db(field_type ft) {
           const direction dsigu = fc.s->sigsize[dsigu0] > 1 ? dsigu0 : NO_DIRECTION;
 
           CurlUpdate d;
-          d.region = make_region(fc.gv, chunk, cc, cmp, sub.little_owned_corner0(cc),
-                                 sub.big_corner());
+          d.region =
+              make_region(fc.gv, chunk, cc, cmp, sub.little_owned_corner0(cc), sub.big_corner());
           d.target = target;
-          d.plus_source = sources.have_plus
-                              ? find_array(f_, chunk, array_kind::f, int(sources.plus_component), cmp,
-                                           0)
-                              : invalid_array();
-          d.minus_source = sources.have_minus
-                               ? find_array(f_, chunk, array_kind::f, int(sources.minus_component),
-                                            cmp, 0)
-                               : invalid_array();
+          d.plus_source = sources.have_plus ? find_array(f_, chunk, array_kind::f,
+                                                         int(sources.plus_component), cmp, 0)
+                                            : invalid_array();
+          d.minus_source = sources.have_minus ? find_array(f_, chunk, array_kind::f,
+                                                           int(sources.minus_component), cmp, 0)
+                                              : invalid_array();
           d.plus_stride = sources.have_plus ? fc.gv.stride(sources.plus_direction) : 0;
           d.minus_stride = sources.have_minus ? fc.gv.stride(sources.minus_direction) : 0;
           if (ft == D_stuff) {
@@ -495,7 +585,43 @@ void StepPlanBuilder::add_db(field_type ft) {
           d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
           d.dtdx = fc.Courant;
           d.dt = fc.dt;
+          d.radial_prefix_index = UINT32_MAX;
           d.bfast_update_index = UINT32_MAX;
+
+          if (fc.gv.dim == Dcyl) {
+            switch (dc) {
+              case R: d.plus_source = invalid_array(); break;
+              case P: break;
+              case Z: {
+                CylindricalRadialPrefix prefix;
+                prefix.chunk = chunk;
+                prefix.target_component = cc;
+                prefix.source_component = sources.plus_component;
+                prefix.cmp = cmp;
+                prefix.source = d.plus_source;
+                prefix.scratch = find_array(f_, chunk, array_kind::f_rderiv_int, -1, -1, 0);
+                prefix.nr = size_t(fc.gv.nr());
+                prefix.nz = size_t(fc.gv.nz());
+                prefix.row_stride = prefix.nz + 1;
+                prefix.source_elements =
+                    is_valid(prefix.source) ? f_.array_catalog->spec(prefix.source).elements : 0;
+                prefix.scratch_elements =
+                    is_valid(prefix.scratch) ? f_.array_catalog->spec(prefix.scratch).elements : 0;
+                const realnum ir0 = fc.gv.origin_r() * fc.gv.a +
+                                    0.5 * fc.gv.iyee_shift(sources.plus_component).in_direction(R);
+                prefix.ir0 = ir0;
+                d.radial_prefix_index = uint32_t(plan_.cylindrical_radial_prefixes.size());
+                plan_.cylindrical_radial_prefixes.push_back(prefix);
+                d.plus_source = prefix.scratch;
+                d.minus_source = invalid_array();
+                add_access(f_, op, prefix.source, AccessMode::read);
+                add_access(f_, op, prefix.scratch, AccessMode::read_write);
+                break;
+              }
+              default: meep::abort("bug - non-cylindrical field component in Dcyl");
+            }
+          }
+
           if (is_valid(d.plus_source) && is_valid(d.minus_source))
             d.region.variant_key |= curl_has_second_derivative;
           if (dsig != NO_DIRECTION) d.region.variant_key |= curl_has_pml;
@@ -521,9 +647,8 @@ void StepPlanBuilder::add_db(field_type ft) {
             realnum k1 = sources.have_minus
                              ? fc.bfast_scaled_k[component_index(sources.minus_component)]
                              : 0;
-            realnum k2 = sources.have_plus
-                             ? fc.bfast_scaled_k[component_index(sources.plus_component)]
-                             : 0;
+            realnum k2 =
+                sources.have_plus ? fc.bfast_scaled_k[component_index(sources.plus_component)] : 0;
             if (ft == D_stuff) {
               k1 = -k1;
               k2 = -k2;
@@ -576,12 +701,10 @@ void StepPlanBuilder::add_db(field_type ft) {
     const int components = fc.is_real ? 1 : 2;
     for (int cmp = 0; cmp < components; ++cmp)
       for (direction dc = X; dc <= Y; dc = direction(dc + 1)) {
-        const component target_component =
-            direction_component(first_field_component(ft), dc);
+        const component target_component = direction_component(first_field_component(ft), dc);
         const component source_component =
             direction_component(ft == D_stuff ? Hx : Ex, dc == X ? Y : X);
-        const ArrayId target =
-            find_array(f_, chunk, array_kind::f, int(target_component), cmp, 0);
+        const ArrayId target = find_array(f_, chunk, array_kind::f, int(target_component), cmp, 0);
         const ArrayId opposite_source =
             find_array(f_, chunk, array_kind::f, int(source_component), 1 - cmp, 0);
         const ArrayId same_source =
@@ -603,8 +726,7 @@ void StepPlanBuilder::add_db(field_type ft) {
         d.source = source;
         d.target_u = find_array(f_, chunk, array_kind::f_u, int(target_component), cmp, 0);
         d.condinv = find_array(f_, chunk, array_kind::condinv, int(target_component), -1, int(dc));
-        d.target_cond =
-            find_array(f_, chunk, array_kind::f_cond, int(target_component), cmp, 0);
+        d.target_cond = find_array(f_, chunk, array_kind::f_cond, int(target_component), cmp, 0);
         d.pml = make_pml_profile(f_, fc, chunk, dsig, d.region.begin);
         d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
         const realnum betadt =
@@ -626,6 +748,207 @@ void StepPlanBuilder::add_db(field_type ft) {
       }
   }
   op.beta_descriptor_count = uint32_t(plan_.beta_updates.size()) - op.beta_descriptor_index;
+
+  /* Cylindrical m/r terms are chunk-wide tails after every tiled curl and
+     paired BFAST postpass. */
+  for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+    if (!f_.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f_.chunks[chunk];
+    if (fc.gv.dim != Dcyl || fc.m == 0) continue;
+    const int components = fc.is_real ? 1 : 2;
+    for (int cmp = 0; cmp < components; ++cmp)
+      FOR_FT_COMPONENTS(ft, cc) {
+        const direction dc = component_direction(cc);
+        if (dc != R && dc != Z) continue;
+        const ArrayId target = find_array(f_, chunk, array_kind::f, int(cc), cmp, 0);
+        const CurlSources tail_sources = curl_sources_for(fc, cc);
+        const component source_component =
+            dc == R ? tail_sources.plus_component : tail_sources.minus_component;
+        if (source_component == NO_COMPONENT) continue;
+        const ArrayId source =
+            find_array(f_, chunk, array_kind::f, int(source_component), 1 - cmp, 0);
+        if (!is_valid(target) || !is_valid(source)) continue;
+
+        const direction dsig0 = cycle_direction(fc.gv.dim, dc, 1);
+        const direction dsig = fc.s->sigsize[dsig0] > 1 ? dsig0 : NO_DIRECTION;
+        const direction dsigu0 = cycle_direction(fc.gv.dim, dc, 2);
+        const direction dsigu = fc.s->sigsize[dsigu0] > 1 ? dsigu0 : NO_DIRECTION;
+
+        CylindricalMOverRUpdate d;
+        d.region =
+            make_region(fc.gv, chunk, cc, cmp, fc.gv.little_owned_corner0(cc), fc.gv.big_corner());
+        d.target = target;
+        d.source = source;
+        d.target_u = find_array(f_, chunk, array_kind::f_u, int(cc), cmp, 0);
+        d.condinv = find_array(f_, chunk, array_kind::condinv, int(cc), -1, int(dc));
+        d.target_cond = dsig != NO_DIRECTION && is_valid(d.condinv)
+                            ? find_array(f_, chunk, array_kind::f_cond, int(cc), cmp, 0)
+                            : invalid_array();
+        d.pml = make_pml_profile(f_, fc, chunk, dsig, d.region.begin);
+        d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
+        const realnum numerator =
+            2 * fc.m * (1 - 2 * cmp) * (1 - 2 * (ft == B_stuff)) * (1 - 2 * (dc == R)) * fc.Courant;
+        d.numerator = numerator;
+        d.raw_radial_start = d.region.begin.in_direction(R);
+        if (dsig != NO_DIRECTION) d.region.variant_key |= cylindrical_m_has_pml;
+        if (dsigu != NO_DIRECTION) d.region.variant_key |= cylindrical_m_has_pml_aux;
+        if (is_valid(d.condinv)) d.region.variant_key |= cylindrical_m_has_conductivity;
+        plan_.cylindrical_m_updates.push_back(d);
+
+        add_access(f_, op, d.target, AccessMode::read_write);
+        add_access(f_, op, d.source, AccessMode::read);
+        add_access(f_, op, d.target_u, AccessMode::read_write);
+        add_access(f_, op, d.condinv, AccessMode::read);
+        add_access(f_, op, d.target_cond, AccessMode::read_write);
+        add_access(f_, op, d.pml.siginv, AccessMode::read);
+        add_access(f_, op, d.pml_u.siginv, AccessMode::read);
+      }
+  }
+  op.cylindrical_m_descriptor_count =
+      uint32_t(plan_.cylindrical_m_updates.size()) - op.cylindrical_m_descriptor_index;
+
+  auto add_zero_slab = [&](fields_chunk &fc, ArrayId id, int radial_row) {
+    if (!is_valid(id)) return;
+    SlabRef slab;
+    slab.array = id;
+    slab.base = ptrdiff_t(radial_row) * ptrdiff_t(fc.gv.nz() + 1);
+    slab.counts[0] = fc.gv.nz() + 1;
+    slab.counts[1] = slab.counts[2] = 1;
+    slab.strides[0] = 1;
+    slab.strides[1] = slab.strides[2] = 0;
+    plan_.cylindrical_zero_slabs.push_back(slab);
+    plan_.cylindrical_origin_actions.push_back(CylindricalOriginAction{
+        CylindricalOriginActionKind::zero_slab, uint32_t(plan_.cylindrical_zero_slabs.size() - 1)});
+    add_access(f_, op, id, AccessMode::write);
+  };
+
+  auto add_component_zero = [&](fields_chunk &fc, int chunk, component c, int cmp, int radial_row) {
+    add_zero_slab(fc, find_array(f_, chunk, array_kind::f, int(c), cmp, 0), radial_row);
+    add_zero_slab(fc, find_array(f_, chunk, array_kind::f_cond, int(c), cmp, 0), radial_row);
+    add_zero_slab(fc, find_array(f_, chunk, array_kind::f_u, int(c), cmp, 0), radial_row);
+  };
+
+  auto add_family_zero = [&](fields_chunk &fc, int chunk, field_type family, int cmp,
+                             int radial_row) {
+    const array_kind kinds[] = {array_kind::f, array_kind::f_cond, array_kind::f_u};
+    for (array_kind kind : kinds)
+      FOR_FT_COMPONENTS(family, c)
+    add_zero_slab(fc, find_array(f_, chunk, kind, int(c), cmp, 0), radial_row);
+  };
+
+  /* Origin arithmetic and zero slabs execute after the m/r tail. */
+  for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+    if (!f_.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f_.chunks[chunk];
+    if (fc.gv.dim != Dcyl || fc.gv.origin_r() != 0.0) continue;
+    const int components = fc.is_real ? 1 : 2;
+    for (int cmp = 0; cmp < components; ++cmp) {
+      component target_component = NO_COMPONENT;
+      CylindricalAxisKind kind = CylindricalAxisKind::m0_dz;
+      ArrayId source1 = invalid_array(), source2 = invalid_array();
+      ptrdiff_t source1_neighbor_offset = 0, source2_offset = 0;
+      realnum scale = 0, source2_multiplier = 0;
+      component zero_after_axis = NO_COMPONENT;
+
+      if (fc.m == 0 && ft == D_stuff) {
+        target_component = Dz;
+        source1 = find_array(f_, chunk, array_kind::f, int(Hp), cmp, 0);
+        scale = fc.Courant * 4;
+        zero_after_axis = Dp;
+      }
+      else if (fc.m == 0 && ft == B_stuff) {
+        if (is_valid(find_array(f_, chunk, array_kind::f, int(Br), cmp, 0)))
+          add_component_zero(fc, chunk, Br, cmp, 0);
+      }
+      else if (fabs(fc.m) == 1) {
+        kind = CylindricalAxisKind::abs_m1;
+        target_component = ft == D_stuff ? Dp : Br;
+        const int sd = ft == D_stuff ? +1 : -1;
+        source1 = find_array(f_, chunk, array_kind::f, int(ft == D_stuff ? Hr : Ep), cmp, 0);
+        source2 = find_array(f_, chunk, array_kind::f, int(ft == D_stuff ? Hz : Ez),
+                             ft == D_stuff ? cmp : 1 - cmp, 0);
+        source1_neighbor_offset = -sd;
+        source2_offset = ft == D_stuff ? 0 : fc.gv.nz() + 1;
+        scale = sd * fc.Courant;
+        source2_multiplier = ft == D_stuff ? 2 : (1 - 2 * cmp) * fc.m;
+        if (ft == D_stuff) zero_after_axis = Dz;
+      }
+      else if (fc.m != 0) {
+        int radial_rows = 1;
+        if (fc.zero_fields_near_cylorigin) {
+          radial_rows = 0;
+          const double rmax = fabs(fc.m) - int(fc.gv.origin_r() * fc.gv.a + 0.5);
+          while (radial_rows <= fc.gv.nr() && radial_rows < rmax)
+            ++radial_rows;
+        }
+        for (int row = 0; row < radial_rows; ++row)
+          add_family_zero(fc, chunk, ft, cmp, row);
+      }
+
+      const ArrayId target =
+          target_component == NO_COMPONENT
+              ? invalid_array()
+              : find_array(f_, chunk, array_kind::f, int(target_component), cmp, 0);
+      if (is_valid(target) && is_valid(source1) &&
+          (kind == CylindricalAxisKind::m0_dz || is_valid(source2))) {
+        const direction dc = component_direction(target_component);
+        const direction dsig0 = cycle_direction(fc.gv.dim, dc, 1);
+        const direction dsig = fc.s->sigsize[dsig0] > 1 ? dsig0 : NO_DIRECTION;
+        const direction dsigu0 = cycle_direction(fc.gv.dim, dc, 2);
+        const direction dsigu = fc.s->sigsize[dsigu0] > 1 ? dsigu0 : NO_DIRECTION;
+        ivec begin = fc.gv.little_owned_corner(target_component);
+        ivec end = fc.gv.big_owned_corner(target_component);
+        end.set_direction(R, 0);
+
+        CylindricalAxisUpdate d;
+        d.kind = kind;
+        d.region = make_region(fc.gv, chunk, target_component, cmp, begin, end);
+        d.target = target;
+        d.source1 = source1;
+        d.source2 = source2;
+        d.source1_neighbor_offset = source1_neighbor_offset;
+        d.source2_offset = source2_offset;
+        d.target_u = find_array(f_, chunk, array_kind::f_u, int(target_component), cmp, 0);
+        d.conductivity =
+            find_array(f_, chunk, array_kind::conductivity, int(target_component), -1, int(dc));
+        d.condinv = find_array(f_, chunk, array_kind::condinv, int(target_component), -1, int(dc));
+        d.target_cond = find_array(f_, chunk, array_kind::f_cond, int(target_component), cmp, 0);
+        if (!is_valid(d.target_cond)) {
+          d.conductivity = invalid_array();
+          d.condinv = invalid_array();
+        }
+        d.pml = make_pml_profile(f_, fc, chunk, dsig, d.region.begin);
+        d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
+        d.scale = scale;
+        d.source2_multiplier = source2_multiplier;
+        d.dt = fc.dt;
+        if (dsig != NO_DIRECTION) d.region.variant_key |= cylindrical_axis_has_pml;
+        if (dsigu != NO_DIRECTION) d.region.variant_key |= cylindrical_axis_has_pml_aux;
+        if (is_valid(d.target_cond)) d.region.variant_key |= cylindrical_axis_has_conductivity;
+        plan_.cylindrical_axis_updates.push_back(d);
+        plan_.cylindrical_origin_actions.push_back(
+            CylindricalOriginAction{CylindricalOriginActionKind::axis_update,
+                                    uint32_t(plan_.cylindrical_axis_updates.size() - 1)});
+
+        add_access(f_, op, d.target, AccessMode::read_write);
+        add_access(f_, op, d.source1, AccessMode::read);
+        add_access(f_, op, d.source2, AccessMode::read);
+        add_access(f_, op, d.target_u, AccessMode::read_write);
+        add_access(f_, op, d.conductivity, AccessMode::read);
+        add_access(f_, op, d.condinv, AccessMode::read);
+        add_access(f_, op, d.target_cond, AccessMode::read_write);
+        add_access(f_, op, d.pml.sig, AccessMode::read);
+        add_access(f_, op, d.pml.kap, AccessMode::read);
+        add_access(f_, op, d.pml.siginv, AccessMode::read);
+        add_access(f_, op, d.pml_u.sig, AccessMode::read);
+        add_access(f_, op, d.pml_u.kap, AccessMode::read);
+        add_access(f_, op, d.pml_u.siginv, AccessMode::read);
+        if (zero_after_axis != NO_COMPONENT) add_component_zero(fc, chunk, zero_after_axis, cmp, 0);
+      }
+    }
+  }
+  op.cylindrical_origin_action_count =
+      uint32_t(plan_.cylindrical_origin_actions.size()) - op.cylindrical_origin_action_index;
 }
 
 void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
@@ -639,7 +962,8 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
     const int components = fc.is_real ? 1 : 2;
     for (size_t tile = 0; tile < fc.gvs_eh[ft].size(); ++tile) {
       const grid_volume &sub = fc.gvs_eh[ft][tile];
-      for (int cmp = 0; cmp < components; ++cmp) FOR_FT_COMPONENTS(ft, ec) {
+      for (int cmp = 0; cmp < components; ++cmp)
+        FOR_FT_COMPONENTS(ft, ec) {
           if (!fc.f[ec][cmp]) continue;
           const component dc = field_type_component(ft2, ec);
           if (fc.f[ec][cmp] == fc.f[dc][cmp]) continue;
@@ -652,8 +976,8 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
           const direction dsigw = fc.s->sigsize[dec] > 1 ? dec : NO_DIRECTION;
 
           ConstitutiveUpdate d;
-          d.region = make_region(fc.gv, chunk, ec, cmp, sub.little_owned_corner0(ec),
-                                 sub.big_corner());
+          d.region =
+              make_region(fc.gv, chunk, ec, cmp, sub.little_owned_corner0(ec), sub.big_corner());
           d.target = find_array(f_, chunk, array_kind::f, int(ec), cmp, 0);
           const ArrayId primary_minus_p =
               find_array(f_, chunk, array_kind::f_minus_p, int(dc), cmp, 0);
@@ -695,8 +1019,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
           if (dsigw != NO_DIRECTION) d.region.variant_key |= constitutive_has_pml;
           if (is_valid(d.chi2) || is_valid(d.chi3))
             d.region.variant_key |= constitutive_has_nonlinearity;
-          if (is_valid(primary_minus_p) || is_valid(cross1_minus_p) ||
-              is_valid(cross2_minus_p))
+          if (is_valid(primary_minus_p) || is_valid(cross1_minus_p) || is_valid(cross2_minus_p))
             d.region.variant_key |= constitutive_has_minus_p;
           if (tile == 0 && is_valid(d.previous_w))
             d.region.variant_key |= constitutive_copy_w_previous;
@@ -722,6 +1045,42 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
           add_access(f_, op, d.pml.sig, AccessMode::read);
           add_access(f_, op, d.pml.kap, AccessMode::read);
           add_access(f_, op, d.pml.siginv, AccessMode::read);
+
+          if (fc.gv.dim == Dcyl) {
+            ivec axis_begin = sub.little_owned_corner(ec);
+            if (axis_begin.in_direction(R) == 0) {
+              ConstitutiveUpdate axis = d;
+              ivec axis_end = sub.big_corner();
+              axis_end.set_direction(R, 0);
+              axis.region = make_region(fc.gv, chunk, ec, cmp, axis_begin, axis_end);
+              axis.region.variant_key =
+                  d.region.variant_key &
+                  ~(constitutive_one_offdiagonal | constitutive_two_offdiagonals |
+                    constitutive_has_minus_p | constitutive_copy_w_previous);
+              if (axis.primary != axis.base_primary)
+                axis.region.variant_key |= constitutive_has_minus_p;
+              axis.region.variant_key |= constitutive_axis_override;
+              axis.base_cross1 = axis.base_cross2 = invalid_array();
+              axis.cross1 = axis.cross2 = invalid_array();
+              axis.offdiagonal1 = axis.offdiagonal2 = invalid_array();
+              axis.cross1_stride = axis.cross2_stride = 0;
+              axis.previous_w = invalid_array();
+              plan_.eh_updates.push_back(axis);
+
+              add_access(f_, op, axis.target, AccessMode::read_write);
+              add_access(f_, op, axis.base_primary, AccessMode::read);
+              add_access(f_, op, axis.primary,
+                         axis.primary != axis.base_primary ? AccessMode::read_write
+                                                           : AccessMode::read);
+              add_access(f_, op, axis.diagonal, AccessMode::read);
+              add_access(f_, op, axis.chi2, AccessMode::read);
+              add_access(f_, op, axis.chi3, AccessMode::read);
+              add_access(f_, op, axis.target_w, AccessMode::read_write);
+              add_access(f_, op, axis.pml.sig, AccessMode::read);
+              add_access(f_, op, axis.pml.kap, AccessMode::read);
+              add_access(f_, op, axis.pml.siginv, AccessMode::read);
+            }
+          }
         }
     }
   }
