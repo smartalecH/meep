@@ -220,6 +220,10 @@ void fields::use_real_fields() {
     if (boundaries[High][d] == Periodic && k[d] != 0.0)
       meep::abort("Can't use real fields with bloch boundary conditions!\n");
   }
+  if (!is_real)
+    backend_prepare_field_layout_change(*this,
+                                        DirtyMask(dirty_storage | dirty_halos | dirty_executable),
+                                        "fields::use_real_fields");
   is_real = 1;
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->use_real_fields();
@@ -369,8 +373,7 @@ fields_chunk::fields_chunk(structure_chunk *the_s, const char *od, double m, dou
     f_bfast_backup[c][cmp] = NULL;
   }
   f_rderiv_int = NULL;
-  FOR_FIELD_TYPES(ft) {
-  }
+  FOR_FIELD_TYPES(ft) {}
   figure_out_step_plan();
 }
 
@@ -452,8 +455,7 @@ fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv)
       memcpy(f[c][cmp], thef.f[c][cmp], sizeof(realnum) * gv.ntot());
     }
   }
-  FOR_FIELD_TYPES(ft) {
-  }
+  FOR_FIELD_TYPES(ft) {}
   FOR_COMPONENTS(c) DOCMP2 {
     if (thef.f_minus_p[c][cmp]) {
       f_minus_p[c][cmp] = new realnum[gv.ntot()];
@@ -904,7 +906,7 @@ double linear_interpolate(double rx, double ry, double rz, double *data, int nx,
 
   /* define a macro to give us data(x,y,z) on the grid,
      in row-major order (the order used by HDF5): */
-#define D(x, y, z) (data[(((x)*ny + (y)) * nz + (z)) * stride])
+#define D(x, y, z) (data[(((x) * ny + (y)) * nz + (z)) * stride])
 
   return (((D(x1, y1, z1) * (1.0 - dx) + D(x2, y1, z1) * dx) * (1.0 - dy) +
            (D(x1, y2, z1) * (1.0 - dx) + D(x2, y2, z1) * dx) * dy) *
@@ -922,13 +924,13 @@ bool operator==(const comms_key &lhs, const comms_key &rhs) {
 
 void fields::change_m(double new_m) {
   const bool coordinate_changed = new_m != m;
-  m = new_m;
   if ((new_m != 0) && (is_real)) {
     meep::abort("The simulation must be reinitialized if switching to complex fields!\n");
   }
 
   if ((new_m == 0) && (!is_real)) { use_real_fields(); }
 
+  m = new_m;
   for (int i = 0; i < num_chunks; i++) {
     chunks[i]->change_m(new_m);
   }
