@@ -139,6 +139,37 @@ bool backend_read_host_range(const fields &f, const void *host_address, size_t e
   return false;
 }
 
+bool backend_write_host_range(fields &f, const void *host_address, size_t elements,
+                              std::string &local_error) {
+  if (!local_error.empty()) return false;
+  try {
+    if (!host_address || !elements || !backend_host_refresh_required(f)) return true;
+    if (!f.array_catalog)
+      throw std::logic_error("resident backend access requires a storage catalog");
+
+    ArrayId id;
+    ptrdiff_t offset;
+    if (!f.array_catalog->locate(host_address, id, offset) || offset < 0)
+      throw std::out_of_range("host access does not name catalogued backend storage");
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (size_t(offset) > spec.elements || elements > spec.elements - size_t(offset))
+      throw std::out_of_range("host access exceeds catalogued backend storage");
+    const size_t element_bytes = host_element_bytes(spec.element_type);
+    if (elements > std::numeric_limits<size_t>::max() / element_bytes)
+      throw std::overflow_error("backend host-access byte count overflow");
+    f.backend->write(ArrayRef{id, size_t(offset), elements}, host_address,
+                     elements * element_bytes);
+    return true;
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown backend host-access failure";
+  }
+  return false;
+}
+
 void backend_reconcile_host_access(const std::string &local_error, const char *site) {
   if (!or_to_all(!local_error.empty())) return;
   if (local_error.empty())
@@ -175,6 +206,25 @@ bool backend_read_dft_chain(const dft_chunk *head, std::string &local_error) {
   return true;
 }
 
+bool backend_write_dft_chunk(dft_chunk *chunk, std::string &local_error) {
+  if (!chunk || !local_error.empty()) return local_error.empty();
+  fields *owner = chunk->monitor_lifetime ? chunk->monitor_lifetime->owner : NULL;
+  if (!owner || !backend_host_refresh_required(*owner)) return true;
+
+  ArrayId id;
+  ptrdiff_t offset;
+  if (!owner->array_catalog || !owner->array_catalog->locate(chunk->dft, id, offset)) {
+    if (!chunk->attached_to_fields || is_dirty(*owner, dirty_storage)) return true;
+  }
+  return backend_write_host_range(*owner, chunk->dft, chunk->N * chunk->omega.size(), local_error);
+}
+
+bool backend_write_dft_chain(dft_chunk *head, std::string &local_error) {
+  for (dft_chunk *cur = head; cur; cur = cur->next_in_dft)
+    if (!backend_write_dft_chunk(cur, local_error)) return false;
+  return true;
+}
+
 void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *heads,
                                 const char *site) {
   if (!backend_host_refresh_required(owner)) return;
@@ -182,6 +232,43 @@ void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *head
   for (int i = 0; i < count; ++i)
     backend_read_dft_chain(heads[i], local_error);
   backend_reconcile_host_access(local_error, site);
+}
+
+void backend_refresh_dft_chain(const dft_chunk *head, const char *site) {
+  bool local_refresh = false;
+  for (const dft_chunk *cur = head; cur; cur = cur->next_in_dft) {
+    fields *owner = cur->monitor_lifetime ? cur->monitor_lifetime->owner : NULL;
+    local_refresh = local_refresh || (owner && backend_host_refresh_required(*owner));
+  }
+  std::string local_error;
+  backend_read_dft_chain(head, local_error);
+  if (or_to_all(local_refresh)) backend_reconcile_host_access(local_error, site);
+}
+
+void backend_publish_dft_chain(dft_chunk *head, const char *site) {
+  bool local_publish = false;
+  for (dft_chunk *cur = head; cur; cur = cur->next_in_dft) {
+    fields *owner = cur->monitor_lifetime ? cur->monitor_lifetime->owner : NULL;
+    local_publish = local_publish || (owner && backend_host_refresh_required(*owner));
+  }
+  std::string local_error;
+  backend_write_dft_chain(head, local_error);
+  if (or_to_all(local_publish)) backend_reconcile_host_access(local_error, site);
+}
+
+void backend_publish_dft_chains(fields &owner, int count, dft_chunk *const *heads,
+                                const char *site) {
+  if (!backend_host_refresh_required(owner)) return;
+  std::string local_error;
+  for (int i = 0; i < count; ++i)
+    backend_write_dft_chain(heads[i], local_error);
+  backend_reconcile_host_access(local_error, site);
+}
+
+void backend_require_magnetic_synchronization(const fields &f, const char *site) {
+  if (!f.backend || !f.backend_state || f.backend->supports_magnetic_synchronization()) return;
+  throw std::runtime_error(std::string(site) +
+                           ": magnetic synchronization is not supported by the resident backend");
 }
 
 bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
