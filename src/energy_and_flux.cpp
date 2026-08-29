@@ -147,7 +147,15 @@ void fields_chunk::average_with_backup(component c) {
 
 void fields::synchronize_magnetic_fields() {
   backend_require_magnetic_synchronization(*this, "fields::synchronize_magnetic_fields");
-  if (synchronized_magnetic_fields++) return; // already synched
+  if (synchronized_magnetic_fields) {
+    ++synchronized_magnetic_fields;
+    return; // already synched
+  }
+  if (backend_try_synchronize_magnetic_fields(*this, "fields::synchronize_magnetic_fields")) {
+    synchronized_magnetic_fields = 1;
+    return;
+  }
+  synchronized_magnetic_fields = 1;
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) {
       FOR_B_COMPONENTS(c) { chunks[i]->backup_component(c); }
@@ -171,9 +179,17 @@ void fields::synchronize_magnetic_fields() {
 }
 
 void fields::restore_magnetic_fields() {
-  if (!synchronized_magnetic_fields      // already restored
-      || --synchronized_magnetic_fields) // not ready to restore yet
+  backend_require_magnetic_synchronization(*this, "fields::restore_magnetic_fields");
+  if (!synchronized_magnetic_fields) return; // already restored
+  if (synchronized_magnetic_fields > 1) {
+    --synchronized_magnetic_fields;
+    return; // not ready to restore yet
+  }
+  if (backend_try_restore_magnetic_fields(*this, "fields::restore_magnetic_fields")) {
+    synchronized_magnetic_fields = 0;
     return;
+  }
+  synchronized_magnetic_fields = 0;
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) {
       FOR_B_COMPONENTS(c) { chunks[i]->restore_component(c); }
