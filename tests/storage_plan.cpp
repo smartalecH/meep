@@ -76,7 +76,9 @@ static void test_coverage(const char *name, structure &s, bool with_flux, const 
 
   const size_t problems = audit_storage_catalog(f, *f.array_catalog, true);
   CHECK(problems == 0, "%s: %zu arrays are reachable but not registered", name, problems);
-  CHECK(f.array_catalog->size() > 0, "%s: catalog is empty", name);
+  /* More MPI ranks than chunks legitimately leaves some ranks with no owned
+     storage.  The plan must be nonempty globally, not on every rank. */
+  CHECK(or_to_all(f.array_catalog->size() > 0), "%s: catalog is empty on every rank", name);
   CHECK(f.storage_plan->arrays.size() == f.array_catalog->size(),
         "%s: storage plan/catalog sizes differ", name);
   for (size_t i = 0; i < f.array_catalog->size(); ++i)
