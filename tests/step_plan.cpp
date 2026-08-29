@@ -30,6 +30,7 @@
  * optional work, the solve_cw program, and plan stability across steps.
  */
 
+#include <algorithm>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,6 +40,7 @@
 #include <meep.hpp>
 
 #include "backend/lifecycle.hpp"
+#include "backend/storage_plan.hpp"
 #include "backend/step_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -61,6 +63,7 @@ static int failures = 0;
 
 static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+static double magnetic_conductivity(const vec &) { return 0.07; }
 
 static void compare(const char *name, const std::vector<std::string> &got, const char *const *want,
                     size_t nwant) {
@@ -78,6 +81,58 @@ static void compare(const char *name, const std::vector<std::string> &got, const
                     want[i]);
       ++failures;
     }
+}
+
+static const BufferAccess *find_access(const Operation &op, ArrayId id) {
+  for (const BufferAccess &access : op.accesses)
+    if (access.array.id == id) return &access;
+  return NULL;
+}
+
+static AccessMode merge_access_mode(AccessMode a, AccessMode b) {
+  return a == b ? a : AccessMode::read_write;
+}
+
+static void merge_expected_access(std::vector<BufferAccess> &expected, const BufferAccess &access) {
+  if (!is_valid(access.array.id)) return;
+  for (BufferAccess &entry : expected)
+    if (entry.array.id == access.array.id) {
+      entry.mode = merge_access_mode(entry.mode, access.mode);
+      return;
+    }
+  expected.push_back(access);
+}
+
+static void check_exact_magnetic_access_union(const StepPlan &plan, const Operation &synchronize,
+                                              const uint32_t schedule[7]) {
+  std::vector<BufferAccess> expected;
+  for (const MagneticStateArray &row : plan.magnetic_state_arrays)
+    merge_expected_access(expected,
+                          BufferAccess{ArrayRef{row.live, 0, row.elements},
+                                       row.average ? AccessMode::read_write : AccessMode::read});
+  for (int i = 0; i < 7; ++i) {
+    if (schedule[i] == UINT32_MAX) continue;
+    CHECK(schedule[i] < plan.operations.size(), "magnetic schedule slot %d is out of range", i);
+    if (schedule[i] >= plan.operations.size()) continue;
+    for (const BufferAccess &access : plan.operations[schedule[i]].accesses)
+      merge_expected_access(expected, access);
+  }
+
+  CHECK(synchronize.accesses.size() == expected.size(),
+        "magnetic synchronize has %zu accesses, expected exact union of %zu",
+        synchronize.accesses.size(), expected.size());
+  for (const BufferAccess &want : expected) {
+    const BufferAccess *got = find_access(synchronize, want.array.id);
+    CHECK(got && got->mode == want.mode && got->array.offset == want.array.offset &&
+              got->array.elements == want.array.elements,
+          "magnetic synchronize has wrong access for ArrayId %u", want.array.id.value);
+  }
+  for (const BufferAccess &got : synchronize.accesses) {
+    const BufferAccess *want = NULL;
+    for (const BufferAccess &entry : expected)
+      if (entry.array.id == got.array.id) want = &entry;
+    CHECK(want, "magnetic synchronize contains unrelated ArrayId %u", got.array.id.value);
+  }
 }
 
 /* The ordinary timestep, transcribed from fields::step_once. Compare against
@@ -142,7 +197,9 @@ static const char *const expected_empty[] = {
 static void test_full_plan() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
-  fields f(&s);
+  s.set_conductivity(Bx, magnetic_conductivity);
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields f(&s, 0, 0, true, 0, 0, scaled_k);
   gaussian_src_time src(0.3, 0.1);
   f.add_point_source(Ez, src, vec(0.13, 0.11));
   volume fv(vec(0.8, -1.0), vec(0.8, 1.0));
@@ -153,6 +210,37 @@ static void test_full_plan() {
      pin down. */
   f.add_flux_plane(vec(-0.8, -1.0), vec(-0.8, 1.0));
   f.advance(2);
+
+  /* Force one exact H==B catalog alias while retaining a different split H
+     component. This isolates the snapshot contract from update_eh's choice to
+     split trivial H storage during the setup advance. */
+  int controlled_chunk = -1;
+  for (int chunk = 0; chunk < f.num_chunks && controlled_chunk < 0; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    const StorageKey required[] = {
+        {chunk, int(array_kind::f), int(Bx), 0, 0},
+        {chunk, int(array_kind::f_cond), int(Bx), 0, 0},
+        {chunk, int(array_kind::f_bfast), int(Bx), 0, 0},
+        {chunk, int(array_kind::f), int(By), 0, 0},
+        {chunk, int(array_kind::f_u), int(By), 0, 0},
+        {chunk, int(array_kind::f_bfast), int(By), 0, 0},
+        {chunk, int(array_kind::f), int(Hx), 0, 0},
+        {chunk, int(array_kind::f_w), int(Hx), 0, 0},
+        {chunk, int(array_kind::f), int(Hy), 0, 0},
+        {chunk, int(array_kind::f_w), int(Hy), 0, 0},
+    };
+    bool complete = true;
+    for (const StorageKey &key : required)
+      complete = complete && is_valid(f.array_catalog->find(key));
+    if (complete) controlled_chunk = chunk;
+  }
+  CHECK(or_to_all(controlled_chunk >= 0),
+        "magnetic fixture did not realize the controlled sparse-family pattern");
+  if (controlled_chunk >= 0) {
+    const ArrayId h = f.array_catalog->find({controlled_chunk, int(array_kind::f), int(Hx), 0, 0});
+    const ArrayId b = f.array_catalog->find({controlled_chunk, int(array_kind::f), int(Bx), 0, 0});
+    f.array_catalog->set_alias(h, b);
+  }
 
   const StepPlan p = build_step_plan(f, StepProgram::ordinary);
   std::vector<std::string> got;
@@ -169,6 +257,7 @@ static void test_full_plan() {
   /* Guard kinds are load-bearing for Phase 2 even though the CPU executor
      treats them all the same. */
   size_t variants = 0, devices = 0;
+  const Operation *restore = NULL, *synchronize = NULL;
   for (const Operation &op : p.operations) {
     CHECK(op.beta_descriptor_index == 0 && op.beta_descriptor_count == 0,
           "%s has a nonempty beta span in a zero-beta plan", op_kind_name(op.kind));
@@ -179,7 +268,14 @@ static void test_full_plan() {
       CHECK(op.guard.kind == GuardKind::graph_variant, "%s should be a graph_variant guard",
             op_kind_name(op.kind));
       ++variants;
+      if (op.kind == OpKind::restore_magnetic_fields)
+        restore = &op;
+      else
+        synchronize = &op;
     }
+    else
+      CHECK(op.magnetic_state_index == 0 && op.magnetic_state_count == 0,
+            "%s has a nonempty magnetic state span", op_kind_name(op.kind));
     if (op.kind == OpKind::update_dft) {
       CHECK(op.guard.kind == GuardKind::device_predicate,
             "update_dft should be a device_predicate guard (the decimation check)");
@@ -190,20 +286,282 @@ static void test_full_plan() {
   CHECK(devices == (owns_dft ? 1u : 0u), "expected %d decimation guards, got %zu", owns_dft ? 1 : 0,
         devices);
 
+  CHECK(restore && synchronize, "magnetic restore/synchronize markers are missing");
+  if (restore && synchronize) {
+    CHECK(restore->magnetic_state_index == 0 && synchronize->magnetic_state_index == 0,
+          "magnetic state span does not begin at zero");
+    CHECK(restore->magnetic_state_count == p.magnetic_state_arrays.size() &&
+              synchronize->magnetic_state_count == p.magnetic_state_arrays.size(),
+          "magnetic markers do not cover the complete state-array span");
+  }
+
+  for (size_t i = 0; i < p.magnetic_state_arrays.size(); ++i) {
+    const MagneticStateArray &entry = p.magnetic_state_arrays[i];
+    CHECK(entry.elements == f.array_catalog->spec(entry.live).elements,
+          "magnetic state row %zu has the wrong extent", i);
+    CHECK(entry.average == (entry.family == MagneticStateFamily::primary),
+          "magnetic state row %zu has the wrong average flag", i);
+    const StorageKey &key = f.array_catalog->key(entry.live);
+    CHECK(key.chunk == entry.chunk && key.component_ == int(entry.c) && key.cmp == entry.cmp,
+          "magnetic state row %zu identity does not match its ArrayId", i);
+    MagneticStateFamily expected_family = MagneticStateFamily::primary;
+    if (key.kind == int(array_kind::f_u)) expected_family = MagneticStateFamily::u;
+    if (key.kind == int(array_kind::f_w)) expected_family = MagneticStateFamily::w;
+    if (key.kind == int(array_kind::f_cond)) expected_family = MagneticStateFamily::conductivity;
+    if (key.kind == int(array_kind::f_bfast)) expected_family = MagneticStateFamily::bfast;
+    CHECK(entry.family == expected_family, "magnetic state row %zu has the wrong family", i);
+    if (restore && synchronize) {
+      const BufferAccess *restore_access = find_access(*restore, entry.live);
+      const BufferAccess *sync_access = find_access(*synchronize, entry.live);
+      CHECK(restore_access && restore_access->mode == AccessMode::write,
+            "magnetic restore row %zu is not declared write-only", i);
+      CHECK(sync_access && sync_access->mode != AccessMode::write,
+            "magnetic synchronize row %zu is not readable", i);
+      if (entry.average)
+        CHECK(sync_access && sync_access->mode == AccessMode::read_write,
+              "magnetic primary row %zu is not declared read-write", i);
+    }
+  }
+
+  if (controlled_chunk >= 0) {
+    struct ExpectedMagneticRow {
+      component c;
+      int cmp;
+      MagneticStateFamily family;
+      array_kind kind;
+    };
+    const ExpectedMagneticRow expected[] = {
+        {Bx, 0, MagneticStateFamily::primary, array_kind::f},
+        {Bx, 0, MagneticStateFamily::conductivity, array_kind::f_cond},
+        {Bx, 0, MagneticStateFamily::bfast, array_kind::f_bfast},
+        {Bx, 1, MagneticStateFamily::primary, array_kind::f},
+        {Bx, 1, MagneticStateFamily::conductivity, array_kind::f_cond},
+        {Bx, 1, MagneticStateFamily::bfast, array_kind::f_bfast},
+        {By, 0, MagneticStateFamily::primary, array_kind::f},
+        {By, 0, MagneticStateFamily::u, array_kind::f_u},
+        {By, 0, MagneticStateFamily::bfast, array_kind::f_bfast},
+        {By, 1, MagneticStateFamily::primary, array_kind::f},
+        {By, 1, MagneticStateFamily::u, array_kind::f_u},
+        {By, 1, MagneticStateFamily::bfast, array_kind::f_bfast},
+        /* Hx/cmp0 is the forced H==B alias and contributes no row in any family. */
+        {Hx, 1, MagneticStateFamily::primary, array_kind::f},
+        {Hx, 1, MagneticStateFamily::w, array_kind::f_w},
+        {Hy, 0, MagneticStateFamily::primary, array_kind::f},
+        {Hy, 0, MagneticStateFamily::w, array_kind::f_w},
+        {Hy, 1, MagneticStateFamily::primary, array_kind::f},
+        {Hy, 1, MagneticStateFamily::w, array_kind::f_w},
+    };
+    std::vector<const MagneticStateArray *> actual;
+    for (const MagneticStateArray &row : p.magnetic_state_arrays)
+      if (row.chunk == controlled_chunk) actual.push_back(&row);
+    CHECK(actual.size() == sizeof(expected) / sizeof(expected[0]),
+          "controlled magnetic chunk has %zu rows, expected %zu", actual.size(),
+          sizeof(expected) / sizeof(expected[0]));
+    for (size_t i = 0; i < actual.size() && i < sizeof(expected) / sizeof(expected[0]); ++i) {
+      const ExpectedMagneticRow &want = expected[i];
+      const MagneticStateArray &got = *actual[i];
+      const ArrayId expected_id =
+          f.array_catalog->find({controlled_chunk, int(want.kind), int(want.c), want.cmp, 0});
+      CHECK(got.c == want.c && got.cmp == want.cmp && got.family == want.family &&
+                got.live == expected_id,
+            "controlled magnetic row %zu has the wrong identity or order", i);
+    }
+    for (const MagneticStateArray &row : p.magnetic_state_arrays)
+      CHECK(row.chunk != controlled_chunk || row.c != Hx || row.cmp != 0,
+            "H==B alias emitted an Hx/cmp0 magnetic row");
+  }
+
+  const uint32_t schedule[] = {
+      p.magnetic_half_step.evaluate_b_sources, p.magnetic_half_step.update_b,
+      p.magnetic_half_step.apply_b_sources,    p.magnetic_half_step.transfer_b,
+      p.magnetic_half_step.evaluate_h_sources, p.magnetic_half_step.update_h,
+      p.magnetic_half_step.transfer_h};
+  const OpKind schedule_kinds[] = {OpKind::evaluate_source_scalars,
+                                   OpKind::update_db,
+                                   OpKind::apply_sources,
+                                   OpKind::transfer_halo,
+                                   OpKind::evaluate_source_scalars,
+                                   OpKind::update_eh,
+                                   OpKind::transfer_halo};
+  const field_type schedule_types[] = {field_type(NUM_FIELD_TYPES), B_stuff, B_stuff, B_stuff,
+                                       field_type(NUM_FIELD_TYPES), H_stuff, H_stuff};
+  for (size_t i = 0; i < sizeof(schedule) / sizeof(schedule[0]); ++i) {
+    CHECK(schedule[i] < p.operations.size(), "magnetic half-step slot %zu is out of range", i);
+    if (schedule[i] >= p.operations.size()) continue;
+    const Operation &op = p.operations[schedule[i]];
+    CHECK(op.kind == schedule_kinds[i] && op.ft == schedule_types[i],
+          "magnetic half-step slot %zu has the wrong operation", i);
+  }
+  if (synchronize) check_exact_magnetic_access_union(p, *synchronize, schedule);
+
+  bool promoted_u = false, promoted_w = false, promoted_cond = false, promoted_bfast = false;
+  if (synchronize)
+    for (const MagneticStateArray &row : p.magnetic_state_arrays) {
+      if (row.average) continue;
+      const BufferAccess *access = find_access(*synchronize, row.live);
+      if (!access || access->mode != AccessMode::read_write) continue;
+      promoted_u = promoted_u || row.family == MagneticStateFamily::u;
+      promoted_w = promoted_w || row.family == MagneticStateFamily::w;
+      promoted_cond = promoted_cond || row.family == MagneticStateFamily::conductivity;
+      promoted_bfast = promoted_bfast || row.family == MagneticStateFamily::bfast;
+    }
+  CHECK(and_to_all(controlled_chunk < 0 ||
+                   (promoted_u && promoted_w && promoted_cond && promoted_bfast)),
+        "controlled magnetic fixture did not promote every auxiliary family to read-write");
+  CHECK(p.operations[schedule[0]].source_time_offset == 0.0 &&
+            p.operations[schedule[4]].source_time_offset == 0.5,
+        "magnetic half-step source-time offsets are wrong");
+
   /* Rebuilding without touching anything gives the same plan. */
   const StepPlan again = build_step_plan(f, StepProgram::ordinary);
   CHECK(again.signature == p.signature, "plan signature is not stable");
+}
+
+static void test_magnetic_schema_signature() {
+  StepPlan plan;
+  Operation restore = {};
+  restore.kind = OpKind::restore_magnetic_fields;
+  restore.guard = guard_variant(0);
+  restore.magnetic_state_index = 0;
+  restore.magnetic_state_count = 1;
+  plan.operations.push_back(restore);
+
+  MagneticStateArray entry = {};
+  entry.chunk = 2;
+  entry.c = Hy;
+  entry.cmp = 1;
+  entry.family = MagneticStateFamily::w;
+  entry.live = ArrayId{7};
+  entry.elements = 257;
+  entry.average = false;
+  plan.magnetic_state_arrays.push_back(entry);
+  MagneticStateArray second = entry;
+  second.chunk = 3;
+  second.c = Bx;
+  second.cmp = 0;
+  second.family = MagneticStateFamily::primary;
+  second.live = ArrayId{9};
+  second.elements = 511;
+  second.average = true;
+  plan.magnetic_state_arrays.push_back(second);
+  plan.operations[0].magnetic_state_count = 2;
+  plan.magnetic_half_step.evaluate_b_sources = 1;
+  plan.magnetic_half_step.update_b = 2;
+  plan.magnetic_half_step.apply_b_sources = 3;
+  plan.magnetic_half_step.transfer_b = 4;
+  plan.magnetic_half_step.evaluate_h_sources = 5;
+  plan.magnetic_half_step.update_h = 6;
+  plan.magnetic_half_step.transfer_h = 7;
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+#define CHECK_MAGNETIC_SIGNATURE(expr, message)                                                    \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
+  } while (0)
+  CHECK_MAGNETIC_SIGNATURE(++changed.operations[0].magnetic_state_index,
+                           "signature ignored magnetic span start");
+  CHECK_MAGNETIC_SIGNATURE(++changed.operations[0].magnetic_state_count,
+                           "signature ignored magnetic span count");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_state_arrays[0].chunk,
+                           "signature ignored magnetic chunk");
+  CHECK_MAGNETIC_SIGNATURE(changed.magnetic_state_arrays[0].c = Hz,
+                           "signature ignored magnetic component");
+  CHECK_MAGNETIC_SIGNATURE(changed.magnetic_state_arrays[0].cmp = 0,
+                           "signature ignored magnetic cmp");
+  CHECK_MAGNETIC_SIGNATURE(changed.magnetic_state_arrays[0].family =
+                               MagneticStateFamily::conductivity,
+                           "signature ignored magnetic family");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_state_arrays[0].live.value,
+                           "signature ignored magnetic ArrayId");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_state_arrays[0].elements,
+                           "signature ignored magnetic extent");
+  CHECK_MAGNETIC_SIGNATURE(changed.magnetic_state_arrays[0].average = true,
+                           "signature ignored magnetic average flag");
+  CHECK_MAGNETIC_SIGNATURE(
+      std::swap(changed.magnetic_state_arrays[0], changed.magnetic_state_arrays[1]),
+      "signature ignored magnetic row ordering");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.evaluate_b_sources,
+                           "signature ignored magnetic B source schedule");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.update_b,
+                           "signature ignored magnetic B schedule");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.apply_b_sources,
+                           "signature ignored magnetic B source application");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.transfer_b,
+                           "signature ignored magnetic B boundary schedule");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.evaluate_h_sources,
+                           "signature ignored magnetic H source schedule");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.update_h,
+                           "signature ignored magnetic H update schedule");
+  CHECK_MAGNETIC_SIGNATURE(++changed.magnetic_half_step.transfer_h,
+                           "signature ignored magnetic H schedule");
+#undef CHECK_MAGNETIC_SIGNATURE
+
+  plan.clear();
+  CHECK(plan.operations.empty() && plan.magnetic_state_arrays.empty() &&
+            plan.magnetic_half_step.evaluate_b_sources == UINT32_MAX &&
+            plan.magnetic_half_step.update_b == UINT32_MAX &&
+            plan.magnetic_half_step.apply_b_sources == UINT32_MAX &&
+            plan.magnetic_half_step.transfer_b == UINT32_MAX &&
+            plan.magnetic_half_step.evaluate_h_sources == UINT32_MAX &&
+            plan.magnetic_half_step.update_h == UINT32_MAX &&
+            plan.magnetic_half_step.transfer_h == UINT32_MAX,
+        "StepPlan::clear retained magnetic state");
+  Operation unrelated = {};
+  unrelated.kind = OpKind::increment_time;
+  plan.operations.push_back(unrelated);
+  CHECK(plan.operations[0].magnetic_state_index == 0 &&
+            plan.operations[0].magnetic_state_count == 0 && plan.magnetic_state_arrays.empty(),
+        "plan rebuild inherited a cleared magnetic span");
 }
 
 static void test_empty_plan() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   structure s(gv, one, no_pml());
   fields f(&s);
+  f.require_component(Ez);
+  f.advance(1);
   const StepPlan p = build_step_plan(f, StepProgram::ordinary);
   std::vector<std::string> got;
   format_step_plan(p, got);
   compare("ordinary/empty", got, expected_empty,
           sizeof(expected_empty) / sizeof(expected_empty[0]));
+  const uint32_t schedule[] = {
+      p.magnetic_half_step.evaluate_b_sources, p.magnetic_half_step.update_b,
+      p.magnetic_half_step.apply_b_sources,    p.magnetic_half_step.transfer_b,
+      p.magnetic_half_step.evaluate_h_sources, p.magnetic_half_step.update_h,
+      p.magnetic_half_step.transfer_h};
+  CHECK(schedule[0] == UINT32_MAX && schedule[4] == UINT32_MAX,
+        "source-free magnetic schedule retained source evaluation nodes");
+  const OpKind kinds[] = {OpKind::evaluate_source_scalars,
+                          OpKind::update_db,
+                          OpKind::apply_sources,
+                          OpKind::transfer_halo,
+                          OpKind::evaluate_source_scalars,
+                          OpKind::update_eh,
+                          OpKind::transfer_halo};
+  const field_type types[] = {field_type(NUM_FIELD_TYPES), B_stuff, B_stuff, B_stuff,
+                              field_type(NUM_FIELD_TYPES), H_stuff, H_stuff};
+  uint32_t previous = 0;
+  for (int i = 0; i < 7; ++i) {
+    if (i == 0 || i == 4) continue;
+    CHECK(schedule[i] < p.operations.size(), "source-free magnetic slot %d is out of range", i);
+    if (schedule[i] >= p.operations.size()) continue;
+    CHECK(p.operations[schedule[i]].kind == kinds[i] && p.operations[schedule[i]].ft == types[i],
+          "source-free magnetic slot %d has the wrong operation", i);
+    CHECK(!previous || previous < schedule[i], "source-free magnetic slots are out of order");
+    previous = schedule[i];
+  }
+  const Operation *synchronize = NULL;
+  for (const Operation &op : p.operations)
+    if (op.kind == OpKind::synchronize_magnetic_fields) synchronize = &op;
+  CHECK(synchronize, "source-free plan has no synchronize marker");
+  if (synchronize) {
+    CHECK(schedule[6] < size_t(synchronize - &p.operations[0]),
+          "source-free synchronize marker precedes its half-step");
+    check_exact_magnetic_access_union(p, *synchronize, schedule);
+  }
 }
 
 /* The CW program must exist and must differ from the ordinary one. A stale or
@@ -749,6 +1107,7 @@ int main(int argc, char **argv) {
   test_empty_plan();
   test_solve_cw_plan();
   test_phasing_plan();
+  test_magnetic_schema_signature();
   test_polarization_schema_signature();
   test_beta_schema_signature();
   test_bfast_schema_signature();
