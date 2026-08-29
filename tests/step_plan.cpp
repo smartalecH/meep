@@ -273,6 +273,7 @@ static void test_polarization_schema_signature() {
   plan.operations.push_back(op);
 
   PolarizationUpdate update = {};
+  update.kind = PolarizationUpdateKind::gyrotropic;
   update.region.chunk = 2;
   update.region.c = Ez;
   update.region.cmp = 1;
@@ -289,6 +290,10 @@ static void test_polarization_schema_signature() {
   update.state_index = 4;
   update.p = ArrayId{1};
   update.p_prev = ArrayId{2};
+  update.p_cross1 = ArrayId{8};
+  update.p_prev_cross1 = ArrayId{9};
+  update.p_cross2 = ArrayId{10};
+  update.p_prev_cross2 = ArrayId{11};
   update.primary_w = ArrayId{3};
   update.cross_w1 = ArrayId{4};
   update.cross_w2 = invalid_array();
@@ -300,6 +305,10 @@ static void test_polarization_schema_signature() {
   update.cross_stride2 = 0;
   update.omega_0 = 0.25;
   update.gamma = 0.05;
+  update.alpha = 0.07;
+  update.gyro_tensor[0][1] = 0.11;
+  update.gyro_tensor[1][0] = -0.11;
+  update.gyro_model = GYROTROPIC_SATURATED;
   update.dt = 0.01;
   plan.polarization_updates.push_back(update);
 
@@ -331,10 +340,21 @@ static void test_polarization_schema_signature() {
                         "signature ignored polarization region begin");
   CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].p.value,
                         "signature ignored polarization ArrayId");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].kind =
+                            PolarizationUpdateKind::lorentzian,
+                        "signature ignored polarization update kind");
+  CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].p_cross1.value,
+                        "signature ignored gyrotropic state ArrayId");
   CHECK_SIGNATURE_FIELD(--changed.polarization_updates[0].primary_stride,
                         "signature ignored polarization stride");
   CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].gamma += 0.01,
                         "signature ignored polarization coefficient");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].alpha += 0.01,
+                        "signature ignored gyrotropic alpha");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].gyro_tensor[2][1] += 0.01,
+                        "signature ignored gyrotropic tensor");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].gyro_model = GYROTROPIC_DRUDE,
+                        "signature ignored gyrotropic model");
   CHECK_SIGNATURE_FIELD(++changed.polarization_subtractions[0].elements,
                         "signature ignored polarization subtraction size");
 #undef CHECK_SIGNATURE_FIELD
