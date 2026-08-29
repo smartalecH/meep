@@ -2469,6 +2469,9 @@ public:
 
 private:
   friend void backend_classify_and_finalize(fields &);
+  friend void backend_prepare_field_layout_change(fields &, uint32_t, const char *);
+  friend bool backend_try_synchronize_magnetic_fields(fields &, const char *);
+  friend bool backend_try_restore_magnetic_fields(fields &, const char *);
   int synchronized_magnetic_fields; // count number of nested synchs
   double last_wall_time;
   std::vector<time_sink> was_working_on;
@@ -2502,6 +2505,7 @@ private:
   void prepare_storage_for(field_type ft);       // one field type
   void prepare_storage_if_stale(field_type ft);  // no-op if already prepared
   void classify_and_finalize();                  // preparation pass 2
+  void ensure_backend_executable();
   void step_once(); // one timestep; advance(n) calls this n times
   const StepPlan &step_plan_for(StepProgram program);
   void execute_step_plan(const StepPlan &plan, int save_synchronized_magnetic_fields);

@@ -69,6 +69,8 @@ struct lifetime_counts {
   int reads;
   int writes;
   int rebuilds;
+  int magnetic_synchronizes;
+  int magnetic_restores;
   size_t arrays_at_create;
   size_t polarization_arrays_at_create;
   size_t polarization_updates_at_compile;
@@ -82,16 +84,23 @@ struct lifetime_counts {
   bool connections_current_at_create;
   bool rebuild_saw_live_imaginary;
   bool fail_rebuild;
+  bool fail_compile;
+  bool fail_magnetic_synchronize;
+  bool fail_magnetic_restore;
+  bool fail_magnetic_synchronize_dispatch;
 
   lifetime_counts()
       : states_created(0), states_destroyed(0), executables_created(0), executables_destroyed(0),
         initialized(0), classified(0), finalized(0), advanced(0), reads(0), writes(0), rebuilds(0),
-        arrays_at_create(0), polarization_arrays_at_create(0), polarization_updates_at_compile(0),
+        magnetic_synchronizes(0), magnetic_restores(0), arrays_at_create(0),
+        polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
         bfast_updates_at_compile(0), cylindrical_m_updates_at_compile(0),
         cylindrical_origin_actions_at_compile(0), gyrotropic_update_at_compile(false),
         polarization_zero_at_create(true), connections_current_at_create(false),
-        rebuild_saw_live_imaginary(false), fail_rebuild(false) {}
+        rebuild_saw_live_imaginary(false), fail_rebuild(false), fail_compile(false),
+        fail_magnetic_synchronize(false), fail_magnetic_restore(false),
+        fail_magnetic_synchronize_dispatch(false) {}
 };
 
 struct tracking_state : BackendState {
@@ -110,7 +119,8 @@ struct tracking_executable : Executable {
 
 class tracking_backend : public ExecutionBackend {
 public:
-  tracking_backend(fields &f_, lifetime_counts &counts_) : f(f_), counts(counts_) {}
+  tracking_backend(fields &f_, lifetime_counts &counts_, bool magnetic_supported_ = false)
+      : f(f_), counts(counts_), magnetic_supported(magnetic_supported_) {}
 
   BackendState *create_state(const StoragePlan &plan) override {
     counts.arrays_at_create = plan.arrays.size();
@@ -132,6 +142,7 @@ public:
   }
   void finalize_storage(const StoragePlan &, BackendState &) override { ++counts.finalized; }
   Executable *compile(const StepPlan &plan, BackendState &) override {
+    if (counts.fail_compile) throw std::runtime_error("injected executable compilation failure");
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
     counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
     counts.beta_updates_at_compile = plan.beta_updates.size();
@@ -147,6 +158,21 @@ public:
   void read(ArrayRef, void *, size_t) override { ++counts.reads; }
   void write(ArrayRef, const void *, size_t) override { ++counts.writes; }
   void synchronize() override {}
+  bool supports_magnetic_synchronization() const override { return magnetic_supported; }
+  void preflight_magnetic_transition(Executable &, BackendState &, bool synchronize) override {
+    if (synchronize && counts.fail_magnetic_synchronize)
+      throw std::runtime_error("injected magnetic synchronize failure");
+    if (!synchronize && counts.fail_magnetic_restore)
+      throw std::runtime_error("injected magnetic restore failure");
+  }
+  void synchronize_magnetic_fields(Executable &, BackendState &) override {
+    if (counts.fail_magnetic_synchronize_dispatch)
+      throw std::runtime_error("injected magnetic synchronize dispatch failure");
+    ++counts.magnetic_synchronizes;
+  }
+  void restore_magnetic_fields(Executable &, BackendState &) override {
+    ++counts.magnetic_restores;
+  }
   backend_capabilities capabilities() const override {
     backend_capabilities c = {true, true, true, 0, "tracking"};
     return c;
@@ -170,7 +196,173 @@ public:
 private:
   fields &f;
   lifetime_counts &counts;
+  bool magnetic_supported;
 };
+
+static void build(structure **sp, fields **fp, const execution_options *opts = NULL);
+
+static void test_resident_magnetic_dispatch() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts, true);
+
+  counts.fail_compile = my_rank() == 0;
+  bool compile_failed = false;
+  try {
+    f->synchronize_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    compile_failed = true;
+  }
+  CHECK(sum_to_all(int(compile_failed)) == count_processors(),
+        "rank-asymmetric magnetic compile failure was not reconciled");
+  CHECK(counts.magnetic_synchronizes == 0,
+        "magnetic compile failure entered the synchronization dispatch");
+  CHECK(!f->executable && counts.executables_created == counts.executables_destroyed,
+        "failed first compile retained a partial executable");
+  counts.fail_compile = false;
+
+  f->synchronize_magnetic_fields();
+  CHECK(counts.states_created == 1 &&
+            counts.executables_created == counts.executables_destroyed + 1,
+        "pre-step resident sync did not prepare state and executable");
+  CHECK(counts.magnetic_synchronizes == 1 && counts.magnetic_restores == 0,
+        "first resident sync dispatched the wrong transition");
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    if (f->chunks[chunk]->is_mine()) DOCMP2 FOR_COMPONENTS(c) {
+        CHECK(!f->chunks[chunk]->f_backup[c][cmp] && !f->chunks[chunk]->f_u_backup[c][cmp] &&
+                  !f->chunks[chunk]->f_w_backup[c][cmp] &&
+                  !f->chunks[chunk]->f_cond_backup[c][cmp] &&
+                  !f->chunks[chunk]->f_bfast_backup[c][cmp],
+              "resident sync allocated legacy host backup storage");
+      }
+
+  f->synchronize_magnetic_fields();
+  CHECK(counts.magnetic_synchronizes == 1, "nested resident sync performed work");
+  f->restore_magnetic_fields();
+  CHECK(counts.magnetic_restores == 0, "inner resident restore performed work");
+
+  BackendState *state = f->backend_state;
+  Executable *executable = f->executable;
+  bool rebuild_rejected = false;
+  try {
+    backend_prepare_field_layout_change(*f, dirty_storage, "magnetic rebuild test");
+  }
+  catch (const std::runtime_error &) {
+    rebuild_rejected = true;
+  }
+  CHECK(sum_to_all(int(rebuild_rejected)) == count_processors(),
+        "live resident magnetic snapshot did not reject a state rebuild collectively");
+  CHECK(f->backend_state == state && f->executable == executable,
+        "rejected magnetic rebuild changed state or executable");
+
+  counts.fail_magnetic_restore = my_rank() == 0;
+  bool restore_failed = false;
+  try {
+    f->restore_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    restore_failed = true;
+  }
+  CHECK(sum_to_all(int(restore_failed)) == count_processors(),
+        "resident magnetic restore failure was not reconciled");
+  CHECK(counts.magnetic_restores == 0, "failed resident restore completed the transition");
+  counts.fail_magnetic_restore = false;
+  f->restore_magnetic_fields();
+  CHECK(counts.magnetic_restores == 1, "final resident restore did not dispatch exactly once");
+  f->restore_magnetic_fields();
+  CHECK(counts.magnetic_restores == 1, "unmatched resident restore performed work");
+
+  Executable *compiled = f->executable;
+  const int created_before_recompile = counts.executables_created;
+  const int destroyed_before_recompile = counts.executables_destroyed;
+  f->dirty_mask |= dirty_executable;
+  counts.fail_compile = my_rank() == 0;
+  compile_failed = false;
+  try {
+    f->synchronize_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    compile_failed = true;
+  }
+  CHECK(sum_to_all(int(compile_failed)) == count_processors(),
+        "rank-asymmetric replacement compile failure was not reconciled");
+  CHECK(f->executable == compiled && is_dirty(*f, dirty_executable),
+        "replacement compile failure lost the prior executable or dirty bit");
+  CHECK(counts.executables_created - created_before_recompile ==
+            counts.executables_destroyed - destroyed_before_recompile,
+        "replacement compile failure leaked a candidate executable");
+  CHECK(counts.magnetic_synchronizes == 1,
+        "replacement compile failure entered the synchronization dispatch");
+  counts.fail_compile = false;
+  f->synchronize_magnetic_fields();
+  CHECK(!is_dirty(*f, dirty_executable) &&
+            counts.executables_created == created_before_recompile + 1 + (my_rank() != 0) &&
+            counts.executables_destroyed == destroyed_before_recompile + 1 + (my_rank() != 0),
+        "replacement compile retry did not replace exactly one live executable");
+  f->restore_magnetic_fields();
+
+  counts.fail_magnetic_synchronize = my_rank() == 0;
+  bool sync_failed = false;
+  try {
+    f->synchronize_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    sync_failed = true;
+  }
+  CHECK(sum_to_all(int(sync_failed)) == count_processors(),
+        "resident magnetic synchronize failure was not reconciled");
+  CHECK(counts.magnetic_synchronizes == 2, "failed resident sync completed the transition");
+  counts.fail_magnetic_synchronize = false;
+  f->synchronize_magnetic_fields();
+  f->restore_magnetic_fields();
+  CHECK(counts.magnetic_synchronizes == 3 && counts.magnetic_restores == 3,
+        "resident magnetic transition did not recover after injected failures");
+
+  counts.fail_magnetic_synchronize_dispatch = my_rank() == 0;
+  bool dispatch_failed = false;
+  try {
+    f->synchronize_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    dispatch_failed = true;
+  }
+  CHECK(sum_to_all(int(dispatch_failed)) == count_processors(),
+        "rank-asymmetric dispatch failure was not reconciled");
+  CHECK(f->backend->is_poisoned(), "dispatch failure did not poison every resident backend");
+  bool poison_rejected = false;
+  try {
+    f->restore_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    poison_rejected = true;
+  }
+  CHECK(sum_to_all(int(poison_rejected)) == count_processors(),
+        "poisoned resident backend accepted another magnetic transition");
+  bool layout_rejected = false;
+  try {
+    backend_prepare_field_layout_change(*f, dirty_storage, "poisoned magnetic test");
+  }
+  catch (const std::runtime_error &) {
+    layout_rejected = true;
+  }
+  CHECK(sum_to_all(int(layout_rejected)) == count_processors(),
+        "poisoned resident backend accepted a layout rebuild");
+  bool advance_rejected = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    advance_rejected = true;
+  }
+  CHECK(sum_to_all(int(advance_rejected)) == count_processors(),
+        "poisoned resident backend accepted an ordinary advance");
+
+  delete f;
+  delete s;
+}
 
 struct rebuild_trace {
   std::vector<std::string> events;
@@ -394,7 +586,7 @@ private:
   compact_trace &compact;
 };
 
-static void build(structure **sp, fields **fp, const execution_options *opts = NULL) {
+static void build(structure **sp, fields **fp, const execution_options *opts) {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   *sp = new structure(gv, eps_slab, pml(0.5));
   *fp = opts ? new fields(*sp, *opts) : new fields(*sp);
@@ -866,6 +1058,32 @@ static void test_backend_lifecycle_epoch() {
   delete f;
   CHECK(counts.states_destroyed == 2 && counts.executables_destroyed == 2,
         "polymorphic backend artifacts were not destroyed exactly once");
+  delete s;
+}
+
+static void test_backend_reselection_invalidates_representation() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+  CHECK(f->backend_state && f->executable,
+        "backend replacement fixture did not prepare resident execution");
+  const uint64_t generation_before = generation(*f, MutationKind::precision_policy);
+
+  execution_options cpu;
+  f->select_backend(cpu);
+  CHECK(!f->backend_state && !f->executable && counts.states_destroyed == 1 &&
+            counts.executables_destroyed == 1,
+        "backend replacement did not retire the prior representation exactly once");
+  CHECK(is_dirty(*f, dirty_storage) && is_dirty(*f, dirty_initialization) &&
+            is_dirty(*f, dirty_executable),
+        "backend replacement did not invalidate storage, values, and executable");
+  CHECK(generation(*f, MutationKind::precision_policy) == generation_before + 1,
+        "backend replacement did not record a representation generation");
+
+  delete f;
   delete s;
 }
 
@@ -1867,6 +2085,13 @@ int main(int argc, char **argv) {
     master_printf("backend_api: cylindrical checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_MAGNETIC_ONLY")) {
+    test_backend_reselection_invalidates_representation();
+    test_resident_magnetic_dispatch();
+    if (failures) return 1;
+    master_printf("backend_api: magnetic checks passed\n");
+    return 0;
+  }
 
   test_selection();
   test_construction_equivalence();
@@ -1875,6 +2100,8 @@ int main(int argc, char **argv) {
   test_dft_access_boundaries();
   test_detached_dft_access();
   test_backend_lifecycle_epoch();
+  test_backend_reselection_invalidates_representation();
+  test_resident_magnetic_dispatch();
   test_resident_polarization_preparation();
   test_resident_beta_fingerprint();
   test_resident_bfast_fingerprint();
