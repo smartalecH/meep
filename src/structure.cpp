@@ -15,7 +15,6 @@
 %  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 
-#include <memory>
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
@@ -25,6 +24,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "meepgeom.hpp"
+#include "backend/backend.hpp"
 
 using namespace std;
 
@@ -563,7 +563,7 @@ void structure::mix_with(const structure *oth, double f) {
     if (chunks[i]->is_mine()) chunks[i]->mix_with(oth->chunks[i], f);
 }
 
-structure_chunk::~structure_chunk() {
+void structure_chunk::release_owned_data() noexcept {
   FOR_COMPONENTS(c) {
     FOR_DIRECTIONS(d) {
       delete[] chi1inv[c][d];
@@ -578,8 +578,13 @@ structure_chunk::~structure_chunk() {
     delete[] kap[d];
     delete[] siginv[d];
   }
-  FOR_FIELD_TYPES(ft) { delete chiP[ft]; }
+  FOR_FIELD_TYPES(ft) {
+    delete chiP[ft];
+    chiP[ft] = NULL;
+  }
 }
+
+structure_chunk::~structure_chunk() { release_owned_data(); }
 
 void structure_chunk::mix_with(const structure_chunk *n, double f) {
   FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
@@ -708,92 +713,95 @@ void structure_chunk::update_condinv() {
 
 structure_chunk::structure_chunk(const structure_chunk *o) : v(o->v) {
   refcount = 1;
-
-  FOR_FIELD_TYPES(ft) {
-    {
-      susceptibility *cur = NULL;
-      chiP[ft] = NULL;
-      for (const susceptibility *ocur = o->chiP[ft]; ocur; ocur = ocur->next) {
-        if (cur) {
-          cur->next = ocur->clone();
-          cur = cur->next;
-        }
-        else { chiP[ft] = cur = ocur->clone(); }
-        cur->next = NULL;
-      }
-    }
-  }
-  a = o->a;
-  Courant = o->Courant;
-  dt = o->dt;
-  gv = o->gv;
-  the_proc = o->the_proc;
-  the_is_mine = my_rank() == n_proc();
-  cost = o->cost;
+  FOR_FIELD_TYPES(ft) chiP[ft] = NULL;
   FOR_COMPONENTS(c) {
-    if (is_mine() && o->chi3[c]) {
-      chi3[c] = new realnum[gv.ntot()];
-      if (chi3[c] == NULL) meep::abort("Out of memory!\n");
-      for (size_t i = 0; i < gv.ntot(); i++)
-        chi3[c][i] = o->chi3[c][i];
-    }
-    else { chi3[c] = NULL; }
-    if (is_mine() && o->chi2[c]) {
-      chi2[c] = new realnum[gv.ntot()];
-      if (chi2[c] == NULL) meep::abort("Out of memory!\n");
-      for (size_t i = 0; i < gv.ntot(); i++)
-        chi2[c][i] = o->chi2[c][i];
-    }
-    else { chi2[c] = NULL; }
-  }
-  FOR_COMPONENTS(c) FOR_DIRECTIONS(d) { trivial_chi1inv[c][d] = true; }
-  FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
-    if (is_mine()) {
-      trivial_chi1inv[c][d] = o->trivial_chi1inv[c][d];
-      if (o->chi1inv[c][d]) {
-        chi1inv[c][d] = new realnum[gv.ntot()];
-        memcpy(chi1inv[c][d], o->chi1inv[c][d], gv.ntot() * sizeof(realnum));
-      }
-      else
-        chi1inv[c][d] = NULL;
-      if (o->conductivity[c][d]) {
-        conductivity[c][d] = new realnum[gv.ntot()];
-        memcpy(conductivity[c][d], o->conductivity[c][d], gv.ntot() * sizeof(realnum));
-      }
-      else
-        conductivity[c][d] = NULL;
-      if (o->condinv[c][d]) {
-        condinv[c][d] = new realnum[gv.ntot()];
-        memcpy(condinv[c][d], o->condinv[c][d], gv.ntot() * sizeof(realnum));
-      }
-      else
-        condinv[c][d] = NULL;
+    chi2[c] = chi3[c] = NULL;
+    FOR_DIRECTIONS(d) {
+      chi1inv[c][d] = conductivity[c][d] = condinv[c][d] = NULL;
+      trivial_chi1inv[c][d] = true;
     }
   }
-  condinv_stale = o->condinv_stale;
-  // Allocate the PML conductivity arrays:
   for (int d = 0; d < 6; ++d) {
     sig[d] = NULL;
     kap[d] = NULL;
     siginv[d] = NULL;
     sigsize[d] = 0;
   }
-  for (int i = 0; i < 5; ++i)
-    sigsize[i] = 0;
-  // Copy over the PML conductivity arrays:
-  if (is_mine()) FOR_DIRECTIONS(d) {
-      if (o->sig[d]) {
-        sig[d] = new realnum[2 * gv.num_direction(d) + 1];
-        kap[d] = new realnum[2 * gv.num_direction(d) + 1];
-        siginv[d] = new realnum[2 * gv.num_direction(d) + 1];
-        sigsize[d] = o->sigsize[d];
-        for (int i = 0; i < 2 * gv.num_direction(d) + 1; i++) {
-          sig[d][i] = o->sig[d][i];
-          kap[d][i] = o->kap[d][i];
-          siginv[d][i] = o->siginv[d][i];
+  try {
+    FOR_FIELD_TYPES(ft) {
+      susceptibility *cur = NULL;
+      for (const susceptibility *ocur = o->chiP[ft]; ocur; ocur = ocur->next) {
+        susceptibility *next = ocur->clone();
+        if (cur)
+          cur->next = next;
+        else
+          chiP[ft] = next;
+        cur = next;
+        cur->next = NULL;
+        backend_cw_clone_checkpoint();
+      }
+    }
+    a = o->a;
+    Courant = o->Courant;
+    dt = o->dt;
+    gv = o->gv;
+    the_proc = o->the_proc;
+    the_is_mine = my_rank() == n_proc();
+    cost = o->cost;
+    FOR_COMPONENTS(c) {
+      if (is_mine() && o->chi3[c]) {
+        chi3[c] = new realnum[gv.ntot()];
+        memcpy(chi3[c], o->chi3[c], gv.ntot() * sizeof(realnum));
+        backend_cw_clone_checkpoint();
+      }
+      if (is_mine() && o->chi2[c]) {
+        chi2[c] = new realnum[gv.ntot()];
+        memcpy(chi2[c], o->chi2[c], gv.ntot() * sizeof(realnum));
+        backend_cw_clone_checkpoint();
+      }
+    }
+    FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+      if (is_mine()) {
+        trivial_chi1inv[c][d] = o->trivial_chi1inv[c][d];
+        if (o->chi1inv[c][d]) {
+          chi1inv[c][d] = new realnum[gv.ntot()];
+          memcpy(chi1inv[c][d], o->chi1inv[c][d], gv.ntot() * sizeof(realnum));
+          backend_cw_clone_checkpoint();
+        }
+        if (o->conductivity[c][d]) {
+          conductivity[c][d] = new realnum[gv.ntot()];
+          memcpy(conductivity[c][d], o->conductivity[c][d], gv.ntot() * sizeof(realnum));
+          backend_cw_clone_checkpoint();
+        }
+        if (o->condinv[c][d]) {
+          condinv[c][d] = new realnum[gv.ntot()];
+          memcpy(condinv[c][d], o->condinv[c][d], gv.ntot() * sizeof(realnum));
+          backend_cw_clone_checkpoint();
         }
       }
     }
+    condinv_stale = o->condinv_stale;
+    if (is_mine()) FOR_DIRECTIONS(d) {
+        if (o->sig[d]) {
+          sigsize[d] = o->sigsize[d];
+          sig[d] = new realnum[sigsize[d]];
+          backend_cw_clone_checkpoint();
+          kap[d] = new realnum[sigsize[d]];
+          backend_cw_clone_checkpoint();
+          siginv[d] = new realnum[sigsize[d]];
+          backend_cw_clone_checkpoint();
+          for (int i = 0; i < sigsize[d]; i++) {
+            sig[d][i] = o->sig[d][i];
+            kap[d][i] = o->kap[d][i];
+            siginv[d][i] = o->siginv[d][i];
+          }
+        }
+      }
+  }
+  catch (...) {
+    release_owned_data();
+    throw;
+  }
 }
 
 void structure_chunk::set_chi3(component c, material_function &epsilon) {
