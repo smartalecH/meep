@@ -115,7 +115,8 @@ static void check_finite_value_accesses(const fields &f, const StepPlan &plan) {
               (key.cmp == 0 || key.cmp == 1),
           "finite-check access %zu lacks deterministic chunk/component/cmp attribution", i);
   }
-  CHECK(!finite->accesses.empty(), "prepared finite check has no field accesses");
+  CHECK(or_to_all(!finite->accesses.empty()),
+        "prepared finite check has no field accesses on any rank");
 
   if (!finite->accesses.empty()) {
     StepPlan changed = plan;
@@ -161,7 +162,8 @@ static void check_prepared_updates() {
     const Operation &op = plan.operations[oi];
     if (op.kind != OpKind::update_db && op.kind != OpKind::update_eh) continue;
     ++update_ops;
-    CHECK(op.descriptor_count > 0, "%s has an empty descriptor span", op_kind_name(op.kind));
+    CHECK(or_to_all(op.descriptor_count > 0), "%s has an empty descriptor span on every rank",
+          op_kind_name(op.kind));
     if (op.kind == OpKind::update_db) {
       CHECK(size_t(op.descriptor_index) + op.descriptor_count <= plan.db_updates.size(),
             "update_db descriptor span is out of range");
