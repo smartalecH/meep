@@ -171,6 +171,8 @@ static void test_full_plan() {
      treats them all the same. */
   size_t variants = 0, devices = 0;
   for (const Operation &op : p.operations) {
+    CHECK(op.beta_descriptor_index == 0 && op.beta_descriptor_count == 0,
+          "%s has a nonempty beta span in a zero-beta plan", op_kind_name(op.kind));
     CHECK(op.polarization_subtraction_index == 0 && op.polarization_subtraction_count == 0,
           "%s has a nonempty PR6 polarization-subtraction span",
           op_kind_name(op.kind));
@@ -268,6 +270,8 @@ static void test_polarization_schema_signature() {
   op.kind = OpKind::update_polarization;
   op.ft = E_stuff;
   op.guard = guard_always();
+  op.beta_descriptor_index = 0;
+  op.beta_descriptor_count = 0;
   op.polarization_subtraction_index = 0;
   op.polarization_subtraction_count = 0;
   plan.operations.push_back(op);
@@ -324,7 +328,9 @@ static void test_polarization_schema_signature() {
 
   const uint64_t signature = compute_step_plan_signature(plan);
   CHECK(plan.operations[0].polarization_subtraction_index == 0 &&
-            plan.operations[0].polarization_subtraction_count == 0,
+            plan.operations[0].polarization_subtraction_count == 0 &&
+            plan.operations[0].beta_descriptor_index == 0 &&
+            plan.operations[0].beta_descriptor_count == 0,
         "new operation spans are not zero-initialized");
 
 #define CHECK_SIGNATURE_FIELD(expr, message)                                                       \
@@ -360,6 +366,76 @@ static void test_polarization_schema_signature() {
 #undef CHECK_SIGNATURE_FIELD
 }
 
+static void test_beta_schema_signature() {
+  StepPlan plan;
+  plan.beta = 0.17;
+  Operation op = {};
+  op.kind = OpKind::update_db;
+  op.ft = D_stuff;
+  op.guard = guard_always();
+  op.beta_descriptor_index = 0;
+  op.beta_descriptor_count = 1;
+  plan.operations.push_back(op);
+
+  BetaUpdate update = {};
+  update.region.chunk = 3;
+  update.region.c = Dx;
+  update.region.cmp = 1;
+  update.region.begin = ivec(1, 3, 0);
+  update.region.end = ivec(7, 9, 0);
+  update.region.base = 11;
+  update.region.counts[0] = 4;
+  update.region.counts[1] = 5;
+  update.region.counts[2] = 1;
+  update.region.strides[0] = 1;
+  update.region.strides[1] = 17;
+  update.region.strides[2] = 0;
+  update.region.variant_key = beta_has_pml | beta_has_pml_aux | beta_has_conductivity;
+  update.target = ArrayId{1};
+  update.source = ArrayId{2};
+  update.target_u = ArrayId{3};
+  update.condinv = ArrayId{4};
+  update.target_cond = ArrayId{5};
+  update.pml.siginv = ArrayId{6};
+  update.pml.base = 7;
+  update.pml.strides[1] = 2;
+  update.pml_u.siginv = ArrayId{8};
+  update.pml_u.base = 9;
+  update.pml_u.strides[0] = 2;
+  update.betadt = -0.125;
+  plan.beta_updates.push_back(update);
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+#define CHECK_BETA_SIGNATURE(expr, message)                                                        \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                           \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                              \
+  } while (0)
+  CHECK_BETA_SIGNATURE(++changed.operations[0].beta_descriptor_index,
+                       "signature ignored beta descriptor index");
+  CHECK_BETA_SIGNATURE(changed.beta = -0.17, "signature ignored plan beta");
+  CHECK_BETA_SIGNATURE(++changed.operations[0].beta_descriptor_count,
+                       "signature ignored beta descriptor count");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].region.variant_key,
+                       "signature ignored beta variant");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].source.value,
+                       "signature ignored beta source");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].target_u.value,
+                       "signature ignored beta auxiliary target");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].condinv.value,
+                       "signature ignored beta conductivity inverse");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].target_cond.value,
+                       "signature ignored beta conductivity target");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].pml.siginv.value,
+                       "signature ignored beta primary PML profile");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].pml_u.base,
+                       "signature ignored beta auxiliary PML profile");
+  CHECK_BETA_SIGNATURE(changed.beta_updates[0].betadt = 0.125,
+                       "signature ignored beta coefficient");
+#undef CHECK_BETA_SIGNATURE
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -369,6 +445,7 @@ int main(int argc, char **argv) {
   test_solve_cw_plan();
   test_phasing_plan();
   test_polarization_schema_signature();
+  test_beta_schema_signature();
 
   if (failures) {
     master_printf("step_plan: %d FAILURE(S)\n", failures);
