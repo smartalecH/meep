@@ -33,6 +33,7 @@
 #include "config.h"
 #include "backend/backend.hpp"
 #include "backend/cpu/cpu_backend.hpp"
+#include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/prepare.hpp"
@@ -57,6 +58,7 @@ static int failures = 0;
 
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static double unit_epsilon(const vec &) { return 1.0; }
+static double phase_conductivity(const vec &);
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
 
 struct lifetime_counts {
@@ -73,6 +75,12 @@ struct lifetime_counts {
   int rebuilds;
   int magnetic_synchronizes;
   int magnetic_restores;
+  int cw_executables_created;
+  int cw_executables_destroyed;
+  int cw_preflights;
+  int cw_solves;
+  int cw_callback_effects;
+  int malformed_cw_result;
   size_t arrays_at_create;
   size_t polarization_arrays_at_create;
   size_t polarization_updates_at_compile;
@@ -85,24 +93,46 @@ struct lifetime_counts {
   bool polarization_zero_at_create;
   bool connections_current_at_create;
   bool rebuild_saw_live_imaginary;
+  bool migrate_authoritative_value;
+  realnum authoritative_value;
   bool fail_rebuild;
+  bool fail_create_state;
+  bool fail_initialize;
   bool fail_compile;
+  bool corrupt_catalog_after_compile;
   bool fail_magnetic_synchronize;
   bool fail_magnetic_restore;
   bool fail_magnetic_synchronize_dispatch;
+  bool fail_cw_preflight;
+  bool fail_cw_dispatch;
+  bool alias_cw_to_ordinary;
+  bool mutate_cw_cache_during_preflight;
+  bool mutate_after_cw_boundary;
+  bool cw_saw_transient_mode;
+  bool cw_final_dft_at_entry_time;
+  CwSolveStatus cw_status;
 
   lifetime_counts()
       : states_created(0), states_destroyed(0), executables_created(0), executables_destroyed(0),
         initialized(0), classified(0), finalized(0), advanced(0), reads(0), writes(0), rebuilds(0),
-        magnetic_synchronizes(0), magnetic_restores(0), arrays_at_create(0),
+        magnetic_synchronizes(0), magnetic_restores(0),
+        cw_executables_created(0), cw_executables_destroyed(0), cw_preflights(0), cw_solves(0),
+        cw_callback_effects(0), malformed_cw_result(0), arrays_at_create(0),
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
         bfast_updates_at_compile(0), cylindrical_m_updates_at_compile(0),
         cylindrical_origin_actions_at_compile(0), gyrotropic_update_at_compile(false),
         polarization_zero_at_create(true), connections_current_at_create(false),
-        rebuild_saw_live_imaginary(false), fail_rebuild(false), fail_compile(false),
+        rebuild_saw_live_imaginary(false), migrate_authoritative_value(false),
+        authoritative_value(0), fail_rebuild(false), fail_create_state(false),
+        fail_initialize(false), fail_compile(false), corrupt_catalog_after_compile(false),
         fail_magnetic_synchronize(false), fail_magnetic_restore(false),
-        fail_magnetic_synchronize_dispatch(false) {}
+        fail_magnetic_synchronize_dispatch(false), fail_cw_preflight(false),
+        fail_cw_dispatch(false), alias_cw_to_ordinary(false),
+        mutate_cw_cache_during_preflight(false), mutate_after_cw_boundary(false),
+        cw_saw_transient_mode(false),
+        cw_final_dft_at_entry_time(false),
+        cw_status(CwSolveStatus::converged) {}
 };
 
 struct tracking_state : BackendState {
@@ -119,12 +149,23 @@ struct tracking_executable : Executable {
   lifetime_counts &counts;
 };
 
+struct tracking_cw_executable : Executable {
+  explicit tracking_cw_executable(lifetime_counts &counts_) : counts(counts_) {
+    ++counts.cw_executables_created;
+  }
+  ~tracking_cw_executable() override { ++counts.cw_executables_destroyed; }
+  lifetime_counts &counts;
+};
+
 class tracking_backend : public ExecutionBackend {
 public:
-  tracking_backend(fields &f_, lifetime_counts &counts_, bool magnetic_supported_ = false)
-      : f(f_), counts(counts_), magnetic_supported(magnetic_supported_) {}
+  tracking_backend(fields &f_, lifetime_counts &counts_, bool magnetic_supported_ = false,
+                   bool cw_supported_ = false)
+      : f(f_), counts(counts_), magnetic_supported(magnetic_supported_),
+        cw_supported(cw_supported_) {}
 
   BackendState *create_state(const StoragePlan &plan) override {
+    if (counts.fail_create_state) throw std::runtime_error("injected state creation failure");
     counts.arrays_at_create = plan.arrays.size();
     counts.connections_current_at_create = connections_are_current(f);
     for (size_t i = 0; i < plan.arrays.size(); ++i) {
@@ -137,7 +178,10 @@ public:
     }
     return new tracking_state(counts);
   }
-  void initialize(const InitializationPlan &, BackendState &) override { ++counts.initialized; }
+  void initialize(const InitializationPlan &, BackendState &) override {
+    ++counts.initialized;
+    if (counts.fail_initialize) throw std::runtime_error("injected initialization failure");
+  }
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
     ++counts.classified;
     return classify(f, plan);
@@ -154,9 +198,77 @@ public:
     for (const PolarizationUpdate &update : plan.polarization_updates)
       if (update.kind == PolarizationUpdateKind::gyrotropic)
         counts.gyrotropic_update_at_compile = true;
-    return new tracking_executable(counts);
+    Executable *result = new tracking_executable(counts);
+    if (counts.corrupt_catalog_after_compile) f.array_catalog->clear();
+    return result;
   }
   void advance(Executable &, BackendState &, int) override { ++counts.advanced; }
+  bool supports_cw(const CwSolveRequest &, std::string &why) const override {
+    if (cw_supported) return true;
+    why = "tracking backend CW support is disabled";
+    return false;
+  }
+  Executable *preflight_cw(const CwSolveRequest &, const StepPlan &step_plan,
+                           const CwPlan &cw_plan, Executable *cached,
+                           BackendState &state) override {
+    ++counts.cw_preflights;
+    if (counts.fail_cw_preflight)
+      throw std::runtime_error("injected solve_cw preflight failure");
+    CHECK(step_plan.program == StepProgram::solve_cw && cw_plan.step_plan_signature == step_plan.signature,
+          "CW preflight received mismatched canonical plans");
+    if (counts.alias_cw_to_ordinary) return f.executable;
+    if (counts.mutate_cw_cache_during_preflight) {
+      state.cw_executable = new tracking_cw_executable(counts);
+      state.cw_storage_fingerprint = 1;
+      state.cw_step_plan_signature = 2;
+      state.cw_plan_signature = 3;
+      return state.cw_executable;
+    }
+    return cached ? cached : new tracking_cw_executable(counts);
+  }
+  CwSolveResult solve_cw(const CwSolveRequest &request, const StepPlan &step_plan,
+                         const CwPlan &cw_plan,
+                         Executable &ordinary, Executable &cw, BackendState &,
+                         CwSolveSession &session) override {
+    ++counts.cw_solves;
+    ++counts.cw_callback_effects;
+    counts.cw_saw_transient_mode = true;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      counts.cw_saw_transient_mode =
+          counts.cw_saw_transient_mode && f.chunks[chunk]->is_solving_cw();
+    CHECK(&ordinary != &cw, "CW dispatch aliased the ordinary executable");
+    CHECK(step_plan.program == StepProgram::solve_cw && cw_plan.step_plan_signature == step_plan.signature,
+          "CW dispatch received mismatched canonical plans");
+    f.t += 7;
+    if (counts.fail_cw_dispatch)
+      throw std::runtime_error("injected solve_cw dispatch failure");
+    session.restore_before_final_dft();
+    counts.cw_final_dft_at_entry_time = f.t == request.entry_t && f.time() == request.entry_time;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      counts.cw_final_dft_at_entry_time =
+          counts.cw_final_dft_at_entry_time && !f.chunks[chunk]->is_solving_cw();
+    if (counts.mutate_after_cw_boundary) {
+      f.t += 9;
+      f.set_solve_cw_omega(2.0 * pi * request.frequency);
+    }
+    CwSolveResult result;
+    result.status = counts.cw_status;
+    result.iterations = 3;
+    result.operator_applications = 11;
+    result.recursive_relative_residual = 1e-7;
+    result.true_relative_residual = 2e-7;
+    if (counts.malformed_cw_result == 1) result.status = CwSolveStatus(99);
+    if (counts.malformed_cw_result == 2)
+      result.recursive_relative_residual = std::numeric_limits<double>::quiet_NaN();
+    if (counts.malformed_cw_result == 3) result.true_relative_residual = -1.0;
+    if (counts.malformed_cw_result == 4) result.iterations = 21;
+    if (counts.malformed_cw_result == 5) result.operator_applications = 0;
+    if (counts.malformed_cw_result == 6) {
+      result.iterations = 0;
+      result.operator_applications = 0;
+    }
+    return result;
+  }
   void read(ArrayRef, void *, size_t) override { ++counts.reads; }
   void write(ArrayRef, const void *, size_t) override { ++counts.writes; }
   void synchronize() override {}
@@ -182,9 +294,14 @@ public:
   bool requires_full_storage_preparation() const override { return true; }
   void prepare_state_rebuild(BackendState &, DirtyMask) override {
     ++counts.rebuilds;
+    bool migrated = false;
     for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
       if (!f.chunks[chunk] || !f.chunks[chunk]->is_mine()) continue;
       FOR_COMPONENTS(c) {
+        if (counts.migrate_authoritative_value && !migrated && f.chunks[chunk]->f[c][0]) {
+          f.chunks[chunk]->f[c][0][0] = counts.authoritative_value;
+          migrated = true;
+        }
         if (!f.chunks[chunk]->f[c][1]) continue;
         const ArrayId id = f.array_catalog->find({chunk, int(array_kind::f), int(c), 1, 0});
         if (is_valid(id) && f.array_catalog->resolve<realnum>(id) == f.chunks[chunk]->f[c][1])
@@ -199,9 +316,1377 @@ private:
   fields &f;
   lifetime_counts &counts;
   bool magnetic_supported;
+  bool cw_supported;
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL);
+
+static CwSolveRequest cw_request() {
+  CwSolveRequest request;
+  request.tolerance = 1e-6;
+  request.maxiters = 20;
+  request.frequency = std::complex<double>(0.3, 0.0);
+  request.L = 2;
+  return request;
+}
+
+static std::vector<const void *> cw_chunk_storage_addresses(const fields &f) {
+  std::vector<const void *> result;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    const fields_chunk &fc = *f.chunks[chunk];
+    result.push_back(&fc);
+    result.push_back(fc.s);
+    result.push_back(fc.dft_chunks);
+    DOCMP2 FOR_COMPONENTS(c) {
+      result.push_back(fc.f[c][cmp]);
+      result.push_back(fc.f_u[c][cmp]);
+      result.push_back(fc.f_w[c][cmp]);
+      result.push_back(fc.f_cond[c][cmp]);
+      result.push_back(fc.f_bfast[c][cmp]);
+      result.push_back(fc.f_minus_p[c][cmp]);
+      result.push_back(fc.f_w_prev[c][cmp]);
+      result.push_back(fc.f_backup[c][cmp]);
+      result.push_back(fc.f_u_backup[c][cmp]);
+      result.push_back(fc.f_w_backup[c][cmp]);
+      result.push_back(fc.f_cond_backup[c][cmp]);
+      result.push_back(fc.f_bfast_backup[c][cmp]);
+    }
+    result.push_back(fc.f_rderiv_int);
+  }
+  return result;
+}
+
+static realnum *first_owned_real_field(fields &f) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    FOR_COMPONENTS(c) if (f.chunks[chunk]->f[c][0]) return f.chunks[chunk]->f[c][0];
+  }
+  return NULL;
+}
+
+struct cw_source_snapshot {
+  std::vector<int> metadata;
+  std::vector<ptrdiff_t> indices;
+  std::vector<std::complex<double> > amplitudes;
+  bool operator==(const cw_source_snapshot &other) const {
+    return metadata == other.metadata && indices == other.indices && amplitudes == other.amplitudes;
+  }
+};
+
+static cw_source_snapshot snapshot_cw_sources(const fields &f) {
+  cw_source_snapshot result;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    FOR_FIELD_TYPES(ft) for (const src_vol &source : f.chunks[chunk]->sources[ft]) {
+      result.metadata.push_back(chunk);
+      result.metadata.push_back(int(ft));
+      result.metadata.push_back(int(source.c));
+      result.metadata.push_back(source.needs_boundary_fix ? 1 : 0);
+      result.metadata.push_back(int(source.num_points()));
+      for (size_t point = 0; point < source.num_points(); ++point) {
+        result.indices.push_back(source.index_at(point));
+        result.amplitudes.push_back(source.amplitude_at(point));
+      }
+    }
+  return result;
+}
+
+namespace meep {
+struct BackendEpochSnapshot {
+  fields_chunk **chunks;
+  halo_plan_set *halos;
+  CpuArrayCatalog *catalog;
+  StoragePlan *storage;
+  DescriptorSet *descriptors;
+  InitializationPlan *initialization;
+  StepPlan *steps[2];
+  BackendState *state;
+  Executable *ordinary;
+  Executable *cw;
+  std::vector<const void *> raw;
+  std::vector<const void *> dft_fc;
+  std::vector<const void *> comm;
+  std::vector<uint64_t> catalog_values;
+  std::vector<std::vector<unsigned char> > catalog_bytes;
+  std::vector<int> source_metadata;
+  std::vector<ptrdiff_t> source_indices;
+  std::vector<std::complex<double> > source_amplitudes;
+  std::vector<bool> cw_flags;
+  std::vector<std::complex<double> > cw_frequencies;
+  uint64_t catalog_hash, storage_hash, descriptor_hash, halo_hash, comm_hash, comm_block_hash,
+      comm_sequence_hash, comm_map_hash, raw_hash;
+  uint32_t dirty, prepared_mask, classification_reentries;
+  uint64_t classification_hash, connections_generation, connections_built_generation;
+  uint64_t local_generation, local_synced, mutations[fields::num_mutation_kinds];
+  bool components_allocated, connections_valid, changed_materials;
+  int time_step;
+  uint64_t cw_storage_key, cw_step_key, cw_plan_key;
+
+  static void mix(uint64_t &h, uint64_t v) {
+    h ^= v;
+    h *= 1099511628211ULL;
+  }
+  static void mix_bytes(uint64_t &h, const void *p, size_t n) {
+    const unsigned char *bytes = static_cast<const unsigned char *>(p);
+    for (size_t i = 0; i < n; ++i) mix(h, bytes[i]);
+  }
+  static size_t element_bytes(ElementType type) {
+    switch (type) {
+      case ElementType::realnum_value: return sizeof(realnum);
+      case ElementType::complex_realnum: return sizeof(std::complex<realnum>);
+      case ElementType::float64: return sizeof(double);
+      case ElementType::complex_float64: return sizeof(std::complex<double>);
+      case ElementType::int32: return sizeof(int32_t);
+      case ElementType::index: return sizeof(ptrdiff_t);
+    }
+    return 0;
+  }
+  template <typename T> static void mix_vector(uint64_t &h, const std::vector<T> &values) {
+    mix(h, values.size());
+    if (!values.empty()) mix_bytes(h, values.data(), values.size() * sizeof(T));
+  }
+
+  explicit BackendEpochSnapshot(const fields &f)
+      : chunks(f.chunks), halos(f.halos), catalog(f.array_catalog), storage(f.storage_plan),
+        descriptors(f.descriptors), initialization(f.initialization_plan), state(f.backend_state),
+        ordinary(f.executable), cw(f.backend_state ? f.backend_state->cw_executable : NULL),
+        raw(cw_chunk_storage_addresses(f)), catalog_hash(1469598103934665603ULL),
+        storage_hash(1469598103934665603ULL), descriptor_hash(1469598103934665603ULL),
+        halo_hash(1469598103934665603ULL), comm_hash(1469598103934665603ULL),
+        comm_block_hash(1469598103934665603ULL),
+        comm_sequence_hash(1469598103934665603ULL), comm_map_hash(0),
+        raw_hash(1469598103934665603ULL), dirty(f.dirty_mask),
+        prepared_mask(f.storage_prepared_mask), classification_reentries(f.classification_reentries),
+        classification_hash(f.prepared_classification_hash),
+        connections_generation(f.connections_generation),
+        connections_built_generation(f.connections_built_generation),
+        local_generation(f.local_invalidation_generation), local_synced(f.local_invalidation_synced),
+        components_allocated(f.components_allocated), connections_valid(f.chunk_connections_valid),
+        changed_materials(f.changed_materials), time_step(f.t), cw_storage_key(0), cw_step_key(0),
+        cw_plan_key(0) {
+    steps[0] = f.step_plans[0];
+    steps[1] = f.step_plans[1];
+    for (int i = 0; i < fields::num_mutation_kinds; ++i) mutations[i] = f.mutation_generation[i];
+    if (f.backend_state) {
+      cw_storage_key = f.backend_state->cw_storage_fingerprint;
+      cw_step_key = f.backend_state->cw_step_plan_signature;
+      cw_plan_key = f.backend_state->cw_plan_signature;
+    }
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      cw_flags.push_back(f.chunks[chunk]->doing_solve_cw);
+      cw_frequencies.push_back(f.chunks[chunk]->solve_cw_omega);
+      FOR_FIELD_TYPES(ft) for (const src_vol &source : f.chunks[chunk]->sources[ft]) {
+        source_metadata.push_back(chunk);
+        source_metadata.push_back(int(ft));
+        source_metadata.push_back(int(source.c));
+        source_metadata.push_back(source.needs_boundary_fix ? 1 : 0);
+        source_metadata.push_back(int(source.num_points()));
+        for (size_t point = 0; point < source.num_points(); ++point) {
+          source_indices.push_back(source.index_at(point));
+          source_amplitudes.push_back(source.amplitude_at(point));
+        }
+      }
+      for (dft_chunk *dft = f.chunks[chunk]->dft_chunks; dft; dft = dft->next_in_chunk) {
+        dft_fc.push_back(dft);
+        dft_fc.push_back(dft->fc);
+      }
+    }
+    if (catalog) for (size_t i = 0; i < catalog->size(); ++i) {
+      const ArrayId id = {uint32_t(i)};
+      const StorageKey &key = catalog->key(id);
+      const ArraySpec &spec = catalog->spec(id);
+      const void *base = catalog->resolve_untyped(id);
+      mix(catalog_hash, uint64_t(reinterpret_cast<uintptr_t>(base)));
+      mix_bytes(catalog_hash, &key, sizeof(key));
+      mix(catalog_hash, spec.id.value);
+      mix(catalog_hash, uint64_t(spec.role));
+      mix(catalog_hash, uint64_t(spec.element_type));
+      mix(catalog_hash, uint64_t(spec.storage));
+      mix(catalog_hash, spec.elements);
+      mix(catalog_hash, spec.alignment);
+      mix(catalog_hash, spec.alias_of.value);
+      mix(catalog_hash, spec.classification_provisional);
+      uint64_t value_hash = 1469598103934665603ULL;
+      std::vector<unsigned char> value_bytes;
+      if (base && !is_valid(spec.alias_of)) {
+        const size_t bytes = spec.elements * element_bytes(spec.element_type);
+        mix_bytes(raw_hash, base, bytes);
+        mix_bytes(value_hash, base, bytes);
+        const unsigned char *begin = static_cast<const unsigned char *>(base);
+        value_bytes.assign(begin, begin + bytes);
+      }
+      catalog_values.push_back(value_hash);
+      catalog_bytes.push_back(value_bytes);
+    }
+    if (storage) for (size_t i = 0; i < storage->arrays.size(); ++i) {
+      const ArraySpec &spec = storage->arrays[i];
+      mix_bytes(storage_hash, &storage->keys[i], sizeof(StorageKey));
+      mix(storage_hash, spec.id.value);
+      mix(storage_hash, uint64_t(spec.role));
+      mix(storage_hash, uint64_t(spec.element_type));
+      mix(storage_hash, uint64_t(spec.storage));
+      mix(storage_hash, spec.elements);
+      mix(storage_hash, spec.alignment);
+      mix(storage_hash, spec.alias_of.value);
+      mix(storage_hash, spec.classification_provisional);
+    }
+    if (descriptors) {
+      mix(descriptor_hash, source_plan_signature(descriptors->sources));
+      mix(descriptor_hash, dft_plan_signature(descriptors->dfts));
+      mix(descriptor_hash, descriptors->polarizations.size());
+      mix_vector(descriptor_hash, descriptors->regions);
+    }
+    if (steps[0]) mix(descriptor_hash, steps[0]->signature);
+    if (steps[1]) mix(descriptor_hash, steps[1]->signature);
+    if (initialization) {
+      mix_vector(descriptor_hash, initialization->operations);
+      for (const MaterialRecipe &recipe : initialization->materials) {
+        mix_bytes(descriptor_hash, recipe.description.data(), recipe.description.size());
+        mix(descriptor_hash, recipe.eps_averaging);
+        mix_bytes(descriptor_hash, &recipe.subpixel_tol, sizeof(recipe.subpixel_tol));
+        mix(descriptor_hash, recipe.subpixel_maxeval);
+        mix(descriptor_hash, recipe.host_callback_id);
+        mix(descriptor_hash, recipe.from_host_callback);
+      }
+      mix_vector(descriptor_hash, initialization->pml);
+      for (const HostCallbackRecipe &recipe : initialization->host_callbacks) {
+        mix(descriptor_hash, recipe.id);
+        mix_bytes(descriptor_hash, recipe.description.data(), recipe.description.size());
+      }
+    }
+    if (halos) {
+      mix(halo_hash, halos->arrays.size());
+      mix(halo_hash, halos->index.size());
+      for (size_t i = 0; i < halos->arrays.size(); ++i) {
+        const ArrayId id = {uint32_t(i)};
+        mix(halo_hash, uint64_t(reinterpret_cast<uintptr_t>(halos->arrays.base(id))));
+        const ArraySpec &spec = halos->arrays.spec(id);
+        mix(halo_hash, spec.id.value);
+        mix(halo_hash, uint64_t(spec.role));
+        mix(halo_hash, uint64_t(spec.element_type));
+        mix(halo_hash, spec.elements);
+      }
+      for (const HaloPlan &plan : halos->plans) {
+        mix(halo_hash, uint64_t(plan.ft));
+        mix_bytes(halo_hash, &plan.chunks, sizeof(plan.chunks));
+        mix(halo_hash, uint64_t(plan.phase));
+        mix(halo_hash, plan.peer_rank);
+        mix(halo_hash, plan.tag);
+        mix(halo_hash, plan.same_rank);
+        mix(halo_hash, plan.sequence_index);
+        mix(halo_hash, plan.block_offset);
+        mix(halo_hash, plan.block_elements);
+        mix_vector(halo_hash, plan.gather_slabs);
+        mix_vector(halo_hash, plan.scatter_slabs);
+        mix_vector(halo_hash, plan.gather);
+        mix_vector(halo_hash, plan.scatter);
+        mix_vector(halo_hash, plan.gather_order);
+        mix_vector(halo_hash, plan.scatter_order);
+        mix_vector(halo_hash, plan.phase_values);
+      }
+      FOR_FIELD_TYPES(ft) for (const ZeroPlan &zero : halos->zeros[ft]) {
+        mix_vector(halo_hash, zero.slabs);
+        mix_vector(halo_hash, zero.residue);
+      }
+    }
+    FOR_FIELD_TYPES(ft) {
+      comm.push_back(f.comm_blocks[ft]);
+      if (f.comm_blocks[ft])
+        for (int i = 0; i < f.num_chunks * f.num_chunks; ++i) {
+          comm.push_back(f.comm_blocks[ft][i]);
+          const chunk_pair pair(i % f.num_chunks, i / f.num_chunks);
+          const size_t count = f.comm_size_tot(field_type(ft), pair);
+          if (f.comm_blocks[ft][i] && count)
+            mix_bytes(comm_block_hash, f.comm_blocks[ft][i], count * sizeof(realnum));
+        }
+      for (const comms_operation &op : f.comms_sequence_for_field[ft].receive_ops)
+        mix_bytes(comm_sequence_hash, &op, sizeof(op));
+      for (const comms_operation &op : f.comms_sequence_for_field[ft].send_ops)
+        mix_bytes(comm_sequence_hash, &op, sizeof(op));
+    }
+    uint64_t map_hash = 0;
+    for (const auto &entry : f.comm_sizes) {
+      uint64_t item = 1469598103934665603ULL;
+      mix_bytes(item, &entry.first, sizeof(entry.first));
+      mix(item, entry.second);
+      map_hash ^= item + 0x9e3779b97f4a7c15ULL;
+    }
+    comm_map_hash = map_hash;
+    mix(comm_hash, comm_block_hash);
+    mix(comm_hash, comm_sequence_hash);
+    mix(comm_hash, comm_map_hash);
+  }
+
+  bool matches(const BackendEpochSnapshot &other) const {
+    if (chunks != other.chunks || halos != other.halos || catalog != other.catalog ||
+        storage != other.storage || descriptors != other.descriptors ||
+        initialization != other.initialization || steps[0] != other.steps[0] ||
+        steps[1] != other.steps[1] || state != other.state || ordinary != other.ordinary ||
+        cw != other.cw || raw != other.raw || dft_fc != other.dft_fc || comm != other.comm ||
+        catalog_values != other.catalog_values ||
+        catalog_bytes != other.catalog_bytes ||
+        source_metadata != other.source_metadata || source_indices != other.source_indices ||
+        source_amplitudes != other.source_amplitudes || cw_flags != other.cw_flags ||
+        cw_frequencies != other.cw_frequencies ||
+        catalog_hash != other.catalog_hash || storage_hash != other.storage_hash ||
+        descriptor_hash != other.descriptor_hash || halo_hash != other.halo_hash ||
+        comm_hash != other.comm_hash || raw_hash != other.raw_hash || dirty != other.dirty ||
+        prepared_mask != other.prepared_mask || classification_hash != other.classification_hash ||
+        classification_reentries != other.classification_reentries ||
+        connections_generation != other.connections_generation ||
+        connections_built_generation != other.connections_built_generation ||
+        local_generation != other.local_generation || local_synced != other.local_synced ||
+        components_allocated != other.components_allocated ||
+        connections_valid != other.connections_valid || changed_materials != other.changed_materials ||
+        time_step != other.time_step ||
+        cw_storage_key != other.cw_storage_key || cw_step_key != other.cw_step_key ||
+        cw_plan_key != other.cw_plan_key)
+      return false;
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      if (mutations[i] != other.mutations[i]) return false;
+    return true;
+  }
+  bool matches(const fields &f) const { return matches(BackendEpochSnapshot(f)); }
+};
+} // namespace meep
+
+static void expect_cheap_cw_rejection(fields &f, lifetime_counts &counts,
+                                      const CwSolveRequest &request, const char *label) {
+  const int saved_t = f.t;
+  const uint32_t saved_dirty = f.dirty_mask;
+  CwSolveResult result;
+  bool rejected = false;
+  try {
+    (void)backend_try_solve_cw(f, request, result);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(sum_to_all(int(rejected)) == count_processors(), "%s was not rejected collectively", label);
+  CHECK(!f.backend_state && !f.executable, "%s initialized resident state", label);
+  CHECK(counts.states_created == 0 && counts.executables_created == 0 &&
+            counts.cw_preflights == 0 && counts.cw_solves == 0 && counts.cw_callback_effects == 0,
+        "%s crossed the cheap preflight boundary", label);
+  CHECK(f.t == saved_t && f.dirty_mask == saved_dirty, "%s changed host time or lifecycle state",
+        label);
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    CHECK(!f.chunks[chunk]->is_solving_cw(), "%s left transient CW mode active", label);
+}
+
+static void test_resident_cw_lifecycle() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  component cw_monitor_component = Ez;
+  dft_fields cw_monitor =
+      f->add_dft_fields(&cw_monitor_component, 1, f->v, 0.3, 0.3, 1, 2);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts, false, true);
+  bool marked_boundary_source = false;
+  for (int chunk = 0; chunk < f->num_chunks && !marked_boundary_source; ++chunk)
+    FOR_FIELD_TYPES(ft) if (!f->chunks[chunk]->sources[ft].empty()) {
+      f->chunks[chunk]->sources[ft][0].needs_boundary_fix = true;
+      marked_boundary_source = true;
+      break;
+    }
+  CHECK(or_to_all(marked_boundary_source),
+        "CW fixture has no source row for staged boundary fix coverage");
+
+  if (count_processors() != 1) {
+    expect_cheap_cw_rejection(*f, counts, cw_request(), "MPI resident solve_cw");
+    delete f;
+    delete s;
+    return;
+  }
+
+  const uint32_t cold_dirty = f->dirty_mask;
+  counts.fail_cw_preflight = true;
+  bool failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend_state && !f->executable && f->dirty_mask == cold_dirty,
+        "cold CW preflight failure published resident artifacts or dirty-state changes");
+  CHECK(counts.cw_solves == 0 && counts.cw_callback_effects == 0,
+        "cold CW preflight failure entered dispatch/callback territory");
+  bool boundary_fix_restored = false;
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    FOR_FIELD_TYPES(ft) for (const src_vol &source : f->chunks[chunk]->sources[ft])
+      boundary_fix_restored = boundary_fix_restored || source.needs_boundary_fix;
+  CHECK(boundary_fix_restored,
+        "cold CW preflight rollback changed the live source boundary-fix state");
+  counts.fail_cw_preflight = false;
+
+  counts.cw_status = CwSolveStatus::not_converged;
+  const int entry_t = f->t;
+  CHECK(!f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "ordinary nonconvergence was reported as success");
+  CHECK(!f->backend->is_poisoned(), "ordinary nonconvergence poisoned the backend");
+  CHECK(f->t == entry_t && counts.cw_saw_transient_mode,
+        "resident solve did not restore time or enter transient CW mode");
+  CHECK(counts.cw_final_dft_at_entry_time,
+        "resident backend did not restore solve-entry time before its final DFT boundary");
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    FOR_FIELD_TYPES(ft) for (const src_vol &source : f->chunks[chunk]->sources[ft])
+      CHECK(!source.needs_boundary_fix,
+            "staged source-boundary rewrite was not transferred to the stable chunk");
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    CHECK(!f->chunks[chunk]->is_solving_cw(), "resident solve did not restore chunk CW flags");
+  CHECK(counts.cw_preflights == 2 && counts.cw_solves == 1 &&
+            counts.cw_executables_created == 1 && counts.cw_executables_destroyed == 0,
+        "first resident solve did not create exactly one private CW executable");
+  BackendState *const state = f->backend_state;
+  Executable *const ordinary = f->executable;
+  Executable *const cached_cw = state->cw_executable;
+  CHECK(cached_cw && cached_cw != ordinary, "ordinary and CW executables are not separately owned");
+
+  counts.cw_status = CwSolveStatus::converged;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "converged resident solve was reported as failure");
+  CHECK(f->backend_state == state && f->executable == ordinary &&
+            f->backend_state->cw_executable == cached_cw,
+        "unchanged resident solve did not reuse state and both executables");
+  CHECK(counts.cw_preflights == 3 && counts.cw_solves == 2 &&
+            counts.cw_executables_created == 1,
+        "unchanged resident solve rebuilt its private executable");
+
+  invalidate(*f, MutationKind::source_values, "CW source-value reuse test");
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "source-value-only resident solve failed");
+  CHECK(f->backend_state->cw_executable == cached_cw && counts.cw_executables_created == 1,
+        "source-value-only refresh rebuilt the private CW executable");
+
+  counts.cw_status = CwSolveStatus::breakdown;
+  CHECK(!f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2) &&
+            !f->backend->is_poisoned(),
+        "ordinary solver breakdown did not remain a non-poisoning result");
+  counts.cw_status = CwSolveStatus::converged;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "retry after ordinary solver breakdown did not succeed");
+
+  counts.fail_cw_preflight = true;
+  const int solves_before_preflight = counts.cw_solves;
+  const int callbacks_before_preflight = counts.cw_callback_effects;
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend->is_poisoned(),
+        "compiled CW preflight failure was not retryable");
+  CHECK(f->backend_state == state && f->executable == ordinary &&
+            f->backend_state->cw_executable == cached_cw && f->t == entry_t,
+        "compiled CW preflight failure changed live executable/time state");
+  CHECK(counts.cw_solves == solves_before_preflight &&
+            counts.cw_callback_effects == callbacks_before_preflight,
+        "compiled CW preflight entered dispatch/callback territory");
+  counts.fail_cw_preflight = false;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "retry after CW preflight failure did not succeed");
+
+  int created_before = counts.cw_executables_created;
+  int destroyed_before = counts.cw_executables_destroyed;
+  invalidate(*f, MutationKind::source_definition, "CW source-definition invalidation test");
+  const BackendEpochSnapshot source_entry_epoch(*f);
+  const uint32_t dirty_before_source_preflight = f->dirty_mask;
+  fields_chunk **const chunks_before_source_preflight = f->chunks;
+  fields_chunk *const first_chunk_before_source_preflight = f->chunks[0];
+  CpuArrayCatalog *const catalog_before_source_preflight = f->array_catalog;
+  StoragePlan *const storage_before_source_preflight = f->storage_plan;
+  DescriptorSet *const descriptors_before_source_preflight = f->descriptors;
+  StepPlan *const ordinary_plan_before_source_preflight = f->step_plans[0];
+  StepPlan *const cw_plan_before_source_preflight = f->step_plans[1];
+  counts.fail_cw_preflight = true;
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend->is_poisoned() && f->backend_state == state &&
+            f->executable == ordinary && f->backend_state->cw_executable == cached_cw &&
+            f->dirty_mask == dirty_before_source_preflight,
+        "dirty source preflight failure did not restore the live backend epoch");
+  CHECK(f->chunks == chunks_before_source_preflight &&
+            f->chunks[0] == first_chunk_before_source_preflight &&
+            f->array_catalog == catalog_before_source_preflight &&
+            f->storage_plan == storage_before_source_preflight &&
+            f->descriptors == descriptors_before_source_preflight &&
+            f->step_plans[0] == ordinary_plan_before_source_preflight &&
+            f->step_plans[1] == cw_plan_before_source_preflight,
+        "dirty source preflight failure changed stable chunk/plan metadata identity");
+  CHECK(source_entry_epoch.matches(*f),
+        "dirty source preflight failure changed exact epoch content");
+  counts.fail_cw_preflight = false;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "source-definition-invalidated resident solve failed");
+  CHECK(counts.cw_executables_created == created_before + 1 &&
+            counts.cw_executables_destroyed == destroyed_before + 1,
+        "source-definition invalidation did not replace the private CW executable");
+
+  created_before = counts.cw_executables_created;
+  destroyed_before = counts.cw_executables_destroyed;
+  invalidate(*f, MutationKind::monitor_definition, "CW monitor invalidation test");
+  const BackendEpochSnapshot monitor_entry_epoch(*f);
+  BackendState *const monitor_entry_state = f->backend_state;
+  Executable *const monitor_entry_ordinary = f->executable;
+  Executable *const monitor_entry_cw = f->backend_state->cw_executable;
+  fields_chunk **const monitor_entry_chunks = f->chunks;
+  dft_chunk *const monitor_entry_dft = f->chunks[0]->dft_chunks;
+  CHECK(monitor_entry_dft, "dirty monitor rollback fixture has no live DFT chain");
+  const uint32_t monitor_entry_dirty = f->dirty_mask;
+  counts.fail_cw_preflight = true;
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend->is_poisoned() && f->backend_state == monitor_entry_state &&
+            f->executable == monitor_entry_ordinary &&
+            f->backend_state->cw_executable == monitor_entry_cw &&
+            f->chunks == monitor_entry_chunks && f->chunks[0]->dft_chunks == monitor_entry_dft &&
+            f->dirty_mask == monitor_entry_dirty,
+        "dirty monitor preflight failure did not restore the live epoch/DFT ownership");
+  CHECK(monitor_entry_epoch.matches(*f),
+        "dirty monitor preflight failure changed exact epoch content");
+  counts.fail_cw_preflight = false;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "monitor-invalidated resident solve failed");
+  CHECK(counts.cw_executables_created == created_before + 1 &&
+            counts.cw_executables_destroyed == destroyed_before + 1,
+        "monitor invalidation did not replace/destroy the private CW executable");
+
+  created_before = counts.cw_executables_created;
+  destroyed_before = counts.cw_executables_destroyed;
+  invalidate(*f, MutationKind::field_layout, "CW layout invalidation test");
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "layout-invalidated resident solve failed");
+  CHECK(counts.cw_executables_created == created_before + 1 &&
+            counts.cw_executables_destroyed == destroyed_before + 1,
+        "layout invalidation did not replace/destroy the private CW executable");
+
+  counts.fail_cw_dispatch = true;
+  const int callbacks_before_failure = counts.cw_callback_effects;
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && f->backend->is_poisoned(), "post-dispatch failure did not poison the backend");
+  CHECK(counts.cw_callback_effects == callbacks_before_failure + 1,
+        "post-dispatch callback side effect was incorrectly rolled back");
+  CHECK(f->t == entry_t, "post-dispatch failure did not restore host time");
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    CHECK(!f->chunks[chunk]->is_solving_cw(), "post-dispatch failure did not restore CW flags");
+
+  const int callbacks_after_poison = counts.cw_callback_effects;
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && counts.cw_callback_effects == callbacks_after_poison,
+        "poisoned retry reached the resident CW dispatch");
+
+  delete f;
+  CHECK(counts.cw_executables_created == counts.cw_executables_destroyed,
+        "backend-state destruction leaked the private CW executable");
+  delete s;
+}
+
+static void test_resident_cw_rejection_surface() {
+  CwSolveRequest request = cw_request();
+
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    CwSolveRequest bad = request;
+    bad.eigfrequency = true;
+    expect_cheap_cw_rejection(*f, counts, bad, "eigfrequency request");
+    bad = request;
+    bad.L = 0;
+    expect_cheap_cw_rejection(*f, counts, bad, "L=0 request");
+    bad = request;
+    bad.maxiters = 0;
+    expect_cheap_cw_rejection(*f, counts, bad, "maxiters=0 request");
+    bad = request;
+    bad.frequency = 0.0;
+    expect_cheap_cw_rejection(*f, counts, bad, "zero-frequency request");
+    bad = request;
+    bad.frequency = std::complex<double>(std::numeric_limits<double>::infinity(), 0.0);
+    expect_cheap_cw_rejection(*f, counts, bad, "nonfinite-frequency request");
+    delete f;
+    delete s;
+  }
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    CwSolveRequest bad = request;
+    bad.tolerance = std::numeric_limits<double>::quiet_NaN();
+    expect_cheap_cw_rejection(*f, counts, bad, "nonfinite tolerance");
+    delete f;
+    delete s;
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml());
+    fields f(&s);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, true);
+    expect_cheap_cw_rejection(f, counts, request, "missing source");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml());
+    fields f(&s);
+    gaussian_src_time source(0.3, 0.1);
+    f.add_point_source(Ez, source, vec(0.0, 0.0), std::complex<double>(0.0, 0.0));
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, true);
+    expect_cheap_cw_rejection(f, counts, request, "zero source amplitude");
+  }
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->use_real_fields();
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    expect_cheap_cw_rejection(*f, counts, request, "real fields");
+    delete f;
+    delete s;
+  }
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->phasein_time = 1;
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    expect_cheap_cw_rejection(*f, counts, request, "active material phase");
+    delete f;
+    delete s;
+  }
+  {
+    grid_volume gv = volcyl(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml());
+    fields f(&s);
+    gaussian_src_time source(0.3, 0.1);
+    f.add_point_source(Ez, source, gv.center());
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, true);
+    expect_cheap_cw_rejection(f, counts, request, "cylindrical coordinates");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml());
+    lorentzian_susceptibility susceptibility(1.1, 0.05);
+    s.add_susceptibility(unit_epsilon, E_stuff, susceptibility);
+    fields f(&s);
+    gaussian_src_time source(0.3, 0.1);
+    f.add_point_source(Ez, source, vec(0.0, 0.0));
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, true);
+    expect_cheap_cw_rejection(f, counts, request, "polarization topology");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml());
+    fields f(&s, 0.0, 0.2);
+    gaussian_src_time source(0.3, 0.1);
+    f.add_point_source(Ez, source, vec(0.0, 0.0));
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, true);
+    expect_cheap_cw_rejection(f, counts, request, "beta coordinates");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml());
+    std::vector<double> scaled_k(3, 0.0);
+    scaled_k[0] = 0.1;
+    fields f(&s, 0.0, 0.0, true, 0, 0, scaled_k);
+    gaussian_src_time source(0.3, 0.1);
+    f.add_point_source(Ez, source, vec(0.0, 0.0));
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, true);
+    expect_cheap_cw_rejection(f, counts, request, "BFAST coordinates");
+  }
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->add_flux_plane(vec(-0.8, -1.0), vec(-0.8, 1.0));
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    expect_cheap_cw_rejection(*f, counts, request, "legacy flux accumulator");
+    delete f;
+    delete s;
+  }
+  if (count_processors() == 1) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, true, true);
+    f->synchronize_magnetic_fields();
+    BackendState *const state = f->backend_state;
+    const int preflights = counts.cw_preflights;
+    bool rejected = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+    }
+    catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    CHECK(rejected && f->backend_state == state && counts.cw_preflights == preflights,
+          "live magnetic snapshot crossed the cheap CW preflight boundary");
+    f->restore_magnetic_fields();
+    delete f;
+    delete s;
+  }
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    f->backend->poison();
+    expect_cheap_cw_rejection(*f, counts, request, "poisoned backend");
+    delete f;
+    delete s;
+  }
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, false);
+    expect_cheap_cw_rejection(*f, counts, request, "resident backend without CW support");
+    delete f;
+    delete s;
+  }
+  if (count_processors() > 1) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, my_rank() != 0);
+    expect_cheap_cw_rejection(*f, counts, request, "rank-asymmetric CW support");
+    delete f;
+    delete s;
+    build(&s, &f);
+    lifetime_counts request_counts;
+    f->backend = new tracking_backend(*f, request_counts, false, true);
+    CwSolveRequest asymmetric = request;
+    if (my_rank() == 0) asymmetric.L = 0;
+    expect_cheap_cw_rejection(*f, request_counts, asymmetric,
+                              "rank-asymmetric invalid CW request");
+    delete f;
+    delete s;
+
+    build(&s, &f);
+    lifetime_counts implicit_absent_counts;
+    f->backend = new tracking_backend(*f, implicit_absent_counts, false, true);
+    src_time *saved_sources = f->sources;
+    if (my_rank() == 0) f->sources = NULL;
+    bool implicit_rejected = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, 2);
+    }
+    catch (const std::runtime_error &) {
+      implicit_rejected = true;
+    }
+    if (my_rank() == 0) f->sources = saved_sources;
+    CHECK(sum_to_all(int(implicit_rejected)) == count_processors() &&
+              implicit_absent_counts.cw_preflights == 0 && !f->backend_state,
+          "rank-asymmetric absent implicit frequency crossed the collective preflight");
+    delete f;
+    delete s;
+
+    build(&s, &f);
+    lifetime_counts implicit_mismatch_counts;
+    f->backend = new tracking_backend(*f, implicit_mismatch_counts, false, true);
+    gaussian_src_time other_source(0.3, 0.2);
+    f->add_point_source(Ez, other_source, vec(0.2, 0.0));
+    CHECK(f->sources && f->sources->next,
+          "implicit-frequency mismatch fixture did not register two source times");
+    if (my_rank() == 0) f->sources->set_frequency(0.4);
+    implicit_rejected = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, 2);
+    }
+    catch (const std::runtime_error &) {
+      implicit_rejected = true;
+    }
+    CHECK(sum_to_all(int(implicit_rejected)) == count_processors() &&
+              implicit_mismatch_counts.cw_preflights == 0 && !f->backend_state,
+          "rank-asymmetric inconsistent implicit frequency crossed the collective preflight");
+    delete f;
+    delete s;
+  }
+}
+
+static void test_resident_cw_malformed_results_and_alias() {
+  if (count_processors() != 1) return;
+  for (int malformed = 1; malformed <= 6; ++malformed) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    counts.malformed_cw_result = malformed;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    const int entry_t = f->t;
+    bool failed = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    CHECK(failed && f->backend->is_poisoned(),
+          "malformed CW result %d did not poison the backend", malformed);
+    CHECK(f->t == entry_t, "malformed CW result %d did not restore host time", malformed);
+    for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+      CHECK(!f->chunks[chunk]->is_solving_cw(),
+            "malformed CW result %d left transient mode active", malformed);
+    delete f;
+    delete s;
+  }
+
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  counts.alias_cw_to_ordinary = true;
+  f->backend = new tracking_backend(*f, counts, false, true);
+  bool failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend->is_poisoned() && !f->backend_state && !f->executable,
+        "ordinary/CW executable alias was published or treated as a dispatch failure");
+  CHECK(counts.executables_created == 1 && counts.executables_destroyed == 1,
+        "ordinary/CW alias rejection did not roll back the staged ordinary executable");
+  delete f;
+  CHECK(counts.executables_created == counts.executables_destroyed,
+        "ordinary executable ownership was corrupted by CW alias rejection");
+  delete s;
+
+  build(&s, &f);
+  lifetime_counts mutation_counts;
+  mutation_counts.mutate_cw_cache_during_preflight = true;
+  f->backend = new tracking_backend(*f, mutation_counts, false, true);
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend->is_poisoned() && !f->backend_state && !f->executable,
+        "preflight cache mutation escaped the retryable staged boundary");
+  CHECK(mutation_counts.cw_executables_created ==
+            mutation_counts.cw_executables_destroyed,
+        "preflight cache mutation leaked or double-owned its executable");
+  delete f;
+  delete s;
+
+  build(&s, &f);
+  lifetime_counts boundary_counts;
+  boundary_counts.mutate_after_cw_boundary = true;
+  f->backend = new tracking_backend(*f, boundary_counts, false, true);
+  const int boundary_entry_t = f->t;
+  failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && f->backend->is_poisoned() && f->t == boundary_entry_t,
+        "post-boundary state mutation was not rejected and defensively restored");
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    CHECK(!f->chunks[chunk]->is_solving_cw(),
+          "post-boundary state mutation escaped defensive session cleanup");
+  delete f;
+  delete s;
+}
+
+static void test_cw_clone_failure_is_atomic() {
+  if (count_processors() != 1) return;
+  bool reached_end_of_clone = false;
+  for (int checkpoint = 0; checkpoint < 512 && !reached_end_of_clone; ++checkpoint) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    simple_material_function conductivity_material(phase_conductivity);
+    std::vector<realnum *> entry_condinv;
+    for (int chunk = 0; chunk < f->num_chunks; ++chunk) {
+      fields_chunk &fc = *f->chunks[chunk];
+      structure_chunk *old_structure = fc.s;
+      fc.s = new structure_chunk(old_structure);
+      if (old_structure->refcount-- <= 1) delete old_structure;
+      if (fc.s->is_mine()) {
+        fc.s->set_conductivity(Dz, conductivity_material);
+        fc.s->update_condinv();
+      }
+      entry_condinv.push_back(fc.s->condinv[Dz][Z]);
+    }
+    CHECK(or_to_all(entry_condinv[0] != NULL),
+          "clone failpoint fixture did not realize live conductivity/condinv storage");
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    const BackendEpochSnapshot entry_epoch(*f);
+    fields_chunk **const entry_chunks = f->chunks;
+    const uint32_t entry_dirty = f->dirty_mask;
+    std::vector<int> entry_refcounts;
+    for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+      entry_refcounts.push_back(f->chunks[chunk]->s->refcount);
+    backend_set_cw_clone_fail_after_for_testing(checkpoint);
+    bool failed = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    backend_set_cw_clone_fail_after_for_testing(-1);
+    if (failed) {
+      CHECK(!f->backend_state && !f->executable && f->chunks == entry_chunks &&
+                f->dirty_mask == entry_dirty && entry_epoch.matches(*f),
+            "clone checkpoint %d published a partial staged epoch", checkpoint);
+      for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+        CHECK(f->chunks[chunk]->s->refcount == entry_refcounts[size_t(chunk)] &&
+                  f->chunks[chunk]->s->condinv[Dz][Z] == entry_condinv[size_t(chunk)],
+              "clone checkpoint %d leaked a structure reference", checkpoint);
+    }
+    else
+      reached_end_of_clone = true;
+    delete f;
+    delete s;
+  }
+  CHECK(reached_end_of_clone,
+        "clone failpoint sweep did not reach metadata/communication completion");
+}
+
+static void test_cw_staged_pipeline_failures() {
+  if (count_processors() != 1) return;
+  for (int injection = 0; injection < 5; ++injection) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    if (injection == 0) counts.fail_create_state = true;
+    if (injection == 1) counts.fail_initialize = true;
+    if (injection == 2) counts.fail_compile = true;
+    if (injection == 3) counts.corrupt_catalog_after_compile = true;
+    if (injection == 4) backend_set_cw_plan_corruption_for_testing(true);
+    f->backend = new tracking_backend(*f, counts, false, true);
+    const BackendEpochSnapshot entry_epoch(*f);
+
+    fields_chunk **const entry_chunks = f->chunks;
+    halo_plan_set *const entry_halos = f->halos;
+    CpuArrayCatalog *const entry_catalog = f->array_catalog;
+    StoragePlan *const entry_storage = f->storage_plan;
+    DescriptorSet *const entry_descriptors = f->descriptors;
+    InitializationPlan *const entry_initialization = f->initialization_plan;
+    StepPlan *const entry_steps[2] = {f->step_plans[0], f->step_plans[1]};
+    const uint32_t entry_dirty = f->dirty_mask;
+    const uint32_t entry_prepared = f->storage_prepared_mask;
+    const uint64_t entry_classification = f->prepared_classification_hash;
+    const uint32_t entry_reentries = f->classification_reentries;
+    uint64_t entry_generations[fields::num_mutation_kinds];
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      entry_generations[i] = f->mutation_generation[i];
+    const std::vector<const void *> entry_raw = cw_chunk_storage_addresses(*f);
+
+    bool failed = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    CHECK(failed && !f->backend->is_poisoned() && !f->backend_state && !f->executable,
+          "staged pipeline injection %d was not retryable", injection);
+    CHECK(entry_epoch.matches(*f),
+          "staged pipeline injection %d changed the exact host epoch", injection);
+    CHECK(f->chunks == entry_chunks && f->halos == entry_halos &&
+              f->array_catalog == entry_catalog && f->storage_plan == entry_storage &&
+              f->descriptors == entry_descriptors && f->initialization_plan == entry_initialization &&
+              f->step_plans[0] == entry_steps[0] && f->step_plans[1] == entry_steps[1] &&
+              f->dirty_mask == entry_dirty && f->storage_prepared_mask == entry_prepared &&
+              f->prepared_classification_hash == entry_classification &&
+              f->classification_reentries == entry_reentries &&
+              cw_chunk_storage_addresses(*f) == entry_raw,
+          "staged pipeline injection %d changed the host epoch", injection);
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      CHECK(f->mutation_generation[i] == entry_generations[i],
+            "staged pipeline injection %d changed mutation generation %d", injection, i);
+
+    counts.fail_create_state = false;
+    counts.fail_initialize = false;
+    counts.fail_compile = false;
+    counts.corrupt_catalog_after_compile = false;
+    backend_set_cw_plan_corruption_for_testing(false);
+    CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+          "staged pipeline injection %d did not permit retry", injection);
+    delete f;
+    CHECK(counts.states_created == counts.states_destroyed &&
+              counts.executables_created == counts.executables_destroyed &&
+              counts.cw_executables_created == counts.cw_executables_destroyed,
+          "staged pipeline injection %d leaked a backend artifact", injection);
+    delete s;
+  }
+}
+
+static void test_cw_structural_rebuild_migrates_authority() {
+  if (count_processors() != 1) return;
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts, false, true);
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "authority-migration fixture did not create a resident epoch");
+  realnum *entry_field = first_owned_real_field(*f);
+  CHECK(entry_field, "authority-migration fixture has no owned real field");
+  if (entry_field) *entry_field = realnum(-17);
+  counts.migrate_authoritative_value = true;
+  counts.authoritative_value = realnum(23);
+  counts.fail_cw_preflight = true;
+  BackendState *const entry_state = f->backend_state;
+  fields_chunk **const entry_chunks = f->chunks;
+  invalidate(*f, MutationKind::source_definition, "CW authority migration rollback");
+  bool failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend->is_poisoned() && f->backend_state == entry_state &&
+            f->chunks == entry_chunks && first_owned_real_field(*f) == entry_field &&
+            (!entry_field || *entry_field == realnum(23)),
+        "failed structural rebuild lost the migrated authoritative value");
+  counts.fail_cw_preflight = false;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2) &&
+            f->chunks == entry_chunks && first_owned_real_field(*f) &&
+            *first_owned_real_field(*f) == realnum(23),
+        "successful structural rebuild did not clone the migrated authoritative value");
+  delete f;
+  delete s;
+}
+
+static void test_cw_warm_staged_pipeline_failures() {
+  if (count_processors() != 1) return;
+  for (int injection = 0; injection < 5; ++injection) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+          "warm staged-failure fixture did not create its entry epoch");
+    invalidate(*f, MutationKind::source_definition, "warm staged pipeline failure");
+    if (injection == 0) counts.fail_create_state = true;
+    if (injection == 1) counts.fail_initialize = true;
+    if (injection == 2) counts.fail_compile = true;
+    if (injection == 3) counts.corrupt_catalog_after_compile = true;
+    if (injection == 4) backend_set_cw_plan_corruption_for_testing(true);
+    const BackendEpochSnapshot entry_epoch(*f);
+    const int solves_before = counts.cw_solves;
+    bool failed = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    const BackendEpochSnapshot after_failure(*f);
+    CHECK(failed && !f->backend->is_poisoned() && entry_epoch.matches(after_failure) &&
+              counts.cw_solves == solves_before,
+          "warm staged pipeline injection %d changed the entry epoch", injection);
+    if (!entry_epoch.matches(after_failure))
+      printf("[rank %d] warm injection %d snapshot: ptr=%d raw=%d catalog=%d storage=%d "
+             "descriptor=%d halo=%d comm=%d dirty=%d lifecycle=%d cache=%d\n",
+             my_rank(), injection,
+             int(entry_epoch.chunks == after_failure.chunks &&
+                 entry_epoch.state == after_failure.state &&
+                 entry_epoch.ordinary == after_failure.ordinary),
+             int(entry_epoch.raw == after_failure.raw &&
+                 entry_epoch.raw_hash == after_failure.raw_hash),
+             int(entry_epoch.catalog == after_failure.catalog &&
+                 entry_epoch.catalog_hash == after_failure.catalog_hash),
+             int(entry_epoch.storage == after_failure.storage &&
+                 entry_epoch.storage_hash == after_failure.storage_hash),
+             int(entry_epoch.descriptors == after_failure.descriptors &&
+                 entry_epoch.descriptor_hash == after_failure.descriptor_hash),
+             int(entry_epoch.halos == after_failure.halos &&
+                 entry_epoch.halo_hash == after_failure.halo_hash),
+             int(entry_epoch.comm == after_failure.comm &&
+                 entry_epoch.comm_hash == after_failure.comm_hash),
+             int(entry_epoch.dirty == after_failure.dirty),
+             int(entry_epoch.connections_generation == after_failure.connections_generation &&
+                 entry_epoch.connections_built_generation ==
+                     after_failure.connections_built_generation &&
+                 entry_epoch.local_generation == after_failure.local_generation &&
+                 entry_epoch.local_synced == after_failure.local_synced),
+             int(entry_epoch.cw == after_failure.cw &&
+                 entry_epoch.cw_storage_key == after_failure.cw_storage_key &&
+                 entry_epoch.cw_step_key == after_failure.cw_step_key &&
+                 entry_epoch.cw_plan_key == after_failure.cw_plan_key));
+    if (!entry_epoch.matches(after_failure))
+      printf("[rank %d] warm injection %d snapshot2: dft=%d prepared=%d class=%d flags=%d "
+             "mutations=%d steps=%d catalog_values=%d metadata_ptrs=%d\n",
+             my_rank(), injection, int(entry_epoch.dft_fc == after_failure.dft_fc),
+             int(entry_epoch.prepared_mask == after_failure.prepared_mask),
+             int(entry_epoch.classification_hash == after_failure.classification_hash &&
+                 entry_epoch.classification_reentries == after_failure.classification_reentries),
+             int(entry_epoch.components_allocated == after_failure.components_allocated &&
+                 entry_epoch.connections_valid == after_failure.connections_valid &&
+                 entry_epoch.changed_materials == after_failure.changed_materials),
+             int(std::equal(entry_epoch.mutations,
+                            entry_epoch.mutations + fields::num_mutation_kinds,
+                            after_failure.mutations)),
+             int(entry_epoch.initialization == after_failure.initialization &&
+                 entry_epoch.steps[0] == after_failure.steps[0] &&
+                 entry_epoch.steps[1] == after_failure.steps[1]),
+             int(entry_epoch.catalog_values == after_failure.catalog_values),
+             int(entry_epoch.catalog == after_failure.catalog &&
+                 entry_epoch.storage == after_failure.storage &&
+                 entry_epoch.descriptors == after_failure.descriptors &&
+                 entry_epoch.halos == after_failure.halos));
+    if (entry_epoch.catalog_values != after_failure.catalog_values)
+      for (size_t i = 0; i < entry_epoch.catalog_values.size(); ++i)
+        if (entry_epoch.catalog_values[i] != after_failure.catalog_values[i]) {
+          size_t changed_byte = 0;
+          while (changed_byte < entry_epoch.catalog_bytes[i].size() &&
+                 entry_epoch.catalog_bytes[i][changed_byte] ==
+                     after_failure.catalog_bytes[i][changed_byte])
+            ++changed_byte;
+          printf("[rank %d] warm injection %d changed catalog value row %zu kind=%d component=%d\n",
+                 my_rank(), injection, i, int(f->array_catalog->key(ArrayId{uint32_t(i)}).kind),
+                 f->array_catalog->key(ArrayId{uint32_t(i)}).component_);
+          printf("[rank %d] first changed byte %zu: %u -> %u\n", my_rank(), changed_byte,
+                 unsigned(entry_epoch.catalog_bytes[i][changed_byte]),
+                 unsigned(after_failure.catalog_bytes[i][changed_byte]));
+        }
+    counts.fail_create_state = false;
+    counts.fail_initialize = false;
+    counts.fail_compile = false;
+    counts.corrupt_catalog_after_compile = false;
+    backend_set_cw_plan_corruption_for_testing(false);
+    CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+          "warm staged pipeline injection %d did not permit retry", injection);
+    delete f;
+    CHECK(counts.states_created == counts.states_destroyed &&
+              counts.executables_created == counts.executables_destroyed &&
+              counts.cw_executables_created == counts.cw_executables_destroyed,
+          "warm staged pipeline injection %d leaked a backend artifact", injection);
+    delete s;
+  }
+}
+
+static void test_cw_cold_conductivity_transaction() {
+  if (count_processors() != 1) return;
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure *s = new structure(gv, eps_slab, pml(0.5));
+  s->set_conductivity(Dz, phase_conductivity);
+  fields *f = new fields(s);
+  gaussian_src_time source(0.3, 0.1);
+  f->add_point_source(Ez, source, vec(0.11, 0.13));
+  lifetime_counts counts;
+  counts.fail_cw_preflight = true;
+  f->backend = new tracking_backend(*f, counts, false, true);
+  fields_chunk *const entry_chunk = f->chunks[0];
+  structure_chunk *const entry_structure = entry_chunk->s;
+  realnum *const entry_condinv = entry_structure->condinv[Dz][Z];
+  const cw_source_snapshot entry_sources = snapshot_cw_sources(*f);
+  bool failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && counts.cw_preflights == 1 && f->chunks[0] == entry_chunk &&
+            f->chunks[0]->s == entry_structure &&
+            f->chunks[0]->s->condinv[Dz][Z] == entry_condinv && !f->backend_state,
+        "cold conductive preflight rollback published staged condinv/structure state");
+  CHECK(snapshot_cw_sources(*f) == entry_sources,
+        "cold conductive preflight rollback changed source indices/amplitudes/boundary state");
+  counts.fail_cw_preflight = false;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "cold conductive resident solve did not retry");
+  CHECK(f->chunks[0] == entry_chunk && f->chunks[0]->s != entry_structure &&
+            f->chunks[0]->s->condinv[Dz][Z] &&
+            is_valid(f->array_catalog->find(
+                {0, int(array_kind::condinv), int(Dz), -1, int(Z)})),
+        "cold conductive commit did not publish catalogued staged condinv storage");
+  delete f;
+  delete s;
+}
+
+static void test_cw_warm_monitor_pipeline_failures() {
+  if (count_processors() != 1) return;
+  for (int injection = 0; injection < 2; ++injection) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    component c = Ez;
+    dft_fields monitor = f->add_dft_fields(&c, 1, f->v, 0.3, 0.3, 1, 3);
+    (void)monitor;
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts, false, true);
+    CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+          "warm monitor failure fixture did not create its entry epoch");
+    invalidate(*f, MutationKind::monitor_definition, "warm monitor staged pipeline failure");
+    if (injection == 0) counts.fail_create_state = true;
+    if (injection == 1) counts.fail_compile = true;
+    const BackendEpochSnapshot entry_epoch(*f);
+    bool failed = false;
+    try {
+      (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    const BackendEpochSnapshot after_failure(*f);
+    CHECK(failed && !f->backend->is_poisoned() && entry_epoch.matches(after_failure),
+          "warm monitor pipeline injection %d changed DFT/backend epoch state", injection);
+    if (!entry_epoch.matches(after_failure))
+      for (size_t i = 0; i < entry_epoch.catalog_bytes.size(); ++i)
+        if (entry_epoch.catalog_bytes[i] != after_failure.catalog_bytes[i])
+          printf("[rank %d] warm monitor injection %d changed catalog row %zu kind=%d\n",
+                 my_rank(), injection, i,
+                 int(f->array_catalog->key(ArrayId{uint32_t(i)}).kind));
+    counts.fail_create_state = false;
+    counts.fail_compile = false;
+    CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+          "warm monitor pipeline injection %d did not permit retry", injection);
+    delete f;
+    delete s;
+  }
+}
+
+static void test_cold_cw_preflight_restores_existing_plans() {
+  if (count_processors() != 1) return;
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->advance(1);
+  if (!f->initialization_plan)
+    f->initialization_plan = new InitializationPlan(build_initialization_plan(*f));
+  CHECK(f->backend_state && f->executable && f->initialization_plan && f->step_plans[0],
+        "CPU setup did not create the expected preparation artifacts");
+
+  const uint64_t ordinary_signature = f->step_plans[0]->signature;
+  const bool had_cw_plan = f->step_plans[1] != NULL;
+  const uint64_t cw_signature = had_cw_plan ? f->step_plans[1]->signature : 0;
+  const size_t init_ops = f->initialization_plan->operations.size();
+
+  delete f->executable;
+  f->executable = NULL;
+  delete f->backend_state;
+  f->backend_state = NULL;
+  delete f->backend;
+  lifetime_counts counts;
+  counts.fail_cw_preflight = true;
+  f->backend = new tracking_backend(*f, counts, false, true);
+  invalidate(*f, MutationKind::precision_policy, "CPU-to-resident CW test");
+  const uint32_t entry_dirty = f->dirty_mask;
+  const BackendEpochSnapshot entry_epoch(*f);
+
+  bool failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(failed && !f->backend_state && !f->executable && f->dirty_mask == entry_dirty,
+        "cold CPU-to-resident preflight failure published state or dirty changes");
+  CHECK(f->initialization_plan && f->initialization_plan->operations.size() == init_ops,
+        "cold preflight failure did not restore the initialization plan");
+  CHECK(f->step_plans[0] && f->step_plans[0]->signature == ordinary_signature &&
+            (!!f->step_plans[1] == had_cw_plan) &&
+            (!had_cw_plan || f->step_plans[1]->signature == cw_signature),
+        "cold preflight failure did not restore exact StepPlan signatures");
+  const BackendEpochSnapshot after_cold_failure(*f);
+  CHECK(entry_epoch.matches(after_cold_failure),
+        "cold CPU-prepared preflight failure changed exact epoch content");
+  if (!entry_epoch.matches(after_cold_failure))
+    printf("[rank %d] cold CPU snapshot: raw=%d catalog=%d storage=%d descriptor=%d halo=%d "
+           "comm_ptr=%d comm_hash=%d(block=%d seq=%d map=%d) source=%d dft=%d lifecycle=%d\n",
+           my_rank(),
+           int(entry_epoch.raw == after_cold_failure.raw &&
+               entry_epoch.raw_hash == after_cold_failure.raw_hash &&
+               entry_epoch.catalog_bytes == after_cold_failure.catalog_bytes),
+           int(entry_epoch.catalog == after_cold_failure.catalog &&
+               entry_epoch.catalog_hash == after_cold_failure.catalog_hash),
+           int(entry_epoch.storage == after_cold_failure.storage &&
+               entry_epoch.storage_hash == after_cold_failure.storage_hash),
+           int(entry_epoch.descriptors == after_cold_failure.descriptors &&
+               entry_epoch.descriptor_hash == after_cold_failure.descriptor_hash),
+           int(entry_epoch.halos == after_cold_failure.halos &&
+               entry_epoch.halo_hash == after_cold_failure.halo_hash),
+           int(entry_epoch.comm == after_cold_failure.comm),
+           int(entry_epoch.comm_hash == after_cold_failure.comm_hash),
+           int(entry_epoch.comm_block_hash == after_cold_failure.comm_block_hash),
+           int(entry_epoch.comm_sequence_hash == after_cold_failure.comm_sequence_hash),
+           int(entry_epoch.comm_map_hash == after_cold_failure.comm_map_hash),
+           int(entry_epoch.source_metadata == after_cold_failure.source_metadata &&
+               entry_epoch.source_indices == after_cold_failure.source_indices &&
+               entry_epoch.source_amplitudes == after_cold_failure.source_amplitudes),
+           int(entry_epoch.dft_fc == after_cold_failure.dft_fc),
+           int(entry_epoch.dirty == after_cold_failure.dirty &&
+               entry_epoch.connections_generation == after_cold_failure.connections_generation &&
+               entry_epoch.local_generation == after_cold_failure.local_generation));
+
+  counts.fail_cw_preflight = false;
+  CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
+        "cold preflight rollback did not permit retry");
+  delete f;
+  delete s;
+}
+
+static void test_cpu_cw_hook_declines_without_initialization() {
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, unit_epsilon, no_pml());
+  fields f(&s);
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.0, 0.0));
+  CwSolveResult result;
+  CHECK(!backend_try_solve_cw(f, cw_request(), result),
+        "unselected CPU/default path claimed resident solve_cw");
+  CHECK(!f.backend && !f.backend_state && !f.executable,
+        "declined CPU/default hook initialized backend state");
+  f.init_backend();
+  BackendState *state = f.backend_state;
+  CHECK(!backend_try_solve_cw(f, cw_request(), result) && f.backend_state == state,
+        "initialized CPU backend did not retain the legacy solve_cw path");
+}
 
 static void test_resident_magnetic_dispatch() {
   structure *s;
@@ -2504,6 +3989,22 @@ int main(int argc, char **argv) {
     master_printf("backend_api: material checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_CW_ONLY")) {
+    test_resident_cw_lifecycle();
+    test_resident_cw_rejection_surface();
+    test_resident_cw_malformed_results_and_alias();
+    test_cw_clone_failure_is_atomic();
+    test_cw_staged_pipeline_failures();
+    test_cw_structural_rebuild_migrates_authority();
+    test_cw_warm_staged_pipeline_failures();
+    test_cw_cold_conductivity_transaction();
+    test_cw_warm_monitor_pipeline_failures();
+    test_cold_cw_preflight_restores_existing_plans();
+    test_cpu_cw_hook_declines_without_initialization();
+    if (failures) return 1;
+    master_printf("backend_api: CW checks passed\n");
+    return 0;
+  }
 
   test_selection();
   test_construction_equivalence();
@@ -2516,6 +4017,17 @@ int main(int argc, char **argv) {
   test_resident_magnetic_dispatch();
   test_material_phase_transaction();
   test_material_phase_cpu_to_resident_preparation();
+  test_resident_cw_lifecycle();
+  test_resident_cw_rejection_surface();
+  test_resident_cw_malformed_results_and_alias();
+  test_cw_clone_failure_is_atomic();
+  test_cw_staged_pipeline_failures();
+  test_cw_structural_rebuild_migrates_authority();
+  test_cw_warm_staged_pipeline_failures();
+  test_cw_cold_conductivity_transaction();
+  test_cw_warm_monitor_pipeline_failures();
+  test_cold_cw_preflight_restores_existing_plans();
+  test_cpu_cw_hook_declines_without_initialization();
   test_resident_polarization_preparation();
   test_resident_beta_fingerprint();
   test_resident_bfast_fingerprint();
