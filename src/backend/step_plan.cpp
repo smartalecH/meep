@@ -303,8 +303,15 @@ public:
                                          : sc.condinv[c][d];
           if (!row) continue;
           const ArrayId current = find_array(f_, chunk, storage_kind, int(c), -1, d);
-          if (!is_valid(current))
-            meep::abort("material refresh row is absent from the current array catalog");
+          if (!is_valid(current)) {
+            /* The CPU backend intentionally keeps material preparation lazy.
+               A phase configured before its first step may therefore acquire
+               current rows after the last catalog build; CPU arithmetic does
+               not consume these upload descriptors. Resident backends freeze
+               the complete union before plan construction and must fail
+               closed if any such row is absent. */
+            continue;
+          }
           const ArraySpec &spec = f_.array_catalog->spec(current);
           plan_.material_refresh_arrays.push_back(MaterialRefreshArray{
               chunk, c, direction(d), family, current, spec.elements});

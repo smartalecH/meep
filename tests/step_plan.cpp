@@ -751,6 +751,21 @@ static void test_phasing_plan() {
     }
   }
   f.advance(3);
+
+  /* CPU-only phasing remains lazy.  In particular, a phase configured before
+     the first step may create current rows after an empty/incomplete catalog
+     was observed; refresh descriptors are resident upload metadata and must
+     not make the host executor reject that legacy path. */
+  structure lazy_current(gv, one, pml(0.5));
+  structure lazy_target(gv, eps_slab, pml(0.5));
+  lazy_target.set_conductivity(Dz, magnetic_conductivity);
+  fields lazy(&lazy_current);
+  lazy.require_component(Ez);
+  CHECK(lazy.phase_in_material(&lazy_target, 3.0 * lazy.dt) == 3,
+        "lazy CPU material phase setup returned the wrong countdown");
+  lazy.advance(4);
+  CHECK(!lazy.is_phasing() && lazy.t == 4,
+        "lazy CPU material phase did not advance through and beyond its countdown");
 }
 
 static void test_material_schema_signature() {
