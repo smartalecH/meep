@@ -72,6 +72,7 @@ struct lifetime_counts {
   size_t polarization_arrays_at_create;
   size_t polarization_updates_at_compile;
   size_t polarization_subtractions_at_compile;
+  bool gyrotropic_update_at_compile;
   bool polarization_zero_at_create;
   bool connections_current_at_create;
 
@@ -80,8 +81,8 @@ struct lifetime_counts {
         executables_destroyed(0), initialized(0), classified(0), finalized(0), advanced(0),
         reads(0), writes(0), rebuilds(0), arrays_at_create(0),
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
-        polarization_subtractions_at_compile(0), polarization_zero_at_create(true),
-        connections_current_at_create(false) {}
+        polarization_subtractions_at_compile(0), gyrotropic_update_at_compile(false),
+        polarization_zero_at_create(true), connections_current_at_create(false) {}
 };
 
 struct tracking_state : BackendState {
@@ -124,6 +125,9 @@ public:
   Executable *compile(const StepPlan &plan, BackendState &) override {
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
     counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
+    for (const PolarizationUpdate &update : plan.polarization_updates)
+      if (update.kind == PolarizationUpdateKind::gyrotropic)
+        counts.gyrotropic_update_at_compile = true;
     return new tracking_executable(counts);
   }
   void advance(Executable &, BackendState &, int) override { ++counts.advanced; }
@@ -825,9 +829,12 @@ static void test_backend_lifecycle_epoch() {
 static void test_resident_polarization_preparation() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07,
+                                 GYROTROPIC_SATURATED);
 
   structure resident_structure(gv, eps_slab, pml(0.5), identity(), 2);
   resident_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
+  resident_structure.add_susceptibility(eps_slab, E_stuff, gyro);
   fields resident(&resident_structure);
   resident.require_component(Ez);
   bool initially_null = true;
@@ -840,11 +847,16 @@ static void test_resident_polarization_preparation() {
   lifetime_counts counts;
   resident.backend = new tracking_backend(resident, counts);
   resident.advance(1);
-  CHECK(or_to_all(counts.polarization_arrays_at_create > 0),
+  bool owns_chunk = false;
+  for (int i = 0; i < resident.num_chunks; ++i)
+    owns_chunk = owns_chunk || resident.chunks[i]->is_mine();
+  CHECK(and_to_all(!owns_chunk || counts.polarization_arrays_at_create > 0),
         "resident state was created without P/P_prev arrays");
-  CHECK(or_to_all(counts.polarization_updates_at_compile > 0 &&
-                      counts.polarization_subtractions_at_compile > 0),
+  CHECK(and_to_all(!owns_chunk || (counts.polarization_updates_at_compile > 0 &&
+                                   counts.polarization_subtractions_at_compile > 0)),
         "resident executable was compiled without polarization spans");
+  CHECK(and_to_all(!owns_chunk || counts.gyrotropic_update_at_compile),
+        "resident executable was compiled without a gyrotropic update");
   CHECK(counts.polarization_zero_at_create,
         "resident polarization arrays were not zero-initialized before state creation");
   CHECK(counts.connections_current_at_create,
@@ -858,8 +870,24 @@ static void test_resident_polarization_preparation() {
   CHECK(counts.polarization_arrays_at_create == arrays_after_first,
         "second resident preparation changed the polarization catalog");
 
+  const size_t catalog_after_first = counts.arrays_at_create;
+  counts.gyrotropic_update_at_compile = false;
+  resident.require_component(Ex);
+  resident.advance(1);
+  CHECK(counts.states_created == 2 && counts.states_destroyed == 1,
+        "post-allocation field growth did not replace resident state");
+  CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
+        "post-allocation field growth did not replace the resident executable");
+  CHECK(and_to_all(!owns_chunk || counts.gyrotropic_update_at_compile),
+        "rebuilt resident executable lost its gyrotropic update");
+  CHECK(!owns_chunk || counts.arrays_at_create > catalog_after_first,
+        "post-allocation field growth did not expand the resident field catalog");
+  CHECK(counts.polarization_arrays_at_create - arrays_after_first == arrays_after_first,
+        "post-allocation field growth changed immutable gyrotropic state storage");
+
   structure cpu_structure(gv, eps_slab, pml(0.5), identity(), 2);
   cpu_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
+  cpu_structure.add_susceptibility(eps_slab, E_stuff, gyro);
   fields cpu(&cpu_structure);
   cpu.require_component(Ez);
   bool cpu_null = true;
