@@ -268,10 +268,16 @@ static void compare_source_scalars(const fields &cpu, const fields &gpu) {
   }
 }
 
+static std::complex<double> plane_source_amplitude(const vec &point) {
+  const double phase = 0.7 * point.x() - 0.4 * point.y();
+  return std::complex<double>(std::cos(phase), std::sin(phase));
+}
+
 static void run_source_case(const char *name, precision_policy_kind policy, bool real_fields,
                             bool conductivity, bool integrated = false,
                             material_function *material = NULL,
-                            const boundary_region *boundaries = NULL, bool continuous = false) {
+                            const boundary_region *boundaries = NULL, bool continuous = false,
+                            bool plane_source = false) {
   const bool anisotropic = material != NULL;
   const grid_volume gv = anisotropic ? vol3d(2.0, 2.0, 2.0, 5.0) : vol2d(2.0, 2.0, 8.0);
   const boundary_region no_boundaries = no_pml();
@@ -313,8 +319,15 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
   const std::complex<double> amplitude =
       real_fields ? std::complex<double>(0.37, 0.0) : std::complex<double>(0.37, -0.23);
   const vec location = anisotropic ? vec(0.73, 0.83, 0.41) : vec(0.73, 0.83);
-  cpu.add_point_source(Ez, *cpu_time, location, amplitude);
-  gpu.add_point_source(Ez, *gpu_time, location, amplitude);
+  if (plane_source) {
+    const volume plane(vec(0.25, 0.83), vec(1.75, 0.83));
+    cpu.add_volume_source(Ez, *cpu_time, plane, plane_source_amplitude, amplitude);
+    gpu.add_volume_source(Ez, *gpu_time, plane, plane_source_amplitude, amplitude);
+  }
+  else {
+    cpu.add_point_source(Ez, *cpu_time, location, amplitude);
+    gpu.add_point_source(Ez, *gpu_time, location, amplitude);
+  }
 
   /* Prepare the CPU catalog without retaining the preparation step's fields. */
   cpu.advance(1);
@@ -648,6 +661,8 @@ int main(int argc, char **argv) {
     run_source_case("complex-conductive-point-source", policies[p], false, true);
     run_source_case("complex-continuous-point-source", policies[p], false, false, false, NULL,
                     NULL, true);
+    run_source_case("complex-volume-plane-source", policies[p], false, false, false, NULL, NULL,
+                    false, true);
     run_source_case("real-integrated-point-source", policies[p], true, false, true);
     run_source_case("complex-integrated-anisotropic-pml", policies[p], false, false, true,
                     &two_offdiagonals, &xy_pml);
