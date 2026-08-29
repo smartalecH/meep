@@ -62,7 +62,7 @@ enum class OpKind {
   finite_value_check,
   reduction,
   host_callback,
-  pack_state,   // solve_cw BiCGSTAB vector packing
+  pack_state, // solve_cw BiCGSTAB vector packing
   unpack_state,
   num_kinds
 };
@@ -108,6 +108,10 @@ struct Operation {
   uint32_t descriptor_count;
   uint32_t beta_descriptor_index;
   uint32_t beta_descriptor_count;
+  uint32_t cylindrical_m_descriptor_index;
+  uint32_t cylindrical_m_descriptor_count;
+  uint32_t cylindrical_origin_action_index;
+  uint32_t cylindrical_origin_action_count;
   uint32_t polarization_subtraction_index;
   uint32_t polarization_subtraction_count;
   Guard guard;
@@ -167,9 +171,28 @@ struct CurlUpdate {
   PmlProfile pml_u;
   double dtdx;
   double dt;
+  /* UINT32_MAX means that this curl has no paired cylindrical radial
+     prefix. The prefix, curl, and optional BFAST postpass execute in that
+     order before the next curl row may reuse the chunk scratch. */
+  uint32_t radial_prefix_index;
   /* BFAST is an ordered postpass for this exact curl row, not a chunk-level
      tail. UINT32_MAX means that the ordinary curl has no paired postpass. */
   uint32_t bfast_update_index;
+};
+
+struct CylindricalRadialPrefix {
+  int chunk;
+  component target_component;
+  component source_component;
+  int cmp;
+  ArrayId source;
+  ArrayId scratch;
+  size_t nr;
+  size_t nz;
+  size_t row_stride;
+  size_t source_elements;
+  size_t scratch_elements;
+  double ir0;
 };
 
 enum BfastVariant : uint32_t {
@@ -216,13 +239,67 @@ struct BetaUpdate {
   double betadt;
 };
 
+enum CylindricalMVariant : uint32_t {
+  cylindrical_m_has_pml = 1u << 0,
+  cylindrical_m_has_pml_aux = 1u << 1,
+  cylindrical_m_has_conductivity = 1u << 2
+};
+
+struct CylindricalMOverRUpdate {
+  UpdateRegion region;
+  ArrayId target;
+  ArrayId source;
+  ArrayId target_u;
+  ArrayId condinv;
+  ArrayId target_cond;
+  PmlProfile pml;
+  PmlProfile pml_u;
+  double numerator;
+  int raw_radial_start;
+};
+
+enum class CylindricalAxisKind : uint32_t { m0_dz = 0, abs_m1 = 1 };
+
+enum CylindricalAxisVariant : uint32_t {
+  cylindrical_axis_has_pml = 1u << 0,
+  cylindrical_axis_has_pml_aux = 1u << 1,
+  cylindrical_axis_has_conductivity = 1u << 2
+};
+
+struct CylindricalAxisUpdate {
+  CylindricalAxisKind kind;
+  UpdateRegion region;
+  ArrayId target;
+  ArrayId source1;
+  ArrayId source2;
+  ptrdiff_t source1_neighbor_offset;
+  ptrdiff_t source2_offset;
+  ArrayId target_u;
+  ArrayId conductivity;
+  ArrayId condinv;
+  ArrayId target_cond;
+  PmlProfile pml;
+  PmlProfile pml_u;
+  double scale;
+  double source2_multiplier;
+  double dt;
+};
+
+enum class CylindricalOriginActionKind : uint32_t { axis_update = 0, zero_slab = 1 };
+
+struct CylindricalOriginAction {
+  CylindricalOriginActionKind kind;
+  uint32_t index;
+};
+
 enum ConstitutiveVariant : uint32_t {
   constitutive_one_offdiagonal = 1u << 0,
   constitutive_two_offdiagonals = 1u << 1,
   constitutive_has_pml = 1u << 2,
   constitutive_has_nonlinearity = 1u << 3,
   constitutive_has_minus_p = 1u << 4,
-  constitutive_copy_w_previous = 1u << 5
+  constitutive_copy_w_previous = 1u << 5,
+  constitutive_axis_override = 1u << 6
 };
 
 struct ConstitutiveUpdate {
@@ -304,25 +381,46 @@ enum class StepProgram { ordinary, solve_cw };
 
 struct StepPlan {
   StepProgram program;
+  /* Lifecycle provenance, deliberately excluded from the content signature. */
+  uint64_t coordinate_generation;
   double beta;
+  double cylindrical_m;
   std::vector<double> bfast_scaled_k;
+  std::vector<double> cylindrical_origin_r;
+  std::vector<uint8_t> cylindrical_zero_near_origin;
   std::vector<Operation> operations;
   std::vector<CurlUpdate> db_updates;
+  std::vector<CylindricalRadialPrefix> cylindrical_radial_prefixes;
   std::vector<BfastUpdate> bfast_updates;
   std::vector<BetaUpdate> beta_updates;
+  std::vector<CylindricalMOverRUpdate> cylindrical_m_updates;
+  std::vector<CylindricalAxisUpdate> cylindrical_axis_updates;
+  std::vector<SlabRef> cylindrical_zero_slabs;
+  std::vector<CylindricalOriginAction> cylindrical_origin_actions;
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
   uint64_t signature;
 
-  StepPlan() : program(StepProgram::ordinary), beta(0), signature(0) {}
+  StepPlan()
+      : program(StepProgram::ordinary), coordinate_generation(0), beta(0), cylindrical_m(0),
+        signature(0) {}
   void clear() {
+    coordinate_generation = 0;
     beta = 0;
+    cylindrical_m = 0;
     bfast_scaled_k.clear();
+    cylindrical_origin_r.clear();
+    cylindrical_zero_near_origin.clear();
     operations.clear();
     db_updates.clear();
+    cylindrical_radial_prefixes.clear();
     bfast_updates.clear();
     beta_updates.clear();
+    cylindrical_m_updates.clear();
+    cylindrical_axis_updates.clear();
+    cylindrical_zero_slabs.clear();
+    cylindrical_origin_actions.clear();
     eh_updates.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
