@@ -26,6 +26,7 @@
 
 #include <meep.hpp>
 
+#include "backend/backend.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
@@ -50,6 +51,34 @@ static double one(const vec &) { return 1.0; }
       ++failures;                                                                                  \
     }                                                                                              \
   } while (0)
+
+static void test_cw_source_time_rounding() {
+  const int steps[] = {0, 1, 16777217, 100000003};
+  const double timesteps[] = {0.05, 0.1, 1.0 / 37.0};
+  const double offsets[] = {0.0, 0.5, 1.0};
+  for (int step : steps)
+    for (double dt : timesteps) {
+      volatile double materialized = double(step) * dt;
+      for (double offset : offsets) {
+        const double expected = materialized + offset * dt;
+        const double actual = cw_source_time(step, dt, offset);
+        CHECK(memcmp(&actual, &expected, sizeof(double)) == 0,
+              "CW source time changed materialized arithmetic bits at t=%d dt=%.17g offset=%g",
+              step, dt, offset);
+      }
+    }
+
+  /* Golden bits captured from the approved PR6 step-source path, which first
+     materialized t*dt and then added offsets 0, 1/2, and 1. */
+  const uint64_t golden[] = {0x41399999b3333334ULL, 0x41399999c0000001ULL,
+                             0x41399999ccccccceULL};
+  for (int i = 0; i < 3; ++i) {
+    const double actual = cw_source_time(16777217, 0.1, offsets[i]);
+    uint64_t bits = 0;
+    memcpy(&bits, &actual, sizeof(bits));
+    CHECK(bits == golden[i], "CW source time offset %g changed PR6 parent bits", offsets[i]);
+  }
+}
 
 /* ------------------------------------------------------------------ */
 /* 1. The dirty-closure table (plan section 6.4), one row at a time.   */
@@ -460,6 +489,7 @@ int main(int argc, char **argv) {
   verbosity = 0;
 
   test_closure_table();
+  test_cw_source_time_rounding();
   test_generations();
   test_legacy_flux_invalidation();
   test_advance_equivalence();

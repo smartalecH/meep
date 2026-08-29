@@ -43,18 +43,86 @@
 
 namespace meep {
 
-/* Type-erased backend ownership. Concrete CPU/device implementations derive
-   from these private bases so fields can destroy them without knowing their
-   representation. */
-struct BackendState {
-  virtual ~BackendState() {}
-};
-
 struct Executable {
   virtual ~Executable() {}
 };
 
+/* Type-erased backend ownership. Concrete CPU/device implementations derive
+   from these private bases so fields can destroy them without knowing their
+   representation. The ordinary executable remains fields-owned. A resident
+   CW executable is deliberately separate and state-owned: it may retain
+   workspace and resolved array references that cannot outlive the state.
+   Because the base destructor releases it after derived members have been
+   destroyed, its destructor must not dereference derived BackendState data. */
+struct BackendState {
+  BackendState()
+      : cw_executable(NULL), cw_storage_fingerprint(0), cw_step_plan_signature(0),
+        cw_plan_signature(0) {}
+  virtual ~BackendState() { delete cw_executable; }
+
+  void clear_cw_executable() {
+    delete cw_executable;
+    cw_executable = NULL;
+    cw_storage_fingerprint = 0;
+    cw_step_plan_signature = 0;
+    cw_plan_signature = 0;
+  }
+
+  Executable *cw_executable;
+  uint64_t cw_storage_fingerprint;
+  uint64_t cw_step_plan_signature;
+  uint64_t cw_plan_signature;
+};
+
 struct InitializationPlan; // src/backend/initialization_plan.hpp
+
+/* Retire a backend epoch while its derived state is still intact. This clears
+   the state-owned CW executable before derived-state members are destroyed. */
+void destroy_backend_state(BackendState *&state);
+
+enum class CwSolveStatus { converged, not_converged, breakdown };
+
+struct CwSolveRequest {
+  double tolerance;
+  int maxiters;
+  std::complex<double> frequency;
+  int L;
+  bool eigfrequency;
+  int entry_t;
+  double entry_time;
+
+  CwSolveRequest()
+      : tolerance(0.0), maxiters(0), frequency(0.0, 0.0), L(0), eigfrequency(false), entry_t(0),
+        entry_time(0.0) {}
+};
+
+struct CwSolveResult {
+  CwSolveStatus status;
+  int iterations;
+  size_t operator_applications;
+  double recursive_relative_residual;
+  double true_relative_residual;
+
+  CwSolveResult()
+      : status(CwSolveStatus::breakdown), iterations(0), operator_applications(0),
+        recursive_relative_residual(0.0), true_relative_residual(0.0) {}
+};
+
+class CwSolveSession {
+public:
+  CwSolveSession(fields &owner, const CwSolveRequest &request);
+  ~CwSolveSession();
+  void restore_before_final_dft() noexcept;
+  bool boundary_called() const { return boundary_called_; }
+  bool at_entry_state() const;
+
+private:
+  CwSolveSession(const CwSolveSession &);
+  CwSolveSession &operator=(const CwSolveSession &);
+  fields &owner_;
+  int entry_t_;
+  bool boundary_called_;
+};
 
 enum class DftReductionKind { norm2, real_weighted_product, complex_weighted_product };
 
@@ -94,6 +162,29 @@ public:
 
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
   virtual void advance(Executable &, BackendState &, int num_steps) = 0;
+
+  /* A resident CW solve is one coarse operation. CPU declines this hook and
+     keeps the legacy solver unchanged. preflight_cw must not invoke source
+     callbacks or mutate fields; it may return `cached` after validating and
+     reserving workspace, or a replacement compiled artifact. solve_cw owns
+     the complete post-preflight operation, including final synchronization
+     and the single due-filtered DFT action. */
+  virtual bool supports_cw(const CwSolveRequest &, std::string &why) const {
+    why = "backend does not implement resident solve_cw";
+    return false;
+  }
+  virtual Executable *preflight_cw(const CwSolveRequest &, const StepPlan &, const CwPlan &,
+                                   Executable *, BackendState &) {
+    throw std::logic_error("backend does not implement resident solve_cw preflight");
+  }
+  /* Immediately before its owned final due-filtered DFT action, the coarse
+     hook must call session.restore_before_final_dft(), which restores both the
+     solve-entry clock and every chunk's transient CW flag. The wrapper checks
+     that boundary and restores the same state defensively on every return. */
+  virtual CwSolveResult solve_cw(const CwSolveRequest &, const StepPlan &, const CwPlan &,
+                                 Executable &, Executable &, BackendState &, CwSolveSession &) {
+    throw std::logic_error("backend does not implement resident solve_cw");
+  }
 
   virtual void read(ArrayRef, void *host_buffer, size_t bytes) = 0;        // converts from storage
   virtual void write(ArrayRef, const void *host_buffer, size_t bytes) = 0; // converts to storage
@@ -212,6 +303,20 @@ void backend_publish_dft_chain(dft_chunk *head, const char *site);
 void backend_require_magnetic_synchronization(const fields &f, const char *site);
 bool backend_try_synchronize_magnetic_fields(fields &f, const char *site);
 bool backend_try_restore_magnetic_fields(fields &f, const char *site);
+
+/* Dispatch a complete resident CW solve. Returns false only for the CPU/default
+   backend, which preserves the legacy fields::solve_cw implementation. A
+   resident backend that declines is fail-closed. */
+bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResult &result);
+
+/* Shared, noncontracting source time used by both legacy and resident CW
+   paths. Keeping this out of line prevents an optimizer from fusing t*dt with
+   the half-step addition and changing the last bit at a callback boundary. */
+double cw_source_time(int t, double dt, double offset_in_dt);
+/* Deterministic allocation-failure seam for lifecycle tests. Negative disables it. */
+void backend_set_cw_clone_fail_after_for_testing(int checkpoints);
+void backend_cw_clone_checkpoint();
+void backend_set_cw_plan_corruption_for_testing(bool enabled);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI
