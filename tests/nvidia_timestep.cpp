@@ -402,6 +402,86 @@ static void set_uniform_conductivity(structure &s) {
   s.set_conductivity(Dz, uniform_conductivity);
 }
 
+static void run_beta_case(const char *name, precision_policy_kind policy, bool real_fields,
+                          double beta, bool use_pml, bool conductivity, int chunks) {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  const boundary_region boundaries =
+      use_pml ? pml(0.4, X) + pml(0.4, Y) : no_pml();
+  structure cpu_structure(gv, isotropic_eps, boundaries, identity(), chunks);
+  structure gpu_structure(gv, isotropic_eps, boundaries, identity(), chunks);
+  if (conductivity) {
+    set_uniform_conductivity(cpu_structure);
+    set_uniform_conductivity(gpu_structure);
+  }
+
+  fields cpu(&cpu_structure, 0, beta);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options, 0, beta);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  gaussian_src_time cpu_time(0.31, 0.14), gpu_time(0.31, 0.14);
+  const std::complex<double> amplitude =
+      real_fields ? std::complex<double>(0.37, 0.0) : std::complex<double>(0.37, -0.23);
+  cpu.add_point_source(Ez, cpu_time, vec(0.73, 0.83), amplitude);
+  gpu.add_point_source(Ez, gpu_time, vec(0.73, 0.83), amplitude);
+
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
+  require(prepared.beta == beta && !prepared.beta_updates.empty(),
+          "NVIDIA beta plan has no coordinate updates");
+  bool saw_b = false, saw_d = false, saw_x = false, saw_y = false;
+  bool saw_cmp0 = false, saw_cmp1 = false, saw_main = false, saw_aux = false, saw_cond = false;
+  for (const BetaUpdate &update : prepared.beta_updates) {
+    const StorageKey &target = gpu.array_catalog->key(update.target);
+    const StorageKey &source = gpu.array_catalog->key(update.source);
+    saw_b |= is_B(component(target.component_));
+    saw_d |= is_D(component(target.component_));
+    saw_x |= component_direction(component(target.component_)) == X;
+    saw_y |= component_direction(component(target.component_)) == Y;
+    saw_cmp0 |= target.cmp == 0;
+    saw_cmp1 |= target.cmp == 1;
+    saw_main |= (update.region.variant_key & beta_has_pml) != 0;
+    saw_aux |= (update.region.variant_key & beta_has_pml_aux) != 0;
+    saw_cond |= (update.region.variant_key & beta_has_conductivity) != 0;
+    require(real_fields ? source.cmp == target.cmp : source.cmp == 1 - target.cmp,
+            "NVIDIA beta source has incorrect real/complex cmp routing");
+#if MEEP_SINGLE
+    require(float_bits(realnum(update.betadt)) ==
+                (update.betadt < 0 ? 0xbd88b8dcu : 0x3d88b8dcu),
+            "native-single beta coefficient bits regressed");
+#endif
+  }
+  require(saw_b && saw_d && saw_x && saw_y && saw_cmp0,
+          "NVIDIA beta plan lacks B/D, X/Y, or cmp0 coverage");
+  require(real_fields ? !saw_cmp1 : saw_cmp1,
+          "NVIDIA beta plan has incorrect real/complex cmp coverage");
+  require(saw_main == use_pml && saw_aux == use_pml && saw_cond == conductivity,
+          "NVIDIA beta plan has incorrect PML/conductivity variants");
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 3e-5 : 3e-13;
+  const int checkpoints[] = {1, 2, 100};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA beta timestep did not advance host time");
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoints[i];
+  }
+  master_printf("nvidia_timestep: beta-%s/%s PASS\n", name, precision_policy_name(policy));
+}
+
 static void require_source_plan(fields &f, bool conductivity, bool integrated,
                                 bool expect_cross_copy, bool expect_nonlinear = false) {
   require(f.descriptors, "source test has no prepared descriptor set");
@@ -980,6 +1060,63 @@ static void test_gyrotropic_compile_rejections() {
   require(before == after, "rejected gyrotropic descriptors mutated device storage");
 }
 
+static void test_beta_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, pml(0.4, X) + pml(0.4, Y), identity(), 1);
+  set_uniform_conductivity(s);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&s, options, 0, 0.17);
+  gaussian_src_time source_time(0.31, 0.14);
+  gpu.add_point_source(Ez, source_time, vec(0.73, 0.83));
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(!baseline.beta_updates.empty(), "beta rejection test has no update descriptor");
+  size_t operation_index = baseline.operations.size();
+  for (size_t i = 0; i < baseline.operations.size(); ++i)
+    if (baseline.operations[i].kind == OpKind::update_db &&
+        baseline.operations[i].beta_descriptor_count) {
+      operation_index = i;
+      break;
+    }
+  require(operation_index < baseline.operations.size(), "beta rejection test has no owning op");
+
+  const ArrayId target = baseline.beta_updates[0].target;
+  const size_t elements = gpu.storage_plan->arrays[target.value].elements;
+  std::vector<realnum> before(elements), after(elements);
+  gpu.backend->read(ArrayRef{target, 0, elements}, before.data(), before.size() * sizeof(realnum));
+
+  StepPlan malformed = baseline;
+  malformed.operations[operation_index].beta_descriptor_count =
+      uint32_t(malformed.beta_updates.size() + 1);
+  expect_compile_rejected(gpu, malformed, "beta descriptor span is out of range");
+
+  malformed = baseline;
+  malformed.beta_updates[0].source = invalid_array();
+  expect_compile_rejected(gpu, malformed, "no source field");
+
+  malformed = baseline;
+  malformed.beta_updates[0].source = malformed.beta_updates[0].target;
+  expect_compile_rejected(gpu, malformed, "aliases mutable and input state");
+
+  malformed = baseline;
+  malformed.beta_updates[0].region.counts[0] = 0;
+  expect_compile_rejected(gpu, malformed, "empty axis");
+
+  malformed = baseline;
+  malformed.beta_updates[0].region.base = std::numeric_limits<size_t>::max();
+  expect_compile_rejected(gpu, malformed, "base exceeds ptrdiff_t");
+
+  malformed = baseline;
+  malformed.beta_updates[0].betadt = std::numeric_limits<double>::infinity();
+  expect_compile_rejected(gpu, malformed, "coefficient is non-finite");
+
+  gpu.backend->read(ArrayRef{target, 0, elements}, after.data(), after.size() * sizeof(realnum));
+  require(before == after, "rejected beta descriptors mutated device storage");
+}
+
 static void run_dispersion_case(const char *name, precision_policy_kind policy, bool real_fields,
                                 bool drude, bool anisotropic_sigma, bool magnetic,
                                 bool use_pml, int chunks, const vec *bloch,
@@ -1272,6 +1409,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   const bool gyro_only = getenv("MEEP_NVIDIA_TIMESTEP_GYRO_ONLY") != NULL;
+  const bool beta_only = getenv("MEEP_NVIDIA_TIMESTEP_BETA_ONLY") != NULL;
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
     master_printf("nvidia_timestep: coefficient checks PASS\n");
@@ -1289,22 +1427,30 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
-    run_gyrotropic_case("lorentz-real-e-copy", policies[p], true, GYROTROPIC_LORENTZIAN,
-                        false, false, NULL, false, 1u << CONNECT_COPY);
-    run_gyrotropic_case("lorentz-complex-e-pml-phase", policies[p], false,
-                        GYROTROPIC_LORENTZIAN, false, true, &bloch3, false,
-                        (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
-    run_gyrotropic_case("drude-real-h-negate", policies[p], true, GYROTROPIC_DRUDE, true,
-                        false, NULL, true, 1u << CONNECT_NEGATE);
-    run_gyrotropic_case("drude-complex-h-pml-phase", policies[p], false, GYROTROPIC_DRUDE,
-                        true, true, &bloch3, false,
-                        (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
-    run_gyrotropic_case("saturated-real-e-copy", policies[p], true, GYROTROPIC_SATURATED,
-                        false, false, NULL, false, 1u << CONNECT_COPY);
-    run_gyrotropic_case("saturated-complex-h-pml-phase", policies[p], false,
-                        GYROTROPIC_SATURATED, true, true, &bloch3, false,
-                        (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
-    if (gyro_only) continue;
+    if (!beta_only) {
+      run_gyrotropic_case("lorentz-real-e-copy", policies[p], true, GYROTROPIC_LORENTZIAN,
+                          false, false, NULL, false, 1u << CONNECT_COPY);
+      run_gyrotropic_case("lorentz-complex-e-pml-phase", policies[p], false,
+                          GYROTROPIC_LORENTZIAN, false, true, &bloch3, false,
+                          (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+      run_gyrotropic_case("drude-real-h-negate", policies[p], true, GYROTROPIC_DRUDE, true,
+                          false, NULL, true, 1u << CONNECT_NEGATE);
+      run_gyrotropic_case("drude-complex-h-pml-phase", policies[p], false, GYROTROPIC_DRUDE,
+                          true, true, &bloch3, false,
+                          (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+      run_gyrotropic_case("saturated-real-e-copy", policies[p], true, GYROTROPIC_SATURATED,
+                          false, false, NULL, false, 1u << CONNECT_COPY);
+      run_gyrotropic_case("saturated-complex-h-pml-phase", policies[p], false,
+                          GYROTROPIC_SATURATED, true, true, &bloch3, false,
+                          (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+    }
+    if (!gyro_only) {
+      run_beta_case("real-positive", policies[p], true, +0.17, false, false, 2);
+      run_beta_case("real-negative-pml", policies[p], true, -0.17, true, false, 4);
+      run_beta_case("complex-positive-conductive", policies[p], false, +0.17, false, true, 2);
+      run_beta_case("complex-negative-pml-conductive", policies[p], false, -0.17, true, true, 4);
+    }
+    if (gyro_only || beta_only) continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
     run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
@@ -1366,8 +1512,9 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   set_finite_check_mode(FiniteCheckMode::off);
-  test_gyrotropic_compile_rejections();
-  if (!gyro_only) {
+  if (!beta_only) test_gyrotropic_compile_rejections();
+  if (!gyro_only) test_beta_compile_rejections();
+  if (!gyro_only && !beta_only) {
     test_compile_allocation_retry();
     test_rejections();
     test_nonlinear_compile_rejections();
