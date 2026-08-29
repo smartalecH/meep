@@ -34,6 +34,7 @@ static int failures = 0;
   } while (0)
 
 static double eps_slab(const vec &p) { return fabs(p.y()) < 0.4 ? 12.0 : 1.0; }
+static double unit_conductivity(const vec &) { return 0.25; }
 
 class one_cross_material : public material_function {
 public:
@@ -334,6 +335,104 @@ static void check_alias_elision() {
   CHECK(field_aliases > 0, "alias-elision test prepared no physical-field aliases");
 }
 
+static void check_beta_plan(bool real_fields, double beta) {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5));
+  s.set_conductivity(Bx, unit_conductivity);
+  s.set_conductivity(By, unit_conductivity);
+  s.set_conductivity(Dx, unit_conductivity);
+  s.set_conductivity(Dy, unit_conductivity);
+  fields f(&s, 0, beta);
+  if (real_fields) f.use_real_fields();
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.11, 0.13));
+  f.advance(1);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  CHECK(plan.beta == beta, "plan did not retain its prepared beta value");
+  size_t rows = 0;
+  bool saw_main_pml = false, saw_aux_pml = false, saw_conductivity = false;
+  bool saw_b = false, saw_d = false, saw_x = false, saw_y = false;
+  bool saw_cmp0 = false, saw_cmp1 = false;
+  for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
+    const Operation &op = plan.operations[oi];
+    if (op.kind != OpKind::update_db) {
+      CHECK(op.beta_descriptor_count == 0, "non-update_db operation owns beta rows");
+      continue;
+    }
+    CHECK(size_t(op.beta_descriptor_index) + op.beta_descriptor_count <=
+              plan.beta_updates.size(),
+          "beta descriptor span is out of range");
+    for (size_t i = op.beta_descriptor_index;
+         i < size_t(op.beta_descriptor_index) + op.beta_descriptor_count; ++i) {
+      const BetaUpdate &d = plan.beta_updates[i];
+      ++rows;
+      check_region(f, d.region);
+      CHECK(d.region.c == Bx || d.region.c == By || d.region.c == Dx || d.region.c == Dy,
+            "beta row targets a non-transverse component");
+      CHECK((d.region.variant_key &
+             ~(beta_has_pml | beta_has_pml_aux | beta_has_conductivity)) == 0,
+            "beta descriptor has an unbounded variant bit");
+      CHECK(is_valid(d.target) && is_valid(d.source), "beta row lacks a required operand");
+      CHECK(has_access(op, d.target, AccessMode::read_write) &&
+                has_access(op, d.source, AccessMode::read) &&
+                has_access(op, d.target_u, AccessMode::read_write) &&
+                has_access(op, d.condinv, AccessMode::read) &&
+                has_access(op, d.target_cond, AccessMode::read_write) &&
+                has_access(op, d.pml.siginv, AccessMode::read) &&
+                has_access(op, d.pml_u.siginv, AccessMode::read),
+            "beta descriptor access set is incomplete");
+
+      const fields_chunk &fc = *f.chunks[d.region.chunk];
+      const direction dc = component_direction(d.region.c);
+      const field_type ft = op.ft;
+      saw_main_pml |= (d.region.variant_key & beta_has_pml) != 0;
+      saw_aux_pml |= (d.region.variant_key & beta_has_pml_aux) != 0;
+      saw_conductivity |= (d.region.variant_key & beta_has_conductivity) != 0;
+      saw_b |= ft == B_stuff;
+      saw_d |= ft == D_stuff;
+      saw_x |= dc == X;
+      saw_y |= dc == Y;
+      saw_cmp0 |= d.region.cmp == 0;
+      saw_cmp1 |= d.region.cmp == 1;
+      const component source_component =
+          direction_component(ft == D_stuff ? Hx : Ex, dc == X ? Y : X);
+      const ArrayId opposite = f.array_catalog->find(
+          {d.region.chunk, int(array_kind::f), int(source_component), 1 - d.region.cmp, 0});
+      const ArrayId same = f.array_catalog->find(
+          {d.region.chunk, int(array_kind::f), int(source_component), d.region.cmp, 0});
+      CHECK(d.source == (is_valid(opposite) ? opposite : same),
+            "beta source does not follow real/complex cmp routing");
+      const realnum expected =
+          2 * pi * fc.beta * fc.dt * (dc == X ? +1 : -1) *
+          (is_valid(opposite) ? (ft == D_stuff ? -1 : +1) * (2 * d.region.cmp - 1) : 1);
+      CHECK(d.betadt == double(expected), "beta coefficient differs from host realnum order");
+    }
+  }
+  CHECK(or_to_all(rows > 0), "%s beta=%g produced no beta rows",
+        real_fields ? "real" : "complex", beta);
+  CHECK(or_to_all(saw_main_pml) && or_to_all(saw_aux_pml) && or_to_all(saw_conductivity),
+        "beta plan did not cover primary PML, auxiliary PML, and conductivity");
+  CHECK(or_to_all(saw_b) && or_to_all(saw_d) && or_to_all(saw_x) && or_to_all(saw_y),
+        "beta plan did not cover B/D and X/Y routing");
+  CHECK(or_to_all(saw_cmp0), "beta plan did not cover cmp 0");
+  CHECK(real_fields ? !or_to_all(saw_cmp1) : or_to_all(saw_cmp1),
+        "beta plan has the wrong real/complex cmp coverage");
+}
+
+static void check_zero_beta_plan() {
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, eps_slab, pml(0.5));
+  fields f(&s, 0, 0.0);
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.11, 0.13));
+  f.advance(1);
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  CHECK(plan.beta_updates.empty(), "zero beta emitted beta descriptors");
+  for (const Operation &op : plan.operations)
+    CHECK(op.beta_descriptor_count == 0, "zero beta emitted a nonempty beta span");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -341,6 +440,11 @@ int main(int argc, char **argv) {
   check_integrated_source_inputs();
   check_one_cross_normalization();
   check_alias_elision();
+  check_beta_plan(false, +0.17);
+  check_beta_plan(false, -0.17);
+  check_beta_plan(true, +0.17);
+  check_beta_plan(true, -0.17);
+  check_zero_beta_plan();
   if (failures) {
     master_printf("prepared_plan: %d FAILURE(S)\n", failures);
     return 1;
