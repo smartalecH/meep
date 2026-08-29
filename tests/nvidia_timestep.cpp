@@ -482,6 +482,112 @@ static void run_beta_case(const char *name, precision_policy_kind policy, bool r
   master_printf("nvidia_timestep: beta-%s/%s PASS\n", name, precision_policy_name(policy));
 }
 
+static void run_bfast_case(const char *name, const grid_volume &gv,
+                           precision_policy_kind policy, bool real_fields,
+                           const std::vector<double> &scaled_k, bool use_pml,
+                           bool conductivity, int chunks, const vec *bloch = NULL,
+                           double beta = 0.0) {
+  const boundary_region boundaries =
+      use_pml ? pml(0.35, X) + pml(0.35, Y) : no_pml();
+  structure cpu_structure(gv, isotropic_eps, boundaries, identity(), chunks);
+  structure gpu_structure(gv, isotropic_eps, boundaries, identity(), chunks);
+  if (conductivity) {
+    set_uniform_conductivity(cpu_structure);
+    set_uniform_conductivity(gpu_structure);
+  }
+
+  fields cpu(&cpu_structure, 0, beta, true, 0, 0, scaled_k);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options, 0, beta, true, 0, 0, scaled_k);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  else if (bloch) {
+    cpu.use_bloch(*bloch);
+    gpu.use_bloch(*bloch);
+  }
+  const component source_component = gv.dim == D1 ? Ex : Ez;
+  gaussian_src_time cpu_time(0.31, 0.14), gpu_time(0.31, 0.14);
+  const std::complex<double> amplitude =
+      real_fields ? std::complex<double>(0.37, 0.0) : std::complex<double>(0.37, -0.23);
+  cpu.add_point_source(source_component, cpu_time, gv.center(), amplitude);
+  gpu.add_point_source(source_component, gpu_time, gv.center(), amplitude);
+
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
+  require(prepared.bfast_scaled_k == scaled_k && !prepared.bfast_updates.empty(),
+          "NVIDIA BFAST plan has no coordinate updates");
+  bool saw_one_source = false, saw_two_sources = false, saw_zero_pair = false;
+  bool saw_main = false, saw_aux = false, saw_cond = false;
+  size_t paired = 0;
+  for (const CurlUpdate &curl : prepared.db_updates) {
+    require((curl.region.variant_key & curl_has_bfast) != 0 &&
+                curl.bfast_update_index < prepared.bfast_updates.size(),
+            "NVIDIA BFAST plan has an unpaired curl row");
+    const BfastUpdate &update = prepared.bfast_updates[curl.bfast_update_index];
+    ++paired;
+    saw_one_source |= is_valid(update.source1) != is_valid(update.source2);
+    saw_two_sources |= is_valid(update.source1) && is_valid(update.source2);
+    saw_zero_pair |= update.k1 == 0.0 && update.k2 == 0.0;
+    saw_main |= (update.region.variant_key & bfast_has_pml) != 0;
+    saw_aux |= (update.region.variant_key & bfast_has_pml_aux) != 0;
+    saw_cond |= (update.region.variant_key & bfast_has_conductivity) != 0;
+    const StorageKey &target = gpu.array_catalog->key(update.target);
+    const StorageKey &state = gpu.array_catalog->key(update.f_bfast);
+    require(state.chunk == target.chunk && state.component_ == target.component_ &&
+                state.cmp == target.cmp && state.kind == int(array_kind::f_bfast),
+            "NVIDIA BFAST persistent-state identity is incorrect");
+#if MEEP_SINGLE
+    const uint32_t k1_bits = float_bits(realnum(update.k1));
+    const uint32_t k2_bits = float_bits(realnum(update.k2));
+    const bool known_k1 = k1_bits == 0 || k1_bits == 0x80000000u ||
+                          k1_bits == 0x3e2e147bu ||
+                          k1_bits == 0xbe2e147bu || k1_bits == 0x3de147aeu ||
+                          k1_bits == 0xbde147aeu || k1_bits == 0x3d8f5c29u ||
+                          k1_bits == 0xbd8f5c29u;
+    const bool known_k2 = k2_bits == 0 || k2_bits == 0x80000000u ||
+                          k2_bits == 0x3e2e147bu ||
+                          k2_bits == 0xbe2e147bu || k2_bits == 0x3de147aeu ||
+                          k2_bits == 0xbde147aeu || k2_bits == 0x3d8f5c29u ||
+                          k2_bits == 0xbd8f5c29u;
+    require(known_k1 && known_k2, "native-single BFAST coefficient bits regressed");
+#endif
+  }
+  require(paired == prepared.bfast_updates.size() && paired == prepared.db_updates.size(),
+          "NVIDIA BFAST plan pairing is not one-to-one");
+  if (gv.dim == D1) require(saw_one_source, "D1 BFAST plan has no one-source row");
+  if (gv.dim == D3) require(saw_two_sources, "D3 BFAST plan has no two-source row");
+  if (scaled_k[1] == 0.0 || scaled_k[2] == 0.0)
+    require(saw_zero_pair, "BFAST plan did not retain a zero-k row while enabled");
+  require(saw_main == use_pml && saw_aux == use_pml && saw_cond == conductivity,
+          "NVIDIA BFAST plan has incorrect PML/conductivity variants");
+  require((beta != 0.0) == !prepared.beta_updates.empty(),
+          "NVIDIA beta+BFAST composition has incorrect beta tail");
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 4e-5 : 4e-13;
+  const int checkpoints[] = {1, 2, 100};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA BFAST timestep did not advance host time");
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoints[i];
+  }
+  master_printf("nvidia_timestep: bfast-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
 static void require_source_plan(fields &f, bool conductivity, bool integrated,
                                 bool expect_cross_copy, bool expect_nonlinear = false) {
   require(f.descriptors, "source test has no prepared descriptor set");
@@ -1117,6 +1223,118 @@ static void test_beta_compile_rejections() {
   require(before == after, "rejected beta descriptors mutated device storage");
 }
 
+static void test_bfast_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, pml(0.4, X) + pml(0.4, Y), identity(), 1);
+  set_uniform_conductivity(s);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields gpu(&s, options, 0, 0, true, 0, 0, scaled_k);
+  gaussian_src_time source_time(0.31, 0.14);
+  gpu.add_point_source(Ez, source_time, vec(0.73, 0.83));
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(!baseline.bfast_updates.empty() && baseline.db_updates.size() > 1,
+          "BFAST rejection test has insufficient descriptors");
+  size_t curl_index = baseline.db_updates.size();
+  for (size_t i = 0; i < baseline.db_updates.size(); ++i) {
+    const uint32_t index = baseline.db_updates[i].bfast_update_index;
+    if (index < baseline.bfast_updates.size() &&
+        baseline.bfast_updates[index].region.variant_key ==
+            (bfast_has_pml | bfast_has_pml_aux | bfast_has_conductivity)) {
+      curl_index = i;
+      break;
+    }
+  }
+  require(curl_index < baseline.db_updates.size(),
+          "BFAST rejection test has no fully auxiliary descriptor");
+  const uint32_t bfast_index = baseline.db_updates[curl_index].bfast_update_index;
+  require(bfast_index < baseline.bfast_updates.size(),
+          "BFAST rejection test has no paired descriptor");
+  const ArrayId target = baseline.bfast_updates[bfast_index].target;
+  const size_t elements = gpu.storage_plan->arrays[target.value].elements;
+  std::vector<realnum> before(elements), after(elements);
+  gpu.backend->read(ArrayRef{target, 0, elements}, before.data(), before.size() * sizeof(realnum));
+
+  StepPlan malformed = baseline;
+  malformed.db_updates[curl_index].region.variant_key &= ~curl_has_bfast;
+  expect_compile_rejected(gpu, malformed, "bit and paired index disagree");
+  malformed = baseline;
+  malformed.db_updates[curl_index].bfast_update_index = UINT32_MAX;
+  expect_compile_rejected(gpu, malformed, "live BFAST coordinate has an unpaired curl row");
+  malformed = baseline;
+  malformed.db_updates[curl_index].region.variant_key &= ~curl_has_bfast;
+  malformed.db_updates[curl_index].bfast_update_index = UINT32_MAX;
+  expect_compile_rejected(gpu, malformed, "live BFAST coordinate has an unpaired curl row");
+  malformed = baseline;
+  malformed.db_updates[curl_index].bfast_update_index = uint32_t(malformed.bfast_updates.size());
+  expect_compile_rejected(gpu, malformed, "paired index is out of range");
+
+  malformed = baseline;
+  malformed.bfast_updates.push_back(malformed.bfast_updates[bfast_index]);
+  expect_compile_rejected(gpu, malformed, "not paired with exactly one curl");
+  malformed = baseline;
+  const size_t duplicate_curl = curl_index == 0 ? 1 : 0;
+  malformed.db_updates[duplicate_curl] = malformed.db_updates[curl_index];
+  expect_compile_rejected(gpu, malformed, "not paired with exactly one curl");
+
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].region.begin.set_direction(
+      X, malformed.bfast_updates[bfast_index].region.begin.in_direction(X) + 2);
+  expect_compile_rejected(gpu, malformed, "curl and paired BFAST descriptors disagree");
+  malformed = baseline;
+  std::swap(malformed.bfast_updates[bfast_index].source1,
+            malformed.bfast_updates[bfast_index].source2);
+  expect_compile_rejected(gpu, malformed, "source identity");
+  malformed = baseline;
+  ++malformed.bfast_updates[bfast_index].stride1;
+  expect_compile_rejected(gpu, malformed, "source stride");
+  malformed = baseline;
+  std::swap(malformed.bfast_updates[bfast_index].pml.sig,
+            malformed.bfast_updates[bfast_index].pml.kap);
+  expect_compile_rejected(gpu, malformed, "curl and paired BFAST descriptors disagree");
+
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].source1 = invalid_array();
+  malformed.bfast_updates[bfast_index].source2 = invalid_array();
+  expect_compile_rejected(gpu, malformed, "no source field");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].f_bfast = invalid_array();
+  expect_compile_rejected(gpu, malformed, "persistent-state identity");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].f_bfast = malformed.bfast_updates[bfast_index].target;
+  expect_compile_rejected(gpu, malformed, "persistent-state identity");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].f_bfast = malformed.bfast_updates[bfast_index].source1;
+  expect_compile_rejected(gpu, malformed, "persistent-state identity");
+
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].region.variant_key |= 1u << 12;
+  expect_compile_rejected(gpu, malformed, "unsupported variant bit");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].target_u = invalid_array();
+  expect_compile_rejected(gpu, malformed, "variant bits and auxiliary arrays disagree");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].k1 = std::numeric_limits<double>::infinity();
+  expect_compile_rejected(gpu, malformed, "coefficient is non-finite");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].k1 = -malformed.bfast_updates[bfast_index].k1;
+  expect_compile_rejected(gpu, malformed, "coefficients do not match live coordinate routing");
+  malformed = baseline;
+  malformed.bfast_scaled_k[0] = -malformed.bfast_scaled_k[0];
+  expect_compile_rejected(gpu, malformed, "coordinate fingerprint is stale");
+  malformed = baseline;
+  malformed.bfast_updates[bfast_index].region.base = 0;
+  malformed.db_updates[curl_index].region.base = 0;
+  expect_compile_rejected(gpu, malformed, "index range exceeds its array");
+
+  gpu.backend->read(ArrayRef{target, 0, elements}, after.data(), after.size() * sizeof(realnum));
+  require(before == after, "rejected BFAST descriptors mutated device storage");
+}
+
 static void run_dispersion_case(const char *name, precision_policy_kind policy, bool real_fields,
                                 bool drude, bool anisotropic_sigma, bool magnetic,
                                 bool use_pml, int chunks, const vec *bloch,
@@ -1410,12 +1628,18 @@ int main(int argc, char **argv) {
   }
   const bool gyro_only = getenv("MEEP_NVIDIA_TIMESTEP_GYRO_ONLY") != NULL;
   const bool beta_only = getenv("MEEP_NVIDIA_TIMESTEP_BETA_ONLY") != NULL;
+  const bool bfast_only = getenv("MEEP_NVIDIA_TIMESTEP_BFAST_ONLY") != NULL;
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
     master_printf("nvidia_timestep: coefficient checks PASS\n");
     return 0;
   }
   set_finite_check_mode(FiniteCheckMode::off);
+  if (getenv("MEEP_NVIDIA_BFAST_REJECTIONS_ONLY")) {
+    test_bfast_compile_rejections();
+    master_printf("nvidia_timestep: BFAST rejection checks PASS\n");
+    return 0;
+  }
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
   const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
   const vec bloch2(0.17, 0.11);
@@ -1427,7 +1651,7 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
-    if (!beta_only) {
+    if (!beta_only && !bfast_only) {
       run_gyrotropic_case("lorentz-real-e-copy", policies[p], true, GYROTROPIC_LORENTZIAN,
                           false, false, NULL, false, 1u << CONNECT_COPY);
       run_gyrotropic_case("lorentz-complex-e-pml-phase", policies[p], false,
@@ -1444,13 +1668,29 @@ int main(int argc, char **argv) {
                           GYROTROPIC_SATURATED, true, true, &bloch3, false,
                           (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
     }
-    if (!gyro_only) {
+    if (!gyro_only && !bfast_only) {
       run_beta_case("real-positive", policies[p], true, +0.17, false, false, 2);
       run_beta_case("real-negative-pml", policies[p], true, -0.17, true, false, 4);
       run_beta_case("complex-positive-conductive", policies[p], false, +0.17, false, true, 2);
       run_beta_case("complex-negative-pml-conductive", policies[p], false, -0.17, true, true, 4);
     }
-    if (gyro_only || beta_only) continue;
+    if (!gyro_only && !beta_only) {
+      const std::vector<double> positive_k{0.17, 0.11, 0.07};
+      const std::vector<double> negative_k{-0.17, -0.11, -0.07};
+      const std::vector<double> sparse_k{0.17, 0.0, 0.0};
+      run_bfast_case("d1-one-source", vol1d(3.0, 8.0), policies[p], true, positive_k,
+                     false, false, 2);
+      run_bfast_case("d3-two-source-copy", gv3, policies[p], true, positive_k, false,
+                     false, 4);
+      run_bfast_case("d3-negative-complex-phase", gv3, policies[p], false, negative_k,
+                     false, false, 4, &bloch3);
+      run_bfast_case("d2-pml", gv2, policies[p], true, positive_k, true, false, 2);
+      run_bfast_case("d2-pml-conductive-zero-row", gv2, policies[p], false, sparse_k, true,
+                     true, 4, &bloch2);
+      run_bfast_case("d2-beta-composed", gv2, policies[p], false, positive_k, false,
+                     false, 2, &bloch2, 0.17);
+    }
+    if (gyro_only || beta_only || bfast_only) continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
     run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
@@ -1512,9 +1752,10 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   set_finite_check_mode(FiniteCheckMode::off);
-  if (!beta_only) test_gyrotropic_compile_rejections();
-  if (!gyro_only) test_beta_compile_rejections();
-  if (!gyro_only && !beta_only) {
+  if (!beta_only && !bfast_only) test_gyrotropic_compile_rejections();
+  if (!gyro_only && !bfast_only) test_beta_compile_rejections();
+  if (!gyro_only && !beta_only) test_bfast_compile_rejections();
+  if (!gyro_only && !beta_only && !bfast_only) {
     test_compile_allocation_retry();
     test_rejections();
     test_nonlinear_compile_rejections();
