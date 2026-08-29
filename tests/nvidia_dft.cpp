@@ -3,12 +3,14 @@
 
 #include <meep.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <complex>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <stdexcept>
 #include <vector>
 #include <unistd.h>
@@ -150,6 +152,36 @@ static void compare_hdf5_field_access(fields &cpu, fields &gpu, const volume &wh
   delete cpu_file;
   delete gpu_file;
 }
+
+static void compare_hdf5_dataset(const char *cpu_filename, const char *gpu_filename,
+                                 const char *dataset, double tolerance) {
+  h5file cpu_file(cpu_filename, h5file::READONLY, false);
+  h5file gpu_file(gpu_filename, h5file::READONLY, false);
+  int cpu_rank = 0, gpu_rank = 0;
+  size_t cpu_dims[3] = {0, 0, 0}, gpu_dims[3] = {0, 0, 0};
+  std::unique_ptr<double[]> expected(
+      static_cast<double *>(cpu_file.read(dataset, &cpu_rank, cpu_dims, 3, false)));
+  std::unique_ptr<double[]> observed(
+      static_cast<double *>(gpu_file.read(dataset, &gpu_rank, gpu_dims, 3, false)));
+  require(expected.get() && observed.get(), "DFT HDF5 dataset readback failed");
+  require(cpu_rank == gpu_rank, "CPU and NVIDIA DFT HDF5 ranks differ");
+  size_t elements = 1;
+  for (int axis = 0; axis < cpu_rank; ++axis) {
+    require(cpu_dims[axis] == gpu_dims[axis], "CPU and NVIDIA DFT HDF5 dimensions differ");
+    elements *= cpu_dims[axis];
+  }
+  for (size_t i = 0; i < elements; ++i)
+    compare_scalar(expected[i], observed[i], tolerance, "DFT HDF5 dataset");
+}
+
+static std::string temporary_stem(const char *kind, precision_policy_kind policy) {
+  char name[192];
+  snprintf(name, sizeof(name), "meep-nvidia-dft-%ld-%s-%s", static_cast<long>(getpid()),
+           precision_policy_name(policy), kind);
+  return std::string(name);
+}
+
+static void remove_h5(const std::string &stem) { std::remove((stem + ".h5").c_str()); }
 
 static void compare_monitor_storage(fields &cpu, fields &gpu, double tolerance) {
   require(cpu.array_catalog && gpu.array_catalog, "DFT comparison has no storage catalog");
@@ -297,6 +329,59 @@ static void check_malformed_dft_reduction_rejections(fields &gpu, size_t frequen
   expect_reduction_rejected(gpu, malformed, frequencies, "bad reduction result count was accepted");
 }
 
+static void run_ldos_boundary(precision_policy_kind policy) {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, vacuum, no_pml(), identity(), 1);
+  structure gpu_structure(gv, vacuum, no_pml(), identity(), 1);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  gaussian_src_time cpu_source(0.31, 0.20), gpu_source(0.31, 0.20);
+  cpu.add_point_source(Ez, cpu_source, vec(0.37, 0.41), 0.9);
+  gpu.add_point_source(Ez, gpu_source, vec(0.37, 0.41), 0.9);
+  size_t source_points_before_init = 0;
+  for (int ic = 0; ic < gpu.num_chunks; ++ic)
+    for (const src_vol &sv : gpu.chunks[ic]->get_sources(D_stuff))
+      source_points_before_init += sv.num_points();
+  require(source_points_before_init > 0, "LDOS fixture source did not intersect the grid");
+  cpu.init_backend();
+  gpu.init_backend();
+  cpu.advance(4);
+  gpu.advance(4);
+
+  const double frequency = 0.31;
+  dft_ldos cpu_ldos(&frequency, 1);
+  dft_ldos gpu_ldos(&frequency, 1);
+  cpu_ldos.update(cpu);
+  poison_host_fields(gpu);
+  nvidia::testing::reset_transfer_accounting();
+  gpu_ldos.update(gpu);
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(transfers.device_to_host_calls > 0 && transfers.device_to_host_bytes > 0,
+          "LDOS update did not read resident source-point fields");
+  size_t largest_field_bytes = 0;
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+    const ArraySpec &spec = gpu.array_catalog->spec(ArrayId{uint32_t(i)});
+    if (spec.role == array_role::field)
+      largest_field_bytes = std::max(largest_field_bytes,
+                                     spec.elements * host_element_bytes(spec.element_type));
+  }
+  require(transfers.device_to_host_bytes < largest_field_bytes,
+          "LDOS update copied a complete field allocation");
+  std::unique_ptr<std::complex<double>[]> expected_f(cpu_ldos.F());
+  std::unique_ptr<std::complex<double>[]> observed_f(gpu_ldos.F());
+  std::unique_ptr<std::complex<double>[]> expected_j(cpu_ldos.J());
+  std::unique_ptr<std::complex<double>[]> observed_j(gpu_ldos.J());
+  const double tolerance = policy == precision_policy_kind::native ? 5e-12 : 3e-4;
+  compare_complex_value(expected_f[0], observed_f[0], 3 * tolerance, "LDOS F");
+  compare_complex_value(expected_j[0], observed_j[0], 3 * tolerance, "LDOS J");
+}
+
 static void run_real_monitor_families(precision_policy_kind policy) {
   const grid_volume gv = vol2d(3.0, 3.0, 7.0);
   structure cpu_structure(gv, vacuum, no_pml(), identity(), 1);
@@ -318,6 +403,10 @@ static void run_real_monitor_families(precision_policy_kind policy) {
   dft_fields cpu_fields =
       cpu.add_dft_fields(components, 3, field_region, frequencies, true, 2, true);
   dft_fields gpu_fields =
+      gpu.add_dft_fields(components, 3, field_region, frequencies, true, 2, true);
+  dft_fields cpu_subtract =
+      cpu.add_dft_fields(components, 3, field_region, frequencies, true, 2, true);
+  dft_fields gpu_subtract =
       gpu.add_dft_fields(components, 3, field_region, frequencies, true, 2, true);
 
   volume_list cpu_flux_surface(volume(vec(0.55, -0.8), vec(0.55, 0.8)), Sx);
@@ -368,6 +457,8 @@ static void run_real_monitor_families(precision_policy_kind policy) {
       const std::complex<double> factor(0.73, -0.19);
       cpu_fields.scale_dfts(factor);
       gpu_fields.scale_dfts(factor);
+      cpu_subtract.scale_dfts(factor);
+      gpu_subtract.scale_dfts(factor);
       compare_monitor_storage(cpu, gpu, tolerance);
     }
     previous = checkpoints[checkpoint];
@@ -459,6 +550,75 @@ static void run_real_monitor_families(precision_policy_kind policy) {
                         3 * tolerance, "integrate resident access");
   compare_hdf5_field_access(cpu, gpu, access_region, tolerance);
 
+  const std::string flux_stem = temporary_stem("flux", policy);
+  const std::string energy_stem = temporary_stem("energy", policy);
+  const std::string force_stem = temporary_stem("force", policy);
+  const std::string n2f_stem = temporary_stem("n2f", policy);
+  poison_host_dft(gpu);
+  gpu_flux.save_hdf5(gpu, flux_stem.c_str());
+  poison_host_dft(gpu);
+  gpu_energy.save_hdf5(gpu, energy_stem.c_str());
+  poison_host_dft(gpu);
+  gpu_force.save_hdf5(gpu, force_stem.c_str());
+  poison_host_dft(gpu);
+  gpu_n2f.save_hdf5(gpu, n2f_stem.c_str());
+
+  gpu_flux.scale_dfts(0.0);
+  gpu_energy.scale_dfts(0.0);
+  gpu_force.scale_dfts(0.0);
+  gpu_n2f.scale_dfts(0.0);
+  gpu_flux.load_hdf5(gpu, flux_stem.c_str());
+  gpu_energy.load_hdf5(gpu, energy_stem.c_str());
+  gpu_force.load_hdf5(gpu, force_stem.c_str());
+  gpu_n2f.load_hdf5(gpu, n2f_stem.c_str());
+  std::unique_ptr<double[]> restored_flux(gpu_flux.flux());
+  std::unique_ptr<double[]> restored_energy(gpu_energy.total());
+  std::unique_ptr<double[]> restored_force(gpu_force.force());
+  for (size_t i = 0; i < frequencies.size(); ++i) {
+    compare_scalar(expected_scaled_flux[i], restored_flux[i], 3 * tolerance, "restored flux");
+    compare_scalar(expected_energy[i], restored_energy[i], 3 * tolerance, "restored energy");
+    compare_scalar(expected_force[i], restored_force[i], 3 * tolerance, "restored force");
+  }
+  gpu_n2f.farfield_lowlevel(observed_far.data(), vec(2.1, 1.7));
+  for (size_t i = 0; i < farfield_values; ++i)
+    compare_complex_value(expected_far[i], observed_far[i], 5 * tolerance,
+                          "restored near2far field");
+
+  const std::string cpu_output_stem = temporary_stem("output-cpu", policy);
+  const std::string gpu_output_stem = temporary_stem("output-gpu", policy);
+  cpu.output_dft(cpu_fields, cpu_output_stem.c_str());
+  poison_host_dft(gpu);
+  gpu.output_dft(gpu_fields, gpu_output_stem.c_str());
+  compare_hdf5_dataset((cpu_output_stem + ".h5").c_str(), (gpu_output_stem + ".h5").c_str(),
+                       "ez_0.r", 3 * tolerance);
+  compare_hdf5_dataset((cpu_output_stem + ".h5").c_str(), (gpu_output_stem + ".h5").c_str(),
+                       "ez_0.i", 3 * tolerance);
+
+  *cpu_fields.chunks -= *cpu_subtract.chunks;
+  *gpu_fields.chunks -= *gpu_subtract.chunks;
+  compare_dft_array(cpu, gpu, cpu_fields, gpu_fields, Ez, 0, tolerance);
+  cpu.advance(2);
+  gpu.advance(2);
+  compare_monitor_storage(cpu, gpu, 3 * tolerance);
+
+  bool magnetic_rejected = false;
+  try { gpu.synchronize_magnetic_fields(); }
+  catch (const std::runtime_error &error) {
+    magnetic_rejected = std::strstr(error.what(), "magnetic synchronization") != NULL;
+  }
+  require(magnetic_rejected, "resident magnetic synchronization was not rejected clearly");
+  const int time_before_recovery = gpu.t;
+  gpu.advance(1);
+  require(gpu.t == time_before_recovery + 1,
+          "NVIDIA execution did not recover after magnetic-sync rejection");
+
+  remove_h5(flux_stem);
+  remove_h5(energy_stem);
+  remove_h5(force_stem);
+  remove_h5(n2f_stem);
+  remove_h5(cpu_output_stem);
+  remove_h5(gpu_output_stem);
+
   master_printf("nvidia_dft: monitor-families/%s PASS\n", precision_policy_name(policy));
 }
 
@@ -502,6 +662,7 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < 3; ++i) {
     run_real_monitor_families(policies[i]);
     run_complex_dft_fields(policies[i]);
+    run_ldos_boundary(policies[i]);
   }
   master_printf("nvidia_dft: PASS\n");
   return 0;
