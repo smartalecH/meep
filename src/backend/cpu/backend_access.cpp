@@ -182,7 +182,7 @@ void backend_reconcile_host_access(const std::string &local_error, const char *s
   throw std::runtime_error(std::string(site) + ": " + local_error);
 }
 
-void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const char *site) {
+void backend_preflight_field_layout_change(fields &f, DirtyMask reasons, const char *site) {
   std::string local_error;
   if (f.backend_state && f.backend && f.backend->requires_full_storage_preparation()) {
     if (f.backend->is_poisoned())
@@ -200,12 +200,20 @@ void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const cha
       local_error = "unknown backend field-layout preparation failure";
     }
   backend_reconcile_host_access(local_error, site);
+}
+
+void backend_commit_field_layout_change(fields &f) {
   if (f.backend_state) {
     delete f.executable;
     f.executable = NULL;
     delete f.backend_state;
     f.backend_state = NULL;
   }
+}
+
+void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const char *site) {
+  backend_preflight_field_layout_change(f, reasons, site);
+  backend_commit_field_layout_change(f);
 }
 
 void backend_refresh_host_fields(fields &owner, int count, const component *components,
