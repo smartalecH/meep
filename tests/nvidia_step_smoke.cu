@@ -22,6 +22,9 @@ using meep::nvidia::constitutive_launch;
 using meep::nvidia::array_copy_launch;
 using meep::nvidia::beta_launch;
 using meep::nvidia::bfast_launch;
+using meep::nvidia::cylindrical_axis_launch;
+using meep::nvidia::cylindrical_m_launch;
+using meep::nvidia::cylindrical_radial_prefix_launch;
 using meep::nvidia::copy_device_to_host_async;
 using meep::nvidia::copy_host_to_device_async;
 using meep::nvidia::curl_launch;
@@ -39,6 +42,9 @@ using meep::nvidia::launch_constitutive;
 using meep::nvidia::launch_array_copy;
 using meep::nvidia::launch_beta;
 using meep::nvidia::launch_bfast;
+using meep::nvidia::launch_cylindrical_axis;
+using meep::nvidia::launch_cylindrical_m;
+using meep::nvidia::launch_cylindrical_radial_prefix;
 using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
@@ -294,7 +300,7 @@ static void check_bfast_variants(int device, stream &execution, scalar_precision
           const T previous = expected_state[i];
           T next;
           if (g2)
-            next = (k1 * (g1[i + s1] + g1[i]) - k2 * (g2[i + s2] + g2[i])) - previous;
+            next = std::fma(-k2, g2[i + s2] + g2[i], k1 * (g1[i + s1] + g1[i])) - previous;
           else if (!main_pml && !auxiliary_pml && !conductive)
             next = k1 * (g1[i + s1] + g1[i]);
           else
@@ -402,6 +408,329 @@ static void check_bfast_variants(int device, stream &execution, scalar_precision
   require(rejected, "BFAST launch accepted an invalid precision");
 }
 
+template <typename T>
+static void check_cylindrical_variants(int device, stream &execution,
+                                       scalar_precision precision) {
+  const size_t elements = 273;
+  const size_t bytes = elements * sizeof(T);
+  std::vector<T> initial(elements), source1(elements), source2(elements), initial_u(elements),
+      initial_cond(elements), conductivity(elements), condinv(elements), sigma(elements),
+      kappa(elements), inverse(elements), sigma_u(elements), kappa_u(elements),
+      inverse_u(elements), observed(elements), observed_u(elements), observed_cond(elements);
+  for (size_t i = 0; i < elements; ++i) {
+    initial[i] = T(0.2 + 0.001 * double(i));
+    source1[i] = T(std::sin(0.019 * double(i + 1)));
+    source2[i] = T(std::cos(0.023 * double(i + 1)));
+    initial_u[i] = T(-0.1 + 0.0007 * double(i));
+    initial_cond[i] = T(0.05 - 0.0002 * double(i));
+    conductivity[i] = T(0.01 + 0.00001 * double(i));
+    condinv[i] = T(1.0 / (1.0 + 0.0003 * double(i + 1)));
+    sigma[i] = T(0.03 + 0.00002 * double(i));
+    kappa[i] = T(1.05 + 0.00003 * double(i));
+    inverse[i] = T(1.0 / (1.0 + 0.0004 * double(i + 1)));
+    sigma_u[i] = T(0.02 + 0.00001 * double(i));
+    kappa_u[i] = T(1.03 + 0.00002 * double(i));
+    inverse_u[i] = T(1.0 / (1.0 + 0.0005 * double(i + 1)));
+  }
+
+  device_buffer d_target(bytes, device), d_source1(bytes, device), d_source2(bytes, device),
+      d_u(bytes, device), d_cond(bytes, device), d_conductivity(bytes, device),
+      d_condinv(bytes, device), d_sigma(bytes, device), d_kappa(bytes, device),
+      d_inverse(bytes, device), d_sigma_u(bytes, device), d_kappa_u(bytes, device),
+      d_inverse_u(bytes, device);
+  copy_host_to_device_async(d_source1, 0, source1.data(), bytes, execution);
+  copy_host_to_device_async(d_source2, 0, source2.data(), bytes, execution);
+  copy_host_to_device_async(d_conductivity, 0, conductivity.data(), bytes, execution);
+  copy_host_to_device_async(d_condinv, 0, condinv.data(), bytes, execution);
+  copy_host_to_device_async(d_sigma, 0, sigma.data(), bytes, execution);
+  copy_host_to_device_async(d_kappa, 0, kappa.data(), bytes, execution);
+  copy_host_to_device_async(d_inverse, 0, inverse.data(), bytes, execution);
+  copy_host_to_device_async(d_sigma_u, 0, sigma_u.data(), bytes, execution);
+  copy_host_to_device_async(d_kappa_u, 0, kappa_u.data(), bytes, execution);
+  copy_host_to_device_async(d_inverse_u, 0, inverse_u.data(), bytes, execution);
+
+  for (unsigned int variant = 0; variant < 8; ++variant) {
+    const bool main_pml = (variant & 1) != 0;
+    const bool auxiliary_pml = (variant & 2) != 0;
+    const bool conductive = (variant & 4) != 0;
+    copy_host_to_device_async(d_target, 0, initial.data(), bytes, execution);
+    copy_host_to_device_async(d_u, 0, initial_u.data(), bytes, execution);
+    copy_host_to_device_async(d_cond, 0, initial_cond.data(), bytes, execution);
+
+    cylindrical_m_launch update = {};
+    update.region.base = 8;
+    update.region.counts[0] = update.region.counts[1] = 1;
+    update.region.counts[2] = 257;
+    update.region.strides[2] = 1;
+    update.target = d_target.opaque_handle();
+    update.source = d_source1.opaque_handle();
+    update.numerator = -0.075;
+    update.raw_radial_start = 3;
+    update.radial_axis = 2;
+    update.precision = precision;
+    if (main_pml) {
+      update.pml.sigma = d_sigma.opaque_handle();
+      update.pml.kappa = d_kappa.opaque_handle();
+      update.pml.inverse = d_inverse.opaque_handle();
+      update.pml.strides[2] = 1;
+    }
+    if (auxiliary_pml) {
+      update.target_u = d_u.opaque_handle();
+      update.pml_u.sigma = d_sigma_u.opaque_handle();
+      update.pml_u.kappa = d_kappa_u.opaque_handle();
+      update.pml_u.inverse = d_inverse_u.opaque_handle();
+      update.pml_u.strides[2] = 1;
+    }
+    if (conductive) {
+      update.conductivity_inverse = d_condinv.opaque_handle();
+      if (main_pml) update.target_conductivity = d_cond.opaque_handle();
+    }
+    launch_cylindrical_m(update, execution);
+
+    std::vector<T> expected = initial, expected_u = initial_u, expected_cond = initial_cond;
+    for (size_t n = 0; n < 257; ++n) {
+      const size_t i = update.region.base + n;
+      T delta = T(update.numerator) / T(update.raw_radial_start + 2 * ptrdiff_t(n)) * source1[i];
+      if (conductive) delta *= condinv[i];
+      if (main_pml) {
+        if (conductive) expected_cond[i] += delta;
+        delta *= inverse[n];
+      }
+      if (auxiliary_pml) {
+        expected_u[i] += delta;
+        delta *= inverse_u[n];
+      }
+      expected[i] += delta;
+    }
+    copy_device_to_host_async(observed.data(), d_target, 0, bytes, execution);
+    copy_device_to_host_async(observed_u.data(), d_u, 0, bytes, execution);
+    copy_device_to_host_async(observed_cond.data(), d_cond, 0, bytes, execution);
+    execution.synchronize();
+    for (size_t i = 0; i < elements; ++i) {
+      require(observed[i] == expected[i], "cylindrical m/r target differs from host recurrence");
+      require(observed_u[i] == expected_u[i],
+              "cylindrical m/r auxiliary differs from host recurrence");
+      require(observed_cond[i] == expected_cond[i],
+              "cylindrical m/r conductivity differs from host recurrence");
+    }
+
+    copy_host_to_device_async(d_target, 0, initial.data(), bytes, execution);
+    copy_host_to_device_async(d_u, 0, initial_u.data(), bytes, execution);
+    copy_host_to_device_async(d_cond, 0, initial_cond.data(), bytes, execution);
+    cylindrical_axis_launch axis = {};
+    axis.region = update.region;
+    axis.target = d_target.opaque_handle();
+    axis.source1 = d_source1.opaque_handle();
+    axis.source2 = d_source2.opaque_handle();
+    axis.source1_neighbor_offset = -2;
+    axis.source2_offset = 3;
+    axis.scale = 0.0625;
+    axis.source2_multiplier = -1.5;
+    axis.dt = 0.125;
+    axis.kind = 1;
+    axis.precision = precision;
+    if (main_pml) axis.pml = update.pml;
+    if (auxiliary_pml) {
+      axis.target_u = d_u.opaque_handle();
+      axis.pml_u = update.pml_u;
+    }
+    if (conductive) {
+      axis.conductivity = d_conductivity.opaque_handle();
+      axis.conductivity_inverse = d_condinv.opaque_handle();
+      axis.target_conductivity = d_cond.opaque_handle();
+    }
+    launch_cylindrical_axis(axis, execution);
+    expected = initial;
+    expected_u = initial_u;
+    expected_cond = initial_cond;
+    for (size_t n = 0; n < 257; ++n) {
+      const ptrdiff_t i = ptrdiff_t(axis.region.base + n);
+      T delta = T(axis.scale) *
+                (source1[i] - source1[i + axis.source1_neighbor_offset] -
+                 T(axis.source2_multiplier) * source2[i + axis.source2_offset]);
+      T *primary = auxiliary_pml ? expected_u.data() : expected.data();
+      const T previous = primary[i];
+      if (conductive) {
+        const T old_cond = expected_cond[i];
+        expected_cond[i] =
+            ((T(1) - T(0.5 * axis.dt) * conductivity[i]) * old_cond + delta) * condinv[i];
+        delta = expected_cond[i] - old_cond;
+      }
+      if (main_pml)
+        primary[i] = ((kappa[n] - sigma[n]) * primary[i] + delta) * inverse[n];
+      else
+        primary[i] += delta;
+      if (auxiliary_pml)
+        expected[i] = inverse_u[n] *
+                      (((kappa_u[n] - sigma_u[n]) * expected[i] + primary[i]) - previous);
+    }
+    copy_device_to_host_async(observed.data(), d_target, 0, bytes, execution);
+    copy_device_to_host_async(observed_u.data(), d_u, 0, bytes, execution);
+    copy_device_to_host_async(observed_cond.data(), d_cond, 0, bytes, execution);
+    execution.synchronize();
+    for (size_t i = 0; i < elements; ++i) {
+      require(observed[i] == expected[i], "cylindrical axis target differs from host recurrence");
+      require(observed_u[i] == expected_u[i],
+              "cylindrical axis auxiliary differs from host recurrence");
+      require(observed_cond[i] == expected_cond[i],
+              "cylindrical axis conductivity differs from host recurrence");
+    }
+  }
+
+  copy_host_to_device_async(d_target, 0, initial.data(), bytes, execution);
+  cylindrical_axis_launch m0_axis = {};
+  m0_axis.region.base = 8;
+  m0_axis.region.counts[0] = m0_axis.region.counts[1] = 1;
+  m0_axis.region.counts[2] = 257;
+  m0_axis.region.strides[2] = 1;
+  m0_axis.target = d_target.opaque_handle();
+  m0_axis.source1 = d_source1.opaque_handle();
+  m0_axis.scale = 0.25;
+  m0_axis.kind = 0;
+  m0_axis.precision = precision;
+  launch_cylindrical_axis(m0_axis, execution);
+  copy_device_to_host_async(observed.data(), d_target, 0, bytes, execution);
+  execution.synchronize();
+  for (size_t i = 0; i < elements; ++i) {
+    const T expected = i >= 8 && i < 265 ? initial[i] + T(m0_axis.scale) * source1[i]
+                                         : initial[i];
+    require(observed[i] == expected, "m=0 cylindrical axis recurrence is incorrect");
+  }
+
+  const size_t nr = 2, nz = 256, row_stride = nz + 1, radial_elements = (nr + 1) * row_stride;
+  const size_t radial_bytes = radial_elements * sizeof(T);
+  std::vector<T> radial_source(radial_elements), radial_source2(radial_elements),
+      radial_expected(radial_elements), radial_expected2(radial_elements),
+      radial_observed(radial_elements, T(-1)), curl_target1(radial_elements, T(0.125)),
+      curl_target2(radial_elements, T(-0.25)), curl_observed1(radial_elements),
+      curl_observed2(radial_elements);
+  for (size_t i = 0; i < radial_elements; ++i) {
+    radial_source[i] = T(0.01 * double(i + 1));
+    radial_source2[i] = T(std::sin(0.013 * double(i + 1)));
+  }
+  for (size_t iz = 0; iz <= nz; ++iz) {
+    radial_expected[iz] = T(0);
+    radial_expected2[iz] = T(0);
+    for (size_t ir = 1; ir <= nr; ++ir) {
+      const size_t i = ir * row_stride + iz;
+      const T rinv = 1.0 / ((T(ir) + T(0.25)) - 0.5);
+      const T weighted = std::fma(-radial_source[i - row_stride], T(ir - 1) + T(0.25),
+                                  radial_source[i] * (T(ir) + T(0.25)));
+      const T weighted2 = std::fma(-radial_source2[i - row_stride], T(ir - 1) + T(0.25),
+                                   radial_source2[i] * (T(ir) + T(0.25)));
+      radial_expected[i] = std::fma(rinv, weighted, radial_expected[i - row_stride]);
+      radial_expected2[i] = std::fma(rinv, weighted2, radial_expected2[i - row_stride]);
+    }
+  }
+  device_buffer d_radial_source(radial_bytes, device), d_radial_source2(radial_bytes, device),
+      d_radial_scratch(radial_bytes, device), d_curl_target1(radial_bytes, device),
+      d_curl_target2(radial_bytes, device);
+  copy_host_to_device_async(d_radial_source, 0, radial_source.data(), radial_bytes, execution);
+  copy_host_to_device_async(d_radial_source2, 0, radial_source2.data(), radial_bytes, execution);
+  copy_host_to_device_async(d_curl_target1, 0, curl_target1.data(), radial_bytes, execution);
+  copy_host_to_device_async(d_curl_target2, 0, curl_target2.data(), radial_bytes, execution);
+  cylindrical_radial_prefix_launch prefix = {};
+  prefix.source = d_radial_source.opaque_handle();
+  prefix.scratch = d_radial_scratch.opaque_handle();
+  prefix.nr = nr;
+  prefix.nz = nz;
+  prefix.row_stride = row_stride;
+  prefix.source_elements = prefix.scratch_elements = radial_elements;
+  prefix.ir0 = 0.25;
+  prefix.precision = precision;
+  launch_cylindrical_radial_prefix(prefix, execution);
+  copy_device_to_host_async(radial_observed.data(), d_radial_scratch, 0, radial_bytes, execution);
+  execution.synchronize();
+  for (size_t i = 0; i < radial_elements; ++i)
+    require(radial_observed[i] == radial_expected[i],
+            "cylindrical radial prefix differs from host recurrence");
+
+  curl_launch radial_curl = {};
+  radial_curl.region.base = row_stride;
+  radial_curl.region.counts[0] = radial_curl.region.counts[1] = 1;
+  radial_curl.region.counts[2] = nz + 1;
+  radial_curl.region.strides[2] = 1;
+  radial_curl.target = d_curl_target1.opaque_handle();
+  radial_curl.plus_source = d_radial_scratch.opaque_handle();
+  radial_curl.plus_stride = -ptrdiff_t(row_stride);
+  radial_curl.dtdx = 0.125;
+  radial_curl.precision = precision;
+  launch_curl(radial_curl, execution);
+  prefix.source = d_radial_source2.opaque_handle();
+  launch_cylindrical_radial_prefix(prefix, execution);
+  radial_curl.target = d_curl_target2.opaque_handle();
+  launch_curl(radial_curl, execution);
+  copy_device_to_host_async(curl_observed1.data(), d_curl_target1, 0, radial_bytes, execution);
+  copy_device_to_host_async(curl_observed2.data(), d_curl_target2, 0, radial_bytes, execution);
+  execution.synchronize();
+  for (size_t n = 0; n <= nz; ++n) {
+    const size_t i = row_stride + n;
+    curl_target1[i] -= T(radial_curl.dtdx) * (radial_expected[n] - radial_expected[i]);
+    curl_target2[i] -= T(radial_curl.dtdx) * (radial_expected2[n] - radial_expected2[i]);
+  }
+  for (size_t i = 0; i < radial_elements; ++i) {
+    require(curl_observed1[i] == curl_target1[i],
+            "first cylindrical prefix/curl pair was overwritten by shared scratch reuse");
+    require(curl_observed2[i] == curl_target2[i],
+            "second cylindrical prefix/curl pair used stale shared scratch");
+  }
+
+  bool rejected = false;
+  try {
+    cylindrical_m_launch malformed = {};
+    malformed.region.counts[0] = malformed.region.counts[1] = malformed.region.counts[2] = 1;
+    malformed.target = d_target.opaque_handle();
+    malformed.source = d_source1.opaque_handle();
+    malformed.radial_axis = 3;
+    malformed.precision = precision;
+    launch_cylindrical_m(malformed, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "cylindrical m/r launch accepted an invalid radial axis");
+  rejected = false;
+  try {
+    cylindrical_m_launch malformed = {};
+    malformed.region.counts[0] = malformed.region.counts[1] = 1;
+    malformed.region.counts[2] = 2;
+    malformed.region.strides[2] = 1;
+    malformed.target = d_target.opaque_handle();
+    malformed.source = d_source1.opaque_handle();
+    malformed.raw_radial_start = -2;
+    malformed.radial_axis = 2;
+    malformed.precision = precision;
+    launch_cylindrical_m(malformed, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "cylindrical m/r launch accepted a zero denominator");
+  rejected = false;
+  try {
+    cylindrical_axis_launch malformed = {};
+    malformed.region.counts[0] = malformed.region.counts[1] = malformed.region.counts[2] = 1;
+    malformed.target = d_target.opaque_handle();
+    malformed.source1 = d_target.opaque_handle();
+    malformed.precision = precision;
+    launch_cylindrical_axis(malformed, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "cylindrical axis launch accepted aliased target/source state");
+  rejected = false;
+  try {
+    cylindrical_radial_prefix_launch malformed = prefix;
+    malformed.scratch_elements = radial_elements - 1;
+    launch_cylindrical_radial_prefix(malformed, execution);
+  }
+  catch (const std::out_of_range &) { rejected = true; }
+  require(rejected, "cylindrical radial prefix accepted undersized storage");
+  rejected = false;
+  try {
+    cylindrical_radial_prefix_launch malformed = prefix;
+    malformed.ir0 = -0.5;
+    launch_cylindrical_radial_prefix(malformed, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "cylindrical radial prefix accepted a zero denominator");
+}
+
 template <typename T> static void check_device(int device) {
   device_scope selected(device);
   stream execution;
@@ -452,6 +781,8 @@ template <typename T> static void check_device(int device) {
   if (std::getenv("MEEP_NVIDIA_STEP_BFAST_ONLY")) return;
   check_beta_variants<T>(device, execution, precision);
   if (std::getenv("MEEP_NVIDIA_STEP_BETA_ONLY")) return;
+  check_cylindrical_variants<T>(device, execution, precision);
+  if (std::getenv("MEEP_NVIDIA_STEP_CYLINDRICAL_ONLY")) return;
 
   curl_launch curl = {};
   curl.region = region;

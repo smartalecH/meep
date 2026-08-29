@@ -404,6 +404,10 @@ struct NvidiaCompiledOperation {
   size_t count;
   size_t beta_first;
   size_t beta_count;
+  size_t cylindrical_m_first;
+  size_t cylindrical_m_count;
+  size_t cylindrical_origin_first;
+  size_t cylindrical_origin_count;
   size_t halo_first;
   size_t halo_count;
   size_t source_first;
@@ -416,6 +420,11 @@ struct NvidiaCompiledOperation {
   size_t subtraction_count;
   size_t source_staging_offset;
   double source_time_offset;
+};
+
+struct NvidiaCompiledCylindricalOriginAction {
+  CylindricalOriginActionKind kind;
+  size_t index;
 };
 
 struct NvidiaCompiledHalo {
@@ -433,8 +442,14 @@ public:
   NvidiaExecutable(const NvidiaBackend *owner, uint64_t signature, uint64_t storage_fingerprint,
                    const std::vector<NvidiaCompiledOperation> &operations,
                    const std::vector<nvidia::curl_launch> &curl_updates,
+                   const std::vector<nvidia::cylindrical_radial_prefix_launch>
+                       &cylindrical_radial_prefixes,
                    const std::vector<nvidia::bfast_launch> &bfast_updates,
                    const std::vector<nvidia::beta_launch> &beta_updates,
+                   const std::vector<nvidia::cylindrical_m_launch> &cylindrical_m_updates,
+                   const std::vector<nvidia::cylindrical_axis_launch> &cylindrical_axis_updates,
+                   const std::vector<NvidiaCompiledCylindricalOriginAction>
+                       &cylindrical_origin_actions,
                    const std::vector<nvidia::constitutive_launch> &constitutive_updates,
                    const std::vector<nvidia::zero_launch> &zero_updates,
                    const std::vector<NvidiaCompiledHalo> &halo_plans,
@@ -453,8 +468,12 @@ public:
                    size_t source_scalar_count, size_t source_staging_elements,
                    NvidiaBackendState &state)
       : owner_(owner), signature_(signature), storage_fingerprint_(storage_fingerprint),
-        operations_(operations), curl_updates_(curl_updates), bfast_updates_(bfast_updates),
-        beta_updates_(beta_updates),
+        operations_(operations), curl_updates_(curl_updates),
+        cylindrical_radial_prefixes_(cylindrical_radial_prefixes),
+        bfast_updates_(bfast_updates), beta_updates_(beta_updates),
+        cylindrical_m_updates_(cylindrical_m_updates),
+        cylindrical_axis_updates_(cylindrical_axis_updates),
+        cylindrical_origin_actions_(cylindrical_origin_actions),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
@@ -526,8 +545,12 @@ public:
   uint64_t storage_fingerprint_;
   std::vector<NvidiaCompiledOperation> operations_;
   std::vector<nvidia::curl_launch> curl_updates_;
+  std::vector<nvidia::cylindrical_radial_prefix_launch> cylindrical_radial_prefixes_;
   std::vector<nvidia::bfast_launch> bfast_updates_;
   std::vector<nvidia::beta_launch> beta_updates_;
+  std::vector<nvidia::cylindrical_m_launch> cylindrical_m_updates_;
+  std::vector<nvidia::cylindrical_axis_launch> cylindrical_axis_updates_;
+  std::vector<NvidiaCompiledCylindricalOriginAction> cylindrical_origin_actions_;
   std::vector<nvidia::constitutive_launch> constitutive_updates_;
   std::vector<nvidia::zero_launch> zero_updates_;
   std::vector<NvidiaCompiledHalo> halo_plans_;
@@ -1288,6 +1311,7 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
                                      "curl auxiliary PML");
   result.dtdx = source.dtdx;
   result.dt = source.dt;
+  result.radial_prefix_index = UINT32_MAX;
   result.bfast_update_index = UINT32_MAX;
 
   const ptrdiff_t region_max = checked_region_max(result.region);
@@ -1315,6 +1339,354 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
   if (is_valid(source.target_cond))
     validate_index_range(state.plan_, source.target_cond, ptrdiff_t(result.region.base), region_max,
                          "curl conductivity target");
+  return result;
+}
+
+nvidia::cylindrical_radial_prefix_launch
+compile_cylindrical_radial_prefix(const CylindricalRadialPrefix &source,
+                                  NvidiaBackendState &state, const fields &f) {
+  if (source.chunk < 0 || source.chunk >= f.num_chunks || !f.chunks[source.chunk] ||
+      !f.chunks[source.chunk]->is_mine())
+    throw std::invalid_argument("cylindrical radial prefix references a nonlocal chunk");
+  const fields_chunk &fc = *f.chunks[source.chunk];
+  const bool valid_pair =
+      (source.target_component == Dz && source.source_component == Hp) ||
+      (source.target_component == Bz && source.source_component == Ep);
+  if (fc.gv.dim != Dcyl || !valid_pair || source.cmp < 0 || source.cmp > 1)
+    throw std::invalid_argument("cylindrical radial prefix has invalid component identity");
+  const StorageKey expected_source{source.chunk, int(array_kind::f), int(source.source_component),
+                                   source.cmp, 0};
+  const StorageKey expected_scratch{source.chunk, int(array_kind::f_rderiv_int), -1, -1, 0};
+  if (!is_valid(source.source) || source.source.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.source.value] == expected_source) ||
+      !is_valid(source.scratch) || source.scratch.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.scratch.value] == expected_scratch) ||
+      is_valid(state.plan_.arrays[source.scratch.value].alias_of) || source.source == source.scratch)
+    throw std::invalid_argument("cylindrical radial-prefix storage identity is invalid");
+  if (source.nr != size_t(fc.gv.nr()) || source.nz != size_t(fc.gv.nz()) ||
+      source.row_stride != source.nz + 1)
+    throw std::invalid_argument("cylindrical radial-prefix shape does not match its chunk");
+  if (source.nr == std::numeric_limits<size_t>::max())
+    throw std::overflow_error("cylindrical radial-prefix radial extent overflow");
+  const size_t required = checked_product(source.nr + 1, source.row_stride,
+                                          "sizing cylindrical radial-prefix storage");
+  if (source.source_elements != state.plan_.arrays[source.source.value].elements ||
+      source.scratch_elements != state.plan_.arrays[source.scratch.value].elements ||
+      source.source_elements < required || source.scratch_elements < required)
+    throw std::out_of_range("cylindrical radial-prefix storage extent is invalid");
+  const realnum expected_ir0 =
+      fc.gv.origin_r() * fc.gv.a +
+      0.5 * fc.gv.iyee_shift(source.source_component).in_direction(R);
+  if (!std::isfinite(source.ir0) || source.ir0 != double(expected_ir0))
+    throw std::invalid_argument("cylindrical radial-prefix coefficient is stale");
+
+  nvidia::cylindrical_radial_prefix_launch result = {};
+  result.precision = scalar_precision_for(state.plan_, source.scratch,
+                                          "cylindrical radial-prefix scratch");
+  require_same_precision(state.plan_, source.source, result.precision,
+                         "cylindrical radial-prefix source");
+  result.source = device_address(state, source.source, "cylindrical radial-prefix source");
+  result.scratch = device_address(state, source.scratch, "cylindrical radial-prefix scratch");
+  result.nr = source.nr;
+  result.nz = source.nz;
+  result.row_stride = source.row_stride;
+  result.source_elements = source.source_elements;
+  result.scratch_elements = source.scratch_elements;
+  result.ir0 = source.ir0;
+  return result;
+}
+
+nvidia::cylindrical_m_launch compile_cylindrical_m(const CylindricalMOverRUpdate &source,
+                                                   NvidiaBackendState &state, const fields &f) {
+  const uint32_t supported = cylindrical_m_has_pml | cylindrical_m_has_pml_aux |
+                             cylindrical_m_has_conductivity;
+  if (source.region.variant_key & ~supported)
+    throw std::invalid_argument("cylindrical m/r descriptor has an unsupported variant bit");
+  if (source.region.chunk < 0 || source.region.chunk >= f.num_chunks ||
+      !f.chunks[source.region.chunk] || !f.chunks[source.region.chunk]->is_mine())
+    throw std::invalid_argument("cylindrical m/r descriptor references a nonlocal chunk");
+  const fields_chunk &fc = *f.chunks[source.region.chunk];
+  const direction dc = component_direction(source.region.c);
+  if (fc.gv.dim != Dcyl || f.m == 0 || (dc != R && dc != Z) ||
+      !(is_D(source.region.c) || is_B(source.region.c)) || source.region.cmp < 0 ||
+      source.region.cmp > 1)
+    throw std::invalid_argument("cylindrical m/r descriptor has invalid target identity");
+  const bool have_pml = source.region.variant_key & cylindrical_m_has_pml;
+  const bool have_pml_u = source.region.variant_key & cylindrical_m_has_pml_aux;
+  const bool have_conductivity = source.region.variant_key & cylindrical_m_has_conductivity;
+  const bool complete_pml = is_valid(source.pml.sig) && is_valid(source.pml.kap) &&
+                            is_valid(source.pml.siginv);
+  const bool complete_pml_u = is_valid(source.pml_u.sig) && is_valid(source.pml_u.kap) &&
+                              is_valid(source.pml_u.siginv);
+  if (have_pml != complete_pml || have_pml_u != complete_pml_u ||
+      have_pml_u != is_valid(source.target_u) ||
+      have_conductivity != is_valid(source.condinv) ||
+      (have_pml && have_conductivity) != is_valid(source.target_cond))
+    throw std::invalid_argument("cylindrical m/r variant bits and auxiliary arrays disagree");
+  const component expected_source_component =
+      is_D(source.region.c) ? (dc == R ? Hz : Hr) : (dc == R ? Ez : Er);
+  const StorageKey expected_target{source.region.chunk, int(array_kind::f), int(source.region.c),
+                                   source.region.cmp, 0};
+  const StorageKey expected_source{source.region.chunk, int(array_kind::f),
+                                   int(expected_source_component), 1 - source.region.cmp, 0};
+  if (!is_valid(source.target) || source.target.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.target.value] == expected_target) || !is_valid(source.source) ||
+      source.source.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.source.value] == expected_source))
+    throw std::invalid_argument("cylindrical m/r target or source identity is invalid");
+  const auto has_key = [&](ArrayId id, const StorageKey &key) {
+    return !is_valid(id) || (id.value < state.plan_.keys.size() && state.plan_.keys[id.value] == key);
+  };
+  if (!has_key(source.target_u,
+               StorageKey{source.region.chunk, int(array_kind::f_u), int(source.region.c),
+                          source.region.cmp, 0}) ||
+      !has_key(source.condinv,
+               StorageKey{source.region.chunk, int(array_kind::condinv), int(source.region.c), -1,
+                          int(dc)}) ||
+      !has_key(source.target_cond,
+               StorageKey{source.region.chunk, int(array_kind::f_cond), int(source.region.c),
+                          source.region.cmp, 0}))
+    throw std::invalid_argument("cylindrical m/r auxiliary storage identity is invalid");
+  const realnum expected_numerator =
+      2 * fc.m * (1 - 2 * source.region.cmp) * (1 - 2 * is_B(source.region.c)) *
+      (1 - 2 * (dc == R)) * fc.Courant;
+  if (!std::isfinite(source.numerator) || source.numerator != double(expected_numerator))
+    throw std::invalid_argument("cylindrical m/r coefficient is stale");
+  if (source.raw_radial_start != source.region.begin.in_direction(R))
+    throw std::invalid_argument("cylindrical m/r raw radial coordinate is stale");
+  const ArrayId mutable_arrays[] = {source.target, source.target_u, source.target_cond};
+  const ArrayId input_arrays[] = {source.source, source.condinv, source.pml.sig,
+                                  source.pml.kap, source.pml.siginv, source.pml_u.sig,
+                                  source.pml_u.kap, source.pml_u.siginv};
+  for (size_t i = 0; i < sizeof(mutable_arrays) / sizeof(mutable_arrays[0]); ++i) {
+    if (!is_valid(mutable_arrays[i])) continue;
+    for (ArrayId input : input_arrays)
+      if (is_valid(input) && mutable_arrays[i] == input)
+        throw std::invalid_argument("cylindrical m/r aliases mutable and input state");
+    for (size_t j = i + 1; j < sizeof(mutable_arrays) / sizeof(mutable_arrays[0]); ++j)
+      if (is_valid(mutable_arrays[j]) && mutable_arrays[i] == mutable_arrays[j])
+        throw std::invalid_argument("cylindrical m/r aliases mutable state");
+  }
+
+  nvidia::cylindrical_m_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.target, "cylindrical m/r target");
+  result.target = device_address(state, source.target, "cylindrical m/r target");
+  result.source = optional_device_address(state, source.source, result.precision,
+                                          "cylindrical m/r source");
+  result.target_u = optional_mutable_device_address(state, source.target_u, result.precision,
+                                                     "cylindrical m/r auxiliary target");
+  result.conductivity_inverse = optional_device_address(
+      state, source.condinv, result.precision, "cylindrical m/r conductivity inverse");
+  result.target_conductivity = optional_mutable_device_address(
+      state, source.target_cond, result.precision, "cylindrical m/r conductivity target");
+  result.pml = compile_pml_profile(source.pml, result.region, result.precision, state,
+                                   "cylindrical m/r main PML");
+  result.pml_u = compile_pml_profile(source.pml_u, result.region, result.precision, state,
+                                     "cylindrical m/r auxiliary PML");
+  result.numerator = source.numerator;
+  result.raw_radial_start = source.raw_radial_start;
+  result.radial_axis = 3;
+  for (unsigned int axis = 0; axis < 3; ++axis)
+    if (fc.gv.yucky_direction(axis) == R) result.radial_axis = axis;
+  if (result.radial_axis >= 3)
+    throw std::invalid_argument("cylindrical m/r region has no radial axis");
+  const size_t radial_count = result.region.counts[result.radial_axis];
+  if (!radial_count)
+    throw std::invalid_argument("cylindrical m/r region has no radial points");
+  if (radial_count - 1 > size_t(std::numeric_limits<ptrdiff_t>::max() / 2))
+    throw std::overflow_error("cylindrical m/r radial coordinate overflow");
+  const ptrdiff_t last_raw = checked_shift(
+      source.raw_radial_start, ptrdiff_t(2 * (radial_count - 1)),
+      "validating cylindrical m/r radial coordinate");
+  if ((source.raw_radial_start <= 0 && last_raw >= 0) ||
+      (source.raw_radial_start >= 0 && last_raw <= 0))
+    throw std::invalid_argument("cylindrical m/r denominator reaches zero");
+
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
+                       "cylindrical m/r target");
+  validate_index_range(state.plan_, source.source, ptrdiff_t(result.region.base), region_max,
+                       "cylindrical m/r source");
+  if (is_valid(source.target_u))
+    validate_index_range(state.plan_, source.target_u, ptrdiff_t(result.region.base), region_max,
+                         "cylindrical m/r auxiliary target");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, ptrdiff_t(result.region.base), region_max,
+                         "cylindrical m/r conductivity inverse");
+  if (is_valid(source.target_cond))
+    validate_index_range(state.plan_, source.target_cond, ptrdiff_t(result.region.base), region_max,
+                         "cylindrical m/r conductivity target");
+  return result;
+}
+
+nvidia::cylindrical_axis_launch compile_cylindrical_axis(const CylindricalAxisUpdate &source,
+                                                         NvidiaBackendState &state,
+                                                         const fields &f) {
+  const uint32_t supported = cylindrical_axis_has_pml | cylindrical_axis_has_pml_aux |
+                             cylindrical_axis_has_conductivity;
+  if (source.region.variant_key & ~supported)
+    throw std::invalid_argument("cylindrical axis descriptor has an unsupported variant bit");
+  if (source.region.chunk < 0 || source.region.chunk >= f.num_chunks ||
+      !f.chunks[source.region.chunk] || !f.chunks[source.region.chunk]->is_mine())
+    throw std::invalid_argument("cylindrical axis descriptor references a nonlocal chunk");
+  const fields_chunk &fc = *f.chunks[source.region.chunk];
+  if (fc.gv.dim != Dcyl || fc.gv.origin_r() != 0.0 || source.region.cmp < 0 ||
+      source.region.cmp > 1 ||
+      source.region.begin.in_direction(R) != 0 || source.region.end.in_direction(R) != 0)
+    throw std::invalid_argument("cylindrical axis descriptor has invalid geometry");
+  const bool have_pml = source.region.variant_key & cylindrical_axis_has_pml;
+  const bool have_pml_u = source.region.variant_key & cylindrical_axis_has_pml_aux;
+  const bool have_conductivity = source.region.variant_key & cylindrical_axis_has_conductivity;
+  const bool complete_pml = is_valid(source.pml.sig) && is_valid(source.pml.kap) &&
+                            is_valid(source.pml.siginv);
+  const bool complete_pml_u = is_valid(source.pml_u.sig) && is_valid(source.pml_u.kap) &&
+                              is_valid(source.pml_u.siginv);
+  if (have_pml != complete_pml || have_pml_u != complete_pml_u ||
+      have_pml_u != is_valid(source.target_u) ||
+      have_conductivity != is_valid(source.conductivity) ||
+      have_conductivity != is_valid(source.condinv) ||
+      have_conductivity != is_valid(source.target_cond))
+    throw std::invalid_argument("cylindrical axis variant bits and auxiliary arrays disagree");
+
+  component expected_target = NO_COMPONENT, expected_source1 = NO_COMPONENT,
+            expected_source2 = NO_COMPONENT;
+  int expected_source2_cmp = source.region.cmp;
+  ptrdiff_t expected_neighbor = 0, expected_source2_offset = 0;
+  realnum expected_scale = 0, expected_multiplier = 0;
+  if (source.kind == CylindricalAxisKind::m0_dz) {
+    if (fc.m != 0) throw std::invalid_argument("m=0 cylindrical axis row has stale live m");
+    expected_target = Dz;
+    expected_source1 = Hp;
+    expected_scale = fc.Courant * 4;
+  }
+  else if (source.kind == CylindricalAxisKind::abs_m1) {
+    if (fabs(fc.m) != 1)
+      throw std::invalid_argument("|m|=1 cylindrical axis row has stale live m");
+    const bool electric = is_D(source.region.c);
+    expected_target = electric ? Dp : Br;
+    expected_source1 = electric ? Hr : Ep;
+    expected_source2 = electric ? Hz : Ez;
+    expected_source2_cmp = electric ? source.region.cmp : 1 - source.region.cmp;
+    expected_neighbor = electric ? -1 : +1;
+    expected_source2_offset = electric ? 0 : fc.gv.nz() + 1;
+    expected_scale = (electric ? +1 : -1) * fc.Courant;
+    expected_multiplier = electric ? 2 : (1 - 2 * source.region.cmp) * fc.m;
+  }
+  else
+    throw std::invalid_argument("cylindrical axis descriptor kind is invalid");
+  const StorageKey expected_target_key{source.region.chunk, int(array_kind::f),
+                                       int(expected_target), source.region.cmp, 0};
+  const StorageKey expected_source1_key{source.region.chunk, int(array_kind::f),
+                                        int(expected_source1), source.region.cmp, 0};
+  if (!is_valid(source.target) || source.target.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.target.value] == expected_target_key) ||
+      !is_valid(source.source1) || source.source1.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.source1.value] == expected_source1_key))
+    throw std::invalid_argument("cylindrical axis target or first-source identity is invalid");
+  const auto has_key = [&](ArrayId id, const StorageKey &key) {
+    return !is_valid(id) || (id.value < state.plan_.keys.size() && state.plan_.keys[id.value] == key);
+  };
+  const direction target_direction = component_direction(expected_target);
+  if (!has_key(source.target_u,
+               StorageKey{source.region.chunk, int(array_kind::f_u), int(expected_target),
+                          source.region.cmp, 0}) ||
+      !has_key(source.conductivity,
+               StorageKey{source.region.chunk, int(array_kind::conductivity), int(expected_target),
+                          -1, int(target_direction)}) ||
+      !has_key(source.condinv,
+               StorageKey{source.region.chunk, int(array_kind::condinv), int(expected_target), -1,
+                          int(target_direction)}) ||
+      !has_key(source.target_cond,
+               StorageKey{source.region.chunk, int(array_kind::f_cond), int(expected_target),
+                          source.region.cmp, 0}))
+    throw std::invalid_argument("cylindrical axis auxiliary storage identity is invalid");
+  if (expected_source2 == NO_COMPONENT) {
+    if (is_valid(source.source2))
+      throw std::invalid_argument("m=0 cylindrical axis row has an unexpected second source");
+  }
+  else {
+    const StorageKey expected_source2_key{source.region.chunk, int(array_kind::f),
+                                          int(expected_source2), expected_source2_cmp, 0};
+    if (!is_valid(source.source2) || source.source2.value >= state.plan_.keys.size() ||
+        !(state.plan_.keys[source.source2.value] == expected_source2_key))
+      throw std::invalid_argument("cylindrical axis second-source identity is invalid");
+  }
+  if (source.region.c != expected_target ||
+      source.source1_neighbor_offset != expected_neighbor ||
+      source.source2_offset != expected_source2_offset ||
+      source.scale != double(expected_scale) ||
+      source.source2_multiplier != double(expected_multiplier) || source.dt != double(fc.dt) ||
+      !std::isfinite(source.scale) || !std::isfinite(source.source2_multiplier) ||
+      !std::isfinite(source.dt))
+    throw std::invalid_argument("cylindrical axis coefficient or offset is stale");
+
+  const ArrayId mutable_arrays[] = {source.target, source.target_u, source.target_cond};
+  const ArrayId input_arrays[] = {source.source1, source.source2, source.conductivity,
+                                  source.condinv, source.pml.sig, source.pml.kap,
+                                  source.pml.siginv, source.pml_u.sig, source.pml_u.kap,
+                                  source.pml_u.siginv};
+  for (ArrayId output : mutable_arrays) {
+    if (!is_valid(output)) continue;
+    for (ArrayId input : input_arrays)
+      if (is_valid(input) && output == input)
+        throw std::invalid_argument("cylindrical axis aliases mutable and input state");
+  }
+  for (size_t i = 0; i < sizeof(mutable_arrays) / sizeof(mutable_arrays[0]); ++i)
+    for (size_t j = i + 1; j < sizeof(mutable_arrays) / sizeof(mutable_arrays[0]); ++j)
+      if (is_valid(mutable_arrays[i]) && mutable_arrays[i] == mutable_arrays[j])
+        throw std::invalid_argument("cylindrical axis aliases mutable state");
+
+  nvidia::cylindrical_axis_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.target, "cylindrical axis target");
+  result.target = device_address(state, source.target, "cylindrical axis target");
+  result.source1 = optional_device_address(state, source.source1, result.precision,
+                                           "cylindrical axis first source");
+  result.source2 = optional_device_address(state, source.source2, result.precision,
+                                           "cylindrical axis second source");
+  result.source1_neighbor_offset = source.source1_neighbor_offset;
+  result.source2_offset = source.source2_offset;
+  result.target_u = optional_mutable_device_address(state, source.target_u, result.precision,
+                                                     "cylindrical axis auxiliary target");
+  result.conductivity = optional_device_address(state, source.conductivity, result.precision,
+                                                "cylindrical axis conductivity");
+  result.conductivity_inverse = optional_device_address(
+      state, source.condinv, result.precision, "cylindrical axis conductivity inverse");
+  result.target_conductivity = optional_mutable_device_address(
+      state, source.target_cond, result.precision, "cylindrical axis conductivity target");
+  result.pml = compile_pml_profile(source.pml, result.region, result.precision, state,
+                                   "cylindrical axis main PML");
+  result.pml_u = compile_pml_profile(source.pml_u, result.region, result.precision, state,
+                                     "cylindrical axis auxiliary PML");
+  result.scale = source.scale;
+  result.source2_multiplier = source.source2_multiplier;
+  result.dt = source.dt;
+  result.kind = static_cast<uint32_t>(source.kind);
+
+  const ptrdiff_t region_min = ptrdiff_t(result.region.base);
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.target, region_min, region_max,
+                       "cylindrical axis target");
+  validate_shifted_index_range(state.plan_, source.source1, region_min, region_max, 0,
+                               source.source1_neighbor_offset, 0, 0,
+                               "cylindrical axis first source");
+  if (is_valid(source.source2))
+    validate_shifted_index_range(state.plan_, source.source2, region_min, region_max, 0,
+                                 source.source2_offset, 0, 0,
+                                 "cylindrical axis second source");
+  if (is_valid(source.target_u))
+    validate_index_range(state.plan_, source.target_u, region_min, region_max,
+                         "cylindrical axis auxiliary target");
+  if (is_valid(source.conductivity))
+    validate_index_range(state.plan_, source.conductivity, region_min, region_max,
+                         "cylindrical axis conductivity");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, region_min, region_max,
+                         "cylindrical axis conductivity inverse");
+  if (is_valid(source.target_cond))
+    validate_index_range(state.plan_, source.target_cond, region_min, region_max,
+                         "cylindrical axis conductivity target");
   return result;
 }
 
@@ -1401,14 +1773,23 @@ nvidia::bfast_launch compile_bfast(const BfastUpdate &source, NvidiaBackendState
       plus_direction = derivative;
     }
   }
-  const ArrayId expected_source1 =
+  ArrayId expected_source1 =
       have_plus ? f.array_catalog->find(StorageKey{source.region.chunk, int(array_kind::f),
                                                    int(plus), source.region.cmp, 0})
                 : invalid_array();
-  const ArrayId expected_source2 =
+  ArrayId expected_source2 =
       have_minus ? f.array_catalog->find(StorageKey{source.region.chunk, int(array_kind::f),
                                                     int(minus), source.region.cmp, 0})
                  : invalid_array();
+  if (fc.gv.dim == Dcyl) {
+    if (target_direction == R)
+      expected_source1 = invalid_array();
+    else if (target_direction == Z) {
+      expected_source1 = f.array_catalog->find(
+          StorageKey{source.region.chunk, int(array_kind::f_rderiv_int), -1, -1, 0});
+      expected_source2 = invalid_array();
+    }
+  }
   if (source.source1 != expected_source1 || source.source2 != expected_source2)
     throw std::invalid_argument(
         "BFAST source identity does not match its curl target (got " +
@@ -1568,7 +1949,8 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
                                                  NvidiaBackendState &state) {
   const uint32_t supported_variants = constitutive_has_pml | constitutive_one_offdiagonal |
                                       constitutive_two_offdiagonals |
-                                      constitutive_has_nonlinearity | constitutive_has_minus_p;
+                                      constitutive_has_nonlinearity | constitutive_has_minus_p |
+                                      constitutive_axis_override;
   if (source.region.variant_key & ~supported_variants)
     throw std::invalid_argument("constitutive descriptor requires unsupported auxiliary state");
   if (is_valid(source.previous_w))
@@ -2026,8 +2408,18 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 does not support solve_cw");
     if (count_processors() != 1)
       throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
-    if (f_.gv.dim == Dcyl || f_.m != 0.0)
-      throw std::invalid_argument("NVIDIA does not yet support cylindrical coordinates");
+    if (f_.gv.dim != Dcyl && f_.m != 0.0)
+      throw std::invalid_argument("NVIDIA nonzero m requires cylindrical coordinates");
+    if (plan.cylindrical_m != f_.m ||
+        plan.cylindrical_origin_r.size() != size_t(f_.num_chunks) ||
+        plan.cylindrical_zero_near_origin.size() != size_t(f_.num_chunks))
+      throw std::invalid_argument("NVIDIA cylindrical coordinate fingerprint is stale");
+    for (int i = 0; i < f_.num_chunks; ++i)
+      if (!f_.chunks[i] || f_.chunks[i]->m != f_.m ||
+          plan.cylindrical_origin_r[i] != f_.chunks[i]->gv.origin_r() ||
+          bool(plan.cylindrical_zero_near_origin[i]) !=
+              f_.chunks[i]->zero_fields_near_cylorigin)
+        throw std::invalid_argument("NVIDIA cylindrical chunk fingerprint is stale");
     if (f_.beta != 0.0 && f_.gv.dim != D2)
       throw std::invalid_argument("NVIDIA nonzero beta requires a 2-D Cartesian grid");
     if (plan.beta != f_.beta)
@@ -2067,6 +2459,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA Lorentzian descriptor has no resident state");
         if (d.kind == SusceptibilityKind::gyrotropic && d.gyrotropic_states.empty())
           throw std::invalid_argument("NVIDIA gyrotropic descriptor has no resident state");
+        if (f_.gv.dim == Dcyl && d.kind == SusceptibilityKind::gyrotropic)
+          throw std::invalid_argument("NVIDIA cylindrical gyrotropic media are not supported");
       }
     }
     if (has_magnetic_backups(state.plan_))
@@ -2098,8 +2492,12 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
 
     std::vector<NvidiaCompiledOperation> operations;
     std::vector<nvidia::curl_launch> curl_updates;
+    std::vector<nvidia::cylindrical_radial_prefix_launch> cylindrical_radial_prefixes;
     std::vector<nvidia::bfast_launch> bfast_updates;
     std::vector<nvidia::beta_launch> beta_updates;
+    std::vector<nvidia::cylindrical_m_launch> cylindrical_m_updates;
+    std::vector<nvidia::cylindrical_axis_launch> cylindrical_axis_updates;
+    std::vector<NvidiaCompiledCylindricalOriginAction> cylindrical_origin_actions;
     std::vector<nvidia::constitutive_launch> constitutive_updates;
     std::vector<nvidia::zero_launch> zero_updates;
     std::vector<NvidiaCompiledHalo> halo_plans;
@@ -2117,6 +2515,16 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<double> dft_omega;
     size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
+    cylindrical_radial_prefixes.reserve(plan.cylindrical_radial_prefixes.size());
+    for (const CylindricalRadialPrefix &prefix : plan.cylindrical_radial_prefixes)
+      cylindrical_radial_prefixes.push_back(
+          compile_cylindrical_radial_prefix(prefix, state, f_));
+    std::vector<unsigned int> radial_prefix_references(plan.cylindrical_radial_prefixes.size(), 0);
+    std::vector<unsigned int> cylindrical_m_references(plan.cylindrical_m_updates.size(), 0);
+    std::vector<unsigned int> cylindrical_axis_references(plan.cylindrical_axis_updates.size(), 0);
+    std::vector<unsigned int> cylindrical_zero_references(plan.cylindrical_zero_slabs.size(), 0);
+    std::vector<unsigned int> cylindrical_origin_references(plan.cylindrical_origin_actions.size(),
+                                                            0);
     bfast_updates.reserve(plan.bfast_updates.size());
     for (const BfastUpdate &update : plan.bfast_updates)
       bfast_updates.push_back(compile_bfast(update, state, f_));
@@ -2141,6 +2549,101 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                i < size_t(op.descriptor_index) + op.descriptor_count; ++i) {
             const CurlUpdate &source = plan.db_updates[i];
             nvidia::curl_launch curl = compile_curl(source, state);
+            const bool cylindrical = f_.chunks[source.region.chunk]->gv.dim == Dcyl;
+            const direction target_direction = component_direction(source.region.c);
+            const bool has_prefix = source.radial_prefix_index != UINT32_MAX;
+            if (cylindrical) {
+              const fields_chunk &fc = *f_.chunks[source.region.chunk];
+              const component source_base = is_D(source.region.c) ? Hx : Ex;
+              direction plus_component_direction = NO_DIRECTION,
+                        minus_component_direction = NO_DIRECTION;
+              direction plus_direction = NO_DIRECTION, minus_direction = NO_DIRECTION;
+              if (target_direction == R) {
+                plus_component_direction = Z;
+                minus_component_direction = P;
+                plus_direction = P;
+                minus_direction = Z;
+              }
+              else if (target_direction == P) {
+                plus_component_direction = R;
+                minus_component_direction = Z;
+                plus_direction = Z;
+                minus_direction = R;
+              }
+              else if (target_direction == Z) {
+                plus_component_direction = P;
+                minus_component_direction = R;
+                plus_direction = R;
+                minus_direction = P;
+              }
+              else {
+                set_reason(local_error, oi, "cylindrical curl has an invalid target direction");
+                break;
+              }
+              const component plus_component =
+                  direction_component(source_base, plus_component_direction);
+              const component minus_component =
+                  direction_component(source_base, minus_component_direction);
+              ArrayId expected_plus = f_.array_catalog->find(
+                  StorageKey{source.region.chunk, int(array_kind::f), int(plus_component),
+                             source.region.cmp, 0});
+              ArrayId expected_minus = f_.array_catalog->find(
+                  StorageKey{source.region.chunk, int(array_kind::f), int(minus_component),
+                             source.region.cmp, 0});
+              if (target_direction == R) expected_plus = invalid_array();
+              if (target_direction == Z) {
+                expected_plus = f_.array_catalog->find(
+                    StorageKey{source.region.chunk, int(array_kind::f_rderiv_int), -1, -1, 0});
+                expected_minus = invalid_array();
+              }
+              ptrdiff_t expected_plus_stride = fc.gv.stride(plus_direction);
+              ptrdiff_t expected_minus_stride = fc.gv.stride(minus_direction);
+              if (is_D(source.region.c)) {
+                expected_plus_stride = -expected_plus_stride;
+                expected_minus_stride = -expected_minus_stride;
+              }
+              const bool expected_second = is_valid(expected_plus) && is_valid(expected_minus);
+              if (source.plus_source != expected_plus || source.minus_source != expected_minus ||
+                  source.plus_stride != expected_plus_stride ||
+                  source.minus_stride != expected_minus_stride ||
+                  bool(source.region.variant_key & curl_has_second_derivative) != expected_second) {
+                set_reason(local_error, oi,
+                           "cylindrical curl source identity, stride, or variant is stale");
+                break;
+              }
+            }
+            if (cylindrical && target_direction == Z) {
+              if (!has_prefix || source.radial_prefix_index >= plan.cylindrical_radial_prefixes.size()) {
+                set_reason(local_error, oi,
+                           "cylindrical Z curl lacks a valid radial-prefix descriptor");
+                break;
+              }
+              const CylindricalRadialPrefix &prefix =
+                  plan.cylindrical_radial_prefixes[source.radial_prefix_index];
+              if (prefix.chunk != source.region.chunk ||
+                  prefix.target_component != source.region.c || prefix.cmp != source.region.cmp ||
+                  source.plus_source != prefix.scratch || is_valid(source.minus_source) ||
+                  prefix.source_component !=
+                      direction_component(is_D(source.region.c) ? Hx : Ex, P)) {
+                set_reason(local_error, oi,
+                           "cylindrical Z curl and radial-prefix descriptors disagree");
+                break;
+              }
+              curl.radial_prefix_index = source.radial_prefix_index;
+              ++radial_prefix_references[source.radial_prefix_index];
+            }
+            else {
+              if (has_prefix) {
+                set_reason(local_error, oi,
+                           "non-Z or Cartesian curl has a radial-prefix descriptor");
+                break;
+              }
+              if (cylindrical && target_direction == R && is_valid(source.plus_source)) {
+                set_reason(local_error, oi,
+                           "cylindrical R curl did not suppress its plus source");
+                break;
+              }
+            }
             const bool has_bfast_bit = (source.region.variant_key & curl_has_bfast) != 0;
             const bool has_bfast_index = source.bfast_update_index != UINT32_MAX;
             if (use_bfast && !has_bfast_index) {
@@ -2207,6 +2710,67 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                i < size_t(op.beta_descriptor_index) + op.beta_descriptor_count; ++i)
             beta_updates.push_back(compile_beta(plan.beta_updates[i], state));
           compiled.beta_count = beta_updates.size() - compiled.beta_first;
+          if (size_t(op.cylindrical_m_descriptor_index) +
+                  op.cylindrical_m_descriptor_count >
+              plan.cylindrical_m_updates.size()) {
+            set_reason(local_error, oi, "cylindrical m/r descriptor span is out of range");
+            break;
+          }
+          compiled.cylindrical_m_first = cylindrical_m_updates.size();
+          for (size_t i = op.cylindrical_m_descriptor_index;
+               i < size_t(op.cylindrical_m_descriptor_index) +
+                       op.cylindrical_m_descriptor_count;
+               ++i)
+          {
+            cylindrical_m_updates.push_back(
+                compile_cylindrical_m(plan.cylindrical_m_updates[i], state, f_));
+            ++cylindrical_m_references[i];
+          }
+          compiled.cylindrical_m_count =
+              cylindrical_m_updates.size() - compiled.cylindrical_m_first;
+          if (size_t(op.cylindrical_origin_action_index) +
+                  op.cylindrical_origin_action_count >
+              plan.cylindrical_origin_actions.size()) {
+            set_reason(local_error, oi, "cylindrical origin-action span is out of range");
+            break;
+          }
+          compiled.cylindrical_origin_first = cylindrical_origin_actions.size();
+          for (size_t i = op.cylindrical_origin_action_index;
+               i < size_t(op.cylindrical_origin_action_index) +
+                       op.cylindrical_origin_action_count;
+               ++i) {
+            const CylindricalOriginAction &action = plan.cylindrical_origin_actions[i];
+            ++cylindrical_origin_references[i];
+            NvidiaCompiledCylindricalOriginAction compiled_action = {};
+            compiled_action.kind = action.kind;
+            if (action.kind == CylindricalOriginActionKind::axis_update) {
+              if (action.index >= plan.cylindrical_axis_updates.size()) {
+                set_reason(local_error, oi, "cylindrical axis action index is out of range");
+                break;
+              }
+              compiled_action.index = cylindrical_axis_updates.size();
+              cylindrical_axis_updates.push_back(
+                  compile_cylindrical_axis(plan.cylindrical_axis_updates[action.index], state, f_));
+              ++cylindrical_axis_references[action.index];
+            }
+            else if (action.kind == CylindricalOriginActionKind::zero_slab) {
+              if (action.index >= plan.cylindrical_zero_slabs.size()) {
+                set_reason(local_error, oi, "cylindrical zero action index is out of range");
+                break;
+              }
+              compiled_action.index = zero_updates.size();
+              zero_updates.push_back(compile_zero(plan.cylindrical_zero_slabs[action.index], state));
+              ++cylindrical_zero_references[action.index];
+            }
+            else {
+              set_reason(local_error, oi, "cylindrical origin action kind is invalid");
+              break;
+            }
+            cylindrical_origin_actions.push_back(compiled_action);
+          }
+          if (!local_error.empty()) break;
+          compiled.cylindrical_origin_count =
+              cylindrical_origin_actions.size() - compiled.cylindrical_origin_first;
           break;
         }
         case OpKind::update_eh: {
@@ -2219,7 +2783,54 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           for (size_t i = op.descriptor_index;
                i < size_t(op.descriptor_index) + op.descriptor_count; ++i) {
             const ConstitutiveUpdate &update = plan.eh_updates[i];
+            const bool axis = update.region.variant_key & constitutive_axis_override;
+            if (axis) {
+              if (i == op.descriptor_index ||
+                  (plan.eh_updates[i - 1].region.variant_key & constitutive_axis_override)) {
+                set_reason(local_error, oi,
+                           "cylindrical constitutive axis replay lacks an adjacent ordinary row");
+                break;
+              }
+              const ConstitutiveUpdate &ordinary = plan.eh_updates[i - 1];
+              bool same_profile = update.pml.sig == ordinary.pml.sig &&
+                                  update.pml.kap == ordinary.pml.kap &&
+                                  update.pml.siginv == ordinary.pml.siginv &&
+                                  update.pml.base == ordinary.pml.base;
+              for (int axis_index = 0; axis_index < 3; ++axis_index)
+                same_profile = same_profile &&
+                               update.pml.strides[axis_index] ==
+                                   ordinary.pml.strides[axis_index];
+              uint32_t expected_variant =
+                  ordinary.region.variant_key &
+                  ~(constitutive_one_offdiagonal | constitutive_two_offdiagonals |
+                    constitutive_has_minus_p | constitutive_copy_w_previous);
+              if (ordinary.primary != ordinary.base_primary)
+                expected_variant |= constitutive_has_minus_p;
+              expected_variant |= constitutive_axis_override;
+              if (update.target != ordinary.target ||
+                  update.region.chunk != ordinary.region.chunk ||
+                  update.region.c != ordinary.region.c ||
+                  update.region.cmp != ordinary.region.cmp ||
+                  update.region.begin.in_direction(R) != 0 ||
+                  update.region.end.in_direction(R) != 0 ||
+                  update.base_primary != ordinary.base_primary ||
+                  update.primary != ordinary.primary || update.diagonal != ordinary.diagonal ||
+                  update.chi2 != ordinary.chi2 || update.chi3 != ordinary.chi3 ||
+                  update.target_w != ordinary.target_w ||
+                  update.primary_stride != ordinary.primary_stride || !same_profile ||
+                  update.region.variant_key != expected_variant ||
+                  is_valid(update.base_cross1) || is_valid(update.base_cross2) ||
+                  is_valid(update.cross1) || is_valid(update.cross2) ||
+                  is_valid(update.offdiagonal1) || is_valid(update.offdiagonal2) ||
+                  update.cross1_stride != 0 || update.cross2_stride != 0 ||
+                  is_valid(update.previous_w)) {
+                set_reason(local_error, oi,
+                           "cylindrical constitutive axis replay does not match its ordinary row");
+                break;
+              }
+            }
             constitutive_updates.push_back(compile_constitutive(update, state));
+            if (axis) continue;
             const ArrayId targets[] = {update.primary, update.cross1, update.cross2};
             const ArrayId bases[] = {update.base_primary, update.base_cross1, update.base_cross2};
             for (size_t j = 0; j < 3; ++j) {
@@ -2444,13 +3055,41 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           break;
         }
 
+    const auto require_single_reference = [&](const std::vector<unsigned int> &references,
+                                              const char *what) {
+      if (!local_error.empty()) return;
+      for (size_t i = 0; i < references.size(); ++i)
+        if (references[i] != 1) {
+          local_error = std::string("NVIDIA ") + what +
+                        " descriptor is not referenced exactly once";
+          return;
+        }
+    };
+    require_single_reference(radial_prefix_references, "cylindrical radial-prefix");
+    require_single_reference(cylindrical_m_references, "cylindrical m/r");
+    require_single_reference(cylindrical_axis_references, "cylindrical axis");
+    require_single_reference(cylindrical_zero_references, "cylindrical zero-slab");
+    require_single_reference(cylindrical_origin_references, "cylindrical origin-action");
+
+    /* Reference counts prove that descriptors which survived into the submitted
+       plan are wired exactly once.  They cannot prove that a re-signed plan did
+       not remove both a descriptor and its operation span.  Cylindrical update
+       construction is deterministic from the live fields state, so compare the
+       complete canonical content signature after the detailed diagnostics above
+       have had a chance to identify malformed individual operands. */
+    if (local_error.empty() && f_.gv.dim == Dcyl) {
+      const StepPlan canonical = build_step_plan(f_, plan.program);
+      if (canonical.signature != plan.signature)
+        local_error = "NVIDIA cylindrical plan is incomplete or non-canonical";
+    }
+
     if (local_error.empty())
       executable.reset(new NvidiaExecutable(
-          this, plan.signature, state.fingerprint_, operations, curl_updates, bfast_updates,
-          beta_updates,
-          constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
-          halo_scratch_bytes, finite_checks, source_batches, source_points, source_copies,
-          polarization_updates,
+          this, plan.signature, state.fingerprint_, operations, curl_updates,
+          cylindrical_radial_prefixes, bfast_updates, beta_updates, cylindrical_m_updates,
+          cylindrical_axis_updates, cylindrical_origin_actions, constitutive_updates, zero_updates,
+          halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, finite_checks,
+          source_batches, source_points, source_copies, polarization_updates,
           polarization_subtractions, dft_updates, dft_omega,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, state));
@@ -2492,6 +3131,10 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         switch (op.kind) {
           case OpKind::update_db:
             for (size_t i = op.first; i < op.first + op.count; ++i) {
+              const uint32_t prefix = executable.curl_updates_[i].radial_prefix_index;
+              if (prefix != UINT32_MAX)
+                nvidia::launch_cylindrical_radial_prefix(
+                    executable.cylindrical_radial_prefixes_[prefix], *state.transfer_);
               nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
               const uint32_t bfast = executable.curl_updates_[i].bfast_update_index;
               if (bfast != UINT32_MAX)
@@ -2499,6 +3142,20 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             }
             for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i)
               nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
+            for (size_t i = op.cylindrical_m_first;
+                 i < op.cylindrical_m_first + op.cylindrical_m_count; ++i)
+              nvidia::launch_cylindrical_m(executable.cylindrical_m_updates_[i],
+                                           *state.transfer_);
+            for (size_t i = op.cylindrical_origin_first;
+                 i < op.cylindrical_origin_first + op.cylindrical_origin_count; ++i) {
+              const NvidiaCompiledCylindricalOriginAction &action =
+                  executable.cylindrical_origin_actions_[i];
+              if (action.kind == CylindricalOriginActionKind::axis_update)
+                nvidia::launch_cylindrical_axis(
+                    executable.cylindrical_axis_updates_[action.index], *state.transfer_);
+              else
+                nvidia::launch_zero(executable.zero_updates_[action.index], *state.transfer_);
+            }
             break;
           case OpKind::update_eh:
             for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i)
