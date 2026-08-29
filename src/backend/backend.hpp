@@ -96,6 +96,12 @@ public:
 
   virtual void read(ArrayRef, void *host_buffer, size_t bytes) = 0;  // converts from storage
   virtual void write(ArrayRef, const void *host_buffer, size_t bytes) = 0; // converts to storage
+  /* Legacy magnetic synchronization mutates several coupled field families
+     through host loops. Resident backends must opt into a complete lowering;
+     merely copying the stale host mirrors is not correct. */
+  virtual bool supports_magnetic_synchronization() const {
+    return !requires_full_storage_preparation();
+  }
   virtual bool supports_compact_dft_reductions() const { return false; }
   virtual void reduce_dft(const DftReductionRequest &, std::complex<double> *, size_t) {
     throw std::logic_error("backend does not support compact DFT reductions");
@@ -136,6 +142,12 @@ bool backend_host_refresh_required(const fields &f);
 bool backend_read_host_range(const fields &f, const void *host_address, size_t elements,
                              std::string &local_error);
 
+/* Publish exactly one catalogued host range after a legacy host-side mutation.
+   Like the read counterpart, this records the first local error so all ranks
+   can reach a single reconciliation boundary. */
+bool backend_write_host_range(fields &f, const void *host_address, size_t elements,
+                              std::string &local_error);
+
 /* Every participating rank must call this at the boundary following a batch
    of backend reads and before entering the next MPI/HDF5 collective. */
 void backend_reconcile_host_access(const std::string &local_error, const char *site);
@@ -154,6 +166,20 @@ bool backend_read_dft_chunk(const dft_chunk *chunk, std::string &local_error);
 bool backend_read_dft_chain(const dft_chunk *head, std::string &local_error);
 void backend_refresh_dft_chains(fields &owner, int count, dft_chunk *const *heads,
                                 const char *site);
+void backend_publish_dft_chains(fields &owner, int count, dft_chunk *const *heads,
+                                const char *site);
+bool backend_write_dft_chunk(dft_chunk *chunk, std::string &local_error);
+bool backend_write_dft_chain(dft_chunk *head, std::string &local_error);
+
+/* Owner-free chain boundaries are used by Python's opaque DFT data helpers.
+   A null local chain is valid: every rank still participates in the global
+   decision and the one subsequent error reconciliation. */
+void backend_refresh_dft_chain(const dft_chunk *head, const char *site);
+void backend_publish_dft_chain(dft_chunk *head, const char *site);
+
+/* Refuse legacy magnetic synchronization before it changes its nesting
+   counter or allocates backup arrays on an unsupported resident backend. */
+void backend_require_magnetic_synchronization(const fields &f, const char *site);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI
