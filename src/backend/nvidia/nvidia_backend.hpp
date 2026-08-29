@@ -32,8 +32,26 @@ struct polarization_coefficients {
   double omega0dtsqr_denom;
 };
 
+struct gyrotropic_coefficients {
+  double omega0dtsqr;
+  double gamma1;
+  double diagonal;
+  double pt;
+  double omega;
+  double gamma;
+  double alpha;
+  double dt2pi;
+  double gyro[3][3];
+  double inverse[3][3];
+};
+
 polarization_coefficients derive_polarization_coefficients(double omega_0, double gamma,
                                                            double dt, bool drude);
+gyrotropic_coefficients derive_gyrotropic_coefficients(double omega_0, double gamma,
+                                                       double alpha,
+                                                       const double gyro_tensor[3][3], double dt,
+                                                       gyrotropy_model model,
+                                                       const direction order[3]);
 
 } // namespace nvidia
 
