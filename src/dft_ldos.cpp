@@ -17,6 +17,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 
 using namespace std;
 
@@ -103,6 +104,29 @@ void dft_ldos::update(fields &f) {
   // compute Jsum for LDOS normalization purposes
   // ...don't worry about the tiny inefficiency of recomputing this repeatedly
   Jsum = 0.0;
+
+  /* LDOS is intentionally a compact host boundary for PR3. Refresh only the
+     source-point values it consumes, then reconcile once before reading any
+     mirror so a rank-local transfer failure cannot strand peers later. */
+  if (backend_host_refresh_required(f)) {
+    std::string local_error;
+    for (int ic = 0; ic < f.num_chunks && local_error.empty(); ++ic)
+      if (f.chunks[ic]->is_mine()) {
+        const field_type source_types[2] = {D_stuff, B_stuff};
+        const component bases[2] = {Ex, Hx};
+        for (int ft = 0; ft < 2 && local_error.empty(); ++ft)
+          for (const src_vol &sv : f.chunks[ic]->get_sources(source_types[ft])) {
+            const component c = direction_component(bases[ft], component_direction(sv.c));
+            for (size_t j = 0; j < sv.num_points() && local_error.empty(); ++j) {
+              const ptrdiff_t idx = sv.index_at(j);
+              for (int cmp = 0; cmp < 2 && local_error.empty(); ++cmp)
+                if (f.chunks[ic]->f[c][cmp])
+                  backend_read_host_range(f, f.chunks[ic]->f[c][cmp] + idx, 1, local_error);
+            }
+          }
+      }
+    backend_reconcile_host_access(local_error, "dft_ldos::update");
+  }
 
   for (int ic = 0; ic < f.num_chunks; ic++)
     if (f.chunks[ic]->is_mine()) {
