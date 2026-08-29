@@ -185,6 +185,14 @@ static void check_prepared_updates() {
                   has_access(op, d.pml_u.sig) && has_access(op, d.pml_u.kap) &&
                   has_access(op, d.pml_u.siginv),
               "curl descriptor access set is incomplete");
+        if (d.region.variant_key & curl_has_bfast) {
+          CHECK(d.bfast_update_index < plan.bfast_updates.size(),
+                "BFAST curl has no paired postpass");
+        }
+        else {
+          CHECK(d.bfast_update_index == UINT32_MAX,
+                "ordinary curl unexpectedly references a BFAST postpass");
+        }
       }
     }
     else {
@@ -224,6 +232,101 @@ static void check_prepared_updates() {
     ++plan.db_updates[0].plus_stride;
     CHECK(compute_step_plan_signature(plan) != original,
           "signature ignored a structural curl descriptor change");
+  }
+}
+
+static void check_bfast_plan() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5));
+  s.set_conductivity(Bx, unit_conductivity);
+  s.set_conductivity(By, unit_conductivity);
+  s.set_conductivity(Bz, unit_conductivity);
+  s.set_conductivity(Dx, unit_conductivity);
+  s.set_conductivity(Dy, unit_conductivity);
+  s.set_conductivity(Dz, unit_conductivity);
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields f(&s, 0, 0, true, 0, 0, scaled_k);
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.11, 0.13));
+  f.advance(1);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t rows = 0;
+  bool owns_chunk = false;
+  for (int i = 0; i < f.num_chunks; ++i) owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+  bool saw_one_source = false, saw_two_sources = false;
+  bool saw_main_pml = false, saw_aux_pml = false, saw_conductivity = false;
+  for (const Operation &op : plan.operations) {
+    if (op.kind != OpKind::update_db) continue;
+    for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
+         ++i) {
+      const CurlUpdate &curl = plan.db_updates[i];
+      CHECK((curl.region.variant_key & curl_has_bfast) != 0,
+            "nonzero scaled-k curl lacks the BFAST bit");
+      CHECK(curl.bfast_update_index < plan.bfast_updates.size(),
+            "nonzero scaled-k curl lacks a paired BFAST row");
+      if (curl.bfast_update_index >= plan.bfast_updates.size()) continue;
+      const BfastUpdate &d = plan.bfast_updates[curl.bfast_update_index];
+      ++rows;
+      check_region(f, d.region);
+      CHECK(d.region.chunk == curl.region.chunk && d.region.c == curl.region.c &&
+                d.region.cmp == curl.region.cmp && d.region.begin == curl.region.begin &&
+                d.region.end == curl.region.end,
+            "BFAST postpass is not paired to its curl region");
+      CHECK(d.target == curl.target && d.source1 == curl.plus_source &&
+                d.source2 == curl.minus_source && d.stride1 == curl.plus_stride &&
+                d.stride2 == curl.minus_stride,
+            "BFAST postpass does not preserve curl sources and strides");
+      CHECK(is_valid(d.f_bfast), "BFAST postpass lacks persistent state");
+      CHECK(has_access(op, d.target, AccessMode::read_write) &&
+                has_access(op, d.source1, AccessMode::read) &&
+                has_access(op, d.source2, AccessMode::read) &&
+                has_access(op, d.f_bfast, AccessMode::read_write) &&
+                has_access(op, d.target_u, AccessMode::read_write) &&
+                has_access(op, d.condinv, AccessMode::read) &&
+                has_access(op, d.target_cond, AccessMode::read_write) &&
+                has_access(op, d.pml.siginv, AccessMode::read) &&
+                has_access(op, d.pml_u.siginv, AccessMode::read),
+            "BFAST descriptor access set is incomplete");
+      CHECK((d.region.variant_key &
+             ~(bfast_has_pml | bfast_has_pml_aux | bfast_has_conductivity)) == 0,
+            "BFAST descriptor has an unbounded variant bit");
+
+      const realnum expected_k1 =
+          is_valid(d.source2)
+              ? scaled_k[component_index(component(f.array_catalog->key(d.source2).component_))]
+              : 0;
+      const realnum expected_k2 =
+          is_valid(d.source1)
+              ? scaled_k[component_index(component(f.array_catalog->key(d.source1).component_))]
+              : 0;
+      const double sign = op.ft == D_stuff ? -1.0 : 1.0;
+      CHECK(d.k1 == sign * double(expected_k1) && d.k2 == sign * double(expected_k2),
+            "BFAST k coefficients differ from host realnum routing");
+      saw_one_source |= is_valid(d.source1) != is_valid(d.source2);
+      saw_two_sources |= is_valid(d.source1) && is_valid(d.source2);
+      saw_main_pml |= (d.region.variant_key & bfast_has_pml) != 0;
+      saw_aux_pml |= (d.region.variant_key & bfast_has_pml_aux) != 0;
+      saw_conductivity |= (d.region.variant_key & bfast_has_conductivity) != 0;
+    }
+  }
+  CHECK(and_to_all(!owns_chunk || rows > 0),
+        "an owning rank produced no BFAST rows for nonzero scaled k");
+  CHECK(or_to_all(saw_one_source) && or_to_all(saw_two_sources),
+        "BFAST plan did not cover one- and two-source rows");
+  CHECK(or_to_all(saw_main_pml) && or_to_all(saw_aux_pml) && or_to_all(saw_conductivity),
+        "BFAST plan did not cover PML, auxiliary PML, and conductivity");
+
+  fields zero(&s, 0, 0, true, 0, 0, std::vector<double>{0, 0, 0});
+  zero.add_point_source(Ez, src, vec(0.11, 0.13));
+  zero.advance(1);
+  const StepPlan zero_plan = build_step_plan(zero, StepProgram::ordinary);
+  CHECK(zero_plan.bfast_updates.empty(), "zero scaled k emitted BFAST descriptors");
+  for (const CurlUpdate &curl : zero_plan.db_updates) {
+    CHECK((curl.region.variant_key & curl_has_bfast) == 0,
+          "zero scaled k retained the BFAST curl bit");
+    CHECK(curl.bfast_update_index == UINT32_MAX,
+          "zero scaled k retained a paired BFAST index");
   }
 }
 
@@ -445,6 +548,7 @@ int main(int argc, char **argv) {
   check_beta_plan(true, +0.17);
   check_beta_plan(true, -0.17);
   check_zero_beta_plan();
+  check_bfast_plan();
   if (failures) {
     master_printf("prepared_plan: %d FAILURE(S)\n", failures);
     return 1;
