@@ -30,6 +30,12 @@ else
   WVG_SRC_TEST =
 endif
 
+if HAVE_NVIDIA_BACKEND
+  NVIDIA_PYTEST = $(TEST_DIR)/test_nvidia_callbacks.py
+else
+  NVIDIA_PYTEST =
+endif
+
 ADJOINT_TESTS =                                \
     $(TEST_DIR)/test_adjoint_solver.py         \
     $(TEST_DIR)/test_adjoint_utils.py          \
@@ -83,6 +89,7 @@ TESTS =                                        \
     $(MODE_DECOMPOSITION_TEST)                 \
     $(TEST_DIR)/test_multilevel_atom.py        \
     $(TEST_DIR)/test_n2f_periodic.py           \
+    $(NVIDIA_PYTEST)                           \
     $(TEST_DIR)/test_oblique_source.py         \
     $(TEST_DIR)/test_pml_cyl.py                \
     $(TEST_DIR)/test_physical.py               \
