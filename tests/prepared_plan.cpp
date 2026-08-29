@@ -152,7 +152,10 @@ static void check_prepared_updates() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07,
+                                 GYROTROPIC_SATURATED);
   s.add_susceptibility(eps_slab, E_stuff, susceptibility);
+  s.add_susceptibility(eps_slab, E_stuff, gyro);
   fields f(&s);
   gaussian_src_time src(0.3, 0.1);
   src.is_integrated = false;
@@ -165,7 +168,8 @@ static void check_prepared_updates() {
   size_t update_ops = 0;
   size_t source_evaluations = 0, source_applications = 0;
   size_t dft_operations = 0;
-  size_t polarization_operations = 0, polarization_rows = 0, subtraction_rows = 0;
+  size_t polarization_operations = 0, polarization_rows = 0, gyrotropic_rows = 0,
+         subtraction_rows = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
     if (op.kind == OpKind::evaluate_source_scalars) {
@@ -232,6 +236,29 @@ static void check_prepared_updates() {
                   has_access(op, d.primary_w, AccessMode::read) &&
                   has_access(op, d.diagonal_sigma, AccessMode::read),
               "polarization update access set is incomplete");
+        if (d.kind == PolarizationUpdateKind::gyrotropic) {
+          ++gyrotropic_rows;
+          CHECK(is_valid(d.p_cross1) && is_valid(d.p_prev_cross1) &&
+                    is_valid(d.p_cross2) && is_valid(d.p_prev_cross2),
+                "gyrotropic update lacks its cross polarization state");
+          CHECK(has_access(op, d.p_cross1, AccessMode::read_write) &&
+                    has_access(op, d.p_prev_cross1, AccessMode::read_write) &&
+                    has_access(op, d.p_cross2, AccessMode::read_write) &&
+                    has_access(op, d.p_prev_cross2, AccessMode::read_write),
+                "gyrotropic update access set omits cross polarization state");
+          CHECK(d.region.variant_key == 0,
+                "gyrotropic update reused Lorentzian variant bits");
+          CHECK(d.gyro_model == GYROTROPIC_SATURATED && d.alpha == realnum(0.07),
+                "gyrotropic update lost its model parameters");
+          if (is_magnetic(d.region.c))
+            CHECK(d.primary_stride < 0 && d.cross_stride1 < 0 && d.cross_stride2 < 0,
+                  "magnetic gyrotropic update lost signed strides");
+        }
+        else {
+          CHECK(!is_valid(d.p_cross1) && !is_valid(d.p_prev_cross1) &&
+                    !is_valid(d.p_cross2) && !is_valid(d.p_prev_cross2),
+                "Lorentzian update contains gyrotropic state IDs");
+        }
       }
     }
     if (op.kind != OpKind::update_db && op.kind != OpKind::update_eh) continue;
@@ -306,6 +333,7 @@ static void check_prepared_updates() {
   CHECK(polarization_operations == 2, "expected two polarization operations, got %zu",
         polarization_operations);
   CHECK(or_to_all(polarization_rows > 0), "prepared plan contains no polarization updates");
+  CHECK(or_to_all(gyrotropic_rows > 0), "prepared plan contains no gyrotropic updates");
   CHECK(or_to_all(subtraction_rows > 0), "prepared plan contains no P subtractions");
   check_finite_value_accesses(f, plan);
   CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",
