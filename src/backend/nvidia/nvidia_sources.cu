@@ -25,12 +25,12 @@ void check_cuda(cudaError_t result, const char *operation) {
 }
 
 template <typename T>
-__global__ void point_source_kernel(point_source_launch source, const source_scalar *scalars) {
-  const source_scalar scalar = scalars[source.scalar_slot];
+__device__ void apply_source_point(const source_batch_launch &source, const source_point &point,
+                                   const source_scalar &scalar) {
   const double scalar_real = source.integrated ? scalar.dipole_real : scalar.current_real;
   const double scalar_imag = source.integrated ? scalar.dipole_imag : scalar.current_imag;
-  double value_real = source.amplitude_real * scalar_real - source.amplitude_imag * scalar_imag;
-  double value_imag = source.amplitude_real * scalar_imag + source.amplitude_imag * scalar_real;
+  double value_real = point.amplitude_real * scalar_real - point.amplitude_imag * scalar_imag;
+  double value_imag = point.amplitude_real * scalar_imag + point.amplitude_imag * scalar_real;
   /* Preserve the legacy association. Ordinary sources multiply the complex
      current by dt and condinv; integrated sources subtract the dipole directly
      from the prepared D/B-minus-polarization array. */
@@ -40,13 +40,30 @@ __global__ void point_source_kernel(point_source_launch source, const source_sca
   }
   if (!source.integrated && source.conductivity_inverse) {
     const double condinv =
-        double(static_cast<const T *>(source.conductivity_inverse)[source.index]);
+        double(static_cast<const T *>(source.conductivity_inverse)[point.index]);
     value_real *= condinv;
     value_imag *= condinv;
   }
-  static_cast<T *>(source.target_real)[source.index] -= T(value_real);
+  static_cast<T *>(source.target_real)[point.index] -= T(value_real);
   if (source.target_imag)
-    static_cast<T *>(source.target_imag)[source.index] -= T(value_imag);
+    static_cast<T *>(source.target_imag)[point.index] -= T(value_imag);
+}
+
+template <typename T>
+__global__ void source_batch_kernel(source_batch_launch source, const source_scalar *scalars) {
+  const source_scalar scalar = scalars[source.scalar_slot];
+  for (size_t point = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+       point < source.point_count; point += size_t(blockDim.x) * gridDim.x)
+    apply_source_point<T>(source, source.points[point], scalar);
+}
+
+template <typename T>
+__global__ void ordered_source_batch_kernel(source_batch_launch source,
+                                            const source_scalar *scalars) {
+  if (blockIdx.x || threadIdx.x) return;
+  const source_scalar scalar = scalars[source.scalar_slot];
+  for (size_t point = 0; point < source.point_count; ++point)
+    apply_source_point<T>(source, source.points[point], scalar);
 }
 
 template <typename T>
@@ -57,12 +74,22 @@ __global__ void array_copy_kernel(array_copy_launch copy) {
 }
 
 template <typename T>
-void launch_point_source_t(const point_source_launch &source, const void *device_scalars,
+void launch_source_batch_t(const source_batch_launch &source, const void *device_scalars,
                            const stream &execution_stream) {
-  point_source_kernel<T><<<1, 1, 0,
-                           static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
-      source, static_cast<const source_scalar *>(device_scalars));
-  check_cuda(cudaPeekAtLastError(), "launch NVIDIA point source");
+  cudaStream_t cuda_stream = static_cast<cudaStream_t>(execution_stream.opaque_handle());
+  if (source.sequential)
+    ordered_source_batch_kernel<T><<<1, 1, 0, cuda_stream>>>(
+        source, static_cast<const source_scalar *>(device_scalars));
+  else {
+    const unsigned int threads = static_cast<unsigned int>(
+        source.point_count < size_t(256) ? source.point_count : size_t(256));
+    const size_t blocks = (source.point_count + threads - 1) / threads;
+    if (blocks > size_t(std::numeric_limits<unsigned int>::max()))
+      throw std::overflow_error("NVIDIA source batch launch grid overflow");
+    source_batch_kernel<T><<<static_cast<unsigned int>(blocks), threads, 0, cuda_stream>>>(
+        source, static_cast<const source_scalar *>(device_scalars));
+  }
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA source batch");
 }
 
 template <typename T>
@@ -78,20 +105,21 @@ void launch_array_copy_t(const array_copy_launch &copy, const stream &execution_
 
 } // namespace
 
-void launch_point_source(const point_source_launch &source, const void *device_scalars,
+void launch_source_batch(const source_batch_launch &source, const void *device_scalars,
                          const stream &execution_stream) {
-  if (!source.target_real) throw std::invalid_argument("NVIDIA point source has no target");
-  if (!device_scalars) throw std::invalid_argument("NVIDIA point source has no scalar block");
-  if (source.index < 0) throw std::out_of_range("NVIDIA point source has a negative index");
+  if (!source.target_real) throw std::invalid_argument("NVIDIA source batch has no target");
+  if (!source.points || !source.point_count)
+    throw std::invalid_argument("NVIDIA source batch has no spatial points");
+  if (!device_scalars) throw std::invalid_argument("NVIDIA source batch has no scalar block");
   switch (source.precision) {
     case scalar_precision::f32:
-      launch_point_source_t<float>(source, device_scalars, execution_stream);
+      launch_source_batch_t<float>(source, device_scalars, execution_stream);
       return;
     case scalar_precision::f64:
-      launch_point_source_t<double>(source, device_scalars, execution_stream);
+      launch_source_batch_t<double>(source, device_scalars, execution_stream);
       return;
   }
-  throw std::invalid_argument("NVIDIA point source has an invalid precision");
+  throw std::invalid_argument("NVIDIA source batch has an invalid precision");
 }
 
 void launch_array_copy(const array_copy_launch &copy, const stream &execution_stream) {
