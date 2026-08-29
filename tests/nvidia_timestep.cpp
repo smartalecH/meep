@@ -25,6 +25,7 @@
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/runtime.hpp"
 #include "backend/precision.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
@@ -137,6 +138,7 @@ static void test_polarization_coefficient_rounding() {
 
 static double isotropic_eps(const vec &p) { return p.x() < 0.0 ? 2.0 : 3.0; }
 static double uniform_conductivity(const vec &) { return 0.17; }
+static double phase_target_conductivity(const vec &) { return 0.29; }
 static double unit_value(const vec &) { return 1.0; }
 static double chi2_value(const vec &) { return 0.03125; }
 static double chi3_value(const vec &) { return 0.0625; }
@@ -295,6 +297,69 @@ static void compare_live_fields_by_key(fields &cpu, fields &gpu, double toleranc
                 array_kind_name(array_kind(key.kind)), key.component_, key.cmp, key.aux, j,
                 double(expected[j]), double(observed[j]), error, tolerance * scale);
         meep::abort("NVIDIA live timestep state differs from CPU");
+      }
+    }
+  }
+}
+
+static void initialize_live_fields_by_key(fields &cpu, fields &gpu, bool f32,
+                                          double scale) {
+  for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
+    const ArrayId cpu_id{uint32_t(i)};
+    const ArraySpec &cpu_spec = cpu.array_catalog->spec(cpu_id);
+    const StorageKey &key = cpu.array_catalog->key(cpu_id);
+    if (is_valid(cpu_spec.alias_of) || is_magnetic_backup_kind(key.kind) ||
+        (cpu_spec.role != array_role::field && cpu_spec.role != array_role::polarization) ||
+        cpu_spec.element_type != ElementType::realnum_value)
+      continue;
+    const ArrayId gpu_id = gpu.array_catalog->find(key);
+    require(is_valid(gpu_id), "NVIDIA live catalog is missing an initialized CPU field key");
+    const ArraySpec &gpu_spec = gpu.array_catalog->spec(gpu_id);
+    require(gpu_spec.elements == cpu_spec.elements,
+            "NVIDIA initialized field extent differs from CPU");
+    std::vector<realnum> values(cpu_spec.elements);
+    for (size_t j = 0; j < values.size(); ++j) {
+      values[j] = realnum(scale * initial_value(i, j));
+      if (f32) values[j] = realnum(float(values[j]));
+    }
+    memcpy(cpu.array_catalog->resolve_untyped(cpu_id), values.data(),
+           values.size() * sizeof(realnum));
+    gpu.backend->write(ArrayRef{gpu_id, 0, values.size()}, values.data(),
+                       values.size() * sizeof(realnum));
+  }
+}
+
+static void compare_material_rows(fields &cpu, fields &gpu, double tolerance) {
+  for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
+    const ArrayId cpu_id{uint32_t(i)};
+    const ArraySpec &cpu_spec = cpu.array_catalog->spec(cpu_id);
+    if (is_valid(cpu_spec.alias_of) || cpu_spec.role != array_role::material ||
+        cpu_spec.element_type != ElementType::realnum_value)
+      continue;
+    const StorageKey &key = cpu.array_catalog->key(cpu_id);
+    const array_kind kind = array_kind(key.kind);
+    if (kind != array_kind::chi1inv && kind != array_kind::conductivity &&
+        kind != array_kind::condinv)
+      continue;
+    const ArrayId gpu_id = gpu.array_catalog->find(key);
+    require(is_valid(gpu_id), "NVIDIA catalog is missing a current material row");
+    const ArraySpec &gpu_spec = gpu.array_catalog->spec(gpu_id);
+    require(gpu_spec.elements == cpu_spec.elements,
+            "NVIDIA current material row has the wrong extent");
+    const realnum *expected = cpu.array_catalog->resolve<realnum>(cpu_id);
+    std::vector<realnum> observed(cpu_spec.elements);
+    gpu.backend->read(ArrayRef{gpu_id, 0, gpu_spec.elements}, observed.data(),
+                      observed.size() * sizeof(realnum));
+    for (size_t j = 0; j < observed.size(); ++j) {
+      const double error = fabs(double(observed[j]) - double(expected[j]));
+      const double scale = 1.0 + fabs(double(expected[j]));
+      if (error > tolerance * scale) {
+        fprintf(stderr,
+                "material row (%s,c=%d,aux=%d) element %zu differs: cpu=%.17g "
+                "nvidia=%.17g error=%.3g tol=%.3g\n",
+                array_kind_name(kind), key.component_, key.aux, j, double(expected[j]),
+                double(observed[j]), error, tolerance * scale);
+        meep::abort("NVIDIA material phase differs from CPU");
       }
     }
   }
@@ -1468,6 +1533,177 @@ static void test_magnetic_historical_host_backups() {
   master_printf("nvidia_timestep: magnetic historical host backups PASS\n");
 }
 
+static void require_material_targets_host_only(fields &gpu) {
+  require(gpu.array_catalog != NULL, "NVIDIA material phase has no current catalog");
+  for (int chunk = 0; chunk < gpu.num_chunks; ++chunk) {
+    if (!gpu.chunks[chunk]->is_mine() || !gpu.chunks[chunk]->new_s) continue;
+    const structure_chunk &target = *gpu.chunks[chunk]->new_s;
+    FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d) {
+      require(!target.chi1inv[c][d] ||
+                  !gpu.array_catalog->contains_address(target.chi1inv[c][d]),
+              "NVIDIA catalog contains a target chi1inv row");
+      require(!target.conductivity[c][d] ||
+                  !gpu.array_catalog->contains_address(target.conductivity[c][d]),
+              "NVIDIA catalog contains a target conductivity row");
+      require(!target.condinv[c][d] ||
+                  !gpu.array_catalog->contains_address(target.condinv[c][d]),
+              "NVIDIA catalog contains a target condinv row");
+    }
+  }
+}
+
+static void run_material_phase_case(const char *name, precision_policy_kind policy,
+                                    bool real_fields, bool current_conductivity) {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  const boundary_region boundaries = pml(0.4, X) + pml(0.4, Y);
+  linear_anisotropic_material current_material(false);
+  linear_anisotropic_material target_material(true);
+  structure cpu_structure(gv, current_material, boundaries, identity(), 2);
+  structure gpu_structure(gv, current_material, boundaries, identity(), 2);
+  structure cpu_target(gv, target_material, boundaries, identity(), 2);
+  structure gpu_target(gv, target_material, boundaries, identity(), 2);
+  if (current_conductivity) {
+    set_uniform_conductivity(cpu_structure);
+    set_uniform_conductivity(gpu_structure);
+  }
+  else {
+    cpu_target.set_conductivity(Dz, phase_target_conductivity);
+    gpu_target.set_conductivity(Dz, phase_target_conductivity);
+  }
+
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  else {
+    const vec bloch(0.17, -0.11);
+    cpu.use_bloch(bloch);
+    gpu.use_bloch(bloch);
+  }
+  cpu.require_component(Ez);
+  gpu.require_component(Ez);
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_live_fields_by_key(cpu, gpu, narrowed, 0.35);
+
+  require(cpu.phase_in_material(&cpu_target, 4.0 * cpu.dt) == 4 &&
+              gpu.phase_in_material(&gpu_target, 4.0 * gpu.dt) == 4,
+          "material phase setup returned the wrong countdown");
+  gpu.init_backend();
+  gpu.synchronize_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  require_material_targets_host_only(gpu);
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  require(!plan.material_refresh_arrays.empty(),
+          "NVIDIA material phase plan has no refresh rows");
+  size_t expected_bytes = 0;
+  for (const MaterialRefreshArray &row : plan.material_refresh_arrays)
+    expected_bytes +=
+        row.elements * storage_element_bytes(ElementType::realnum_value,
+                                             policy_for(policy).material);
+
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13;
+  for (int step = 1; step <= 5; ++step) {
+    cpu.advance(1);
+    nvidia::testing::reset_transfer_accounting();
+    gpu.advance(1);
+    const nvidia::testing::transfer_accounting transfers =
+        nvidia::testing::current_transfer_accounting();
+    const bool active = step <= 4;
+    require(transfers.host_to_device_calls ==
+                (active ? plan.material_refresh_arrays.size() : 0),
+            "NVIDIA material phase issued the wrong number of refresh uploads");
+    require(transfers.host_to_device_bytes == (active ? expected_bytes : 0),
+            "NVIDIA material phase uploaded the wrong byte count");
+    compare_fields(cpu, gpu, tolerance);
+    compare_material_rows(cpu, gpu, tolerance);
+  }
+  master_printf("nvidia_timestep: material-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void test_material_copy_after_compile_rejected() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  linear_anisotropic_material current_material(false), target_material(true);
+  structure current(gv, current_material, no_pml(), identity(), 1);
+  structure target(gv, target_material, no_pml(), identity(), 1);
+  target.set_conductivity(Dz, phase_target_conductivity);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&current, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  gpu.phase_in_material(&target, 2.0 * gpu.dt);
+  gpu.init_backend();
+  gpu.synchronize_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  const int countdown = gpu.phasein_time;
+  structure_chunk *const current_chunk = gpu.chunks[0]->s;
+  const realnum current_value = current_chunk->conductivity[Dz][Z][0];
+  {
+    fields copy(gpu);
+    bool rejected = false;
+    try {
+      gpu.advance(1);
+    }
+    catch (const std::logic_error &error) {
+      rejected = std::string(error.what()).find("current storage") != std::string::npos;
+    }
+    require(rejected, "NVIDIA material phase accepted shared current storage after compile");
+    require(gpu.phasein_time == countdown && gpu.chunks[0]->s == current_chunk &&
+                gpu.chunks[0]->s->conductivity[Dz][Z][0] == current_value,
+            "rejected NVIDIA material phase changed countdown or current coefficients");
+  }
+  gpu.advance(1);
+  require(gpu.phasein_time == countdown - 1,
+          "NVIDIA material phase did not recover after the copied fields was destroyed");
+  master_printf("nvidia_timestep: material copy-after-compile rejection PASS\n");
+}
+
+static void test_material_cpu_setup_to_nvidia() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  linear_anisotropic_material current_material(false), target_material(true);
+  structure reference_structure(gv, current_material, no_pml(), identity(), 1);
+  structure migrating_structure(gv, current_material, no_pml(), identity(), 1);
+  structure reference_target(gv, target_material, no_pml(), identity(), 1);
+  structure migrating_target(gv, target_material, no_pml(), identity(), 1);
+  reference_target.set_conductivity(Dz, phase_target_conductivity);
+  migrating_target.set_conductivity(Dz, phase_target_conductivity);
+  fields reference(&reference_structure);
+  fields migrating(&migrating_structure);
+  reference.use_real_fields();
+  migrating.use_real_fields();
+  gaussian_src_time source(0.31, 0.12);
+  reference.add_point_source(Ez, source, vec(0.11, 0.13));
+  migrating.add_point_source(Ez, source, vec(0.11, 0.13));
+  require(reference.phase_in_material(&reference_target, 3.0 * reference.dt) == 3 &&
+              migrating.phase_in_material(&migrating_target, 3.0 * migrating.dt) == 3,
+          "CPU material setup did not retain its countdown before NVIDIA selection");
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  migrating.select_backend(options);
+  for (int step = 0; step < 4; ++step) {
+    reference.advance(1);
+    migrating.advance(1);
+    compare_fields(reference, migrating,
+                   sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+    compare_material_rows(reference, migrating,
+                          sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  }
+  require_material_targets_host_only(migrating);
+  master_printf("nvidia_timestep: material CPU-setup-to-NVIDIA PASS\n");
+}
+
 static void require_advance_rejected(fields &f, const char *expected) {
   bool rejected = false;
   try {
@@ -2386,6 +2622,7 @@ int main(int argc, char **argv) {
   const bool bfast_only = getenv("MEEP_NVIDIA_TIMESTEP_BFAST_ONLY") != NULL;
   const bool cylindrical_only = getenv("MEEP_NVIDIA_TIMESTEP_CYLINDRICAL_ONLY") != NULL;
   const bool magnetic_only = getenv("MEEP_NVIDIA_TIMESTEP_MAGNETIC_ONLY") != NULL;
+  const bool material_only = getenv("MEEP_NVIDIA_TIMESTEP_MATERIAL_ONLY") != NULL;
   const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
@@ -2428,6 +2665,11 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (material_only) {
+      run_material_phase_case("real-target-conductivity", policies[p], true, false);
+      run_material_phase_case("complex-current-conductivity", policies[p], false, true);
+      continue;
+    }
     if (magnetic_only) {
       run_magnetic_sync_case("real-pml-conductive-bfast", policies[p], true, true);
       run_magnetic_sync_case("complex-pml-conductive", policies[p], false, false);
@@ -2505,7 +2747,7 @@ int main(int argc, char **argv) {
       run_bfast_case("d2-beta-composed", gv2, policies[p], false, positive_k, false,
                      false, 2, &bloch2, 0.17);
     }
-    if (gyro_only || beta_only || bfast_only || magnetic_only) continue;
+    if (gyro_only || beta_only || bfast_only || magnetic_only || material_only) continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
     run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
@@ -2571,17 +2813,22 @@ int main(int argc, char **argv) {
     test_magnetic_historical_host_backups();
     test_magnetic_compile_rejections();
   }
+  if (material_only) {
+    test_material_copy_after_compile_rejected();
+    test_material_cpu_setup_to_nvidia();
+  }
   set_finite_check_mode(FiniteCheckMode::off);
   if (cylindrical_only && !cylindrical_case) {
     test_nvidia_cylindrical_change_m(precision_policy_kind::native);
     test_cylindrical_compile_rejections();
   }
-  else {
+  else if (!material_only) {
     if (!beta_only && !bfast_only) test_gyrotropic_compile_rejections();
     if (!gyro_only && !bfast_only) test_beta_compile_rejections();
     if (!gyro_only && !beta_only) test_bfast_compile_rejections();
   }
-  if (!gyro_only && !beta_only && !bfast_only && !cylindrical_only && !magnetic_only) {
+  if (!gyro_only && !beta_only && !bfast_only && !cylindrical_only && !magnetic_only &&
+      !material_only) {
     test_rejections();
     test_nonlinear_compile_rejections();
     test_polarization_compile_rejections();
