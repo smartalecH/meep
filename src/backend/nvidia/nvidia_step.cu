@@ -140,7 +140,40 @@ __device__ T offdiagonal_value(const T *coefficient, const T *field, ptrdiff_t i
               coefficient[i + primary_stride]);
 }
 
-template <typename T, bool Pml, unsigned int Offdiagonals>
+template <typename T>
+__device__ T nonlinear_factor(const constitutive_launch &update, ptrdiff_t i) {
+  const T *primary = static_cast<const T *>(update.primary);
+  const T *cross1 = static_cast<const T *>(update.cross1);
+  const T *cross2 = static_cast<const T *>(update.cross2);
+  const T *diagonal = static_cast<const T *>(update.diagonal);
+  const T *chi2 = static_cast<const T *>(update.chi2);
+  const T *chi3 = static_cast<const T *>(update.chi3);
+  const T gs = primary[i];
+  const T us = diagonal[i];
+  T dsqr;
+  if (cross2) {
+    const T g1s = cross1[i] + cross1[i + update.primary_stride] +
+                  cross1[i - update.cross1_stride] +
+                  cross1[i + (update.primary_stride - update.cross1_stride)];
+    const T g2s = cross2[i] + cross2[i + update.primary_stride] +
+                  cross2[i - update.cross2_stride] +
+                  cross2[i + (update.primary_stride - update.cross2_stride)];
+    dsqr = gs * gs + T(0.0625) * (g1s * g1s + g2s * g2s);
+  }
+  else if (cross1) {
+    const T g1s = cross1[i] + cross1[i + update.primary_stride] +
+                  cross1[i - update.cross1_stride] +
+                  cross1[i + (update.primary_stride - update.cross1_stride)];
+    dsqr = gs * gs + T(0.0625) * (g1s * g1s);
+  }
+  else
+    dsqr = gs * gs;
+  const T c2 = gs * chi2[i] * (us * us);
+  const T c3 = dsqr * chi3[i] * (us * us * us);
+  return (T(1) + c2 + T(2) * c3) / (T(1) + T(2) * c2 + T(3) * c3);
+}
+
+template <typename T, bool Pml, unsigned int Offdiagonals, bool Nonlinear>
 __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
@@ -157,6 +190,7 @@ __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
     value += offdiagonal_value(static_cast<const T *>(update.offdiagonal2),
                                static_cast<const T *>(update.cross2), i, update.primary_stride,
                                update.cross2_stride);
+  if (Nonlinear) value *= nonlinear_factor<T>(update, i);
   T *target = static_cast<T *>(update.target);
   if (!Pml) {
     target[i] = value;
@@ -237,12 +271,12 @@ void launch_curl_t(const curl_launch &update, const stream &execution_stream) {
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA curl");
 }
 
-template <typename T, bool Pml, unsigned int Offdiagonals>
+template <typename T, bool Pml, unsigned int Offdiagonals, bool Nonlinear>
 void launch_constitutive_t(const constitutive_launch &update, const stream &execution_stream) {
   const size_t points = checked_points(update.region);
   unsigned int blocks = 0, threads = 0;
   launch_geometry(update.region, blocks, threads);
-  constitutive_kernel<T, Pml, Offdiagonals>
+  constitutive_kernel<T, Pml, Offdiagonals, Nonlinear>
       <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
           update, points);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA constitutive update");
@@ -349,6 +383,7 @@ void launch_constitutive(const constitutive_launch &update, const stream &execut
   if (!update.target || !update.primary)
     throw std::invalid_argument("NVIDIA constitutive launch has incomplete operands");
   const bool pml = update.pml.sigma != NULL;
+  const bool nonlinear = update.chi3 != NULL;
   if (update.offdiagonal2 && !update.offdiagonal1)
     throw std::invalid_argument(
         "NVIDIA constitutive launch has a second off-diagonal without first");
@@ -356,26 +391,36 @@ void launch_constitutive(const constitutive_launch &update, const stream &execut
   if ((offdiagonals >= 1 && (!update.cross1 || !update.diagonal)) ||
       (offdiagonals >= 2 && !update.cross2))
     throw std::invalid_argument("NVIDIA constitutive anisotropic state is incomplete");
+  if ((update.chi2 != NULL) != nonlinear || (nonlinear && !update.diagonal) ||
+      (nonlinear && update.cross2 && !update.cross1))
+    throw std::invalid_argument("NVIDIA constitutive nonlinear state is incomplete");
   if (pml && (!update.target_w || !update.pml.kappa))
     throw std::invalid_argument("NVIDIA constitutive PML state is incomplete");
-#define LAUNCH_CONSTITUTIVE(T, P, O) launch_constitutive_t<T, P, O>(update, execution_stream)
+#define LAUNCH_CONSTITUTIVE(T, P, O, N) \
+  launch_constitutive_t<T, P, O, N>(update, execution_stream)
 #define DISPATCH_CONSTITUTIVE(T)                                                                  \
   do {                                                                                            \
     if (pml) {                                                                                    \
       if (offdiagonals == 2)                                                                      \
-        LAUNCH_CONSTITUTIVE(T, true, 2);                                                          \
+        nonlinear ? LAUNCH_CONSTITUTIVE(T, true, 2, true)                                         \
+                  : LAUNCH_CONSTITUTIVE(T, true, 2, false);                                       \
       else if (offdiagonals == 1)                                                                 \
-        LAUNCH_CONSTITUTIVE(T, true, 1);                                                          \
+        nonlinear ? LAUNCH_CONSTITUTIVE(T, true, 1, true)                                         \
+                  : LAUNCH_CONSTITUTIVE(T, true, 1, false);                                       \
       else                                                                                        \
-        LAUNCH_CONSTITUTIVE(T, true, 0);                                                          \
+        nonlinear ? LAUNCH_CONSTITUTIVE(T, true, 0, true)                                         \
+                  : LAUNCH_CONSTITUTIVE(T, true, 0, false);                                       \
     }                                                                                             \
     else {                                                                                        \
       if (offdiagonals == 2)                                                                      \
-        LAUNCH_CONSTITUTIVE(T, false, 2);                                                         \
+        nonlinear ? LAUNCH_CONSTITUTIVE(T, false, 2, true)                                        \
+                  : LAUNCH_CONSTITUTIVE(T, false, 2, false);                                      \
       else if (offdiagonals == 1)                                                                 \
-        LAUNCH_CONSTITUTIVE(T, false, 1);                                                         \
+        nonlinear ? LAUNCH_CONSTITUTIVE(T, false, 1, true)                                        \
+                  : LAUNCH_CONSTITUTIVE(T, false, 1, false);                                      \
       else                                                                                        \
-        LAUNCH_CONSTITUTIVE(T, false, 0);                                                         \
+        nonlinear ? LAUNCH_CONSTITUTIVE(T, false, 0, true)                                        \
+                  : LAUNCH_CONSTITUTIVE(T, false, 0, false);                                      \
     }                                                                                             \
   } while (0)
   if (update.precision == scalar_precision::f32)

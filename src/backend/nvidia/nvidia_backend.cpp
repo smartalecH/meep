@@ -999,13 +999,15 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
                                                  NvidiaBackendState &state) {
   const uint32_t supported_variants = constitutive_has_pml | constitutive_one_offdiagonal |
                                       constitutive_two_offdiagonals |
-                                      constitutive_has_minus_p;
+                                      constitutive_has_nonlinearity | constitutive_has_minus_p;
   if (source.region.variant_key & ~supported_variants)
-    throw std::invalid_argument("constitutive descriptor requires nonlinearity or polarization");
-  if (is_valid(source.chi2) || is_valid(source.chi3) || is_valid(source.previous_w))
+    throw std::invalid_argument("constitutive descriptor requires unsupported auxiliary state");
+  if (is_valid(source.previous_w))
     throw std::invalid_argument("constitutive descriptor contains unsupported auxiliary arrays");
 
   const bool have_pml = (source.region.variant_key & constitutive_has_pml) != 0;
+  const bool have_nonlinearity =
+      (source.region.variant_key & constitutive_has_nonlinearity) != 0;
   const bool have_offdiagonal1 = (source.region.variant_key & constitutive_one_offdiagonal) != 0;
   const bool have_offdiagonal2 = (source.region.variant_key & constitutive_two_offdiagonals) != 0;
   if (have_offdiagonal2 && !have_offdiagonal1)
@@ -1020,6 +1022,14 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
     throw std::invalid_argument("constitutive descriptor PML bit and auxiliary arrays disagree");
   if (!have_pml && (is_valid(source.pml.kap) || is_valid(source.pml.siginv)))
     throw std::invalid_argument("constitutive descriptor has a partial disabled PML profile");
+  if (have_nonlinearity != is_valid(source.chi2) ||
+      have_nonlinearity != is_valid(source.chi3) ||
+      (have_nonlinearity && !is_valid(source.diagonal)))
+    throw std::invalid_argument(
+        "constitutive descriptor nonlinearity bit and operand arrays disagree");
+  if (have_nonlinearity && is_valid(source.cross2) && !is_valid(source.cross1))
+    throw std::invalid_argument(
+        "constitutive descriptor has a second nonlinear cross field without first");
 
   nvidia::constitutive_launch result = {};
   result.region = flat_region_for(source.region);
@@ -1028,11 +1038,11 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
   result.primary =
       optional_device_address(state, source.primary, result.precision, "constitutive primary");
   result.cross1 =
-      have_offdiagonal1
+      (have_offdiagonal1 || (have_nonlinearity && is_valid(source.cross1)))
           ? optional_device_address(state, source.cross1, result.precision, "constitutive cross1")
           : NULL;
   result.cross2 =
-      have_offdiagonal2
+      (have_offdiagonal2 || (have_nonlinearity && is_valid(source.cross2)))
           ? optional_device_address(state, source.cross2, result.precision, "constitutive cross2")
           : NULL;
   result.diagonal =
@@ -1041,6 +1051,8 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
                                                 "constitutive off-diagonal1");
   result.offdiagonal2 = optional_device_address(state, source.offdiagonal2, result.precision,
                                                 "constitutive off-diagonal2");
+  result.chi2 = optional_device_address(state, source.chi2, result.precision, "constitutive chi2");
+  result.chi3 = optional_device_address(state, source.chi3, result.precision, "constitutive chi3");
   result.primary_stride = source.primary_stride;
   result.cross1_stride = source.cross1_stride;
   result.cross2_stride = source.cross2_stride;
@@ -1055,6 +1067,32 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
                        "constitutive target");
   validate_index_range(state.plan_, source.primary, ptrdiff_t(result.region.base), region_max,
                        "constitutive primary");
+  if (have_nonlinearity) {
+    validate_index_range(state.plan_, source.chi2, ptrdiff_t(result.region.base), region_max,
+                         "constitutive chi2");
+    validate_index_range(state.plan_, source.chi3, ptrdiff_t(result.region.base), region_max,
+                         "constitutive chi3");
+    if (is_valid(source.cross1)) {
+      const ptrdiff_t negative_cross_stride =
+          checked_negate(source.cross1_stride, "constitutive nonlinear cross1");
+      const ptrdiff_t combined_stride = checked_shift(
+          source.primary_stride, negative_cross_stride, "constitutive nonlinear cross1");
+      validate_shifted_index_range(state.plan_, source.cross1, ptrdiff_t(result.region.base),
+                                   region_max, 0,
+                                   negative_cross_stride, source.primary_stride, combined_stride,
+                                   "constitutive nonlinear cross1");
+    }
+    if (is_valid(source.cross2)) {
+      const ptrdiff_t negative_cross_stride =
+          checked_negate(source.cross2_stride, "constitutive nonlinear cross2");
+      const ptrdiff_t combined_stride = checked_shift(
+          source.primary_stride, negative_cross_stride, "constitutive nonlinear cross2");
+      validate_shifted_index_range(state.plan_, source.cross2, ptrdiff_t(result.region.base),
+                                   region_max, 0,
+                                   negative_cross_stride, source.primary_stride, combined_stride,
+                                   "constitutive nonlinear cross2");
+    }
+  }
   if (is_valid(source.diagonal))
     validate_index_range(state.plan_, source.diagonal, ptrdiff_t(result.region.base), region_max,
                          "constitutive diagonal");
