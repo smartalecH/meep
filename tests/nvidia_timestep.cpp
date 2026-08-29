@@ -40,10 +40,15 @@ static void require(bool condition, const char *message) {
 static double isotropic_eps(const vec &p) { return p.x() < 0.0 ? 2.0 : 3.0; }
 static double uniform_conductivity(const vec &) { return 0.17; }
 static double unit_value(const vec &) { return 1.0; }
+static double chi2_value(const vec &) { return 0.03125; }
+static double chi3_value(const vec &) { return 0.0625; }
 
 class linear_anisotropic_material : public material_function {
 public:
-  explicit linear_anisotropic_material(bool full) : full_(full) {}
+  explicit linear_anisotropic_material(bool full, bool magnetic = false)
+      : full_(full), magnetic_(magnetic) {}
+
+  bool has_mu() override { return magnetic_; }
 
   void eff_chi1inv_row(component c, double row[3], const volume &, double, int) override {
     row[0] = row[1] = row[2] = 0.0;
@@ -63,6 +68,7 @@ public:
 
 private:
   bool full_;
+  bool magnetic_;
 };
 
 static realnum initial_value(size_t array, size_t element) {
@@ -180,7 +186,7 @@ static void set_uniform_conductivity(structure &s) {
 }
 
 static void require_source_plan(fields &f, bool conductivity, bool integrated,
-                                bool expect_cross_copy) {
+                                bool expect_cross_copy, bool expect_nonlinear = false) {
   require(f.descriptors, "source test has no prepared descriptor set");
   const SourcePlan &sources = f.descriptors->sources;
   require(sources.source_times.size() == 1 && sources.scalars.size() == 1,
@@ -203,6 +209,8 @@ static void require_source_plan(fields &f, bool conductivity, bool integrated,
 
   const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
   size_t evaluations = 0, source_spans = 0;
+  bool have_nonlinear_primary_source = false;
+  bool have_nonlinear_cross_source = false;
   for (size_t i = 0; i < plan.operations.size(); ++i) {
     const Operation &op = plan.operations[i];
     if (op.kind == OpKind::evaluate_source_scalars) {
@@ -234,6 +242,20 @@ static void require_source_plan(fields &f, bool conductivity, bool integrated,
         have_cross_copy |=
             (is_valid(update.cross1) && update.cross1 != update.base_cross1) ||
             (is_valid(update.cross2) && update.cross2 != update.base_cross2);
+        if (expect_nonlinear &&
+            (update.region.variant_key & constitutive_has_nonlinearity) != 0) {
+          for (size_t k = 0; k < sources.sources.size(); ++k) {
+            const SourceDescriptor &source = sources.sources[k];
+            const ArrayId destinations[] = {source.integrated_destination,
+                                            source.integrated_destination_imag};
+            for (size_t d = 0; d < 2; ++d) {
+              if (!is_valid(destinations[d])) continue;
+              have_nonlinear_primary_source |= update.primary == destinations[d];
+              have_nonlinear_cross_source |= update.cross1 == destinations[d] ||
+                                             update.cross2 == destinations[d];
+            }
+          }
+        }
       }
       require(have_primary_copy, "integrated source has no prepared primary copy");
       require(have_cross_copy == expect_cross_copy,
@@ -242,6 +264,12 @@ static void require_source_plan(fields &f, bool conductivity, bool integrated,
   }
   require(evaluations == 4, "ordinary source plan did not schedule four scalar evaluations");
   require(source_spans == sources.sources.size(), "point-source descriptor span was not unique");
+  if (expect_nonlinear) {
+    require(have_nonlinear_primary_source,
+            "integrated source does not alter a nonlinear primary input");
+    require(have_nonlinear_cross_source,
+            "integrated source does not alter a nonlinear centered-cross input");
+  }
 }
 
 static void compare_source_scalars(const fields &cpu, const fields &gpu) {
@@ -276,7 +304,7 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
                             bool conductivity, bool integrated = false,
                             material_function *material = NULL,
                             const boundary_region *boundaries = NULL, bool continuous = false,
-                            bool plane_source = false) {
+                            bool plane_source = false, bool nonlinear = false) {
   const bool anisotropic = material != NULL;
   const grid_volume gv = anisotropic ? vol3d(2.0, 2.0, 2.0, 5.0) : vol2d(2.0, 2.0, 8.0);
   const boundary_region no_boundaries = no_pml();
@@ -293,6 +321,10 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
   if (conductivity) {
     cpu_structure->set_conductivity(Dz, uniform_conductivity);
     gpu_structure->set_conductivity(Dz, uniform_conductivity);
+  }
+  if (nonlinear) {
+    cpu_structure->set_chi3(chi3_value);
+    gpu_structure->set_chi3(chi3_value);
   }
 
   fields cpu(cpu_structure.get());
@@ -332,8 +364,8 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
   cpu.advance(1);
   cpu.t = 0;
   gpu.init_backend();
-  require_source_plan(cpu, conductivity, integrated, anisotropic && integrated);
-  require_source_plan(gpu, conductivity, integrated, anisotropic && integrated);
+  require_source_plan(cpu, conductivity, integrated, anisotropic && integrated, nonlinear);
+  require_source_plan(gpu, conductivity, integrated, anisotropic && integrated, nonlinear);
 
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
@@ -420,7 +452,9 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
                      const symmetry &symmetries, int chunks, const vec *bloch,
                      unsigned int required_halo_phases, unsigned int required_curl_combinations,
                      unsigned int required_constitutive_combinations, bool conductivity,
-                     bool check_lifecycle, material_function *material = NULL) {
+                     bool check_lifecycle, material_function *material = NULL,
+                     bool chi2 = false, bool chi3 = false,
+                     component nonlinear_component = NO_COMPONENT) {
   std::unique_ptr<structure> cpu_structure, gpu_structure;
   if (material) {
     cpu_structure.reset(new structure(gv, *material, boundaries, symmetries, chunks));
@@ -434,6 +468,28 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
     set_uniform_conductivity(*cpu_structure);
     set_uniform_conductivity(*gpu_structure);
   }
+  if (chi2) {
+    if (nonlinear_component == NO_COMPONENT) {
+      cpu_structure->set_chi2(chi2_value);
+      gpu_structure->set_chi2(chi2_value);
+    }
+    else {
+      simple_material_function nonlinear(chi2_value);
+      cpu_structure->set_chi2(nonlinear_component, nonlinear);
+      gpu_structure->set_chi2(nonlinear_component, nonlinear);
+    }
+  }
+  if (chi3) {
+    if (nonlinear_component == NO_COMPONENT) {
+      cpu_structure->set_chi3(chi3_value);
+      gpu_structure->set_chi3(chi3_value);
+    }
+    else {
+      simple_material_function nonlinear(chi3_value);
+      cpu_structure->set_chi3(nonlinear_component, nonlinear);
+      gpu_structure->set_chi3(nonlinear_component, nonlinear);
+    }
+  }
 
   fields cpu(cpu_structure.get());
   if (real_fields)
@@ -441,6 +497,7 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   else if (bloch)
     cpu.use_bloch(*bloch);
   cpu.require_component(Ez);
+  if (nonlinear_component != NO_COMPONENT) cpu.require_component(nonlinear_component);
   /* Preserve a like-for-like prepared CPU reference. */
   cpu.advance(1);
   cpu.t = 0;
@@ -454,11 +511,36 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   else if (bloch)
     gpu.use_bloch(*bloch);
   gpu.require_component(Ez);
+  if (nonlinear_component != NO_COMPONENT) gpu.require_component(nonlinear_component);
   gpu.init_backend();
   require_halo_phases(gpu, required_halo_phases);
   const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
   require_physics_variants(prepared, required_curl_combinations,
                            required_constitutive_combinations);
+  bool found_nonlinearity = false;
+  bool found_requested_nonlinearity = false;
+  bool found_negative_centered_crosses = false;
+  for (size_t i = 0; i < prepared.eh_updates.size(); ++i) {
+    const ConstitutiveUpdate &update = prepared.eh_updates[i];
+    const bool nonlinear =
+        (update.region.variant_key & constitutive_has_nonlinearity) != 0;
+    found_nonlinearity |= nonlinear;
+    if (nonlinear && nonlinear_component != NO_COMPONENT &&
+        gpu.array_catalog->key(update.target).component_ == int(nonlinear_component)) {
+      found_requested_nonlinearity = true;
+      found_negative_centered_crosses |=
+          is_valid(update.cross1) && is_valid(update.cross2) && update.primary_stride < 0 &&
+          update.cross1_stride < 0 && update.cross2_stride < 0;
+    }
+  }
+  require(found_nonlinearity == (chi2 || chi3),
+          "NVIDIA nonlinear constitutive descriptor coverage differs");
+  if (nonlinear_component != NO_COMPONENT) {
+    require(found_requested_nonlinearity,
+            "NVIDIA plan has no nonlinear descriptor for the requested component");
+    require(found_negative_centered_crosses,
+            "magnetic nonlinear descriptor lacks negative centered-cross strides");
+  }
 
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
@@ -510,6 +592,68 @@ static void require_advance_rejected(fields &f, const char *expected) {
     rejected = std::string(error.what()).find(expected) != std::string::npos;
   }
   require(rejected, "NVIDIA unsupported configuration was not rejected as expected");
+}
+
+static void expect_compile_rejected(fields &gpu, StepPlan plan, const char *expected) {
+  plan.signature = compute_step_plan_signature(plan);
+  Executable *unexpected = NULL;
+  bool rejected = false;
+  try {
+    unexpected = gpu.backend->compile(plan, *gpu.backend_state);
+  }
+  catch (const std::runtime_error &error) {
+    rejected = std::string(error.what()).find(expected) != std::string::npos;
+    if (!rejected)
+      fprintf(stderr, "unexpected nonlinear rejection: %s (wanted: %s)\n", error.what(),
+              expected);
+  }
+  delete unexpected;
+  require(rejected, "malformed nonlinear descriptor was not rejected as expected");
+}
+
+static void test_nonlinear_compile_rejections() {
+  const grid_volume gv = vol3d(2.0, 2.0, 2.0, 5.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  s.set_chi3(chi3_value);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&s, options);
+  gpu.use_bloch(vec(0.11, 0.07, 0.05));
+  gpu.require_component(Ez);
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  size_t nonlinear_index = baseline.eh_updates.size();
+  for (size_t i = 0; i < baseline.eh_updates.size(); ++i) {
+    const ConstitutiveUpdate &update = baseline.eh_updates[i];
+    if ((update.region.variant_key & constitutive_has_nonlinearity) &&
+        is_valid(update.cross1)) {
+      nonlinear_index = i;
+      break;
+    }
+  }
+  require(nonlinear_index < baseline.eh_updates.size(),
+          "nonlinear rejection test has no centered cross-field descriptor");
+  const ArrayId target = baseline.eh_updates[nonlinear_index].target;
+  const size_t elements = gpu.storage_plan->arrays[target.value].elements;
+  std::vector<realnum> before(elements), after(elements);
+  gpu.backend->read(ArrayRef{target, 0, elements}, before.data(), before.size() * sizeof(realnum));
+
+  StepPlan malformed = baseline;
+  malformed.eh_updates[nonlinear_index].chi3 = invalid_array();
+  expect_compile_rejected(gpu, malformed, "nonlinearity bit and operand arrays disagree");
+
+  malformed = baseline;
+  ConstitutiveUpdate &out_of_range = malformed.eh_updates[nonlinear_index];
+  out_of_range.region.base = 0;
+  out_of_range.region.counts[0] = 1;
+  out_of_range.region.counts[1] = 1;
+  out_of_range.region.counts[2] = 1;
+  expect_compile_rejected(gpu, malformed, "nonlinear cross1 index range exceeds its array");
+
+  gpu.backend->read(ArrayRef{target, 0, elements}, after.data(), after.size() * sizeof(realnum));
+  require(before == after, "rejected nonlinear descriptors mutated device storage");
 }
 
 static void run_finite_diagnostic_case(const char *name, precision_policy_kind policy,
@@ -580,14 +724,6 @@ static void test_rejections() {
 
   {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    s.set_chi3(unit_value);
-    fields f(&s, options);
-    f.use_real_fields();
-    f.require_component(Ez);
-    require_advance_rejected(f, "nonlinearity");
-  }
-  {
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
     s.add_susceptibility(unit_value, E_stuff, lorentzian_susceptibility(1.1, 0.05));
     fields f(&s, options);
     f.use_real_fields();
@@ -607,6 +743,7 @@ int main(int argc, char **argv) {
   const boundary_region xy_pml = pml(0.4, X) + pml(0.4, Y);
   linear_anisotropic_material one_offdiagonal(false);
   linear_anisotropic_material two_offdiagonals(true);
+  linear_anisotropic_material magnetic_two_offdiagonals(true, true);
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
@@ -619,6 +756,8 @@ int main(int argc, char **argv) {
     run_source_case("real-integrated-point-source", policies[p], true, false, true);
     run_source_case("complex-integrated-anisotropic-pml", policies[p], false, false, true,
                     &two_offdiagonals, &xy_pml);
+    run_source_case("complex-integrated-anisotropic-chi3-pml", policies[p], false, false, true,
+                    &two_offdiagonals, &xy_pml, false, false, true);
     run_custom_source_case("custom-point-source", policies[p], false);
     run_custom_source_case("custom-integrated-point-source", policies[p], true);
     run_case("real-copy", gv2, policies[p], true, no_pml(), identity(), 4, NULL, 1u << CONNECT_COPY,
@@ -639,10 +778,24 @@ int main(int argc, char **argv) {
     run_case("complex-anisotropic-3x3-pml", gv3, policies[p], false, xy_pml, identity(), 2, &bloch3,
              (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), (1u << 1) | (1u << 2) | (1u << 3),
              1u << 5, false, false, &two_offdiagonals);
+    run_case("real-diagonal-chi2", gv3, policies[p], true, no_pml(), identity(), 2, NULL,
+             1u << CONNECT_COPY, 1u << 0, 1u << 0, false, false, NULL, true, false);
+    run_case("complex-diagonal-chi3", gv3, policies[p], false, no_pml(), identity(), 2, &bloch3,
+             (1u << CONNECT_COPY) | (1u << CONNECT_PHASE), 1u << 0, 1u << 0, false, false,
+             NULL, false, true);
+    run_case("complex-anisotropic-chi2-chi3-pml", gv3, policies[p], false, xy_pml, identity(), 2,
+             &bloch3, (1u << CONNECT_COPY) | (1u << CONNECT_PHASE),
+             (1u << 1) | (1u << 2) | (1u << 3), 1u << 5, false, false,
+             &two_offdiagonals, true, true);
+    run_case("complex-magnetic-anisotropic-chi2-chi3-pml", gv3, policies[p], false, xy_pml,
+             identity(), 2, &bloch3, (1u << CONNECT_COPY) | (1u << CONNECT_PHASE),
+             (1u << 1) | (1u << 2) | (1u << 3), 1u << 5, false, false,
+             &magnetic_two_offdiagonals, true, true, Hz);
     test_finite_diagnostics(policies[p]);
   }
   set_finite_check_mode(FiniteCheckMode::off);
   test_rejections();
+  test_nonlinear_compile_rejections();
   master_printf("nvidia_timestep: PASS\n");
   return 0;
 }

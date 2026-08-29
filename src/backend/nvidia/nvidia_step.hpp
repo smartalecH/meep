@@ -62,6 +62,8 @@ struct constitutive_launch {
   const void *diagonal;
   const void *offdiagonal1;
   const void *offdiagonal2;
+  const void *chi2;
+  const void *chi3;
   ptrdiff_t primary_stride;
   ptrdiff_t cross1_stride;
   ptrdiff_t cross2_stride;
