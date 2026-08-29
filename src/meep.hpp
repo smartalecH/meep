@@ -366,6 +366,8 @@ public:
   virtual int num_cinternal_notowned_needed(component c, void *P_internal_data) const;
   virtual realnum *cinternal_notowned_ptr(int inotowned, component c, int cmp, int n,
                                           void *P_internal_data) const;
+  virtual bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &gv,
+                               void *P_internal_data) const;
 
   virtual void dump_params(h5file *h5f, size_t *start);
   virtual int get_num_params() { return 8; }
@@ -376,6 +378,7 @@ public:
   }
 
 protected:
+  friend class susceptibility_descriptor_builder;
   realnum gyro_tensor[3][3];
   realnum omega_0, gamma, alpha;
   gyrotropy_model model;
