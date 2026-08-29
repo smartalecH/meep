@@ -3579,12 +3579,12 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             break;
           case OpKind::phase_material:
             segment_guard = f_.phase_material_mix();
-            upload_material(op);
+            if (segment_guard) upload_material(op);
             break;
           case OpKind::update_material_coefficients:
             for (int i = 0; i < f_.num_chunks; ++i)
               f_.chunks[i]->s->update_condinv();
-            upload_material(op);
+            if (segment_guard) upload_material(op);
             break;
           case OpKind::update_db:
             for (size_t i = op.first; i < op.first + op.count; ++i) {
