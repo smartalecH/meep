@@ -136,15 +136,19 @@ struct rebuild_trace {
 
 struct access_trace {
   size_t reads;
+  size_t writes;
   size_t field_reads;
   size_t dft_reads;
+  size_t field_writes;
+  size_t dft_writes;
   size_t max_elements;
   int prepare_rebuilds;
   int fail_read_rank;
+  int fail_write_rank;
 
   access_trace()
-      : reads(0), field_reads(0), dft_reads(0), max_elements(0), prepare_rebuilds(0),
-        fail_read_rank(-1) {}
+      : reads(0), writes(0), field_reads(0), dft_reads(0), field_writes(0), dft_writes(0),
+        max_elements(0), prepare_rebuilds(0), fail_read_rank(-1), fail_write_rank(-1) {}
 };
 
 struct compact_trace {
@@ -242,6 +246,18 @@ public:
       for (size_t i = 0; i < ref.elements; ++i)
         values[i] = std::complex<realnum>(realnum(1.25), realnum(-0.75));
     }
+  }
+
+  void write(ArrayRef ref, const void *, size_t bytes) override {
+    if (my_rank() == accesses.fail_write_rank)
+      throw std::runtime_error("injected rank-local backend write failure");
+    const ArraySpec &spec = f.array_catalog->spec(ref.id);
+    CHECK(bytes == ref.elements * host_element_bytes(spec.element_type),
+          "backend host-range write byte count is inconsistent");
+    ++accesses.writes;
+    accesses.field_writes += spec.role == array_role::field;
+    accesses.dft_writes += spec.role == array_role::dft;
+    if (ref.elements > accesses.max_elements) accesses.max_elements = ref.elements;
   }
 
   void prepare_state_rebuild(BackendState &, DirtyMask reasons) override {
@@ -933,6 +949,75 @@ static void test_backend_safe_host_access() {
   CHECK(sum_to_all(int(dft_array_failure)) == count_processors(),
         "DFT array read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
+
+  accesses.reads = accesses.writes = accesses.field_reads = accesses.dft_reads = 0;
+  accesses.field_writes = accesses.dft_writes = accesses.max_elements = 0;
+  backend_refresh_dft_chain(monitor.chunks, "backend_api DFT chain read");
+  CHECK(sum_to_all(int(accesses.dft_reads)) == sum_to_all(local_dft_chunks),
+        "DFT chain boundary did not read each local chunk exactly once");
+  backend_publish_dft_chain(monitor.chunks, "backend_api DFT chain write");
+  CHECK(sum_to_all(int(accesses.dft_writes)) == sum_to_all(local_dft_chunks),
+        "DFT chain boundary did not publish each local chunk exactly once");
+
+  accesses.fail_write_rank = 0;
+  bool dft_write_failure = false;
+  try { backend_publish_dft_chain(monitor.chunks, "backend_api injected DFT write"); }
+  catch (const std::runtime_error &) { dft_write_failure = true; }
+  CHECK(sum_to_all(int(dft_write_failure)) == count_processors(),
+        "rank-asymmetric DFT write failure was not reconciled on every rank");
+  accesses.fail_write_rank = -1;
+  backend_publish_dft_chain(monitor.chunks, "backend_api recovered DFT write");
+  const int time_before_recovery = f->t;
+  f->advance(1);
+  CHECK(f->t == time_before_recovery + 1,
+        "execution did not continue after a reconciled DFT write failure");
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  dft_ldos ldos(frequencies, sizeof(frequencies) / sizeof(*frequencies));
+  ldos.update(*f);
+  CHECK(sum_to_all(int(accesses.field_reads)) > 0,
+        "LDOS update did not refresh its source-point fields");
+  CHECK(max_to_all(int(accesses.max_elements)) == 1,
+        "LDOS update read more than one field element at a time");
+
+  accesses.fail_read_rank = 0;
+  bool ldos_failure = false;
+  try { ldos.update(*f); }
+  catch (const std::runtime_error &) { ldos_failure = true; }
+  CHECK(sum_to_all(int(ldos_failure)) == count_processors(),
+        "rank-asymmetric LDOS read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
+  ldos.update(*f);
+
+  BackendState *state_before_magnetic_rejection = f->backend_state;
+  bool direct_magnetic_failure = false;
+  try { f->synchronize_magnetic_fields(); }
+  catch (const std::runtime_error &) { direct_magnetic_failure = true; }
+  CHECK(sum_to_all(int(direct_magnetic_failure)) == count_processors(),
+        "resident magnetic synchronization was not rejected on every rank");
+  CHECK(f->backend_state == state_before_magnetic_rejection,
+        "magnetic rejection replaced resident state");
+  bool repeated_magnetic_failure = false;
+  try { f->synchronize_magnetic_fields(); }
+  catch (const std::runtime_error &) { repeated_magnetic_failure = true; }
+  CHECK(sum_to_all(int(repeated_magnetic_failure)) == count_processors(),
+        "magnetic rejection changed nesting state before returning");
+
+  bool energy_magnetic_failure = false;
+  try { (void)f->field_energy_in_box(f->v); }
+  catch (const std::runtime_error &) { energy_magnetic_failure = true; }
+  CHECK(sum_to_all(int(energy_magnetic_failure)) == count_processors(),
+        "field_energy_in_box did not reject unsupported magnetic synchronization");
+
+  bool flux_magnetic_failure = false;
+  try { (void)f->flux_in_box(X, f->v); }
+  catch (const std::runtime_error &) { flux_magnetic_failure = true; }
+  CHECK(sum_to_all(int(flux_magnetic_failure)) == count_processors(),
+        "flux_in_box did not reject unsupported magnetic synchronization");
+  const int time_before_magnetic_recovery = f->t;
+  f->advance(1);
+  CHECK(f->t == time_before_magnetic_recovery + 1,
+        "execution did not continue after magnetic-sync rejection");
 
   dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where,
                 NO_DIRECTION, true);

@@ -678,17 +678,7 @@ size_t dft_chunks_Ntotal(dft_chunk *dft_chunks, size_t *my_start, bool single_pa
 // Note: the file must have been created in parallel mode, typically via fields::open_h5file.
 void save_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const char *dprefix,
                    bool single_parallel_file) {
-  if (single_parallel_file) {
-    std::string local_error;
-    bool local_refresh = false;
-    for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
-      fields *owner = cur->monitor_lifetime ? cur->monitor_lifetime->owner : NULL;
-      local_refresh = local_refresh || (owner && backend_host_refresh_required(*owner));
-    }
-    backend_read_dft_chain(dft_chunks, local_error);
-    if (or_to_all(local_refresh))
-      backend_reconcile_host_access(local_error, "save_dft_hdf5");
-  }
+  backend_refresh_dft_chain(dft_chunks, "save_dft_hdf5");
 
   size_t istart;
   size_t n = dft_chunks_Ntotal(dft_chunks, &istart, single_parallel_file);
@@ -701,7 +691,6 @@ void save_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const 
   file->create_data(dataname, 1, &n);
 
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
-    if (!single_parallel_file) cur->sync_dft_to_host();
     size_t Nchunk = cur->N * cur->omega.size() * 2;
     file->write_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
     istart += Nchunk;
@@ -734,9 +723,9 @@ void load_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const 
   for (dft_chunk *cur = dft_chunks; cur; cur = cur->next_in_dft) {
     size_t Nchunk = cur->N * cur->omega.size() * 2;
     file->read_chunk(1, &istart, &Nchunk, (realnum *)cur->dft);
-    cur->publish_dft_from_host();
     istart += Nchunk;
   }
+  backend_publish_dft_chain(dft_chunks, "load_dft_hdf5");
 }
 
 void load_dft_hdf5(dft_chunk *dft_chunks, component c, h5file *file, const char *dprefix,
