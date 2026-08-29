@@ -35,6 +35,7 @@
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/prepare.hpp"
 #include "backend/precision.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
@@ -55,6 +56,7 @@ static int failures = 0;
   } while (0)
 
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+static double unit_epsilon(const vec &) { return 1.0; }
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
 
 struct lifetime_counts {
@@ -592,6 +594,299 @@ static void build(structure **sp, fields **fp, const execution_options *opts) {
   *fp = opts ? new fields(*sp, *opts) : new fields(*sp);
   gaussian_src_time src(0.3, 0.1);
   (*fp)->add_point_source(Ez, src, vec(0.11, 0.13));
+}
+
+static double phase_conductivity(const vec &) { return 0.2; }
+
+static void test_material_phase_transaction() {
+  structure *current;
+  fields *f;
+  build(&current, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts, true);
+  f->advance(1);
+  BackendState *initial_state = f->backend_state;
+  Executable *initial_executable = f->executable;
+
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure target_a(gv, eps_slab, pml(0.5));
+  structure target_b(gv, unit_epsilon, pml(0.5));
+  target_a.set_conductivity(Dz, phase_conductivity);
+  target_b.set_conductivity(Dz, phase_conductivity);
+  std::vector<int> refs_a(size_t(target_a.num_chunks), 0);
+  std::vector<int> refs_b(size_t(target_b.num_chunks), 0);
+  for (int i = 0; i < target_a.num_chunks; ++i) {
+    refs_a[size_t(i)] = target_a.chunks[i]->refcount;
+    refs_b[size_t(i)] = target_b.chunks[i]->refcount;
+  }
+
+  const uint32_t initial_dirty = f->dirty_mask;
+  const uint64_t initial_generation = generation(*f, MutationKind::material_phase);
+  const uint64_t initial_local_generation = f->local_invalidation_generation;
+  const int steps = f->phase_in_material(&target_a, 2.25 * f->dt);
+  CHECK(steps == 2 && f->phasein_time == 2, "material phase did not preserve integer truncation");
+  CHECK(!f->backend_state && !f->executable,
+        "successful material setup retained the old resident representation");
+  CHECK(counts.rebuilds == 1 && counts.states_destroyed == 1 &&
+            counts.executables_destroyed == 1,
+        "material setup did not migrate then retire exactly one resident representation");
+  CHECK(initial_state != f->backend_state && initial_executable != f->executable,
+        "material setup did not clear resident artifacts");
+  CHECK(f->dirty_mask == (initial_dirty | invalidation_closure(MutationKind::material_phase)) &&
+            generation(*f, MutationKind::material_phase) == initial_generation + 1 &&
+            f->local_invalidation_generation == initial_local_generation + 1,
+        "successful material setup did not commit the exact lifecycle closure once");
+  for (int i = 0; i < f->num_chunks; ++i) {
+    if (!f->chunks[i]->is_mine()) continue;
+    CHECK(f->chunks[i]->new_s == target_a.chunks[i],
+          "material setup did not install the requested target");
+    CHECK(target_a.chunks[i]->refcount == refs_a[size_t(i)] + 1,
+          "material setup did not retain exactly one target reference");
+    CHECK(f->chunks[i]->s->refcount == 1,
+          "material setup did not install detached current storage");
+    CHECK(f->chunks[i]->s->conductivity[Dz][Z] && f->chunks[i]->s->condinv[Dz][Z],
+          "material setup did not realize the stable conductivity union");
+  }
+
+  f->init_backend();
+  BackendState *live_state = f->backend_state;
+  Executable *live_executable = f->executable;
+  std::vector<structure_chunk *> current_rows(size_t(f->num_chunks), NULL);
+  for (int i = 0; i < f->num_chunks; ++i) current_rows[size_t(i)] = f->chunks[i]->s;
+  const uint32_t dirty_before = f->dirty_mask;
+  const uint64_t generation_before = generation(*f, MutationKind::material_phase);
+  const int countdown_before = f->phasein_time;
+  counts.fail_rebuild = my_rank() == 0;
+  bool rejected = false;
+  try {
+    f->phase_in_material(&target_b, 3.5 * f->dt);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "rank-asymmetric material rebuild failure was not reconciled");
+  CHECK(f->backend_state == live_state && f->executable == live_executable,
+        "failed material setup retired the live resident representation");
+  CHECK(f->dirty_mask == dirty_before &&
+            generation(*f, MutationKind::material_phase) == generation_before &&
+            f->phasein_time == countdown_before,
+        "failed material setup changed lifecycle state or countdown");
+  for (int i = 0; i < f->num_chunks; ++i) {
+    CHECK(f->chunks[i]->s == current_rows[size_t(i)],
+          "failed material setup rebound current structure storage");
+    if (!f->chunks[i]->is_mine()) continue;
+    CHECK(f->chunks[i]->new_s == target_a.chunks[i],
+          "failed material setup replaced the prior target");
+    CHECK(target_a.chunks[i]->refcount == refs_a[size_t(i)] + 1 &&
+              target_b.chunks[i]->refcount == refs_b[size_t(i)],
+          "failed material setup leaked staged target ownership");
+  }
+
+  counts.fail_rebuild = false;
+  CHECK(f->phase_in_material(&target_b, 3.5 * f->dt) == 3,
+        "material setup retry did not succeed");
+  for (int i = 0; i < f->num_chunks; ++i) {
+    if (!f->chunks[i]->is_mine()) continue;
+    CHECK(f->chunks[i]->new_s == target_b.chunks[i],
+          "material retry did not install replacement target");
+    CHECK(target_a.chunks[i]->refcount == refs_a[size_t(i)] &&
+              target_b.chunks[i]->refcount == refs_b[size_t(i)] + 1,
+          "material target replacement has incorrect net ownership");
+  }
+  CHECK(f->phase_in_material(&target_b, 0.25 * f->dt) == 0 && !f->is_phasing(),
+        "zero-step material phase no longer preserves legacy truncation");
+  for (int i = 0; i < f->num_chunks; ++i)
+    if (f->chunks[i]->is_mine())
+      CHECK(target_b.chunks[i]->refcount == refs_b[size_t(i)] + 1,
+            "same-target material setup changed net ownership");
+
+  structure incompatible(vol2d(3.25, 3.0, 10.0), unit_epsilon, pml(0.5));
+  const int stable_countdown = f->phasein_time;
+  const uint32_t topology_dirty = f->dirty_mask;
+  const uint64_t topology_generation = generation(*f, MutationKind::material_phase);
+  const uint64_t topology_local_generation = f->local_invalidation_generation;
+  const bool topology_changed_materials = legacy_material_change_pending(*f);
+  rejected = false;
+  try {
+    f->phase_in_material(&incompatible, f->dt);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "incompatible material target was not rejected collectively");
+  CHECK(f->phasein_time == stable_countdown && f->dirty_mask == topology_dirty &&
+            generation(*f, MutationKind::material_phase) == topology_generation &&
+            f->local_invalidation_generation == topology_local_generation &&
+            legacy_material_change_pending(*f) == topology_changed_materials,
+        "incompatible target changed setup or lifecycle state");
+  for (int i = 0; i < f->num_chunks; ++i)
+    if (f->chunks[i]->is_mine())
+      CHECK(f->chunks[i]->new_s == target_b.chunks[i] &&
+                target_b.chunks[i]->refcount == refs_b[size_t(i)] + 1,
+            "incompatible target changed target ownership");
+
+  structure chunk_mismatch(gv, unit_epsilon, pml(0.5));
+  if (my_rank() == 0 && chunk_mismatch.num_chunks)
+    chunk_mismatch.chunks[0]->a += 1.0;
+  rejected = false;
+  const uint32_t chunk_dirty = f->dirty_mask;
+  const uint64_t chunk_generation = generation(*f, MutationKind::material_phase);
+  const uint64_t chunk_local_generation = f->local_invalidation_generation;
+  const bool chunk_changed_materials = legacy_material_change_pending(*f);
+  try {
+    f->phase_in_material(&chunk_mismatch, f->dt);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "rank-asymmetric chunk-topology mismatch was not rejected collectively");
+  CHECK(f->phasein_time == stable_countdown && f->dirty_mask == chunk_dirty &&
+            generation(*f, MutationKind::material_phase) == chunk_generation &&
+            f->local_invalidation_generation == chunk_local_generation &&
+            legacy_material_change_pending(*f) == chunk_changed_materials,
+        "chunk-topology rejection changed setup or lifecycle state");
+
+  f->init_backend();
+  live_state = f->backend_state;
+  live_executable = f->executable;
+  structure allocation_failure_target(gv, eps_slab, pml(0.5));
+  for (int i = 0; i < allocation_failure_target.num_chunks; ++i) {
+    if (!allocation_failure_target.chunks[i]->is_mine()) continue;
+    structure_chunk &target = *allocation_failure_target.chunks[i];
+    const size_t n = size_t(target.gv.ntot());
+    delete[] target.chi1inv[Ex][Y];
+    target.chi1inv[Ex][Y] = new realnum[n];
+    std::fill(target.chi1inv[Ex][Y], target.chi1inv[Ex][Y] + n, realnum(0.25));
+    target.trivial_chi1inv[Ex][Y] = false;
+  }
+  int owns_chunk = 0;
+  for (int i = 0; i < f->num_chunks; ++i) owns_chunk |= f->chunks[i]->is_mine();
+  const int failure_rank = min_to_all(owns_chunk ? my_rank() : count_processors());
+  set_material_phase_prepare_failure_for_testing(failure_rank, 1);
+  const uint32_t allocation_dirty = f->dirty_mask;
+  const uint64_t allocation_generation = generation(*f, MutationKind::material_phase);
+  const uint64_t allocation_local_generation = f->local_invalidation_generation;
+  const bool allocation_changed_materials = legacy_material_change_pending(*f);
+  const int allocation_countdown = f->phasein_time;
+  std::vector<structure_chunk *> allocation_current(size_t(f->num_chunks), NULL);
+  std::vector<int> allocation_target_refs(size_t(f->num_chunks), 0);
+  for (int i = 0; i < f->num_chunks; ++i) {
+    allocation_current[size_t(i)] = f->chunks[i]->s;
+    allocation_target_refs[size_t(i)] = allocation_failure_target.chunks[i]->refcount;
+  }
+  rejected = false;
+  try {
+    f->phase_in_material(&allocation_failure_target, 2 * f->dt);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  set_material_phase_prepare_failure_for_testing(-1, -1);
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "rank-asymmetric material storage failure was not reconciled");
+  CHECK(f->backend_state == live_state && f->executable == live_executable &&
+            f->dirty_mask == allocation_dirty &&
+            generation(*f, MutationKind::material_phase) == allocation_generation &&
+            f->local_invalidation_generation == allocation_local_generation &&
+            legacy_material_change_pending(*f) == allocation_changed_materials &&
+            f->phasein_time == allocation_countdown,
+        "failed material storage preparation changed resident or lifecycle state");
+  for (int i = 0; i < f->num_chunks; ++i) {
+    CHECK(f->chunks[i]->s == allocation_current[size_t(i)],
+          "failed material storage preparation changed current storage");
+    CHECK(allocation_failure_target.chunks[i]->refcount ==
+              allocation_target_refs[size_t(i)],
+          "failed material storage preparation leaked a target reference");
+    if (f->chunks[i]->is_mine())
+      CHECK(f->chunks[i]->new_s == target_b.chunks[i],
+            "failed material storage preparation changed the attached target");
+  }
+
+  delete f;
+  delete current;
+
+  grid_volume cyl_gv = volcyl(2.0, 3.0, 10.0);
+  structure cyl_current(cyl_gv, unit_epsilon, no_pml());
+  structure cyl_target(cyl_gv, eps_slab, no_pml());
+  fields cyl(&cyl_current, 1.0);
+  CHECK(cyl.phase_in_material(&cyl_target, cyl.dt) == 1,
+        "valid cylindrical target was rejected after symmetry augmentation");
+
+  build(&current, &f);
+  lifetime_counts magnetic_counts;
+  f->backend = new tracking_backend(*f, magnetic_counts, true);
+  f->advance(1);
+  structure magnetic_target(gv, eps_slab, pml(0.5));
+  std::vector<int> magnetic_refs(size_t(magnetic_target.num_chunks), 0);
+  for (int i = 0; i < magnetic_target.num_chunks; ++i)
+    magnetic_refs[size_t(i)] = magnetic_target.chunks[i]->refcount;
+  f->synchronize_magnetic_fields();
+  f->synchronize_magnetic_fields();
+  live_state = f->backend_state;
+  live_executable = f->executable;
+  const uint32_t magnetic_dirty = f->dirty_mask;
+  const uint64_t magnetic_generation = generation(*f, MutationKind::material_phase);
+  const uint64_t magnetic_local_generation = f->local_invalidation_generation;
+  const bool magnetic_changed_materials = legacy_material_change_pending(*f);
+  const int magnetic_countdown = f->phasein_time;
+  rejected = false;
+  try {
+    f->phase_in_material(&magnetic_target, f->dt);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "live nested magnetic snapshot did not reject material setup collectively");
+  CHECK(f->backend_state == live_state && f->executable == live_executable &&
+            f->dirty_mask == magnetic_dirty &&
+            generation(*f, MutationKind::material_phase) == magnetic_generation &&
+            f->local_invalidation_generation == magnetic_local_generation &&
+            legacy_material_change_pending(*f) == magnetic_changed_materials &&
+            f->phasein_time == magnetic_countdown,
+        "snapshot-rejected material setup changed resident or lifecycle state");
+  for (int i = 0; i < f->num_chunks; ++i)
+    if (f->chunks[i]->is_mine())
+      CHECK(!f->chunks[i]->new_s &&
+                magnetic_target.chunks[i]->refcount == magnetic_refs[size_t(i)],
+            "snapshot-rejected material setup retained its target");
+  f->restore_magnetic_fields();
+  f->restore_magnetic_fields();
+  CHECK(magnetic_counts.magnetic_restores == 1,
+        "material rejection stranded the nested magnetic snapshot");
+
+  f->backend->poison();
+  const uint32_t poison_dirty = f->dirty_mask;
+  const uint64_t poison_generation = generation(*f, MutationKind::material_phase);
+  const uint64_t poison_local_generation = f->local_invalidation_generation;
+  const bool poison_changed_materials = legacy_material_change_pending(*f);
+  const int poison_countdown = f->phasein_time;
+  rejected = false;
+  try {
+    f->phase_in_material(&magnetic_target, f->dt);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "poisoned backend accepted material setup");
+  CHECK(f->backend_state == live_state && f->executable == live_executable &&
+            f->dirty_mask == poison_dirty &&
+            generation(*f, MutationKind::material_phase) == poison_generation &&
+            f->local_invalidation_generation == poison_local_generation &&
+            legacy_material_change_pending(*f) == poison_changed_materials &&
+            f->phasein_time == poison_countdown,
+        "poison rejection changed resident or lifecycle state");
+  for (int i = 0; i < f->num_chunks; ++i)
+    if (f->chunks[i]->is_mine())
+      CHECK(!f->chunks[i]->new_s &&
+                magnetic_target.chunks[i]->refcount == magnetic_refs[size_t(i)],
+            "poison rejection changed target ownership");
+  delete f;
+  delete current;
 }
 
 static std::complex<double> multiply_fields(const std::complex<realnum> *values, const vec &,
@@ -2092,6 +2387,12 @@ int main(int argc, char **argv) {
     master_printf("backend_api: magnetic checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_MATERIAL_ONLY")) {
+    test_material_phase_transaction();
+    if (failures) return 1;
+    master_printf("backend_api: material checks passed\n");
+    return 0;
+  }
 
   test_selection();
   test_construction_equivalence();
@@ -2102,6 +2403,7 @@ int main(int argc, char **argv) {
   test_backend_lifecycle_epoch();
   test_backend_reselection_invalidates_representation();
   test_resident_magnetic_dispatch();
+  test_material_phase_transaction();
   test_resident_polarization_preparation();
   test_resident_beta_fingerprint();
   test_resident_bfast_fingerprint();

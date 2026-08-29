@@ -18,6 +18,7 @@
 #include <assert.h>
 #include <algorithm>
 #include <memory>
+#include <stdexcept>
 #include <string.h>
 #include <vector>
 
@@ -32,6 +33,9 @@
 namespace meep {
 
 namespace {
+
+int material_prepare_failure_rank = -1;
+int material_prepare_failure_after = -1;
 
 bool material_phase_storage_needs_update(const structure_chunk &current,
                                          const structure_chunk &target) {
@@ -87,6 +91,11 @@ void realize_material_phase_union(structure_chunk &current, const structure_chun
 
 } // namespace
 
+void set_material_phase_prepare_failure_for_testing(int rank, int after_chunks) {
+  material_prepare_failure_rank = rank;
+  material_prepare_failure_after = after_chunks;
+}
+
 PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f, const structure &target)
     : PreparedMaterialPhaseStorage(f, &target) {}
 
@@ -95,6 +104,7 @@ PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f)
 
 PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f, const structure *target)
     : owner_(f), chunks_(size_t(f.num_chunks)), committed_(false) {
+  int staged = 0;
   for (int i = 0; i < owner_.num_chunks; ++i) {
     if (!owner_.chunks[i]->is_mine()) continue;
     const structure_chunk *target_chunk =
@@ -104,6 +114,10 @@ PreparedMaterialPhaseStorage::PreparedMaterialPhaseStorage(fields &f, const stru
     if (!material_phase_storage_needs_update(*owner_.chunks[i]->s, *target_chunk)) continue;
     chunks_[size_t(i)].reset(new structure_chunk(owner_.chunks[i]->s));
     realize_material_phase_union(*chunks_[size_t(i)], *target_chunk);
+    ++staged;
+    if (my_rank() == material_prepare_failure_rank &&
+        staged == material_prepare_failure_after)
+      throw std::runtime_error("injected material phase storage preparation failure");
   }
 }
 
