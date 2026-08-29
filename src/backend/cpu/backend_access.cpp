@@ -21,6 +21,7 @@
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
+#include "backend/step_plan.hpp"
 
 namespace meep {
 
@@ -384,6 +385,11 @@ void fields::init_backend() {
     return;
   }
 
+  bool coordinates_match = beta_coordinate_state_matches(*this, step_plans[0]);
+  if (step_plans[1]) coordinates_match &= beta_coordinate_state_matches(*this, step_plans[1]);
+  if (!and_to_all(coordinates_match))
+    meep::abort("meep: fields::beta changed after construction; recreate fields so the "
+                "per-chunk coordinate state and resident executable agree");
   /* A value-only material update can change classification without changing
      the existing storage layout. Reconcile the host representation first; any
      promotion it discovers will set dirty_storage for the rebuild below. */
