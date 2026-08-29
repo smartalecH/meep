@@ -23,6 +23,7 @@
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/precision.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
@@ -35,6 +36,53 @@ static void require(bool condition, const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     meep::abort("nvidia_timestep failed");
   }
+}
+
+#if MEEP_SINGLE
+static uint32_t float_bits(float value) {
+  uint32_t bits = 0;
+  memcpy(&bits, &value, sizeof(bits));
+  return bits;
+}
+#endif
+
+static void test_polarization_coefficient_rounding() {
+  const realnum dt = realnum(1.0 / 12.0);
+  const nvidia::polarization_coefficients omega =
+      nvidia::derive_polarization_coefficients(0.28, 0.09, double(dt), false);
+  const realnum omega2pi = 2 * pi * 0.28;
+  const realnum expected_omega0dtsqr = omega2pi * omega2pi * dt * dt;
+  require(omega.omega0dtsqr == double(expected_omega0dtsqr) &&
+              omega.omega0dtsqr_denom == double(expected_omega0dtsqr),
+          "NVIDIA polarization omega coefficient did not preserve host realnum rounding");
+
+  const nvidia::polarization_coefficients damping =
+      nvidia::derive_polarization_coefficients(1.17, 0.035, double(dt), false);
+  const realnum g2pi = 0.035 * 2 * pi;
+  const realnum expected_gamma1inv = 1 / (1 + g2pi * dt / 2);
+  const realnum expected_gamma1 = 1 - g2pi * dt / 2;
+  require(damping.gamma1inv == double(expected_gamma1inv) &&
+              damping.gamma1 == double(expected_gamma1),
+          "NVIDIA polarization damping coefficients did not preserve host realnum rounding");
+
+  const realnum current = realnum(0.37), previous = realnum(-0.19), forcing = realnum(0.23);
+  const realnum expected_next =
+      expected_gamma1inv *
+      (current * (2 - realnum(damping.omega0dtsqr_denom)) - expected_gamma1 * previous +
+       realnum(damping.omega0dtsqr) * forcing);
+  const realnum launch_next =
+      realnum(damping.gamma1inv) *
+      (current * (2 - realnum(damping.omega0dtsqr_denom)) -
+       realnum(damping.gamma1) * previous + realnum(damping.omega0dtsqr) * forcing);
+  require(memcmp(&expected_next, &launch_next, sizeof(realnum)) == 0,
+          "NVIDIA polarization launch coefficients changed the host recurrence");
+
+#if MEEP_SINGLE
+  require(float_bits(realnum(omega.omega0dtsqr)) == 0x3cb013c8u,
+          "native-single omega coefficient regressed by an ULP");
+  require(float_bits(realnum(damping.gamma1inv)) == 0x3f7dacf2u,
+          "native-single damping coefficient regressed by an ULP");
+#endif
 }
 
 static double isotropic_eps(const vec &p) { return p.x() < 0.0 ? 2.0 : 3.0; }
@@ -71,6 +119,25 @@ private:
   bool magnetic_;
 };
 
+class dispersion_sigma_material : public material_function {
+public:
+  explicit dispersion_sigma_material(bool anisotropic) : anisotropic_(anisotropic) {}
+
+  void sigma_row(component c, double row[3], const vec &) override {
+    row[0] = row[1] = row[2] = 0.0;
+    const int d = component_index(c);
+    row[d] = 0.08 + 0.01 * d;
+    if (!anisotropic_) return;
+    static const double offdiagonal[3][3] = {
+        {0.0, 0.004, -0.003}, {0.004, 0.0, 0.005}, {-0.003, 0.005, 0.0}};
+    for (int other = 0; other < 3; ++other)
+      if (other != d) row[other] = offdiagonal[d][other];
+  }
+
+private:
+  bool anisotropic_;
+};
+
 static realnum initial_value(size_t array, size_t element) {
   return realnum(0.02 * sin(double(17 * array + element)) +
                  0.01 * cos(double(3 * array + 5 * element)));
@@ -86,7 +153,7 @@ static void round_real_arrays(CpuArrayCatalog &catalog) {
   }
 }
 
-static void initialize_fields(fields &cpu, fields &gpu, bool f32) {
+static void initialize_fields(fields &cpu, fields &gpu, bool f32, double scale = 1.0) {
   require(cpu.array_catalog->size() == gpu.array_catalog->size(),
           "CPU and NVIDIA catalogs have different sizes");
   for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
@@ -97,13 +164,14 @@ static void initialize_fields(fields &cpu, fields &gpu, bool f32) {
             "CPU and NVIDIA catalog keys differ");
     require(cpu_spec.elements == gpu_spec.elements && cpu_spec.alias_of == gpu_spec.alias_of,
             "CPU and NVIDIA catalog layouts differ");
-    if (is_valid(cpu_spec.alias_of) || cpu_spec.role != array_role::field ||
+    if (is_valid(cpu_spec.alias_of) ||
+        (cpu_spec.role != array_role::field && cpu_spec.role != array_role::polarization) ||
         cpu_spec.element_type != ElementType::realnum_value)
       continue;
 
     std::vector<realnum> values(cpu_spec.elements);
     for (size_t j = 0; j < values.size(); ++j) {
-      values[j] = initial_value(i, j);
+      values[j] = realnum(scale * initial_value(i, j));
       if (f32) values[j] = realnum(float(values[j]));
     }
     memcpy(cpu.array_catalog->resolve_untyped(id), values.data(), values.size() * sizeof(realnum));
@@ -116,7 +184,8 @@ static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
   for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
     const ArrayId id{uint32_t(i)};
     const ArraySpec &spec = cpu.array_catalog->spec(id);
-    if (is_valid(spec.alias_of) || spec.role != array_role::field ||
+    if (is_valid(spec.alias_of) ||
+        (spec.role != array_role::field && spec.role != array_role::polarization) ||
         spec.element_type != ElementType::realnum_value)
       continue;
     const realnum *expected = cpu.array_catalog->resolve<realnum>(id);
@@ -137,6 +206,53 @@ static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
       }
     }
   }
+}
+
+static void require_polarization_plan(fields &f, field_type ft, bool drude,
+                                      bool anisotropic, unsigned int required_halo_phases,
+                                      size_t minimum_states) {
+  require(f.descriptors && f.array_catalog && f.halos,
+          "dispersion test has no prepared backend-neutral state");
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t states = 0, updates = 0, subtractions = 0;
+  bool saw_negative_stride = false;
+  bool saw_requested_model = false;
+  for (size_t i = 0; i < f.descriptors->polarizations.size(); ++i) {
+    const PolarizationDescriptor &d = f.descriptors->polarizations[i];
+    if (d.ft != ft || d.kind != SusceptibilityKind::lorentzian) continue;
+    saw_requested_model |= d.lorentzian.drude == drude;
+    states += d.lorentzian_states.size();
+  }
+  for (size_t i = 0; i < plan.polarization_updates.size(); ++i) {
+    const PolarizationUpdate &update = plan.polarization_updates[i];
+    if (is_electric(update.region.c) != (ft == E_stuff)) continue;
+    ++updates;
+    const unsigned offdiagonals =
+        (update.region.variant_key & polarization_two_offdiagonals)
+            ? 2
+            : unsigned((update.region.variant_key & polarization_one_offdiagonal) != 0);
+    if (anisotropic)
+      require(offdiagonals > 0, "anisotropic dispersion row lost its cross operands");
+    saw_negative_stride |= update.primary_stride < 0 || update.cross_stride1 < 0 ||
+                           update.cross_stride2 < 0;
+  }
+  for (size_t i = 0; i < plan.polarization_subtractions.size(); ++i)
+    if (is_electric(plan.polarization_subtractions[i].c) == (ft == E_stuff)) ++subtractions;
+  require(saw_requested_model, "requested Lorentz/Drude descriptor was not prepared");
+  require(states >= minimum_states && updates >= minimum_states && subtractions >= minimum_states,
+          "dispersion plan lacks recurrence or subtraction rows");
+  if (ft == H_stuff)
+    require(saw_negative_stride, "magnetic dispersion row lacks negative strides");
+
+  unsigned int observed = 0;
+  for (size_t i = 0; i < f.halos->plans.size(); ++i) {
+    const HaloPlan &halo = f.halos->plans[i];
+    if (halo.ft == (ft == E_stuff ? PE_stuff : PH_stuff) && halo.same_rank &&
+        halo.block_elements)
+      observed |= 1u << unsigned(halo.phase);
+  }
+  require((observed & required_halo_phases) == required_halo_phases,
+          "required same-rank polarization halo transform was not prepared");
 }
 
 static void require_halo_phases(const fields &f, unsigned int required) {
@@ -370,7 +486,8 @@ static void run_source_case(const char *name, precision_policy_kind policy, bool
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
   initialize_fields(cpu, gpu, narrowed);
-  const double tolerance = narrowed ? 2e-5 : 2e-13;
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 2e-5 : 2e-13;
   const int checkpoints[] = {1, 2, 8};
   int previous = 0;
   for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
@@ -430,7 +547,8 @@ static void run_custom_source_case(const char *name, precision_policy_kind polic
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
   initialize_fields(cpu, gpu, narrowed);
-  const double tolerance = narrowed ? 2e-5 : 2e-13;
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 2e-5 : 2e-13;
   const int checkpoints[] = {1, 2, 8};
   int previous = 0;
   for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
@@ -546,7 +664,8 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   if (narrowed) round_real_arrays(*cpu.array_catalog);
   initialize_fields(cpu, gpu, narrowed);
 
-  const double tolerance = narrowed ? 2e-5 : 2e-13;
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 2e-5 : 2e-13;
   const int checkpoints[] = {1, 2, 100};
   int previous = 0;
   for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
@@ -604,11 +723,11 @@ static void expect_compile_rejected(fields &gpu, StepPlan plan, const char *expe
   catch (const std::runtime_error &error) {
     rejected = std::string(error.what()).find(expected) != std::string::npos;
     if (!rejected)
-      fprintf(stderr, "unexpected nonlinear rejection: %s (wanted: %s)\n", error.what(),
+      fprintf(stderr, "unexpected compile rejection: %s (wanted: %s)\n", error.what(),
               expected);
   }
   delete unexpected;
-  require(rejected, "malformed nonlinear descriptor was not rejected as expected");
+  require(rejected, "malformed descriptor was not rejected as expected");
 }
 
 static void test_nonlinear_compile_rejections() {
@@ -654,6 +773,146 @@ static void test_nonlinear_compile_rejections() {
 
   gpu.backend->read(ArrayRef{target, 0, elements}, after.data(), after.size() * sizeof(realnum));
   require(before == after, "rejected nonlinear descriptors mutated device storage");
+}
+
+static void test_polarization_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  dispersion_sigma_material sigma(false);
+  s.add_susceptibility(sigma, E_stuff, lorentzian_susceptibility(0.73, 0.09));
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(!baseline.polarization_updates.empty() && !baseline.polarization_subtractions.empty(),
+          "polarization rejection test has no descriptors");
+  const ArrayId p = baseline.polarization_updates[0].p;
+  const size_t elements = gpu.storage_plan->arrays[p.value].elements;
+  std::vector<realnum> before(elements), after(elements);
+  gpu.backend->read(ArrayRef{p, 0, elements}, before.data(), before.size() * sizeof(realnum));
+
+  StepPlan malformed = baseline;
+  malformed.polarization_updates[0].p_prev = invalid_array();
+  expect_compile_rejected(gpu, malformed, "incomplete state");
+
+  malformed = baseline;
+  malformed.polarization_updates[0].region.variant_key |= polarization_two_offdiagonals;
+  malformed.polarization_updates[0].region.variant_key &= ~polarization_one_offdiagonal;
+  expect_compile_rejected(gpu, malformed, "second off-diagonal without first");
+
+  malformed = baseline;
+  --malformed.polarization_subtractions[0].elements;
+  expect_compile_rejected(gpu, malformed, "not a full-array operation");
+
+  gpu.backend->read(ArrayRef{p, 0, elements}, after.data(), after.size() * sizeof(realnum));
+  require(before == after, "rejected polarization descriptors mutated device storage");
+}
+
+static void run_dispersion_case(const char *name, precision_policy_kind policy, bool real_fields,
+                                bool drude, bool anisotropic_sigma, bool magnetic,
+                                bool use_pml, int chunks, const vec *bloch,
+                                unsigned int required_polarization_halo_phases,
+                                bool multiple_states = false, bool integrated_source = false,
+                                bool nonlinear = false, bool negate_symmetry = false) {
+  const grid_volume gv = vol3d(2.4, 2.0, 1.6, 6.0);
+  const boundary_region boundaries = use_pml ? pml(0.35, X) + pml(0.35, Y) : no_pml();
+  const symmetry sym = negate_symmetry ? -mirror(Y, gv) : identity();
+  linear_anisotropic_material tensor_material(anisotropic_sigma, magnetic);
+  dispersion_sigma_material sigma(anisotropic_sigma);
+  std::unique_ptr<structure> cpu_structure, gpu_structure;
+  if (anisotropic_sigma || magnetic) {
+    cpu_structure.reset(new structure(gv, tensor_material, boundaries, sym, chunks));
+    gpu_structure.reset(new structure(gv, tensor_material, boundaries, sym, chunks));
+  }
+  else {
+    cpu_structure.reset(new structure(gv, isotropic_eps, boundaries, sym, chunks));
+    gpu_structure.reset(new structure(gv, isotropic_eps, boundaries, sym, chunks));
+  }
+
+  const field_type ft = magnetic ? H_stuff : E_stuff;
+  const lorentzian_susceptibility primary(drude ? 0.28 : 0.73, 0.09, drude);
+  cpu_structure->add_susceptibility(sigma, ft, primary);
+  gpu_structure->add_susceptibility(sigma, ft, primary);
+  if (multiple_states) {
+    const lorentzian_susceptibility secondary(1.17, 0.035, !drude);
+    cpu_structure->add_susceptibility(sigma, ft, secondary);
+    gpu_structure->add_susceptibility(sigma, ft, secondary);
+  }
+  if (nonlinear) {
+    cpu_structure->set_chi3(chi3_value);
+    gpu_structure->set_chi3(chi3_value);
+  }
+
+  fields cpu(cpu_structure.get());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(gpu_structure.get(), options);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  else if (bloch) {
+    cpu.use_bloch(*bloch);
+    gpu.use_bloch(*bloch);
+  }
+  if (anisotropic_sigma) {
+    const component requested[] = {magnetic ? Hx : Ex, magnetic ? Hy : Ey,
+                                   magnetic ? Hz : Ez};
+    for (size_t i = 0; i < 3; ++i) {
+      cpu.require_component(requested[i]);
+      gpu.require_component(requested[i]);
+    }
+  }
+  else {
+    cpu.require_component(magnetic ? Hz : Ez);
+    gpu.require_component(magnetic ? Hz : Ez);
+  }
+
+  std::unique_ptr<gaussian_src_time> cpu_source, gpu_source;
+  if (integrated_source) {
+    cpu_source.reset(new gaussian_src_time(0.31, 0.14));
+    gpu_source.reset(new gaussian_src_time(0.31, 0.14));
+    cpu_source->is_integrated = true;
+    gpu_source->is_integrated = true;
+    const std::complex<double> amplitude =
+        real_fields ? std::complex<double>(0.21, 0.0) : std::complex<double>(0.21, -0.13);
+    cpu.add_point_source(Ez, *cpu_source, vec(0.37, 0.41, 0.29), amplitude);
+    gpu.add_point_source(Ez, *gpu_source, vec(0.37, 0.41, 0.29), amplitude);
+  }
+
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+  require_polarization_plan(gpu, ft, drude, anisotropic_sigma,
+                            required_polarization_halo_phases,
+                            multiple_states ? size_t(2) : size_t(1));
+  if (integrated_source)
+    require_source_plan(gpu, false, true, anisotropic_sigma || nonlinear, nonlinear);
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.01);
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 2e-5 : 2e-13;
+  const int checkpoints[] = {1, 2, 100};
+  int previous = 0;
+  for (size_t i = 0; i < sizeof(checkpoints) / sizeof(checkpoints[0]); ++i) {
+    const int delta = checkpoints[i] - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA dispersive timestep did not advance host time");
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoints[i];
+  }
+  master_printf("nvidia_timestep: dispersion-%s/%s PASS\n", name,
+                precision_policy_name(policy));
 }
 
 static void run_finite_diagnostic_case(const char *name, precision_policy_kind policy,
@@ -724,17 +983,19 @@ static void test_rejections() {
 
   {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    s.add_susceptibility(unit_value, E_stuff, lorentzian_susceptibility(1.1, 0.05));
+    s.add_susceptibility(unit_value, E_stuff,
+                         noisy_lorentzian_susceptibility(0.01, 1.1, 0.05));
     fields f(&s, options);
     f.use_real_fields();
     f.require_component(Ez);
-    require_advance_rejected(f, "dispersion");
+    require_advance_rejected(f, "noisy_lorentzian");
   }
 }
 
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
+  test_polarization_coefficient_rounding();
   set_finite_check_mode(FiniteCheckMode::off);
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
   const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
@@ -747,6 +1008,20 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
+                        NULL, 1u << CONNECT_COPY);
+    run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
+                        true, 4, &bloch3, (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+    run_dispersion_case("complex-drude-anisotropic-pml", policies[p], false, true, true, false,
+                        true, 2, &bloch3, 1u << CONNECT_COPY);
+    run_dispersion_case("complex-magnetic-lorentz-pml", policies[p], false, false, true, true,
+                        true, 2, &bloch3, 1u << CONNECT_COPY);
+    run_dispersion_case("multiple-integrated-source-chi3", policies[p], true, false, false,
+                        false, false, 2, NULL, 1u << CONNECT_COPY, true, true, true);
+    run_dispersion_case("real-lorentz-negate", policies[p], true, false, false, false, false, 2,
+                        NULL, 1u << CONNECT_NEGATE, false, false, false, true);
+    run_dispersion_case("complex-magnetic-lorentz-negate", policies[p], false, false, false, true,
+                        false, 2, NULL, 1u << CONNECT_NEGATE, false, false, false, true);
     run_source_case("real-point-source", policies[p], true, false);
     run_source_case("complex-conductive-point-source", policies[p], false, true);
     run_source_case("complex-continuous-point-source", policies[p], false, false, false, NULL,
@@ -796,6 +1071,7 @@ int main(int argc, char **argv) {
   set_finite_check_mode(FiniteCheckMode::off);
   test_rejections();
   test_nonlinear_compile_rejections();
+  test_polarization_compile_rejections();
   master_printf("nvidia_timestep: PASS\n");
   return 0;
 }
