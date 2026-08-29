@@ -57,6 +57,14 @@ const char *array_kind_name(array_kind k) {
   return "?";
 }
 
+int polarization_storage_aux(int state_index, size_t layout_ordinal) {
+  const size_t stride = 1024;
+  if (state_index < 0 || layout_ordinal >= stride ||
+      size_t(state_index) > (size_t(std::numeric_limits<int>::max()) - layout_ordinal) / stride)
+    throw std::overflow_error("polarization storage key overflow");
+  return state_index * int(stride) + int(layout_ordinal);
+}
+
 static size_t element_bytes(ElementType t) {
   switch (t) {
     case ElementType::realnum_value: return sizeof(realnum);
@@ -278,7 +286,7 @@ size_t build_storage_catalog(fields &f, CpuArrayCatalog &cat, StoragePlan &plan)
           const ElementType type = entry.element_type == InternalArrayLayout::complex_realnum
                                        ? ElementType::complex_realnum
                                        : ElementType::realnum_value;
-          const int aux = si * 1024 + int(li);
+          const int aux = polarization_storage_aux(si, li);
           r.add(i, array_kind::polarization_internal, int(entry.c), entry.cmp, aux,
                 base + entry.offset_elements, entry.elements, array_role::polarization, type);
         }

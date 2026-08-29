@@ -223,6 +223,7 @@ public:
 
   void add_db(field_type ft);
   void add_eh(field_type ft, Guard guard = guard_always());
+  void add_polarizations(field_type ft);
   void add_source_evaluation(Guard guard, double src_offset);
   void add_sources(field_type ft);
   void add_dfts();
@@ -563,6 +564,99 @@ void StepPlanBuilder::add_dfts() {
   op.descriptor_count = uint32_t(plan_.dft_updates.size()) - op.descriptor_index;
 }
 
+void StepPlanBuilder::add_polarizations(field_type ft) {
+  Operation &op = add(OpKind::update_polarization, ft);
+  op.descriptor_index = uint32_t(plan_.polarization_updates.size());
+  if (!f_.descriptors) return;
+
+  for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
+    const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
+    if (descriptor.ft != ft || descriptor.kind != SusceptibilityKind::lorentzian) continue;
+    if (descriptor.chunk < 0 || descriptor.chunk >= f_.num_chunks)
+      meep::abort("polarization descriptor has invalid chunk");
+    fields_chunk &fc = *f_.chunks[descriptor.chunk];
+
+    for (size_t si = 0; si < descriptor.lorentzian_states.size(); ++si) {
+      const LorentzianStateArrays &state = descriptor.lorentzian_states[si];
+      const direction primary_direction = component_direction(state.c);
+      direction cross_direction1 = cycle_direction(fc.gv.dim, primary_direction, 1);
+      direction cross_direction2 = cycle_direction(fc.gv.dim, primary_direction, 2);
+      component cross_component1 = direction_component(state.c, cross_direction1);
+      component cross_component2 = direction_component(state.c, cross_direction2);
+      const int sigma_aux = descriptor.state_index * NUM_FIELD_TYPES + int(ft);
+
+      PolarizationUpdate update = {};
+      update.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
+                                  fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
+      update.state_index = descriptor.state_index;
+      update.p = state.p;
+      update.p_prev = state.p_prev;
+      update.primary_w = find_array(f_, descriptor.chunk, array_kind::f_w, int(state.c),
+                                    state.cmp, 0);
+      if (!is_valid(update.primary_w))
+        update.primary_w =
+            find_array(f_, descriptor.chunk, array_kind::f, int(state.c), state.cmp, 0);
+      update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f_w,
+                                   int(cross_component1), state.cmp, 0);
+      if (!is_valid(update.cross_w1))
+        update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f,
+                                     int(cross_component1), state.cmp, 0);
+      update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f_w,
+                                   int(cross_component2), state.cmp, 0);
+      if (!is_valid(update.cross_w2))
+        update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f,
+                                     int(cross_component2), state.cmp, 0);
+      update.diagonal_sigma = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                         int(primary_direction), sigma_aux);
+      update.offdiagonal_sigma1 =
+          is_valid(update.cross_w1)
+              ? find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                           int(cross_direction1), sigma_aux)
+              : invalid_array();
+      update.offdiagonal_sigma2 =
+          is_valid(update.cross_w2)
+              ? find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                           int(cross_direction2), sigma_aux)
+              : invalid_array();
+      const ptrdiff_t stride_sign = is_magnetic(state.c) ? -1 : 1;
+      update.primary_stride = stride_sign * fc.gv.stride(primary_direction);
+      update.cross_stride1 = stride_sign * fc.gv.stride(cross_direction1);
+      update.cross_stride2 = stride_sign * fc.gv.stride(cross_direction2);
+
+      if (is_valid(update.offdiagonal_sigma2) && !is_valid(update.offdiagonal_sigma1)) {
+        std::swap(update.cross_w1, update.cross_w2);
+        std::swap(update.offdiagonal_sigma1, update.offdiagonal_sigma2);
+        std::swap(update.cross_stride1, update.cross_stride2);
+      }
+
+      if (!is_valid(update.primary_w) || !is_valid(update.diagonal_sigma)) continue;
+      if (is_valid(update.offdiagonal_sigma1))
+        update.region.variant_key |= polarization_one_offdiagonal;
+      else
+        update.cross_w1 = invalid_array();
+      if (is_valid(update.offdiagonal_sigma2))
+        update.region.variant_key |= polarization_two_offdiagonals;
+      else
+        update.cross_w2 = invalid_array();
+      if (descriptor.lorentzian.drude) update.region.variant_key |= polarization_drude;
+      update.omega_0 = descriptor.lorentzian.omega_0;
+      update.gamma = descriptor.lorentzian.gamma;
+      update.dt = fc.dt;
+
+      plan_.polarization_updates.push_back(update);
+      add_access(f_, op, update.p, AccessMode::read_write);
+      add_access(f_, op, update.p_prev, AccessMode::read_write);
+      add_access(f_, op, update.primary_w, AccessMode::read);
+      add_access(f_, op, update.cross_w1, AccessMode::read);
+      add_access(f_, op, update.cross_w2, AccessMode::read);
+      add_access(f_, op, update.diagonal_sigma, AccessMode::read);
+      add_access(f_, op, update.offdiagonal_sigma1, AccessMode::read);
+      add_access(f_, op, update.offdiagonal_sigma2, AccessMode::read);
+    }
+  }
+  op.descriptor_count = uint32_t(plan_.polarization_updates.size()) - op.descriptor_index;
+}
+
 void StepPlanBuilder::add_db(field_type ft) {
   Operation &op = add(OpKind::update_db, ft);
   op.descriptor_index = uint32_t(plan_.db_updates.size());
@@ -747,7 +841,35 @@ void StepPlanBuilder::add_db(field_type ft) {
 void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
   Operation &op = add(OpKind::update_eh, ft, guard);
   op.descriptor_index = uint32_t(plan_.eh_updates.size());
+  op.polarization_subtraction_index = uint32_t(plan_.polarization_subtractions.size());
   const field_type ft2 = ft == E_stuff ? D_stuff : B_stuff;
+
+  if (f_.descriptors) {
+    for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
+      const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
+      if (descriptor.ft != ft || descriptor.kind != SusceptibilityKind::lorentzian) continue;
+      for (size_t si = 0; si < descriptor.lorentzian_states.size(); ++si) {
+        const LorentzianStateArrays &state = descriptor.lorentzian_states[si];
+        const component target_component = field_type_component(ft2, state.c);
+        const ArrayId target = find_array(f_, descriptor.chunk, array_kind::f_minus_p,
+                                          int(target_component), state.cmp, 0);
+        if (!is_valid(target)) continue;
+        PolarizationSubtraction subtraction;
+        subtraction.chunk = descriptor.chunk;
+        subtraction.c = state.c;
+        subtraction.cmp = state.cmp;
+        subtraction.state_index = descriptor.state_index;
+        subtraction.target = target;
+        subtraction.p = state.p;
+        subtraction.elements = state.elements;
+        plan_.polarization_subtractions.push_back(subtraction);
+        add_access(f_, op, subtraction.target, AccessMode::read_write);
+        add_access(f_, op, subtraction.p, AccessMode::read);
+      }
+    }
+  }
+  op.polarization_subtraction_count =
+      uint32_t(plan_.polarization_subtractions.size()) - op.polarization_subtraction_index;
 
   for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
     if (!f_.chunks[chunk]->is_mine()) continue;
@@ -916,7 +1038,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   if (has_sources) p.add_source_evaluation(guard_static(true), 0.5);
   p.add_eh(H_stuff);
   p.add_boundaries(WH_stuff);
-  p.add(OpKind::update_polarization, H_stuff);
+  p.add_polarizations(H_stuff);
   p.add_boundaries(PH_stuff);
   p.add_boundaries(H_stuff);
 
@@ -930,7 +1052,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   if (has_sources) p.add_source_evaluation(guard_static(true), 1.0);
   p.add_eh(E_stuff);
   p.add_boundaries(WE_stuff);
-  p.add(OpKind::update_polarization, E_stuff);
+  p.add_polarizations(E_stuff);
   p.add_boundaries(PE_stuff);
   p.add_boundaries(E_stuff);
 
