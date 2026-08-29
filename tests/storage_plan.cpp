@@ -36,6 +36,7 @@
 #include <meep.hpp>
 
 #include "backend/lifecycle.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/prepare.hpp"
 #include "backend/storage_plan.hpp"
@@ -179,6 +180,48 @@ static void test_polarization_halo_remap() {
   }
   catch (const std::overflow_error &) { rejected_ordinal = true; }
   CHECK(rejected_ordinal, "polarization storage key accepted an overflowing ordinal");
+}
+
+static void test_gyrotropic_storage_without_p_halos() {
+  grid_volume gv = vol3d(2.0, 2.0, 2.0, 8.0);
+  structure s(gv, eps_slab, pml(0.25), identity(), 2);
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.05);
+  s.add_susceptibility(unit_sigma, E_stuff, gyro);
+  fields f(&s);
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.advance(2);
+
+  size_t gyro_arrays = 0;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::gyrotropic) continue;
+    gyro_arrays += 6 * d.gyrotropic_states.size();
+    for (const GyrotropicStateArrays &state : d.gyrotropic_states)
+      for (int dd = 0; dd < 3; ++dd) {
+        const ArraySpec &p = f.array_catalog->spec(state.p[dd]);
+        const ArraySpec &pp = f.array_catalog->spec(state.p_prev[dd]);
+        CHECK(p.role == array_role::polarization && pp.role == array_role::polarization &&
+                  p.element_type == ElementType::realnum_value &&
+                  pp.element_type == ElementType::realnum_value,
+              "gyrotropic storage has incompatible metadata");
+      }
+  }
+  size_t p_halo_elements = 0;
+  for (const HaloPlan &plan : f.halos->plans) {
+    if (plan.ft != PE_stuff && plan.ft != PH_stuff) continue;
+    std::vector<ElementRef> refs;
+    expand_gather(plan, refs);
+    p_halo_elements += refs.size();
+    expand_scatter(plan, refs);
+    p_halo_elements += refs.size();
+  }
+  CHECK(or_to_all(gyro_arrays > 0 && gyro_arrays % 6 == 0),
+        "gyrotropic storage did not contain complete six-array rows");
+  CHECK(sum_to_all(p_halo_elements) == 0,
+        "gyrotropic polarization unexpectedly created PE/PH halo elements");
+  CHECK(audit_storage_catalog(f, *f.array_catalog, true) == 0,
+        "gyrotropic storage left uncatalogued arrays");
 }
 
 /* ------------------------------------------------------------------ */
@@ -523,6 +566,7 @@ int main(int argc, char **argv) {
   test_polarization_halo_remap();
   test_material_phase_storage_union();
   test_material_coefficient_storage();
+  test_gyrotropic_storage_without_p_halos();
 
   if (failures) {
     master_printf("storage_plan: %d FAILURE(S)\n", failures);
