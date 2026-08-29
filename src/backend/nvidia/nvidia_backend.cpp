@@ -27,10 +27,11 @@
 #include "backend/halo_plan.hpp"
 #include "backend/nvidia/arena.hpp"
 #include "backend/nvidia/nvidia_dft.hpp"
+#include "backend/nvidia/nvidia_magnetic.hpp"
+#include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
-#include "backend/nvidia/nvidia_polarization.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
@@ -107,6 +108,12 @@ size_t checked_product(size_t left, size_t right, const char *what) {
   if (left && right > std::numeric_limits<size_t>::max() / left)
     throw std::overflow_error(std::string("overflow while ") + what);
   return left * right;
+}
+
+size_t checked_add(size_t left, size_t right, const char *what) {
+  if (right > std::numeric_limits<size_t>::max() - left)
+    throw std::overflow_error(std::string("overflow while ") + what);
+  return left + right;
 }
 
 nvidia::arena_role arena_role_for(array_role role) {
@@ -359,7 +366,8 @@ public:
   NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device)
       : owner_(owner), plan_(plan), layout_(allocation_requests_for(plan_)), device_(device),
         fingerprint_(storage_fingerprint(plan_)), initialized_(false), transfer_failed_(false),
-        device_authoritative_(false) {
+        device_authoritative_(false), magnetic_snapshot_bytes_(0),
+        magnetic_snapshot_layout_fingerprint_(0), magnetic_snapshot_valid_(false) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_));
@@ -396,6 +404,10 @@ public:
   nvidia::pinned_buffer staging_;
   nvidia::device_buffer dft_reduction_result_;
   nvidia::device_buffer dft_reduction_partials_;
+  nvidia::device_buffer magnetic_snapshot_;
+  size_t magnetic_snapshot_bytes_;
+  uint64_t magnetic_snapshot_layout_fingerprint_;
+  bool magnetic_snapshot_valid_;
 };
 
 struct NvidiaCompiledOperation {
@@ -437,6 +449,15 @@ struct NvidiaFiniteCheck {
   StorageKey key;
 };
 
+struct NvidiaCompiledMagneticState {
+  void *live;
+  size_t backup_offset;
+  size_t elements;
+  size_t bytes;
+  nvidia::scalar_precision precision;
+  bool average;
+};
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, uint64_t signature, uint64_t storage_fingerprint,
@@ -465,6 +486,9 @@ public:
                        &polarization_subtractions,
                    const std::vector<nvidia::dft_launch> &dft_updates,
                    const std::vector<double> &dft_omega,
+                   const std::vector<NvidiaCompiledMagneticState> &magnetic_states,
+                   size_t magnetic_snapshot_bytes, uint64_t magnetic_layout_fingerprint,
+                   const MagneticHalfStep &magnetic_half_step,
                    size_t source_scalar_count, size_t source_staging_elements,
                    NvidiaBackendState &state)
       : owner_(owner), signature_(signature), storage_fingerprint_(storage_fingerprint),
@@ -478,7 +502,9 @@ public:
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
         polarization_subtractions_(polarization_subtractions), dft_updates_(dft_updates),
-        source_scalar_count_(source_scalar_count) {
+        magnetic_states_(magnetic_states), magnetic_snapshot_bytes_(magnetic_snapshot_bytes),
+        magnetic_layout_fingerprint_(magnetic_layout_fingerprint),
+        magnetic_half_step_(magnetic_half_step), source_scalar_count_(source_scalar_count) {
     try {
       nvidia::device_scope scope(state.device_);
       if (!halo_gathers.empty()) {
@@ -560,6 +586,10 @@ public:
   std::vector<nvidia::compiled_polarization_update> polarization_updates_;
   std::vector<nvidia::polarization_subtract_launch> polarization_subtractions_;
   std::vector<nvidia::dft_launch> dft_updates_;
+  std::vector<NvidiaCompiledMagneticState> magnetic_states_;
+  size_t magnetic_snapshot_bytes_;
+  uint64_t magnetic_layout_fingerprint_;
+  MagneticHalfStep magnetic_half_step_;
   size_t source_scalar_count_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
@@ -666,6 +696,68 @@ void *optional_mutable_device_address(NvidiaBackendState &state, ArrayId id,
   if (!is_valid(id)) return NULL;
   require_same_precision(state.plan_, id, precision, what);
   return state.arenas_->resolve(id.value).address;
+}
+
+array_kind magnetic_array_kind(MagneticStateFamily family) {
+  switch (family) {
+    case MagneticStateFamily::primary: return array_kind::f;
+    case MagneticStateFamily::u: return array_kind::f_u;
+    case MagneticStateFamily::w: return array_kind::f_w;
+    case MagneticStateFamily::conductivity: return array_kind::f_cond;
+    case MagneticStateFamily::bfast: return array_kind::f_bfast;
+  }
+  throw std::invalid_argument("NVIDIA magnetic state family is invalid");
+}
+
+NvidiaCompiledMagneticState compile_magnetic_state(const MagneticStateArray &source,
+                                                   NvidiaBackendState &state, const fields &f,
+                                                   size_t &next_offset) {
+  if (source.chunk < 0 || source.chunk >= f.num_chunks || !f.chunks[source.chunk] ||
+      !f.chunks[source.chunk]->is_mine())
+    throw std::out_of_range("NVIDIA magnetic state has an invalid chunk");
+  if (!is_B(source.c) && !is_magnetic(source.c))
+    throw std::invalid_argument("NVIDIA magnetic state has a nonmagnetic component");
+  if (source.cmp < 0 || source.cmp > 1)
+    throw std::invalid_argument("NVIDIA magnetic state has an invalid complex plane");
+  const nvidia::scalar_precision precision =
+      scalar_precision_for(state.plan_, source.live, "NVIDIA magnetic live state");
+  const ArraySpec &spec = state.plan_.arrays[source.live.value];
+  const StorageKey &key = state.plan_.keys[source.live.value];
+  if (spec.role != array_role::field || is_valid(spec.alias_of))
+    throw std::invalid_argument("NVIDIA magnetic state must name canonical field storage");
+  if (key.chunk != source.chunk || key.kind != int(magnetic_array_kind(source.family)) ||
+      key.component_ != int(source.c) || key.cmp != source.cmp || key.aux != 0)
+    throw std::invalid_argument("NVIDIA magnetic state identity does not match its ArrayId");
+  if (!source.elements || source.elements != spec.elements)
+    throw std::invalid_argument("NVIDIA magnetic state extent does not match its ArrayId");
+  if (source.average != (source.family == MagneticStateFamily::primary))
+    throw std::invalid_argument("NVIDIA magnetic state has an invalid average flag");
+
+  const size_t element_bytes = precision == nvidia::scalar_precision::f32 ? sizeof(float)
+                                                                           : sizeof(double);
+  const size_t padding = (element_bytes - next_offset % element_bytes) % element_bytes;
+  next_offset = checked_add(next_offset, padding, "aligning NVIDIA magnetic snapshot");
+  NvidiaCompiledMagneticState result = {
+      state.arenas_->resolve(source.live.value).address, next_offset, source.elements,
+      checked_product(source.elements, element_bytes, "sizing NVIDIA magnetic snapshot"),
+      precision, source.average};
+  next_offset = checked_add(next_offset, result.bytes, "laying out NVIDIA magnetic snapshot");
+  return result;
+}
+
+uint64_t magnetic_layout_fingerprint(uint64_t storage_fingerprint,
+                                     const std::vector<MagneticStateArray> &rows) {
+  uint64_t hash = mix_fingerprint(storage_fingerprint, rows.size());
+  for (const MagneticStateArray &row : rows) {
+    hash = mix_fingerprint(hash, uint64_t(int64_t(row.chunk)));
+    hash = mix_fingerprint(hash, uint64_t(int64_t(row.c)));
+    hash = mix_fingerprint(hash, uint64_t(int64_t(row.cmp)));
+    hash = mix_fingerprint(hash, uint64_t(row.family));
+    hash = mix_fingerprint(hash, row.live.value);
+    hash = mix_fingerprint(hash, row.elements);
+    hash = mix_fingerprint(hash, row.average ? 1 : 0);
+  }
+  return hash;
 }
 
 void validate_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t minimum, ptrdiff_t maximum,
@@ -2241,17 +2333,6 @@ bool has_polarization(const fields &f) {
   return false;
 }
 
-bool has_magnetic_backups(const StoragePlan &plan) {
-  for (size_t i = 0; i < plan.keys.size(); ++i) {
-    const int kind = plan.keys[i].kind;
-    if (kind == int(array_kind::f_backup) || kind == int(array_kind::f_u_backup) ||
-        kind == int(array_kind::f_w_backup) || kind == int(array_kind::f_cond_backup) ||
-        kind == int(array_kind::f_bfast_backup))
-      return true;
-  }
-  return false;
-}
-
 void set_reason(std::string &why, size_t operation, const char *detail) {
   std::ostringstream message;
   message << "NVIDIA PR2 unsupported operation at index " << operation << ": " << detail;
@@ -2463,8 +2544,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA cylindrical gyrotropic media are not supported");
       }
     }
-    if (has_magnetic_backups(state.plan_))
-      throw std::invalid_argument("NVIDIA PR2 does not support synchronized magnetic fields");
     if (!connections_are_current(f_))
       throw std::invalid_argument(
           "NVIDIA PR2 requires Phase 1 to finalize halo topology before backend compilation");
@@ -2513,6 +2592,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::polarization_subtract_launch> polarization_subtractions;
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
+    std::vector<NvidiaCompiledMagneticState> magnetic_states;
+    size_t magnetic_snapshot_bytes = 0;
     size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
     cylindrical_radial_prefixes.reserve(plan.cylindrical_radial_prefixes.size());
@@ -2529,6 +2610,29 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     for (const BfastUpdate &update : plan.bfast_updates)
       bfast_updates.push_back(compile_bfast(update, state, f_));
     std::vector<unsigned int> bfast_references(plan.bfast_updates.size(), 0);
+
+    const StepPlan canonical = build_step_plan(f_, plan.program);
+    if (canonical.magnetic_state_arrays.size() != plan.magnetic_state_arrays.size())
+      throw std::invalid_argument("NVIDIA magnetic snapshot descriptor count is non-canonical");
+    for (size_t i = 0; i < plan.magnetic_state_arrays.size(); ++i) {
+      const MagneticStateArray &got = plan.magnetic_state_arrays[i];
+      const MagneticStateArray &want = canonical.magnetic_state_arrays[i];
+      if (got.chunk != want.chunk || got.c != want.c || got.cmp != want.cmp ||
+          got.family != want.family || got.live != want.live || got.elements != want.elements ||
+          got.average != want.average)
+        throw std::invalid_argument("NVIDIA magnetic snapshot descriptors are non-canonical");
+      magnetic_states.push_back(
+          compile_magnetic_state(got, state, f_, magnetic_snapshot_bytes));
+    }
+    const MagneticHalfStep &got_half = plan.magnetic_half_step;
+    const MagneticHalfStep &want_half = canonical.magnetic_half_step;
+    if (got_half.evaluate_b_sources != want_half.evaluate_b_sources ||
+        got_half.update_b != want_half.update_b ||
+        got_half.apply_b_sources != want_half.apply_b_sources ||
+        got_half.transfer_b != want_half.transfer_b ||
+        got_half.evaluate_h_sources != want_half.evaluate_h_sources ||
+        got_half.update_h != want_half.update_h || got_half.transfer_h != want_half.transfer_h)
+      throw std::invalid_argument("NVIDIA magnetic half-step schedule is non-canonical");
 
     /* Capability validation is deliberately fail-fast. The first local reason
        is stable and actionable; the collective below only establishes that no
@@ -3027,9 +3131,14 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           break;
         }
         case OpKind::restore_magnetic_fields:
+        case OpKind::synchronize_magnetic_fields:
+          if (op.magnetic_state_index != 0 ||
+              op.magnetic_state_count != plan.magnetic_state_arrays.size())
+            set_reason(local_error, oi, "magnetic snapshot span is incomplete");
+          break;
         case OpKind::update_material_coefficients:
         case OpKind::increment_time:
-        case OpKind::synchronize_magnetic_fields: break;
+          break;
 
         case OpKind::phase_material:
         case OpKind::zero_boundary:
@@ -3077,11 +3186,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
        construction is deterministic from the live fields state, so compare the
        complete canonical content signature after the detailed diagnostics above
        have had a chance to identify malformed individual operands. */
-    if (local_error.empty() && f_.gv.dim == Dcyl) {
-      const StepPlan canonical = build_step_plan(f_, plan.program);
-      if (canonical.signature != plan.signature)
-        local_error = "NVIDIA cylindrical plan is incomplete or non-canonical";
-    }
+    if (local_error.empty() && canonical.signature != plan.signature)
+      local_error = "NVIDIA timestep plan is incomplete or non-canonical";
 
     if (local_error.empty())
       executable.reset(new NvidiaExecutable(
@@ -3091,6 +3197,9 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, finite_checks,
           source_batches, source_points, source_copies, polarization_updates,
           polarization_subtractions, dft_updates, dft_omega,
+          magnetic_states, magnetic_snapshot_bytes,
+          magnetic_layout_fingerprint(state.fingerprint_, plan.magnetic_state_arrays),
+          plan.magnetic_half_step,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, state));
   }
@@ -3107,6 +3216,180 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     throw std::runtime_error(local_error);
   }
   return executable.release();
+}
+
+void NvidiaBackend::preflight_magnetic_transition(Executable &raw_executable,
+                                                  BackendState &raw_state, bool synchronize) {
+  NvidiaExecutable &executable = checked_executable(raw_executable);
+  NvidiaBackendState &state = checked_state(raw_state);
+  if (!state.initialized_) throw std::logic_error("NVIDIA magnetic transition has no initialized state");
+  if (state.transfer_failed_)
+    throw std::logic_error("NVIDIA magnetic transition stream is unavailable");
+  if (executable.storage_fingerprint_ != state.fingerprint_)
+    throw std::logic_error("NVIDIA magnetic executable uses a stale storage layout");
+  if (synchronize) {
+    if (state.magnetic_snapshot_valid_)
+      throw std::logic_error("NVIDIA magnetic snapshot is already live");
+    if (state.magnetic_snapshot_.size() < executable.magnetic_snapshot_bytes_)
+      state.magnetic_snapshot_.allocate(executable.magnetic_snapshot_bytes_, state.device_);
+  }
+  else {
+    if (!state.magnetic_snapshot_valid_)
+      throw std::logic_error("NVIDIA magnetic restore has no live snapshot");
+    if (state.magnetic_snapshot_layout_fingerprint_ !=
+            executable.magnetic_layout_fingerprint_ ||
+        state.magnetic_snapshot_bytes_ != executable.magnetic_snapshot_bytes_)
+      throw std::logic_error("NVIDIA magnetic snapshot layout is stale");
+  }
+}
+
+void NvidiaBackend::execute_magnetic_half_step(NvidiaExecutable &executable,
+                                               NvidiaBackendState &state) {
+  /* The ordinary executor owns the same pinned source-staging ranges.  A
+     synchronization transition can follow an asynchronously queued step, so
+     finish those copies before rewriting the host staging memory. */
+  state.transfer_->synchronize();
+  f_.step_source_times[0] = f_.time();
+  f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
+  f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
+  const uint32_t schedule[] = {
+      executable.magnetic_half_step_.evaluate_b_sources,
+      executable.magnetic_half_step_.update_b,
+      executable.magnetic_half_step_.apply_b_sources,
+      executable.magnetic_half_step_.transfer_b,
+      executable.magnetic_half_step_.evaluate_h_sources,
+      executable.magnetic_half_step_.update_h,
+      executable.magnetic_half_step_.transfer_h};
+  for (int slot = 0; slot < 7; ++slot) {
+    if (schedule[slot] == UINT32_MAX) continue;
+    if (schedule[slot] >= executable.operations_.size())
+      throw std::logic_error("NVIDIA magnetic half-step operation is out of range");
+    const NvidiaCompiledOperation &op = executable.operations_[schedule[slot]];
+    switch (op.kind) {
+      case OpKind::evaluate_source_scalars: {
+        evaluate_supported_source_scalars(f_, op.source_time_offset);
+        const SourcePlan &source_plan = f_.descriptors->sources;
+        if (source_plan.scalars.size() != executable.source_scalar_count_ ||
+            op.count != executable.source_scalar_count_)
+          throw std::logic_error("NVIDIA magnetic source scalar block changed after compilation");
+        nvidia::source_scalar *staging =
+            static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+            op.source_staging_offset;
+        for (size_t i = 0; i < op.count; ++i) {
+          staging[i].current_real = source_plan.scalars[i].current.real();
+          staging[i].current_imag = source_plan.scalars[i].current.imag();
+          staging[i].dipole_real = source_plan.scalars[i].dipole.real();
+          staging[i].dipole_imag = source_plan.scalars[i].dipole.imag();
+        }
+        nvidia::copy_host_to_device_async(
+            executable.source_scalars_, 0, staging,
+            checked_product(op.count, sizeof(nvidia::source_scalar),
+                            "uploading NVIDIA magnetic source scalars"),
+            *state.transfer_);
+        break;
+      }
+      case OpKind::update_db:
+        for (size_t i = op.first; i < op.first + op.count; ++i) {
+          const uint32_t prefix = executable.curl_updates_[i].radial_prefix_index;
+          if (prefix != UINT32_MAX)
+            nvidia::launch_cylindrical_radial_prefix(
+                executable.cylindrical_radial_prefixes_[prefix], *state.transfer_);
+          nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
+          const uint32_t bfast = executable.curl_updates_[i].bfast_update_index;
+          if (bfast != UINT32_MAX)
+            nvidia::launch_bfast(executable.bfast_updates_[bfast], *state.transfer_);
+        }
+        for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i)
+          nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
+        for (size_t i = op.cylindrical_m_first;
+             i < op.cylindrical_m_first + op.cylindrical_m_count; ++i)
+          nvidia::launch_cylindrical_m(executable.cylindrical_m_updates_[i], *state.transfer_);
+        for (size_t i = op.cylindrical_origin_first;
+             i < op.cylindrical_origin_first + op.cylindrical_origin_count; ++i) {
+          const NvidiaCompiledCylindricalOriginAction &action =
+              executable.cylindrical_origin_actions_[i];
+          if (action.kind == CylindricalOriginActionKind::axis_update)
+            nvidia::launch_cylindrical_axis(executable.cylindrical_axis_updates_[action.index],
+                                            *state.transfer_);
+          else
+            nvidia::launch_zero(executable.zero_updates_[action.index], *state.transfer_);
+        }
+        break;
+      case OpKind::apply_sources:
+        for (size_t i = op.first; i < op.first + op.count; ++i)
+          nvidia::launch_source_batch(executable.source_batches_[i],
+                                      executable.source_scalars_.opaque_handle(),
+                                      *state.transfer_);
+        break;
+      case OpKind::update_eh:
+        for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i)
+          nvidia::launch_array_copy(executable.source_copies_[i], *state.transfer_);
+        for (size_t i = op.subtraction_first; i < op.subtraction_first + op.subtraction_count; ++i)
+          nvidia::launch_polarization_subtract(executable.polarization_subtractions_[i],
+                                               *state.transfer_);
+        for (size_t i = op.source_first; i < op.source_first + op.source_count; ++i)
+          nvidia::launch_source_batch(executable.source_batches_[i],
+                                      executable.source_scalars_.opaque_handle(),
+                                      *state.transfer_);
+        for (size_t i = op.first; i < op.first + op.count; ++i)
+          nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
+        break;
+      case OpKind::transfer_halo:
+        for (size_t i = op.first; i < op.first + op.count; ++i)
+          nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
+        for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i)
+          nvidia::launch_halo_gather(executable.halo_plans_[i].gather,
+                                     executable.halo_gathers_.opaque_handle(),
+                                     executable.halo_scratch_.opaque_handle(), *state.transfer_);
+        for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i)
+          nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
+                                      executable.halo_scatters_.opaque_handle(),
+                                      executable.halo_scratch_.opaque_handle(), *state.transfer_);
+        break;
+      default: throw std::logic_error("NVIDIA magnetic half-step contains an invalid operation");
+    }
+  }
+}
+
+void NvidiaBackend::synchronize_magnetic_fields(Executable &raw_executable,
+                                                BackendState &raw_state) {
+  NvidiaExecutable &executable = checked_executable(raw_executable);
+  NvidiaBackendState &state = checked_state(raw_state);
+  nvidia::device_scope scope(state.device_);
+  char *backup = static_cast<char *>(state.magnetic_snapshot_.opaque_handle());
+  for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+    nvidia::launch_magnetic_backup(
+        nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
+                                      row.precision},
+        *state.transfer_);
+  execute_magnetic_half_step(executable, state);
+  for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+    if (row.average)
+      nvidia::launch_magnetic_average(
+          nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
+                                        row.precision},
+          *state.transfer_);
+  state.transfer_->synchronize();
+  state.magnetic_snapshot_bytes_ = executable.magnetic_snapshot_bytes_;
+  state.magnetic_snapshot_layout_fingerprint_ = executable.magnetic_layout_fingerprint_;
+  state.magnetic_snapshot_valid_ = true;
+  state.device_authoritative_ = true;
+}
+
+void NvidiaBackend::restore_magnetic_fields(Executable &raw_executable,
+                                            BackendState &raw_state) {
+  NvidiaExecutable &executable = checked_executable(raw_executable);
+  NvidiaBackendState &state = checked_state(raw_state);
+  nvidia::device_scope scope(state.device_);
+  char *backup = static_cast<char *>(state.magnetic_snapshot_.opaque_handle());
+  for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+    nvidia::launch_magnetic_restore(
+        nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
+                                      row.precision},
+        *state.transfer_);
+  state.transfer_->synchronize();
+  state.magnetic_snapshot_valid_ = false;
+  state.device_authoritative_ = true;
 }
 
 void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state, int num_steps) {
@@ -3129,6 +3412,12 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
       for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
         const NvidiaCompiledOperation &op = executable.operations_[oi];
         switch (op.kind) {
+          case OpKind::restore_magnetic_fields:
+            if (f_.synchronized_magnetic_fields) {
+              preflight_magnetic_transition(executable, state, false);
+              restore_magnetic_fields(executable, state);
+            }
+            break;
           case OpKind::update_db:
             for (size_t i = op.first; i < op.first + op.count; ++i) {
               const uint32_t prefix = executable.curl_updates_[i].radial_prefix_index;
@@ -3222,6 +3511,12 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                                           *state.transfer_);
             break;
           case OpKind::increment_time: ++f_.t; break;
+          case OpKind::synchronize_magnetic_fields:
+            if (f_.synchronized_magnetic_fields) {
+              preflight_magnetic_transition(executable, state, true);
+              synchronize_magnetic_fields(executable, state);
+            }
+            break;
           case OpKind::update_dft:
             for (size_t i = op.first; i < op.first + op.count; ++i) {
               const nvidia::dft_launch &dft = executable.dft_updates_[i];
@@ -3280,6 +3575,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   }
   catch (...) {
     state.transfer_failed_ = true;
+    poison();
     throw;
   }
   state.device_authoritative_ = true;
