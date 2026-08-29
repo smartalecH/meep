@@ -136,15 +136,22 @@ struct rebuild_trace {
 
 struct access_trace {
   size_t reads;
+  size_t writes;
   size_t field_reads;
   size_t dft_reads;
+  size_t field_writes;
+  size_t dft_writes;
   size_t max_elements;
   int prepare_rebuilds;
   int fail_read_rank;
+  int fail_write_rank;
+  int fail_dft_read_rank;
+  int fail_dft_write_rank;
 
   access_trace()
-      : reads(0), field_reads(0), dft_reads(0), max_elements(0), prepare_rebuilds(0),
-        fail_read_rank(-1) {}
+      : reads(0), writes(0), field_reads(0), dft_reads(0), field_writes(0), dft_writes(0),
+        max_elements(0), prepare_rebuilds(0), fail_read_rank(-1), fail_write_rank(-1),
+        fail_dft_read_rank(-1), fail_dft_write_rank(-1) {}
 };
 
 struct compact_trace {
@@ -223,9 +230,10 @@ public:
   void advance(Executable &, BackendState &, int num_steps) override { f.t += num_steps; }
 
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override {
-    if (my_rank() == accesses.fail_read_rank)
-      throw std::runtime_error("injected rank-local backend read failure");
     const ArraySpec &spec = f.array_catalog->spec(ref.id);
+    if (my_rank() == accesses.fail_read_rank ||
+        (spec.role == array_role::dft && my_rank() == accesses.fail_dft_read_rank))
+      throw std::runtime_error("injected rank-local backend read failure");
     CHECK(bytes == ref.elements * host_element_bytes(spec.element_type),
           "backend host-range read byte count is inconsistent");
     ++accesses.reads;
@@ -242,6 +250,19 @@ public:
       for (size_t i = 0; i < ref.elements; ++i)
         values[i] = std::complex<realnum>(realnum(1.25), realnum(-0.75));
     }
+  }
+
+  void write(ArrayRef ref, const void *, size_t bytes) override {
+    const ArraySpec &spec = f.array_catalog->spec(ref.id);
+    if (my_rank() == accesses.fail_write_rank ||
+        (spec.role == array_role::dft && my_rank() == accesses.fail_dft_write_rank))
+      throw std::runtime_error("injected rank-local backend write failure");
+    CHECK(bytes == ref.elements * host_element_bytes(spec.element_type),
+          "backend host-range write byte count is inconsistent");
+    ++accesses.writes;
+    accesses.field_writes += spec.role == array_role::field;
+    accesses.dft_writes += spec.role == array_role::dft;
+    if (ref.elements > accesses.max_elements) accesses.max_elements = ref.elements;
   }
 
   void prepare_state_rebuild(BackendState &, DirtyMask reasons) override {
@@ -341,6 +362,122 @@ static std::complex<double> multiply_fields(const std::complex<realnum> *values,
                                             void *) {
   return values[0] * values[1];
 }
+
+#ifdef HAVE_HDF5
+static std::unique_ptr<binary_partition> uneven_repeated_partition() {
+  std::unique_ptr<binary_partition> tree(new binary_partition(3));
+  tree.reset(new binary_partition(split_plane{X, 0.9},
+                                  std::unique_ptr<binary_partition>(new binary_partition(2)),
+                                  std::move(tree)));
+  tree.reset(new binary_partition(split_plane{X, 0.3},
+                                  std::unique_ptr<binary_partition>(new binary_partition(1)),
+                                  std::move(tree)));
+  tree.reset(new binary_partition(split_plane{X, -0.3},
+                                  std::unique_ptr<binary_partition>(new binary_partition(0)),
+                                  std::move(tree)));
+  return std::unique_ptr<binary_partition>(new binary_partition(
+      split_plane{X, -0.9}, std::unique_ptr<binary_partition>(new binary_partition(0)),
+      std::move(tree)));
+}
+
+static void test_sharded_dft_checkpoint_ordering() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  std::unique_ptr<binary_partition> partition = uneven_repeated_partition();
+  structure *s = new structure(gv, eps_slab, boundary_region(), identity(), 0, 0.5, false,
+                               DEFAULT_SUBPIXEL_TOL, DEFAULT_SUBPIXEL_MAXEVAL, partition.get());
+  fields *f = new fields(s);
+  gaussian_src_time src(0.3, 0.1);
+  f->add_point_source(Ez, src, vec(0.11, 0.13));
+  f->require_component(Ez);
+  component component_ez = Ez;
+  dft_fields monitor = f->add_dft_fields(&component_ez, 1, f->v, 0.3, 0.3, 1,
+                                         /*use_centered_grid=*/true,
+                                         /*decimation_factor=*/1,
+                                         /*persist=*/true);
+
+  rebuild_trace rebuilds;
+  access_trace accesses;
+  f->backend = new access_tracking_backend(*f, rebuilds, accesses);
+  f->advance(2);
+
+  int owned_chunks = 0;
+  for (int i = 0; i < f->num_chunks; ++i)
+    owned_chunks += f->chunks[i]->is_mine();
+  if (count_processors() > 1)
+    CHECK(min_to_all(owned_chunks) < max_to_all(owned_chunks),
+          "custom checkpoint partition did not produce uneven ownership");
+  const int dft_failure_rank =
+      min_to_all(monitor.chunks ? my_rank() : count_processors());
+  CHECK(dft_failure_rank < count_processors(), "custom checkpoint monitor has no DFT owner");
+
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-sharded-dft-%ld-%d.h5", long(getpid()),
+           my_rank());
+
+  accesses.fail_dft_read_rank = dft_failure_rank;
+  bool dump_failure = false;
+  try { f->dump(filename, false); }
+  catch (const std::runtime_error &) { dump_failure = true; }
+  const int dump_failures = sum_to_all(int(dump_failure));
+  CHECK(dump_failures == count_processors(),
+        "sharded DFT dump failure was not reconciled at its outer boundary (%d/%d)",
+        dump_failures, count_processors());
+  accesses.fail_dft_read_rank = -1;
+  std::remove(filename);
+  all_wait();
+
+  f->dump(filename, false);
+  CHECK(sum_to_all(int(accesses.dft_reads)) > 0,
+        "sharded DFT dump did not refresh resident accumulators");
+
+  accesses.fail_dft_write_rank = dft_failure_rank;
+  bool load_failure = false;
+  try {
+    h5file file(filename, h5file::READONLY, false, true);
+    std::string local_error;
+    for (int i = 0; i < f->num_chunks; ++i)
+      if (f->chunks[i]->is_mine()) {
+        char dataname[32];
+        snprintf(dataname, sizeof(dataname), "chunk%02d", i);
+        load_dft_hdf5(f->chunks[i]->dft_chunks, dataname, &file, 0, false, &local_error);
+      }
+    backend_reconcile_host_access(local_error, "backend_api sharded DFT load");
+  }
+  catch (const std::runtime_error &) { load_failure = true; }
+  const int load_failures = sum_to_all(int(load_failure));
+  CHECK(load_failures == count_processors(),
+        "sharded DFT load failure was not reconciled at its outer boundary (%d/%d)",
+        load_failures, count_processors());
+  accesses.fail_dft_write_rank = -1;
+
+  {
+    h5file file(filename, h5file::READONLY, false, true);
+    std::string local_error;
+    for (int i = 0; i < f->num_chunks; ++i)
+      if (f->chunks[i]->is_mine()) {
+        char dataname[32];
+        snprintf(dataname, sizeof(dataname), "chunk%02d", i);
+        load_dft_hdf5(f->chunks[i]->dft_chunks, dataname, &file, 0, false, &local_error);
+      }
+    backend_reconcile_host_access(local_error, "backend_api sharded DFT load recovery");
+  }
+
+  f->load(filename, false);
+  const int restored_time = f->t;
+  f->advance(1);
+  CHECK(f->t == restored_time + 1, "execution did not continue after sharded DFT restore");
+  int rank = 0;
+  size_t dims[3] = {0, 0, 0};
+  std::unique_ptr<std::complex<realnum>[]> restored(
+      f->get_dft_array(monitor, Ez, 0, &rank, dims));
+  CHECK(restored.get() != NULL, "restored sharded DFT state could not be queried");
+
+  std::remove(filename);
+  monitor.remove();
+  delete f;
+  delete s;
+}
+#endif
 
 /* Selection: cpu accepted, nvidia and non-native precision rejected -- and
    rejected identically on every rank, since a rank that accepted while its
@@ -934,6 +1071,75 @@ static void test_backend_safe_host_access() {
         "DFT array read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
 
+  accesses.reads = accesses.writes = accesses.field_reads = accesses.dft_reads = 0;
+  accesses.field_writes = accesses.dft_writes = accesses.max_elements = 0;
+  backend_refresh_dft_chain(monitor.chunks, "backend_api DFT chain read");
+  CHECK(sum_to_all(int(accesses.dft_reads)) == sum_to_all(local_dft_chunks),
+        "DFT chain boundary did not read each local chunk exactly once");
+  backend_publish_dft_chain(monitor.chunks, "backend_api DFT chain write");
+  CHECK(sum_to_all(int(accesses.dft_writes)) == sum_to_all(local_dft_chunks),
+        "DFT chain boundary did not publish each local chunk exactly once");
+
+  accesses.fail_write_rank = 0;
+  bool dft_write_failure = false;
+  try { backend_publish_dft_chain(monitor.chunks, "backend_api injected DFT write"); }
+  catch (const std::runtime_error &) { dft_write_failure = true; }
+  CHECK(sum_to_all(int(dft_write_failure)) == count_processors(),
+        "rank-asymmetric DFT write failure was not reconciled on every rank");
+  accesses.fail_write_rank = -1;
+  backend_publish_dft_chain(monitor.chunks, "backend_api recovered DFT write");
+  const int time_before_recovery = f->t;
+  f->advance(1);
+  CHECK(f->t == time_before_recovery + 1,
+        "execution did not continue after a reconciled DFT write failure");
+
+  accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  dft_ldos ldos(frequencies, sizeof(frequencies) / sizeof(*frequencies));
+  ldos.update(*f);
+  CHECK(sum_to_all(int(accesses.field_reads)) > 0,
+        "LDOS update did not refresh its source-point fields");
+  CHECK(max_to_all(int(accesses.max_elements)) == 1,
+        "LDOS update read more than one field element at a time");
+
+  accesses.fail_read_rank = 0;
+  bool ldos_failure = false;
+  try { ldos.update(*f); }
+  catch (const std::runtime_error &) { ldos_failure = true; }
+  CHECK(sum_to_all(int(ldos_failure)) == count_processors(),
+        "rank-asymmetric LDOS read failure was not reconciled on every rank");
+  accesses.fail_read_rank = -1;
+  ldos.update(*f);
+
+  BackendState *state_before_magnetic_rejection = f->backend_state;
+  bool direct_magnetic_failure = false;
+  try { f->synchronize_magnetic_fields(); }
+  catch (const std::runtime_error &) { direct_magnetic_failure = true; }
+  CHECK(sum_to_all(int(direct_magnetic_failure)) == count_processors(),
+        "resident magnetic synchronization was not rejected on every rank");
+  CHECK(f->backend_state == state_before_magnetic_rejection,
+        "magnetic rejection replaced resident state");
+  bool repeated_magnetic_failure = false;
+  try { f->synchronize_magnetic_fields(); }
+  catch (const std::runtime_error &) { repeated_magnetic_failure = true; }
+  CHECK(sum_to_all(int(repeated_magnetic_failure)) == count_processors(),
+        "magnetic rejection changed nesting state before returning");
+
+  bool energy_magnetic_failure = false;
+  try { (void)f->field_energy_in_box(f->v); }
+  catch (const std::runtime_error &) { energy_magnetic_failure = true; }
+  CHECK(sum_to_all(int(energy_magnetic_failure)) == count_processors(),
+        "field_energy_in_box did not reject unsupported magnetic synchronization");
+
+  bool flux_magnetic_failure = false;
+  try { (void)f->flux_in_box(X, f->v); }
+  catch (const std::runtime_error &) { flux_magnetic_failure = true; }
+  CHECK(sum_to_all(int(flux_magnetic_failure)) == count_processors(),
+        "flux_in_box did not reject unsupported magnetic synchronization");
+  const int time_before_magnetic_recovery = f->t;
+  f->advance(1);
+  CHECK(f->t == time_before_magnetic_recovery + 1,
+        "execution did not continue after magnetic-sync rejection");
+
   dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where,
                 NO_DIRECTION, true);
   flux.monitor_lifetime = monitor.monitor_lifetime;
@@ -1190,6 +1396,9 @@ int main(int argc, char **argv) {
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();
   test_backend_safe_host_access();
+#ifdef HAVE_HDF5
+  test_sharded_dft_checkpoint_ordering();
+#endif
   test_compact_dft_reduction_boundary();
 
   if (failures) {
