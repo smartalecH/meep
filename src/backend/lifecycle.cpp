@@ -169,6 +169,8 @@ bool needs_connection_sync(const fields &f) {
   return f.local_invalidation_generation != f.local_invalidation_synced;
 }
 
+bool legacy_material_change_pending(const fields &f) { return f.changed_materials; }
+
 void note_connection_sync_done(fields &f) {
   f.local_invalidation_synced = f.local_invalidation_generation;
 }

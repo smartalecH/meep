@@ -76,6 +76,11 @@ std::unique_ptr<PreparedMaterialPhaseStorage> prepare_material_phase_storage(
     fields &f, const structure &target);
 std::unique_ptr<PreparedMaterialPhaseStorage> prepare_material_phase_storage(fields &f);
 
+/* Deterministic allocation-failure seam for the backend contract tests.  A
+   negative rank disables it; otherwise preparation throws after staging the
+   requested number of owned replacement chunks on that rank. */
+void set_material_phase_prepare_failure_for_testing(int rank, int after_chunks);
+
 /* Debug-only: assert the lazy paths have nothing left to do. Compiled out with
    NDEBUG; the assertions-on CI configuration is what gives these value. */
 void assert_step_db_prepared(const fields_chunk &fc, field_type ft);

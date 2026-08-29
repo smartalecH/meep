@@ -16,6 +16,10 @@
 */
 
 #include <algorithm>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <string>
 #include <utility>
 #include <stdio.h>
 #include <string.h>
@@ -28,6 +32,7 @@
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/prepare.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/descriptors.hpp"
@@ -35,6 +40,67 @@
 using namespace std;
 
 namespace meep {
+
+namespace {
+
+void release_structure_reference(structure_chunk *chunk) {
+  if (chunk && chunk->refcount-- <= 1) delete chunk;
+}
+
+class staged_material_targets {
+public:
+  staged_material_targets(fields &owner, const structure &target)
+      : owner_(owner), targets_(size_t(owner.num_chunks), NULL), committed_(false) {
+    for (int i = 0; i < owner_.num_chunks; ++i) {
+      if (!owner_.chunks[i]->is_mine()) continue;
+      targets_[size_t(i)] = target.chunks[i];
+      ++targets_[size_t(i)]->refcount;
+    }
+  }
+
+  ~staged_material_targets() {
+    if (committed_) return;
+    for (structure_chunk *target : targets_)
+      release_structure_reference(target);
+  }
+
+  void commit() {
+    if (committed_) return;
+    for (int i = 0; i < owner_.num_chunks; ++i) {
+      structure_chunk *target = targets_[size_t(i)];
+      if (!target) continue;
+      structure_chunk *old = owner_.chunks[i]->new_s;
+      owner_.chunks[i]->new_s = target;
+      targets_[size_t(i)] = NULL;
+      release_structure_reference(old);
+    }
+    committed_ = true;
+  }
+
+private:
+  fields &owner_;
+  std::vector<structure_chunk *> targets_;
+  bool committed_;
+};
+
+bool same_material_phase_grid(const structure_chunk &current, const structure_chunk &target) {
+  if (current.a != target.a || current.v != target.v || current.n_proc() != target.n_proc() ||
+      current.is_mine() != target.is_mine() || current.gv.dim != target.gv.dim ||
+      current.gv.a != target.gv.a || current.gv.ntot() != target.gv.ntot() ||
+      current.gv.little_corner() != target.gv.little_corner() ||
+      current.gv.big_corner() != target.gv.big_corner())
+    return false;
+  for (int axis = 0; axis < 3; ++axis) {
+    const direction d = current.gv.yucky_direction(axis);
+    if (target.gv.yucky_direction(axis) != d ||
+        current.gv.num_direction(d) != target.gv.num_direction(d) ||
+        current.gv.stride(d) != target.gv.stride(d))
+      return false;
+  }
+  return true;
+}
+
+} // namespace
 
 fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylorigin,
                int loop_tile_base_db, int loop_tile_base_eh, std::vector<double> bfast_scaled_k)
@@ -387,7 +453,7 @@ fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv)
   zero_fields_near_cylorigin = thef.zero_fields_near_cylorigin;
   beta = thef.beta;
   new_s = thef.new_s;
-  new_s->refcount++;
+  if (new_s) new_s->refcount++;
   is_real = thef.is_real;
   a = thef.a;
   Courant = thef.Courant;
@@ -783,14 +849,67 @@ bool fields::has_nonlinearities(bool parallel) const {
 }
 
 int fields::phase_in_material(const structure *snew, double time) {
-  if (snew->num_chunks != num_chunks)
-    meep::abort("Can only phase in similar sets of chunks: %d vs %d\n", snew->num_chunks,
-                num_chunks);
-  for (int i = 0; i < num_chunks; i++)
-    if (chunks[i]->is_mine()) chunks[i]->phase_in_material(snew->chunks[i]);
-  phasein_time = (int)(time / dt);
+  std::string local_error;
+  int next_phasein_time = 0;
+  if (!snew)
+    local_error = "material phase target is null";
+  else if (!std::isfinite(time) || !std::isfinite(dt) || dt <= 0 ||
+           time / dt < std::numeric_limits<int>::min() ||
+           time / dt > std::numeric_limits<int>::max())
+    local_error = "material phase duration is not a finite representable step count";
+  else {
+    next_phasein_time = int(time / dt);
+    if (snew->num_chunks != num_chunks || snew->a != a || snew->v != v ||
+        snew->gv.dim != gv.dim || snew->gv.a != gv.a || snew->gv.ntot() != gv.ntot() ||
+        snew->gv.little_corner() != gv.little_corner() ||
+        snew->gv.big_corner() != gv.big_corner())
+      local_error = "material phase target has incompatible global topology";
+  }
+  if (local_error.empty())
+    for (int i = 0; i < num_chunks; ++i)
+      if (!snew->chunks[i] || !same_material_phase_grid(*chunks[i]->s, *snew->chunks[i])) {
+        local_error = "material phase target has incompatible chunk topology";
+        break;
+      }
+  if (local_error.empty() && backend && backend->requires_full_storage_preparation()) {
+    if (backend->is_poisoned())
+      local_error = "cannot phase material after the resident backend was poisoned";
+    else if (synchronized_magnetic_fields)
+      local_error = "cannot phase material while magnetic fields are synchronized";
+  }
+  backend_reconcile_host_access(local_error, "fields::phase_in_material validation");
+
+  std::unique_ptr<staged_material_targets> staged_targets;
+  std::unique_ptr<PreparedMaterialPhaseStorage> prepared_storage;
+  local_error.clear();
+  try {
+    staged_targets.reset(new staged_material_targets(*this, *snew));
+    if (backend && backend->requires_full_storage_preparation())
+      prepared_storage = prepare_material_phase_storage(*this, *snew);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown material phase storage preparation failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::phase_in_material preparation");
+
+  const bool resident = backend && backend->requires_full_storage_preparation();
+  if (resident)
+    backend_preflight_field_layout_change(
+        *this, DirtyMask(dirty_storage | dirty_initialization | dirty_classification |
+                         dirty_executable),
+        "fields::phase_in_material resident rebuild");
+
+  /* Everything after the last collective boundary is a no-throw ownership
+     transfer.  Publish the new representation and lifecycle state together. */
+  if (resident) backend_commit_field_layout_change(*this);
+  if (prepared_storage) prepared_storage->commit();
+  staged_targets->commit();
+  phasein_time = next_phasein_time;
   /* Only owned chunks were touched above, so this is rank-local. */
-  invalidate(*this, MutationKind::material_phase);
+  invalidate(*this, MutationKind::material_phase, "fields::phase_in_material");
   mark_local_invalidation(*this);
   changed_materials = true;
   // FIXME: how to handle changes in susceptibilities?
@@ -798,8 +917,11 @@ int fields::phase_in_material(const structure *snew, double time) {
 }
 
 void fields_chunk::phase_in_material(structure_chunk *snew) {
+  if (new_s == snew) return;
+  ++snew->refcount;
+  structure_chunk *old = new_s;
   new_s = snew;
-  new_s->refcount++;
+  release_structure_reference(old);
 }
 
 int fields::is_phasing() { return phasein_time > 0; }
