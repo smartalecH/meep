@@ -176,6 +176,12 @@ void backend_reconcile_host_access(const std::string &local_error, const char *s
    catalogued storage. Every rank must enter this boundary together. */
 void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const char *site);
 
+/* Split form used by multi-resource transactions: preflight/migrate while the
+   old representation remains live, then retire it only after every other
+   fallible preparation has succeeded collectively. */
+void backend_preflight_field_layout_change(fields &f, DirtyMask reasons, const char *site);
+void backend_commit_field_layout_change(fields &f);
+
 /* Refresh the exact contiguous field envelopes touched by a legacy
    loop_in_chunks consumer, then reconcile any rank-local read failure before
    the consumer reaches an MPI or HDF5 collective. */
