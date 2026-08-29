@@ -889,6 +889,64 @@ static void test_material_phase_transaction() {
   delete current;
 }
 
+static void test_material_phase_cpu_to_resident_preparation() {
+  const grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure current(gv, eps_slab, pml(0.5));
+  structure target(gv, unit_epsilon, pml(0.5));
+  target.set_conductivity(Dz, phase_conductivity);
+  fields f(&current);
+  CHECK(f.phase_in_material(&target, 2.0 * f.dt) == 2,
+        "CPU material setup did not retain its countdown");
+
+  std::vector<structure_chunk *> before(size_t(f.num_chunks), NULL);
+  std::vector<int> target_refs(size_t(target.num_chunks), 0);
+  for (int i = 0; i < f.num_chunks; ++i) {
+    before[size_t(i)] = f.chunks[i]->s;
+    target_refs[size_t(i)] = target.chunks[i]->refcount;
+    if (f.chunks[i]->is_mine())
+      CHECK(!f.chunks[i]->s->conductivity[Dz][Z],
+            "CPU-only material setup eagerly realized resident storage");
+  }
+
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  set_material_phase_prepare_failure_for_testing(0, 1);
+  bool rejected = false;
+  try {
+    f.init_backend();
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  set_material_phase_prepare_failure_for_testing(-1, -1);
+  CHECK(sum_to_all(int(rejected)) == count_processors(),
+        "rank-asymmetric resident material preparation was not rejected collectively");
+  CHECK(!f.backend_state && f.phasein_time == 2,
+        "failed resident material preparation changed state or countdown");
+  for (int i = 0; i < f.num_chunks; ++i) {
+    CHECK(f.chunks[i]->s == before[size_t(i)],
+          "failed resident material preparation committed a current chunk");
+    if (f.chunks[i]->is_mine())
+      CHECK(f.chunks[i]->new_s == target.chunks[i] &&
+                target.chunks[i]->refcount == target_refs[size_t(i)],
+            "failed resident material preparation changed target ownership");
+  }
+
+  f.init_backend();
+  CHECK(f.backend_state && f.phasein_time == 2,
+        "resident material preparation retry did not create state");
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine()) {
+      CHECK(f.chunks[i]->s != before[size_t(i)] && f.chunks[i]->s->refcount == 1,
+            "resident material preparation did not detach current storage");
+      CHECK(f.chunks[i]->s->conductivity[Dz][Z] && f.chunks[i]->s->condinv[Dz][Z],
+            "resident material preparation did not realize the target storage union");
+      CHECK(f.chunks[i]->new_s == target.chunks[i] &&
+                target.chunks[i]->refcount == target_refs[size_t(i)],
+            "resident material preparation retry changed target ownership");
+    }
+}
+
 static std::complex<double> multiply_fields(const std::complex<realnum> *values, const vec &,
                                             void *) {
   return values[0] * values[1];
@@ -2389,6 +2447,7 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_BACKEND_API_MATERIAL_ONLY")) {
     test_material_phase_transaction();
+    test_material_phase_cpu_to_resident_preparation();
     if (failures) return 1;
     master_printf("backend_api: material checks passed\n");
     return 0;
@@ -2404,6 +2463,7 @@ int main(int argc, char **argv) {
   test_backend_reselection_invalidates_representation();
   test_resident_magnetic_dispatch();
   test_material_phase_transaction();
+  test_material_phase_cpu_to_resident_preparation();
   test_resident_polarization_preparation();
   test_resident_beta_fingerprint();
   test_resident_bfast_fingerprint();
