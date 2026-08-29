@@ -29,9 +29,25 @@
 #include "backend/nvidia/runtime.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
+#include "backend/nvidia/nvidia_polarization.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
+
+namespace nvidia {
+
+polarization_coefficients derive_polarization_coefficients(double omega_0, double gamma,
+                                                           double dt_value, bool drude) {
+  const realnum omega2pi = 2 * pi * omega_0, g2pi = gamma * 2 * pi;
+  const realnum dt = dt_value;
+  const realnum omega0dtsqr = omega2pi * omega2pi * dt * dt;
+  const realnum gamma1inv = 1 / (1 + g2pi * dt / 2), gamma1 = (1 - g2pi * dt / 2);
+  polarization_coefficients result = {double(omega0dtsqr), double(gamma1inv), double(gamma1),
+                                      drude ? 0.0 : double(omega0dtsqr)};
+  return result;
+}
+
+} // namespace nvidia
 
 namespace {
 
@@ -337,6 +353,10 @@ struct NvidiaCompiledOperation {
   size_t source_count;
   size_t copy_first;
   size_t copy_count;
+  size_t polarization_first;
+  size_t polarization_count;
+  size_t subtraction_first;
+  size_t subtraction_count;
   size_t source_staging_offset;
   double source_time_offset;
 };
@@ -366,6 +386,9 @@ public:
                    const std::vector<nvidia::source_batch_launch> &source_batches,
                    const std::vector<nvidia::source_point> &source_points,
                    const std::vector<nvidia::array_copy_launch> &source_copies,
+                   const std::vector<nvidia::polarization_update_launch> &polarization_updates,
+                   const std::vector<nvidia::polarization_subtract_launch>
+                       &polarization_subtractions,
                    const std::vector<nvidia::dft_launch> &dft_updates,
                    const std::vector<double> &dft_omega,
                    size_t source_scalar_count, size_t source_staging_elements,
@@ -375,7 +398,8 @@ public:
         operations_(operations), curl_updates_(curl_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
-        source_copies_(source_copies), dft_updates_(dft_updates),
+        source_copies_(source_copies), polarization_updates_(polarization_updates),
+        polarization_subtractions_(polarization_subtractions), dft_updates_(dft_updates),
         source_scalar_count_(source_scalar_count) {
     try {
       nvidia::device_scope scope(state.device_);
@@ -452,6 +476,8 @@ public:
   std::vector<NvidiaFiniteCheck> finite_checks_;
   std::vector<nvidia::source_batch_launch> source_batches_;
   std::vector<nvidia::array_copy_launch> source_copies_;
+  std::vector<nvidia::polarization_update_launch> polarization_updates_;
+  std::vector<nvidia::polarization_subtract_launch> polarization_subtractions_;
   std::vector<nvidia::dft_launch> dft_updates_;
   size_t source_scalar_count_;
   nvidia::device_buffer halo_gathers_;
@@ -752,6 +778,118 @@ void validate_shifted_index_range(const StoragePlan &plan, ArrayId id, ptrdiff_t
   const ptrdiff_t maximum_offset = std::max(std::max(offset0, offset1), std::max(offset2, offset3));
   validate_index_range(plan, id, checked_shift(region_min, minimum_offset, what),
                        checked_shift(region_max, maximum_offset, what), what);
+}
+
+nvidia::polarization_update_launch compile_polarization_update(
+    const PolarizationUpdate &source, NvidiaBackendState &state) {
+  const uint32_t supported = polarization_one_offdiagonal | polarization_two_offdiagonals |
+                             polarization_drude;
+  if (source.region.variant_key & ~supported)
+    throw std::invalid_argument("polarization descriptor has unknown variant bits");
+  const bool have_cross1 = source.region.variant_key & polarization_one_offdiagonal;
+  const bool have_cross2 = source.region.variant_key & polarization_two_offdiagonals;
+  if (have_cross2 && !have_cross1)
+    throw std::invalid_argument("polarization descriptor has a second off-diagonal without first");
+  if (have_cross1 != (is_valid(source.cross_w1) && is_valid(source.offdiagonal_sigma1)) ||
+      have_cross2 != (is_valid(source.cross_w2) && is_valid(source.offdiagonal_sigma2)))
+    throw std::invalid_argument("polarization descriptor anisotropy bits and operands disagree");
+  if (!is_valid(source.p) || !is_valid(source.p_prev) || !is_valid(source.primary_w) ||
+      !is_valid(source.diagonal_sigma) || source.p == source.p_prev)
+    throw std::invalid_argument("polarization descriptor has incomplete state");
+
+  nvidia::polarization_update_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.p, "polarization P");
+  require_same_precision(state.plan_, source.p_prev, result.precision, "polarization P_prev");
+  require_same_precision(state.plan_, source.primary_w, result.precision, "polarization W");
+  require_same_precision(state.plan_, source.diagonal_sigma, result.precision,
+                         "polarization diagonal sigma");
+  require_same_precision(state.plan_, source.cross_w1, result.precision,
+                         "polarization cross W1");
+  require_same_precision(state.plan_, source.cross_w2, result.precision,
+                         "polarization cross W2");
+  require_same_precision(state.plan_, source.offdiagonal_sigma1, result.precision,
+                         "polarization off-diagonal sigma1");
+  require_same_precision(state.plan_, source.offdiagonal_sigma2, result.precision,
+                         "polarization off-diagonal sigma2");
+  result.p = device_address(state, source.p, "polarization P");
+  result.p_prev = device_address(state, source.p_prev, "polarization P_prev");
+  result.primary_w = device_address(state, source.primary_w, "polarization W");
+  result.diagonal_sigma =
+      device_address(state, source.diagonal_sigma, "polarization diagonal sigma");
+  result.cross_w1 = optional_device_address(state, source.cross_w1, result.precision,
+                                            "polarization cross W1");
+  result.cross_w2 = optional_device_address(state, source.cross_w2, result.precision,
+                                            "polarization cross W2");
+  result.offdiagonal_sigma1 = optional_device_address(
+      state, source.offdiagonal_sigma1, result.precision, "polarization off-diagonal sigma1");
+  result.offdiagonal_sigma2 = optional_device_address(
+      state, source.offdiagonal_sigma2, result.precision, "polarization off-diagonal sigma2");
+  result.primary_stride = source.primary_stride;
+  result.cross_stride1 = source.cross_stride1;
+  result.cross_stride2 = source.cross_stride2;
+  result.drude = (source.region.variant_key & polarization_drude) != 0;
+  const nvidia::polarization_coefficients coefficients = nvidia::derive_polarization_coefficients(
+      source.omega_0, source.gamma, source.dt, result.drude);
+  result.omega0dtsqr = coefficients.omega0dtsqr;
+  result.gamma1inv = coefficients.gamma1inv;
+  result.gamma1 = coefficients.gamma1;
+  result.omega0dtsqr_denom = coefficients.omega0dtsqr_denom;
+  result.offdiagonals = have_cross2 ? 2 : have_cross1 ? 1 : 0;
+
+  const ptrdiff_t region_min = ptrdiff_t(result.region.base);
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.p, region_min, region_max, "polarization P");
+  validate_index_range(state.plan_, source.p_prev, region_min, region_max, "polarization P_prev");
+  validate_index_range(state.plan_, source.primary_w, region_min, region_max, "polarization W");
+  validate_index_range(state.plan_, source.diagonal_sigma, region_min, region_max,
+                       "polarization diagonal sigma");
+  if (have_cross1) {
+    const ptrdiff_t negative_cross =
+        checked_negate(source.cross_stride1, "polarization cross1");
+    const ptrdiff_t combined =
+        checked_shift(source.primary_stride, negative_cross, "polarization cross1");
+    validate_shifted_index_range(state.plan_, source.cross_w1, region_min, region_max, 0,
+                                 negative_cross, source.primary_stride, combined,
+                                 "polarization cross W1");
+    validate_shifted_index_range(state.plan_, source.offdiagonal_sigma1, region_min, region_max, 0,
+                                 source.primary_stride, 0, source.primary_stride,
+                                 "polarization off-diagonal sigma1");
+  }
+  if (have_cross2) {
+    const ptrdiff_t negative_cross =
+        checked_negate(source.cross_stride2, "polarization cross2");
+    const ptrdiff_t combined =
+        checked_shift(source.primary_stride, negative_cross, "polarization cross2");
+    validate_shifted_index_range(state.plan_, source.cross_w2, region_min, region_max, 0,
+                                 negative_cross, source.primary_stride, combined,
+                                 "polarization cross W2");
+    validate_shifted_index_range(state.plan_, source.offdiagonal_sigma2, region_min, region_max, 0,
+                                 source.primary_stride, 0, source.primary_stride,
+                                 "polarization off-diagonal sigma2");
+  }
+  return result;
+}
+
+nvidia::polarization_subtract_launch compile_polarization_subtraction(
+    const PolarizationSubtraction &source, NvidiaBackendState &state) {
+  if (!is_valid(source.target) || !is_valid(source.p) || source.target == source.p ||
+      !source.elements)
+    throw std::invalid_argument("polarization subtraction has invalid operands");
+  if (source.target.value >= state.plan_.arrays.size() || source.p.value >= state.plan_.arrays.size())
+    throw std::out_of_range("polarization subtraction ArrayId is out of range");
+  const ArraySpec &target_spec = state.plan_.arrays[source.target.value];
+  const ArraySpec &p_spec = state.plan_.arrays[source.p.value];
+  if (source.elements != target_spec.elements || source.elements != p_spec.elements)
+    throw std::out_of_range("polarization subtraction is not a full-array operation");
+  nvidia::polarization_subtract_launch result = {};
+  result.precision = scalar_precision_for(state.plan_, source.target,
+                                          "polarization subtraction target");
+  require_same_precision(state.plan_, source.p, result.precision, "polarization subtraction P");
+  result.target = device_address(state, source.target, "polarization subtraction target");
+  result.p = device_address(state, source.p, "polarization subtraction P");
+  result.elements = source.elements;
+  return result;
 }
 
 nvidia::dft_launch compile_dft(const DftDescriptor &source, const fields &f,
@@ -1463,8 +1601,26 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
     if (f_.fluxes)
       throw std::invalid_argument("NVIDIA PR3 does not support legacy time-domain flux monitors");
-    if (has_polarization(f_))
-      throw std::invalid_argument("NVIDIA PR2 source-free slice does not support dispersion");
+    if (has_polarization(f_) && !f_.descriptors)
+      throw std::invalid_argument("NVIDIA dispersion state has no prepared descriptors");
+    if (f_.descriptors) {
+      size_t live_states = 0;
+      for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+        if (!f_.chunks[chunk]->is_mine()) continue;
+        FOR_FIELD_TYPES(ft) for (polarization_state *p = f_.chunks[chunk]->pol[ft]; p;
+                                p = p->next) ++live_states;
+      }
+      if (live_states != f_.descriptors->polarizations.size())
+        throw std::invalid_argument("NVIDIA dispersion descriptors are stale");
+      for (size_t i = 0; i < f_.descriptors->polarizations.size(); ++i) {
+        const PolarizationDescriptor &d = f_.descriptors->polarizations[i];
+        if (d.kind != SusceptibilityKind::lorentzian)
+          throw std::invalid_argument(std::string("NVIDIA does not support polarization kind ") +
+                                      susceptibility_kind_name(d.kind));
+        if (d.lorentzian_states.empty())
+          throw std::invalid_argument("NVIDIA Lorentzian descriptor has no resident state");
+      }
+    }
     if (has_magnetic_backups(state.plan_))
       throw std::invalid_argument("NVIDIA PR2 does not support synchronized magnetic fields");
     if (!connections_are_current(f_))
@@ -1505,6 +1661,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::source_batch_launch> source_batches;
     std::vector<nvidia::source_point> source_points;
     std::vector<nvidia::array_copy_launch> source_copies;
+    std::vector<nvidia::polarization_update_launch> polarization_updates;
+    std::vector<nvidia::polarization_subtract_launch> polarization_subtractions;
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
     size_t source_staging_elements = 0;
@@ -1565,6 +1723,21 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           }
           compiled.count = constitutive_updates.size() - compiled.first;
           compiled.copy_count = source_copies.size() - compiled.copy_first;
+
+          if (size_t(op.polarization_subtraction_index) + op.polarization_subtraction_count >
+              plan.polarization_subtractions.size()) {
+            set_reason(local_error, oi, "polarization subtraction span is out of range");
+            break;
+          }
+          compiled.subtraction_first = polarization_subtractions.size();
+          for (size_t i = op.polarization_subtraction_index;
+               i < size_t(op.polarization_subtraction_index) +
+                       op.polarization_subtraction_count;
+               ++i)
+            polarization_subtractions.push_back(
+                compile_polarization_subtraction(plan.polarization_subtractions[i], state));
+          compiled.subtraction_count =
+              polarization_subtractions.size() - compiled.subtraction_first;
 
           if (op.source_descriptor_count) {
             if (!source_plan) {
@@ -1708,9 +1881,23 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           compiled.count = dft_updates.size() - compiled.first;
           break;
         }
+        case OpKind::update_polarization: {
+          if (size_t(op.descriptor_index) + op.descriptor_count >
+              plan.polarization_updates.size()) {
+            set_reason(local_error, oi, "polarization update span is out of range");
+            break;
+          }
+          compiled.polarization_first = polarization_updates.size();
+          for (size_t i = op.descriptor_index;
+               i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
+            polarization_updates.push_back(
+                compile_polarization_update(plan.polarization_updates[i], state));
+          compiled.polarization_count =
+              polarization_updates.size() - compiled.polarization_first;
+          break;
+        }
         case OpKind::restore_magnetic_fields:
         case OpKind::update_material_coefficients:
-        case OpKind::update_polarization:
         case OpKind::increment_time:
         case OpKind::synchronize_magnetic_fields: break;
 
@@ -1736,7 +1923,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
           constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
           halo_scratch_bytes, finite_checks, source_batches, source_points, source_copies,
-          dft_updates, dft_omega,
+          polarization_updates,
+          polarization_subtractions, dft_updates, dft_omega,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, state));
   }
@@ -1782,12 +1970,22 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
           case OpKind::update_eh:
             for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i)
               nvidia::launch_array_copy(executable.source_copies_[i], *state.transfer_);
+            for (size_t i = op.subtraction_first; i < op.subtraction_first + op.subtraction_count;
+                 ++i)
+              nvidia::launch_polarization_subtract(executable.polarization_subtractions_[i],
+                                                   *state.transfer_);
             for (size_t i = op.source_first; i < op.source_first + op.source_count; ++i)
               nvidia::launch_source_batch(executable.source_batches_[i],
                                           executable.source_scalars_.opaque_handle(),
                                           *state.transfer_);
             for (size_t i = op.first; i < op.first + op.count; ++i)
               nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
+            break;
+          case OpKind::update_polarization:
+            for (size_t i = op.polarization_first;
+                 i < op.polarization_first + op.polarization_count; ++i)
+              nvidia::launch_polarization_update(executable.polarization_updates_[i],
+                                                 *state.transfer_);
             break;
           case OpKind::transfer_halo:
             for (size_t i = op.first; i < op.first + op.count; ++i)
