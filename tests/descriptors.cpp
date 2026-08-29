@@ -72,6 +72,16 @@ public:
   }
 };
 
+class inherited_gyrotropic_susceptibility : public gyrotropic_susceptibility {
+public:
+  inherited_gyrotropic_susceptibility()
+      : gyrotropic_susceptibility(vec(0.17, -0.23, 0.31), 0.8, 0.05, 0.07,
+                                  GYROTROPIC_LORENTZIAN) {}
+  virtual susceptibility *clone() const {
+    return new inherited_gyrotropic_susceptibility(*this);
+  }
+};
+
 class derived_gaussian_source : public gaussian_src_time {
 public:
   derived_gaussian_source() : gaussian_src_time(0.31, 0.08) {}
@@ -379,6 +389,42 @@ static void test_layout_matches_pointers() {
   master_printf("layout: %zu offsets checked against the object's own pointers\n", compared);
 }
 
+static void test_gyrotropic_layout_matches_pointers() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5));
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 1.1, 1e-5);
+  s.add_susceptibility(one, E_stuff, gyro);
+  fields f(&s);
+  f.require_component(Ez);
+  f.advance(2);
+
+  size_t rows = 0;
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    for (polarization_state *p = f.chunks[i]->pol[E_stuff]; p; p = p->next) {
+      if (!p->data || typeid(*p->s) != typeid(gyrotropic_susceptibility)) continue;
+      std::vector<InternalArrayLayout> layout;
+      CHECK(p->s->internal_layout(layout, f.chunks[i]->gv, p->data),
+            "gyrotropic susceptibility did not publish a layout");
+      const realnum *base = (const realnum *)p->data;
+      CHECK(layout.size() % 6 == 0, "gyrotropic layout is not grouped in sixes");
+      for (size_t li = 0; li + 5 < layout.size(); li += 6) {
+        ++rows;
+        for (int dd = 0; dd < 3; ++dd) {
+          const InternalArrayLayout &pl = layout[li + 2 * dd];
+          const InternalArrayLayout &ppl = layout[li + 2 * dd + 1];
+          const realnum *want = p->s->cinternal_notowned_ptr(dd, pl.c, pl.cmp, 0, p->data);
+          CHECK(want && base + pl.offset_elements == want,
+                "gyrotropic P_%c offset disagrees with the object's pointer", 'x' + dd);
+          CHECK(ppl.offset_elements == pl.offset_elements + pl.elements,
+                "gyrotropic P_prev_%c is not adjacent to P_%c", 'x' + dd, 'x' + dd);
+        }
+      }
+    }
+  }
+  CHECK(or_to_all(rows > 0), "no gyrotropic layout rows were checked against live pointers");
+}
+
 static void test_lorentzian_contract() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
@@ -489,6 +535,137 @@ static void test_lorentzian_layout_after_field_growth() {
         "field-growth case did not exercise a needs_P superset of allocated state");
 }
 
+static void test_gyrotropic_contract() {
+  grid_volume gv = vol3d(2.0, 2.0, 2.0, 8.0);
+  structure s(gv, eps_slab, pml(0.25), identity(), 2);
+  const vec bias(0.17, -0.23, 0.31);
+  gyrotropic_susceptibility lorentz(bias, 1.25, 0.075, 0.0,
+                                    GYROTROPIC_LORENTZIAN);
+  gyrotropic_susceptibility drude(bias, 0.8, 0.125, 0.0, GYROTROPIC_DRUDE);
+  gyrotropic_susceptibility saturated(bias, 0.55, 0.035, 0.19,
+                                      GYROTROPIC_SATURATED);
+  s.add_susceptibility(one, E_stuff, lorentz);
+  s.add_susceptibility(one, E_stuff, drude);
+  s.add_susceptibility(one, H_stuff, saturated);
+  fields f(&s);
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.require_component(Hx);
+  f.require_component(Hy);
+  f.require_component(Hz);
+  f.advance(2);
+
+  std::vector<PolarizationDescriptor> pols;
+  build_polarization_descriptors(f, pols);
+  size_t models[3] = {};
+  size_t rows = 0;
+  for (const PolarizationDescriptor &d : pols) {
+    if (d.kind != SusceptibilityKind::gyrotropic) continue;
+    CHECK(int(d.gyrotropic.model) >= int(GYROTROPIC_LORENTZIAN) &&
+              int(d.gyrotropic.model) <= int(GYROTROPIC_SATURATED),
+          "gyrotropic descriptor has an invalid model");
+    if (int(d.gyrotropic.model) >= 0 && int(d.gyrotropic.model) < 3)
+      ++models[int(d.gyrotropic.model)];
+    if (d.gyrotropic.model == GYROTROPIC_LORENTZIAN)
+      CHECK(d.gyrotropic.omega_0 == realnum(1.25) &&
+                d.gyrotropic.gamma == realnum(0.075),
+            "gyrotropic Lorentzian parameters are not exact realnum values");
+    if (d.gyrotropic.model == GYROTROPIC_DRUDE)
+      CHECK(d.gyrotropic.omega_0 == realnum(0.8) &&
+                d.gyrotropic.gamma == realnum(0.125),
+            "gyrotropic Drude parameters are not exact realnum values");
+    if (d.gyrotropic.model == GYROTROPIC_SATURATED) {
+      const vec normalized = bias / abs(bias);
+      CHECK(d.gyrotropic.alpha == realnum(0.19) &&
+                d.gyrotropic.gyro_tensor[Y][Z] == realnum(normalized.x()) &&
+                d.gyrotropic.gyro_tensor[Z][Y] == realnum(-normalized.x()) &&
+                d.gyrotropic.gyro_tensor[Z][X] == realnum(normalized.y()) &&
+                d.gyrotropic.gyro_tensor[X][Z] == realnum(-normalized.y()) &&
+                d.gyrotropic.gyro_tensor[X][Y] == realnum(normalized.z()) &&
+                d.gyrotropic.gyro_tensor[Y][X] == realnum(-normalized.z()),
+            "saturated gyrotropic tensor was not copied after host normalization");
+    }
+
+    uint64_t expected_w = 0;
+    bool seen[NUM_FIELD_COMPONENTS][2] = {};
+    for (const GyrotropicStateArrays &state : d.gyrotropic_states) {
+      ++rows;
+      CHECK(!seen[int(state.c)][state.cmp], "duplicate gyrotropic component/cmp row");
+      seen[int(state.c)][state.cmp] = true;
+      CHECK(state.elements == size_t(f.chunks[d.chunk]->gv.ntot()),
+            "gyrotropic state has the wrong extent");
+      ArrayId ids[6];
+      for (int dd = 0; dd < 3; ++dd) {
+        ids[2 * dd] = state.p[dd];
+        ids[2 * dd + 1] = state.p_prev[dd];
+        CHECK(is_valid(ids[2 * dd]) && is_valid(ids[2 * dd + 1]),
+              "gyrotropic state lacks a P/P_prev ArrayId");
+      }
+      for (int a = 0; a < 6; ++a) {
+        const ArraySpec &spec = f.array_catalog->spec(ids[a]);
+        CHECK(spec.role == array_role::polarization &&
+                  spec.element_type == ElementType::realnum_value &&
+                  spec.elements == state.elements,
+              "gyrotropic state storage metadata is wrong");
+        for (int b = a + 1; b < 6; ++b)
+          CHECK(ids[a] != ids[b], "gyrotropic state ArrayIds are not distinct");
+      }
+      const direction d0 = component_direction(state.c);
+      expected_w |= uint64_t(1) << (2 * int(state.c) + state.cmp);
+      for (int turn = 1; turn <= 2; ++turn) {
+        const component cross = direction_component(
+            state.c, cycle_direction(f.chunks[d.chunk]->gv.dim, d0, turn));
+        if (f.chunks[d.chunk]->f[cross][state.cmp])
+          expected_w |= uint64_t(1) << (2 * int(cross) + state.cmp);
+      }
+    }
+    CHECK(d.required_w == expected_w,
+          "gyrotropic required-W mask omitted or invented a cross driving field");
+    CHECK(d.internal_arrays.size() == 6 * d.gyrotropic_states.size(),
+          "gyrotropic descriptor did not publish six arrays per row");
+  }
+  CHECK(or_to_all(models[0] && models[1] && models[2]),
+        "all three gyrotropic models were not described");
+  CHECK(or_to_all(rows > 0), "gyrotropic descriptors contained no state rows");
+}
+
+static void test_gyrotropic_layout_after_field_growth() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(1.0, X, High), identity(), 2);
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 1.1, 1e-5);
+  s.add_susceptibility(one, E_stuff, gyro);
+  fields f(&s);
+  f.require_component(Ez);
+  f.advance(1);
+  f.require_component(Ex);
+  f.advance(1);
+
+  size_t descriptors = 0, live_supersets = 0;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::gyrotropic) continue;
+    ++descriptors;
+    uint64_t row_mask = 0;
+    for (const GyrotropicStateArrays &state : d.gyrotropic_states)
+      row_mask |= uint64_t(1) << (2 * int(state.c) + state.cmp);
+    polarization_state *p = f.chunks[d.chunk]->pol[d.ft];
+    for (int i = 0; p && i < d.state_index; ++i)
+      p = p->next;
+    uint64_t live_mask = 0;
+    if (p)
+      FOR_COMPONENTS(c) DOCMP2 if (p->s->needs_P(c, cmp, f.chunks[d.chunk]->f)) {
+        live_mask |= uint64_t(1) << (2 * int(c) + cmp);
+      }
+    if (live_mask & ~row_mask) ++live_supersets;
+    for (const GyrotropicStateArrays &state : d.gyrotropic_states)
+      CHECK(state.elements == size_t(f.chunks[d.chunk]->gv.ntot()),
+            "field growth changed a gyrotropic state extent");
+  }
+  CHECK(sum_to_all(descriptors) > 0, "field-growth case produced no gyrotropic descriptors");
+  CHECK(or_to_all(live_supersets > 0),
+        "field-growth case did not exercise a gyrotropic needs_P superset");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -504,9 +681,17 @@ int main(int argc, char **argv) {
                      SusceptibilityKind::host_custom, false);
   test_polarizations("derived Lorentzian", new inherited_lorentzian_susceptibility(1.1, 1e-5),
                      SusceptibilityKind::host_custom, true);
+  test_polarizations("gyrotropic",
+                     new gyrotropic_susceptibility(vec(0.17, -0.23, 0.31), 0.8, 0.05),
+                     SusceptibilityKind::gyrotropic, true);
+  test_polarizations("derived gyrotropic", new inherited_gyrotropic_susceptibility(),
+                     SusceptibilityKind::host_custom, true);
   test_layout_matches_pointers();
+  test_gyrotropic_layout_matches_pointers();
   test_lorentzian_contract();
   test_lorentzian_layout_after_field_growth();
+  test_gyrotropic_contract();
+  test_gyrotropic_layout_after_field_growth();
 
   if (failures) {
     master_printf("descriptors: %d FAILURE(S)\n", failures);

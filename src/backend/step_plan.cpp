@@ -1277,12 +1277,17 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
 
   for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
     const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
-    if (descriptor.ft != ft || descriptor.kind != SusceptibilityKind::lorentzian) continue;
+    if (descriptor.ft != ft ||
+        (descriptor.kind != SusceptibilityKind::lorentzian &&
+         descriptor.kind != SusceptibilityKind::gyrotropic))
+      continue;
     if (descriptor.chunk < 0 || descriptor.chunk >= f_.num_chunks)
       meep::abort("polarization descriptor has invalid chunk");
     fields_chunk &fc = *f_.chunks[descriptor.chunk];
 
-    for (size_t si = 0; si < descriptor.lorentzian_states.size(); ++si) {
+    for (size_t si = 0; descriptor.kind == SusceptibilityKind::lorentzian &&
+                        si < descriptor.lorentzian_states.size();
+         ++si) {
       const LorentzianStateArrays &state = descriptor.lorentzian_states[si];
       const direction primary_direction = component_direction(state.c);
       direction cross_direction1 = cycle_direction(fc.gv.dim, primary_direction, 1);
@@ -1292,11 +1297,16 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       const int sigma_aux = descriptor.state_index * NUM_FIELD_TYPES + int(ft);
 
       PolarizationUpdate update = {};
+      update.kind = PolarizationUpdateKind::lorentzian;
       update.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
                                   fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
       update.state_index = descriptor.state_index;
       update.p = state.p;
       update.p_prev = state.p_prev;
+      update.p_cross1 = invalid_array();
+      update.p_prev_cross1 = invalid_array();
+      update.p_cross2 = invalid_array();
+      update.p_prev_cross2 = invalid_array();
       update.primary_w = find_array(f_, descriptor.chunk, array_kind::f_w, int(state.c),
                                     state.cmp, 0);
       if (!is_valid(update.primary_w))
@@ -1347,11 +1357,82 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       if (descriptor.lorentzian.drude) update.region.variant_key |= polarization_drude;
       update.omega_0 = descriptor.lorentzian.omega_0;
       update.gamma = descriptor.lorentzian.gamma;
+      update.alpha = 0.0;
+      memset(update.gyro_tensor, 0, sizeof(update.gyro_tensor));
+      update.gyro_model = GYROTROPIC_LORENTZIAN;
       update.dt = fc.dt;
 
       plan_.polarization_updates.push_back(update);
       add_access(f_, op, update.p, AccessMode::read_write);
       add_access(f_, op, update.p_prev, AccessMode::read_write);
+      add_access(f_, op, update.primary_w, AccessMode::read);
+      add_access(f_, op, update.cross_w1, AccessMode::read);
+      add_access(f_, op, update.cross_w2, AccessMode::read);
+      add_access(f_, op, update.diagonal_sigma, AccessMode::read);
+      add_access(f_, op, update.offdiagonal_sigma1, AccessMode::read);
+      add_access(f_, op, update.offdiagonal_sigma2, AccessMode::read);
+    }
+
+    for (size_t si = 0; descriptor.kind == SusceptibilityKind::gyrotropic &&
+                        si < descriptor.gyrotropic_states.size();
+         ++si) {
+      const GyrotropicStateArrays &state = descriptor.gyrotropic_states[si];
+      const direction d0 = component_direction(state.c);
+      const direction d1 = cycle_direction(fc.gv.dim, d0, 1);
+      const direction d2 = cycle_direction(fc.gv.dim, d0, 2);
+      const component c1 = direction_component(state.c, d1);
+      const component c2 = direction_component(state.c, d2);
+      const int sigma_aux = descriptor.state_index * NUM_FIELD_TYPES + int(ft);
+
+      PolarizationUpdate update = {};
+      update.kind = PolarizationUpdateKind::gyrotropic;
+      update.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
+                                  fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
+      update.state_index = descriptor.state_index;
+      update.p = state.p[int(d0)];
+      update.p_prev = state.p_prev[int(d0)];
+      update.p_cross1 = state.p[int(d1)];
+      update.p_prev_cross1 = state.p_prev[int(d1)];
+      update.p_cross2 = state.p[int(d2)];
+      update.p_prev_cross2 = state.p_prev[int(d2)];
+      update.primary_w =
+          find_array(f_, descriptor.chunk, array_kind::f_w, int(state.c), state.cmp, 0);
+      if (!is_valid(update.primary_w))
+        update.primary_w =
+            find_array(f_, descriptor.chunk, array_kind::f, int(state.c), state.cmp, 0);
+      update.cross_w1 =
+          find_array(f_, descriptor.chunk, array_kind::f_w, int(c1), state.cmp, 0);
+      if (!is_valid(update.cross_w1))
+        update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f, int(c1), state.cmp, 0);
+      update.cross_w2 =
+          find_array(f_, descriptor.chunk, array_kind::f_w, int(c2), state.cmp, 0);
+      if (!is_valid(update.cross_w2))
+        update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f, int(c2), state.cmp, 0);
+      update.diagonal_sigma = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                         int(d0), sigma_aux);
+      update.offdiagonal_sigma1 = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                             int(d1), sigma_aux);
+      update.offdiagonal_sigma2 = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                             int(d2), sigma_aux);
+      const ptrdiff_t sign = is_magnetic(state.c) ? -1 : 1;
+      update.primary_stride = sign * fc.gv.stride(d0);
+      update.cross_stride1 = sign * fc.gv.stride(d1);
+      update.cross_stride2 = sign * fc.gv.stride(d2);
+      update.omega_0 = descriptor.gyrotropic.omega_0;
+      update.gamma = descriptor.gyrotropic.gamma;
+      update.alpha = descriptor.gyrotropic.alpha;
+      memcpy(update.gyro_tensor, descriptor.gyrotropic.gyro_tensor,
+             sizeof(update.gyro_tensor));
+      update.gyro_model = descriptor.gyrotropic.model;
+      update.dt = fc.dt;
+
+      plan_.polarization_updates.push_back(update);
+      add_access(f_, op, update.p, AccessMode::read_write);
+      add_access(f_, op, update.p_prev, AccessMode::read_write);
+      add_access(f_, op, update.p_cross1, AccessMode::read_write);
+      add_access(f_, op, update.p_prev_cross1, AccessMode::read_write);
+      add_access(f_, op, update.p_cross2, AccessMode::read_write);
+      add_access(f_, op, update.p_prev_cross2, AccessMode::read_write);
       add_access(f_, op, update.primary_w, AccessMode::read);
       add_access(f_, op, update.cross_w1, AccessMode::read);
       add_access(f_, op, update.cross_w2, AccessMode::read);
@@ -1787,21 +1868,38 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
   if (f_.descriptors) {
     for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
       const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
-      if (descriptor.ft != ft || descriptor.kind != SusceptibilityKind::lorentzian) continue;
-      for (size_t si = 0; si < descriptor.lorentzian_states.size(); ++si) {
-        const LorentzianStateArrays &state = descriptor.lorentzian_states[si];
-        const component target_component = field_type_component(ft2, state.c);
+      if (descriptor.ft != ft) continue;
+      const size_t state_count = descriptor.kind == SusceptibilityKind::lorentzian
+                                     ? descriptor.lorentzian_states.size()
+                                 : descriptor.kind == SusceptibilityKind::gyrotropic
+                                     ? descriptor.gyrotropic_states.size()
+                                     : 0;
+      for (size_t si = 0; si < state_count; ++si) {
+        const component state_c = descriptor.kind == SusceptibilityKind::lorentzian
+                                      ? descriptor.lorentzian_states[si].c
+                                      : descriptor.gyrotropic_states[si].c;
+        const int state_cmp = descriptor.kind == SusceptibilityKind::lorentzian
+                                  ? descriptor.lorentzian_states[si].cmp
+                                  : descriptor.gyrotropic_states[si].cmp;
+        const ArrayId state_p = descriptor.kind == SusceptibilityKind::lorentzian
+                                    ? descriptor.lorentzian_states[si].p
+                                    : descriptor.gyrotropic_states[si]
+                                          .p[int(component_direction(state_c))];
+        const size_t state_elements = descriptor.kind == SusceptibilityKind::lorentzian
+                                          ? descriptor.lorentzian_states[si].elements
+                                          : descriptor.gyrotropic_states[si].elements;
+        const component target_component = field_type_component(ft2, state_c);
         const ArrayId target = find_array(f_, descriptor.chunk, array_kind::f_minus_p,
-                                          int(target_component), state.cmp, 0);
+                                          int(target_component), state_cmp, 0);
         if (!is_valid(target)) continue;
         PolarizationSubtraction subtraction;
         subtraction.chunk = descriptor.chunk;
-        subtraction.c = state.c;
-        subtraction.cmp = state.cmp;
+        subtraction.c = state_c;
+        subtraction.cmp = state_cmp;
         subtraction.state_index = descriptor.state_index;
         subtraction.target = target;
-        subtraction.p = state.p;
-        subtraction.elements = state.elements;
+        subtraction.p = state_p;
+        subtraction.elements = state_elements;
         plan_.polarization_subtractions.push_back(subtraction);
         add_access(f_, op, subtraction.target, AccessMode::read_write);
         add_access(f_, op, subtraction.p, AccessMode::read);

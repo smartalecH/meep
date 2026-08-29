@@ -54,6 +54,17 @@ public:
     p.drude = s.no_omega_0_denominator;
     return p;
   }
+
+  static GyrotropicParameters gyrotropic_parameters(const gyrotropic_susceptibility &s) {
+    GyrotropicParameters p = {};
+    p.omega_0 = s.omega_0;
+    p.gamma = s.gamma;
+    p.alpha = s.alpha;
+    p.model = s.model;
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) p.gyro_tensor[i][j] = s.gyro_tensor[i][j];
+    return p;
+  }
 };
 
 const char *source_time_kind_name(SourceTimeKind k) {
@@ -421,6 +432,81 @@ void build_lorentzian_state_arrays(fields &f, fields_chunk &fc, polarization_sta
   }
 }
 
+void build_gyrotropic_state_arrays(fields &f, fields_chunk &fc, polarization_state *state,
+                                   PolarizationDescriptor &d) {
+  const size_t ntot = size_t(fc.gv.ntot());
+  if (!state->data) return;
+  if (!f.array_catalog)
+    throw std::runtime_error("gyrotropic descriptor requires a prepared array catalog");
+  if (d.internal_arrays.size() % 6)
+    throw std::runtime_error("gyrotropic internal layout has an incomplete state row");
+
+  static const char *p_names[3] = {"P_x", "P_y", "P_z"};
+  static const char *p_prev_names[3] = {"P_prev_x", "P_prev_y", "P_prev_z"};
+  bool seen[NUM_FIELD_COMPONENTS][2] = {};
+  realnum *base = static_cast<realnum *>(state->data);
+  for (size_t i = 0; i < d.internal_arrays.size(); i += 6) {
+    const InternalArrayLayout &first = d.internal_arrays[i];
+    if (int(first.c) < 0 || int(first.c) >= NUM_FIELD_COMPONENTS || first.cmp < 0 ||
+        first.cmp > 1 || seen[int(first.c)][first.cmp])
+      throw std::runtime_error("invalid gyrotropic state row");
+
+    GyrotropicStateArrays arrays = {};
+    arrays.c = first.c;
+    arrays.cmp = first.cmp;
+    arrays.elements = ntot;
+    ArrayId ids[6];
+    for (int dd = 0; dd < 3; ++dd) {
+      const InternalArrayLayout &p = d.internal_arrays[i + 2 * dd];
+      const InternalArrayLayout &p_prev = d.internal_arrays[i + 2 * dd + 1];
+      if (!p.name || !p_prev.name || strcmp(p.name, p_names[dd]) ||
+          strcmp(p_prev.name, p_prev_names[dd]) || p.c != first.c || p_prev.c != first.c ||
+          p.cmp != first.cmp || p_prev.cmp != first.cmp || p.elements != ntot ||
+          p_prev.elements != ntot || p.element_type != InternalArrayLayout::realnum_value ||
+          p_prev.element_type != InternalArrayLayout::realnum_value ||
+          p.offset_elements != first.offset_elements + size_t(2 * dd) * ntot ||
+          p_prev.offset_elements != p.offset_elements + ntot)
+        throw std::runtime_error("invalid gyrotropic P/P_prev internal layout");
+
+      ptrdiff_t p_offset = 0, p_prev_offset = 0;
+      const bool found_p =
+          f.array_catalog->locate(base + p.offset_elements, ids[2 * dd], p_offset);
+      const bool found_p_prev = f.array_catalog->locate(
+          base + p_prev.offset_elements, ids[2 * dd + 1], p_prev_offset);
+      if (!found_p || !found_p_prev || p_offset != 0 || p_prev_offset != 0 ||
+          !is_valid(ids[2 * dd]) || !is_valid(ids[2 * dd + 1]))
+        throw std::runtime_error("gyrotropic state arrays do not resolve to stable ArrayIds at " +
+                                 std::to_string(dd));
+      arrays.p[dd] = ids[2 * dd];
+      arrays.p_prev[dd] = ids[2 * dd + 1];
+    }
+    for (int a = 0; a < 6; ++a)
+      for (int b = a + 1; b < 6; ++b)
+        if (ids[a] == ids[b])
+          throw std::runtime_error("gyrotropic state arrays alias one another");
+    for (int a = 0; a < 6; ++a) {
+      const ArraySpec &spec = f.array_catalog->spec(ids[a]);
+      if (spec.role != array_role::polarization ||
+          spec.element_type != ElementType::realnum_value || spec.elements != ntot)
+        throw std::runtime_error("gyrotropic state ArrayIds have incompatible storage metadata");
+    }
+
+    d.gyrotropic_states.push_back(arrays);
+    seen[int(first.c)][first.cmp] = true;
+    d.required_w |= polarization_component_bit(first.c, first.cmp);
+    const direction d0 = component_direction(first.c);
+    const component c1 = direction_component(first.c, cycle_direction(fc.gv.dim, d0, 1));
+    const component c2 = direction_component(first.c, cycle_direction(fc.gv.dim, d0, 2));
+    if (fc.f[c1][first.cmp]) d.required_w |= polarization_component_bit(c1, first.cmp);
+    if (fc.f[c2][first.cmp]) d.required_w |= polarization_component_bit(c2, first.cmp);
+  }
+
+  FOR_COMPONENTS(c) DOCMP2 {
+    if (seen[int(c)][cmp] && !state->s->needs_P(c, cmp, fc.f))
+      throw std::runtime_error("gyrotropic state layout contains an unexpected component");
+  }
+}
+
 } // namespace
 
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out) {
@@ -437,6 +523,7 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         d.state_index = si;
         d.kind = classify_susceptibility(p->s);
         d.lorentzian = LorentzianParameters{0.0, 0.0, false};
+        d.gyrotropic = GyrotropicParameters{};
         d.per_thread_scratch_elements = 0;
         d.required_w = 0;
         d.required_w_prev = 0;
@@ -454,11 +541,18 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
           d.lorentzian = susceptibility_descriptor_builder::lorentzian_parameters(lorentz);
           build_lorentzian_state_arrays(f, fc, p, d);
         }
+        else if (d.kind == SusceptibilityKind::gyrotropic) {
+          const gyrotropic_susceptibility &gyro =
+              static_cast<const gyrotropic_susceptibility &>(*p->s);
+          d.gyrotropic = susceptibility_descriptor_builder::gyrotropic_parameters(gyro);
+          build_gyrotropic_state_arrays(f, fc, p, d);
+        }
 
         FOR_COMPONENTS(c) {
           /* Exact built-in Lorentzian descriptors bind the state arrays that
              exist, rather than a later grow-only field-layout snapshot. */
-          if (d.kind != SusceptibilityKind::lorentzian) {
+          if (d.kind != SusceptibilityKind::lorentzian &&
+              d.kind != SusceptibilityKind::gyrotropic) {
             DOCMP2 {
               if (p->s->needs_P(c, cmp, fc.f))
                 d.required_w |= polarization_component_bit(c, cmp);
