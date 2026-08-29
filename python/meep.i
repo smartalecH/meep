@@ -49,6 +49,7 @@
 #include "meep/vec.hpp"
 #include "meep.hpp"
 #include "meep/mympi.hpp"
+#include "backend/backend.hpp"
 #include "ctl-math.h"
 #include "ctlgeom.h"
 #include "meepgeom.hpp"
@@ -489,7 +490,7 @@ size_t _get_dft_data_size(meep::dft_chunk *dc) {
     return meep::dft_chunks_Ntotal(dc, &istart) / 2;
 }
 
-void _get_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size) {
+void _get_dft_data(meep::fields *f, meep::dft_chunk *dc, std::complex<double> *cdata, int size) {
     size_t istart;
     size_t n = meep::dft_chunks_Ntotal(dc, &istart) / 2;
     istart /= 2;
@@ -497,6 +498,9 @@ void _get_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size) {
     if (n != (size_t)size) {
         meep::abort("Total dft_chunks size does not agree with size allocated for output array.\n");
     }
+
+    meep::dft_chunk *chains[1] = {dc};
+    meep::backend_refresh_dft_chains(*f, 1, chains, "_get_dft_data");
 
     for (meep::dft_chunk *cur = dc; cur; cur = cur->next_in_dft) {
         size_t Nchunk = cur->N * cur->omega.size();
@@ -507,7 +511,7 @@ void _get_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size) {
     }
 }
 
-void _load_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size) {
+void _load_dft_data(meep::fields *f, meep::dft_chunk *dc, std::complex<double> *cdata, int size) {
     size_t istart;
     size_t n = meep::dft_chunks_Ntotal(dc, &istart) / 2;
     istart /= 2;
@@ -523,6 +527,8 @@ void _load_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size) 
         }
         istart += Nchunk;
     }
+    meep::dft_chunk *chains[1] = {dc};
+    meep::backend_publish_dft_chains(*f, 1, chains, "_load_dft_data");
 }
 
 struct kpoint_list {
@@ -687,8 +693,8 @@ PyObject *_dft_ldos_J(meep::dft_ldos *f);
 template<typename dft_type>
 PyObject *_get_dft_array(meep::fields *f, dft_type dft, meep::component c, int num_freq);
 size_t _get_dft_data_size(meep::dft_chunk *dc);
-void _get_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size);
-void _load_dft_data(meep::dft_chunk *dc, std::complex<double> *cdata, int size);
+void _get_dft_data(meep::fields *f, meep::dft_chunk *dc, std::complex<double> *cdata, int size);
+void _load_dft_data(meep::fields *f, meep::dft_chunk *dc, std::complex<double> *cdata, int size);
 meep::volume_list *make_volume_list(const meep::volume &v, int c,
                                     std::complex<double> weight,
                                     meep::volume_list *next);
