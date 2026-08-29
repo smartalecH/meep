@@ -1845,6 +1845,7 @@ struct DescriptorSet;            // src/backend/descriptors.hpp -- backend-priva
 class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
 class PreparedBackendEpoch;      // src/backend/backend_access.cpp -- backend-private
 struct BackendEpochSnapshot;     // tests/backend_api.cpp -- lifecycle invariant probe
+class NvidiaBackend;             // src/backend/nvidia/nvidia_backend.hpp -- backend-private
 struct BackendState;
 struct Executable;
 struct InitializationPlan;
@@ -2475,6 +2476,7 @@ public:
   void unset_solve_cw_omega();
 
 private:
+  friend class NvidiaBackend;
   friend void backend_prepare_field_layout_change(fields &, uint32_t, const char *);
   friend void backend_preflight_field_layout_change(fields &, uint32_t, const char *);
   friend void backend_commit_field_layout_change(fields &);
