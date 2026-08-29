@@ -27,6 +27,7 @@
 #include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "backend/precision.hpp"
+#include "backend/prepare.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
@@ -1705,6 +1706,75 @@ static void test_material_cpu_setup_to_nvidia() {
   master_printf("nvidia_timestep: material CPU-setup-to-NVIDIA PASS\n");
 }
 
+static void test_material_collective_preflight() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  linear_anisotropic_material current_material(false), target_material(true);
+  structure current(gv, current_material, no_pml(), identity(), 1);
+  structure target(gv, target_material, no_pml(), identity(), 1);
+  target.set_conductivity(Dz, phase_target_conductivity);
+  fields f(&current);
+  f.use_real_fields();
+  f.require_component(Ez);
+  std::unique_ptr<PreparedMaterialPhaseStorage> prepared =
+      prepare_material_phase_storage(f, target);
+  prepared->commit();
+  f.phase_in_material(&target, 3.0 * f.dt);
+  const uint64_t signature = compute_material_phase_target_signature(f);
+  const int countdown = f.phasein_time;
+  realnum *current_row = NULL;
+  for (int i = 0; i < f.num_chunks && !current_row; ++i)
+    if (f.chunks[i]->is_mine()) current_row = f.chunks[i]->s->chi1inv[Ex][X];
+  const realnum current_value = current_row ? current_row[0] : realnum(0);
+
+  if (my_rank() == 0) {
+    structure_chunk &changed = *target.chunks[0];
+    changed.trivial_chi1inv[Ex][X] = !changed.trivial_chi1inv[Ex][X];
+  }
+  bool rejected = false;
+  try {
+    nvidia::validate_material_phase_state(f, signature);
+  }
+  catch (const std::logic_error &) {
+    rejected = true;
+  }
+  require(and_to_all(rejected),
+          "rank-asymmetric material target mutation was not rejected collectively");
+  require(f.phasein_time == countdown && (!current_row || current_row[0] == current_value),
+          "material target rejection changed countdown or current coefficients");
+  if (my_rank() == 0) {
+    structure_chunk &changed = *target.chunks[0];
+    changed.trivial_chi1inv[Ex][X] = !changed.trivial_chi1inv[Ex][X];
+  }
+  nvidia::validate_material_phase_state(f, signature);
+
+  if (my_rank() == 0) ++f.chunks[0]->s->refcount;
+  rejected = false;
+  try {
+    nvidia::validate_material_phase_state(f, signature);
+  }
+  catch (const std::logic_error &) {
+    rejected = true;
+  }
+  require(and_to_all(rejected),
+          "rank-asymmetric shared material storage was not rejected collectively");
+  if (my_rank() == 0) --f.chunks[0]->s->refcount;
+  nvidia::validate_material_phase_state(f, signature);
+
+  if (my_rank() == 0) f.phasein_time = 0;
+  rejected = false;
+  try {
+    nvidia::validate_material_phase_state(f, signature);
+  }
+  catch (const std::logic_error &) {
+    rejected = true;
+  }
+  require(and_to_all(rejected),
+          "rank-asymmetric material countdown was not rejected collectively");
+  if (my_rank() == 0) f.phasein_time = countdown;
+  nvidia::validate_material_phase_state(f, signature);
+  master_printf("nvidia_timestep: material collective preflight PASS\n");
+}
+
 static void require_advance_rejected(fields &f, const char *expected) {
   bool rejected = false;
   try {
@@ -1731,6 +1801,106 @@ static void expect_compile_rejected(fields &gpu, StepPlan plan, const char *expe
   }
   delete unexpected;
   require(rejected, "malformed descriptor was not rejected as expected");
+}
+
+static void test_material_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  linear_anisotropic_material current_material(false), target_material(true);
+  structure current(gv, current_material, pml(0.4), identity(), 1);
+  structure target(gv, target_material, pml(0.4), identity(), 1);
+  target.set_conductivity(Dz, phase_target_conductivity);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&current, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  gpu.phase_in_material(&target, 3.0 * gpu.dt);
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(!baseline.material_refresh_arrays.empty(),
+          "material rejection fixture has no refresh descriptors");
+  size_t phase_index = baseline.operations.size();
+  size_t coefficient_index = baseline.operations.size();
+  for (size_t i = 0; i < baseline.operations.size(); ++i) {
+    if (baseline.operations[i].kind == OpKind::phase_material) phase_index = i;
+    if (baseline.operations[i].kind == OpKind::update_material_coefficients)
+      coefficient_index = i;
+  }
+  require(phase_index < baseline.operations.size() &&
+              coefficient_index < baseline.operations.size(),
+          "material rejection fixture has no refresh operations");
+
+  StepPlan malformed = baseline;
+  malformed.material_refresh_arrays[0].chunk = gpu.num_chunks;
+  expect_compile_rejected(gpu, malformed, "non-canonical");
+  malformed = baseline;
+  malformed.material_refresh_arrays[0].c = NO_COMPONENT;
+  expect_compile_rejected(gpu, malformed, "non-canonical");
+  malformed = baseline;
+  malformed.material_refresh_arrays[0].d = NO_DIRECTION;
+  expect_compile_rejected(gpu, malformed, "non-canonical");
+  malformed = baseline;
+  malformed.material_refresh_arrays[0].family = MaterialRefreshFamily::conductivity;
+  expect_compile_rejected(gpu, malformed, "non-canonical");
+  malformed = baseline;
+  ++malformed.material_refresh_arrays[0].current.value;
+  expect_compile_rejected(gpu, malformed, "non-canonical");
+  malformed = baseline;
+  ++malformed.material_refresh_arrays[0].elements;
+  expect_compile_rejected(gpu, malformed, "non-canonical");
+  malformed = baseline;
+  malformed.operations[phase_index].material_refresh_count =
+      uint32_t(malformed.material_refresh_arrays.size() + 1);
+  expect_compile_rejected(gpu, malformed, "material refresh descriptor span");
+  malformed = baseline;
+  require(!malformed.operations[coefficient_index].accesses.empty(),
+          "material rejection fixture has no coefficient access");
+  malformed.operations[coefficient_index].accesses.pop_back();
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+
+  component target_c = NO_COMPONENT;
+  direction target_d = NO_DIRECTION;
+  FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d)
+    if (target_c == NO_COMPONENT && target.chunks[0]->chi1inv[c][d]) {
+      target_c = c;
+      target_d = direction(d);
+    }
+  require(target_c != NO_COMPONENT, "material rejection fixture has no target row");
+  target.chunks[0]->trivial_chi1inv[target_c][target_d] =
+      !target.chunks[0]->trivial_chi1inv[target_c][target_d];
+  expect_compile_rejected(gpu, baseline, "target fingerprint is stale");
+  target.chunks[0]->trivial_chi1inv[target_c][target_d] =
+      !target.chunks[0]->trivial_chi1inv[target_c][target_d];
+
+  Executable *valid = gpu.backend->compile(baseline, *gpu.backend_state);
+  require(valid != NULL, "valid material plan did not compile after rejection checks");
+  delete valid;
+
+  gpu.synchronize_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  const int countdown = gpu.phasein_time;
+  const realnum current_value = gpu.chunks[0]->s->chi1inv[target_c][target_d][0];
+  target.chunks[0]->trivial_chi1inv[target_c][target_d] =
+      !target.chunks[0]->trivial_chi1inv[target_c][target_d];
+  bool rejected = false;
+  try {
+    gpu.advance(1);
+  }
+  catch (const std::logic_error &error) {
+    rejected = std::string(error.what()).find("target") != std::string::npos;
+  }
+  require(rejected && gpu.phasein_time == countdown &&
+              gpu.chunks[0]->s->chi1inv[target_c][target_d][0] == current_value &&
+              !gpu.backend->is_poisoned(),
+          "stale material target changed countdown/current coefficients or poisoned backend");
+  target.chunks[0]->trivial_chi1inv[target_c][target_d] =
+      !target.chunks[0]->trivial_chi1inv[target_c][target_d];
+  gpu.advance(1);
+  require(gpu.phasein_time == countdown - 1,
+          "material target rejection did not permit a corrected retry");
+  master_printf("nvidia_timestep: material rejection checks PASS\n");
 }
 
 static void test_magnetic_compile_rejections() {
@@ -2614,6 +2784,10 @@ static void test_rejections() {
 
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
+  if (getenv("MEEP_NVIDIA_MATERIAL_MPI_VALIDATION_ONLY")) {
+    test_material_collective_preflight();
+    return 0;
+  }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
     require(sizeof(realnum) == sizeof(float),
@@ -2658,6 +2832,10 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_MATERIAL_LIFECYCLE_ONLY")) {
     test_material_copy_after_compile_rejected();
     test_material_cpu_setup_to_nvidia();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MATERIAL_REJECTIONS_ONLY")) {
+    test_material_compile_rejections();
     return 0;
   }
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
@@ -2822,6 +3000,7 @@ int main(int argc, char **argv) {
   if (material_only) {
     test_material_copy_after_compile_rejected();
     test_material_cpu_setup_to_nvidia();
+    test_material_compile_rejections();
   }
   set_finite_check_mode(FiniteCheckMode::off);
   if (cylindrical_only && !cylindrical_case) {

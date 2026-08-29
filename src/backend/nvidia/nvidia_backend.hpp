@@ -53,6 +53,11 @@ gyrotropic_coefficients derive_gyrotropic_coefficients(double omega_0, double ga
                                                        gyrotropy_model model,
                                                        const direction order[3]);
 
+/* Collective pre-step validation kept CUDA-free so rank-asymmetric target,
+   countdown, and copy-on-write mutations can be rejected before any rank
+   enters host material mixing. */
+void validate_material_phase_state(const fields &f, uint64_t expected_target_signature);
+
 } // namespace nvidia
 
 class NvidiaBackend : public ExecutionBackend {
