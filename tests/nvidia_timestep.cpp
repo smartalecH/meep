@@ -1692,6 +1692,7 @@ static void test_material_cpu_setup_to_nvidia() {
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
   migrating.select_backend(options);
+  migrating.init_backend();
   for (int step = 0; step < 4; ++step) {
     reference.advance(1);
     migrating.advance(1);
@@ -2652,6 +2653,11 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_MAGNETIC_LIFECYCLE_ONLY")) {
     test_magnetic_pre_step_and_recompile();
     test_magnetic_historical_host_backups();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MATERIAL_LIFECYCLE_ONLY")) {
+    test_material_copy_after_compile_rejected();
+    test_material_cpu_setup_to_nvidia();
     return 0;
   }
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
