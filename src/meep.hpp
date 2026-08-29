@@ -699,6 +699,7 @@ public:
   double max_eps() const;
 
 private:
+  void release_owned_data() noexcept;
   double pml_fmin;
   int the_proc;
   int the_is_mine;
@@ -995,6 +996,8 @@ struct dft_monitor_lifetime {
 void begin_dft_monitor_removal(const std::shared_ptr<dft_monitor_lifetime> &lifetime,
                                bool locally_attached, const char *site);
 class fields_chunk;
+class PreparedBackendEpoch;
+struct BackendEpochSnapshot;
 class flux_vol;
 class source_descriptor_builder;
 class legacy_flux_descriptor_builder;
@@ -1639,6 +1642,11 @@ public:
   }
 
 private:
+  friend class PreparedBackendEpoch;
+  friend struct BackendEpochSnapshot;
+  void swap_prepared_state(fields_chunk &other) noexcept;
+  void release_owned_data() noexcept;
+
   // we set a flag during cw_solve to replace some
   // time-dependent stuff with the analogous frequency-domain operation
   bool doing_solve_cw;                 // true when inside solve_cw
@@ -1840,9 +1848,13 @@ struct HaloPlan;
 struct StepPlan;                 // src/backend/step_plan.hpp -- backend-private
 struct DescriptorSet;            // src/backend/descriptors.hpp -- backend-private
 class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
+class PreparedBackendEpoch;      // src/backend/backend_access.cpp -- backend-private
+struct BackendEpochSnapshot;     // tests/backend_api.cpp -- lifecycle invariant probe
 struct BackendState;
 struct Executable;
 struct InitializationPlan;
+struct CwSolveRequest;
+struct CwSolveResult;
 enum class StepProgram;
 
 class fields {
@@ -2476,6 +2488,9 @@ private:
   friend bool legacy_material_change_pending(const fields &);
   friend bool backend_try_synchronize_magnetic_fields(fields &, const char *);
   friend bool backend_try_restore_magnetic_fields(fields &, const char *);
+  friend bool backend_try_solve_cw(fields &, const CwSolveRequest &, CwSolveResult &);
+  friend class PreparedBackendEpoch;
+  friend struct BackendEpochSnapshot;
   int synchronized_magnetic_fields; // count number of nested synchs
   double last_wall_time;
   std::vector<time_sink> was_working_on;
