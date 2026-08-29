@@ -36,10 +36,11 @@ using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
 using meep::nvidia::launch_halo_scatter;
-using meep::nvidia::launch_point_source;
+using meep::nvidia::launch_source_batch;
 using meep::nvidia::launch_zero;
-using meep::nvidia::point_source_launch;
 using meep::nvidia::scalar_precision;
+using meep::nvidia::source_batch_launch;
+using meep::nvidia::source_point;
 using meep::nvidia::source_scalar;
 using meep::nvidia::stream;
 using meep::nvidia::zero_launch;
@@ -526,18 +527,39 @@ template <typename T> static void check_device(int device) {
                   phase_tolerance * (1.0 + std::fabs(double(phase_imag))),
           "halo PHASE result differs");
 
-  std::vector<T> source_real(8), source_imag(8), source_condinv(8), source_observed(8),
-      source_imag_observed(8);
+  /* A 259-point descriptor crosses the 256-thread launch boundary and models
+     the packed plane data used by volume/eigenmode sources. The following
+     descriptors overlap it, and the last contains duplicate indices. */
+  const size_t source_elements = 300;
+  std::vector<T> source_real(source_elements), source_imag(source_elements),
+      source_condinv(source_elements), source_observed(source_elements),
+      source_imag_observed(source_elements);
   for (size_t i = 0; i < source_real.size(); ++i) {
     source_real[i] = T(0.25 + 0.01 * double(i));
     source_imag[i] = T(-0.4 + 0.02 * double(i));
     source_condinv[i] = T(0.8 + 0.01 * double(i));
   }
-  const source_scalar scalar = {0.7, -0.2, 1.3, 0.4};
+  const source_scalar scalar = {0.75, -0.25, 1.25, 0.5};
   device_buffer d_source_real(source_real.size() * sizeof(T), device);
   device_buffer d_source_imag(source_imag.size() * sizeof(T), device);
   device_buffer d_source_condinv(source_condinv.size() * sizeof(T), device);
   device_buffer d_source_scalar(sizeof(scalar), device);
+  std::vector<source_point> source_points(259 + 3 + 3);
+  for (size_t i = 0; i < 259; ++i) {
+    source_points[i].index = ptrdiff_t(i);
+    source_points[i].amplitude_real = 0.003 * double(i + 1);
+    source_points[i].amplitude_imag = -0.002 * double((i % 13) + 1);
+  }
+  const ptrdiff_t overlap_indices[] = {3, 127, 258};
+  for (size_t i = 0; i < 3; ++i) {
+    source_points[259 + i].index = overlap_indices[i];
+    source_points[259 + i].amplitude_real = -0.11 * double(i + 1);
+    source_points[259 + i].amplitude_imag = 0.07 * double(i + 1);
+    source_points[262 + i].index = 41;
+    source_points[262 + i].amplitude_real = 0.125 * double(1u << i);
+    source_points[262 + i].amplitude_imag = -0.0625 * double(1u << i);
+  }
+  device_buffer d_source_points(source_points.size() * sizeof(source_points[0]), device);
   copy_host_to_device_async(d_source_real, 0, source_real.data(),
                             source_real.size() * sizeof(T), execution);
   copy_host_to_device_async(d_source_imag, 0, source_imag.data(),
@@ -545,34 +567,45 @@ template <typename T> static void check_device(int device) {
   copy_host_to_device_async(d_source_condinv, 0, source_condinv.data(),
                             source_condinv.size() * sizeof(T), execution);
   copy_host_to_device_async(d_source_scalar, 0, &scalar, sizeof(scalar), execution);
-  point_source_launch point = {};
-  point.target_real = d_source_real.opaque_handle();
-  point.target_imag = d_source_imag.opaque_handle();
-  point.conductivity_inverse = d_source_condinv.opaque_handle();
-  point.index = 3;
-  point.scalar_slot = 0;
-  point.amplitude_real = 0.3;
-  point.amplitude_imag = 0.4;
-  point.dt = 0.125;
-  point.precision = precision;
-  launch_point_source(point, d_source_scalar.opaque_handle(), execution);
+  copy_host_to_device_async(d_source_points, 0, source_points.data(),
+                            source_points.size() * sizeof(source_points[0]), execution);
+  source_batch_launch batch = {};
+  batch.target_real = d_source_real.opaque_handle();
+  batch.target_imag = d_source_imag.opaque_handle();
+  batch.conductivity_inverse = d_source_condinv.opaque_handle();
+  batch.points = static_cast<const source_point *>(d_source_points.opaque_handle());
+  batch.point_count = 259;
+  batch.scalar_slot = 0;
+  batch.dt = 0.125;
+  batch.precision = precision;
+  launch_source_batch(batch, d_source_scalar.opaque_handle(), execution);
+  source_batch_launch overlap = batch;
+  overlap.points += 259;
+  overlap.point_count = 3;
+  launch_source_batch(overlap, d_source_scalar.opaque_handle(), execution);
+  source_batch_launch duplicate = batch;
+  duplicate.points += 262;
+  duplicate.point_count = 3;
+  duplicate.sequential = true;
+  launch_source_batch(duplicate, d_source_scalar.opaque_handle(), execution);
   copy_device_to_host_async(source_observed.data(), d_source_real, 0,
                             source_observed.size() * sizeof(T), execution);
   copy_device_to_host_async(source_imag_observed.data(), d_source_imag, 0,
                             source_imag_observed.size() * sizeof(T), execution);
   execution.synchronize();
-  double source_value_real =
-      point.amplitude_real * scalar.current_real - point.amplitude_imag * scalar.current_imag;
-  double source_value_imag =
-      point.amplitude_real * scalar.current_imag + point.amplitude_imag * scalar.current_real;
-  source_value_real *= point.dt;
-  source_value_imag *= point.dt;
-  source_value_real *= double(source_condinv[point.index]);
-  source_value_imag *= double(source_condinv[point.index]);
   std::vector<T> source_expected = source_real;
   std::vector<T> source_imag_expected = source_imag;
-  source_expected[point.index] -= T(source_value_real);
-  source_imag_expected[point.index] -= T(source_value_imag);
+  for (size_t p = 0; p < source_points.size(); ++p) {
+    const source_point &point = source_points[p];
+    double source_value_real =
+        point.amplitude_real * scalar.current_real - point.amplitude_imag * scalar.current_imag;
+    double source_value_imag =
+        point.amplitude_real * scalar.current_imag + point.amplitude_imag * scalar.current_real;
+    source_value_real *= batch.dt * double(source_condinv[point.index]);
+    source_value_imag *= batch.dt * double(source_condinv[point.index]);
+    source_expected[point.index] -= T(source_value_real);
+    source_imag_expected[point.index] -= T(source_value_imag);
+  }
   const double source_tolerance = 4.0 * std::numeric_limits<T>::epsilon();
   for (size_t i = 0; i < source_observed.size(); ++i) {
     require(std::fabs(double(source_observed[i] - source_expected[i])) <=
@@ -592,22 +625,31 @@ template <typename T> static void check_device(int device) {
   source_copy.elements = source_real.size();
   source_copy.precision = precision;
   launch_array_copy(source_copy, execution);
-  point.target_real = d_source_real.opaque_handle();
-  point.target_imag = NULL;
-  point.conductivity_inverse = NULL;
-  point.integrated = true;
-  launch_point_source(point, d_source_scalar.opaque_handle(), execution);
+  source_batch_launch integrated = {};
+  integrated.target_real = d_source_real.opaque_handle();
+  integrated.points = static_cast<const source_point *>(d_source_points.opaque_handle()) + 262;
+  integrated.point_count = 3;
+  integrated.scalar_slot = 0;
+  integrated.integrated = true;
+  integrated.sequential = true;
+  integrated.precision = precision;
+  launch_source_batch(integrated, d_source_scalar.opaque_handle(), execution);
   copy_device_to_host_async(source_observed.data(), d_source_real, 0,
                             source_observed.size() * sizeof(T), execution);
   execution.synchronize();
   std::vector<T> integrated_expected = source_imag_observed;
-  const double dipole_real =
-      point.amplitude_real * scalar.dipole_real - point.amplitude_imag * scalar.dipole_imag;
-  integrated_expected[point.index] -= T(dipole_real);
+  for (size_t p = 262; p < 265; ++p) {
+    const source_point &point = source_points[p];
+    const double dipole_real =
+        point.amplitude_real * scalar.dipole_real - point.amplitude_imag * scalar.dipole_imag;
+    integrated_expected[point.index] -= T(dipole_real);
+  }
   for (size_t i = 0; i < source_observed.size(); ++i)
     require(std::fabs(double(source_observed[i] - integrated_expected[i])) <=
                 source_tolerance * (1.0 + std::fabs(double(integrated_expected[i]))),
             "integrated-source copy/application result or sentinel differs");
+  require(source_observed[41] == integrated_expected[41],
+          "ordered duplicate-source fallback changed sequential floating-point behavior");
 }
 
 int main() {
