@@ -171,6 +171,9 @@ static void test_full_plan() {
      treats them all the same. */
   size_t variants = 0, devices = 0;
   for (const Operation &op : p.operations) {
+    CHECK(op.polarization_subtraction_index == 0 && op.polarization_subtraction_count == 0,
+          "%s has a nonempty PR6 polarization-subtraction span",
+          op_kind_name(op.kind));
     if (op.kind == OpKind::restore_magnetic_fields ||
         op.kind == OpKind::synchronize_magnetic_fields) {
       CHECK(op.guard.kind == GuardKind::graph_variant,
@@ -259,6 +262,84 @@ static void test_phasing_plan() {
   f.advance(3);
 }
 
+static void test_polarization_schema_signature() {
+  StepPlan plan;
+  Operation op = {};
+  op.kind = OpKind::update_polarization;
+  op.ft = E_stuff;
+  op.guard = guard_always();
+  op.polarization_subtraction_index = 0;
+  op.polarization_subtraction_count = 0;
+  plan.operations.push_back(op);
+
+  PolarizationUpdate update = {};
+  update.region.chunk = 2;
+  update.region.c = Ez;
+  update.region.cmp = 1;
+  update.region.begin = ivec(1, 3, 5);
+  update.region.end = ivec(7, 9, 11);
+  update.region.base = 13;
+  update.region.counts[0] = 2;
+  update.region.counts[1] = 3;
+  update.region.counts[2] = 4;
+  update.region.strides[0] = 1;
+  update.region.strides[1] = 17;
+  update.region.strides[2] = 37;
+  update.region.variant_key = polarization_one_offdiagonal | polarization_drude;
+  update.state_index = 4;
+  update.p = ArrayId{1};
+  update.p_prev = ArrayId{2};
+  update.primary_w = ArrayId{3};
+  update.cross_w1 = ArrayId{4};
+  update.cross_w2 = invalid_array();
+  update.diagonal_sigma = ArrayId{5};
+  update.offdiagonal_sigma1 = ArrayId{6};
+  update.offdiagonal_sigma2 = invalid_array();
+  update.primary_stride = -7;
+  update.cross_stride1 = -11;
+  update.cross_stride2 = 0;
+  update.omega_0 = 0.25;
+  update.gamma = 0.05;
+  update.dt = 0.01;
+  plan.polarization_updates.push_back(update);
+
+  PolarizationSubtraction subtraction = {};
+  subtraction.chunk = 2;
+  subtraction.c = Ez;
+  subtraction.cmp = 1;
+  subtraction.state_index = 4;
+  subtraction.target = ArrayId{7};
+  subtraction.p = update.p;
+  subtraction.elements = 101;
+  plan.polarization_subtractions.push_back(subtraction);
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+  CHECK(plan.operations[0].polarization_subtraction_index == 0 &&
+            plan.operations[0].polarization_subtraction_count == 0,
+        "new operation spans are not zero-initialized");
+
+#define CHECK_SIGNATURE_FIELD(expr, message)                                                       \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                           \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                              \
+  } while (0)
+  CHECK_SIGNATURE_FIELD(++changed.operations[0].polarization_subtraction_count,
+                        "signature ignored polarization subtraction span");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].region.begin.set_direction(
+                            X, changed.polarization_updates[0].region.begin.in_direction(X) + 2),
+                        "signature ignored polarization region begin");
+  CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].p.value,
+                        "signature ignored polarization ArrayId");
+  CHECK_SIGNATURE_FIELD(--changed.polarization_updates[0].primary_stride,
+                        "signature ignored polarization stride");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].gamma += 0.01,
+                        "signature ignored polarization coefficient");
+  CHECK_SIGNATURE_FIELD(++changed.polarization_subtractions[0].elements,
+                        "signature ignored polarization subtraction size");
+#undef CHECK_SIGNATURE_FIELD
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -267,6 +348,7 @@ int main(int argc, char **argv) {
   test_empty_plan();
   test_solve_cw_plan();
   test_phasing_plan();
+  test_polarization_schema_signature();
 
   if (failures) {
     master_printf("step_plan: %d FAILURE(S)\n", failures);
