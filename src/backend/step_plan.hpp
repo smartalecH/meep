@@ -491,6 +491,11 @@ StepPlan build_step_plan(fields &f, StepProgram program);
 /* Structural identity used by device executables and tests. */
 uint64_t compute_step_plan_signature(const StepPlan &plan);
 
+/* Public fields::beta assignment cannot update the per-chunk coefficient that
+   the CPU and descriptor builders consume. Resident execution therefore
+   rejects any outer/chunk/prepared mismatch instead of reusing stale code. */
+bool beta_coordinate_state_matches(const fields &f, const StepPlan *prepared);
+
 /* Human-readable operation sequence, for the trace test and for debugging. */
 void format_step_plan(const StepPlan &p, std::vector<std::string> &out);
 
