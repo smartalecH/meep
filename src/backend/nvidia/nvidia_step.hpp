@@ -51,6 +51,7 @@ struct curl_launch {
   double dtdx;
   double dt;
   scalar_precision precision;
+  uint32_t bfast_update_index;
 };
 
 struct beta_launch {
