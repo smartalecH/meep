@@ -7,6 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_step.hpp"
+#include "backend/nvidia/nvidia_coordinates.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 
 #include <algorithm>
@@ -20,6 +21,7 @@
 using meep::nvidia::constitutive_launch;
 using meep::nvidia::array_copy_launch;
 using meep::nvidia::beta_launch;
+using meep::nvidia::bfast_launch;
 using meep::nvidia::copy_device_to_host_async;
 using meep::nvidia::copy_host_to_device_async;
 using meep::nvidia::curl_launch;
@@ -36,6 +38,7 @@ using meep::nvidia::halo_scatter_entry;
 using meep::nvidia::launch_constitutive;
 using meep::nvidia::launch_array_copy;
 using meep::nvidia::launch_beta;
+using meep::nvidia::launch_bfast;
 using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
@@ -201,6 +204,204 @@ static void check_beta_variants(int device, stream &execution, scalar_precision 
   require(rejected, "beta launch accepted an invalid precision");
 }
 
+template <typename T>
+static void check_bfast_variants(int device, stream &execution, scalar_precision precision) {
+  const size_t elements = 273;
+  const size_t bytes = elements * sizeof(T);
+  std::vector<T> initial(elements), source1(elements), source2(elements), initial_state(elements),
+      initial_u(elements), initial_cond(elements), condinv(elements), inverse(elements),
+      inverse_u(elements), observed(elements), observed_state(elements), observed_u(elements),
+      observed_cond(elements);
+  for (size_t i = 0; i < elements; ++i) {
+    initial[i] = T(0.2 + 0.001 * double(i));
+    source1[i] = T(std::sin(0.019 * double(i + 1)));
+    source2[i] = T(std::cos(0.023 * double(i + 1)));
+    initial_state[i] = T(-0.07 + 0.0003 * double(i));
+    initial_u[i] = T(-0.1 + 0.0007 * double(i));
+    initial_cond[i] = T(0.05 - 0.0002 * double(i));
+    condinv[i] = T(1.0 / (1.0 + 0.0003 * double(i + 1)));
+    inverse[i] = T(1.0 / (1.0 + 0.0004 * double(i + 1)));
+    inverse_u[i] = T(1.0 / (1.0 + 0.0005 * double(i + 1)));
+  }
+
+  device_buffer d_target(bytes, device), d_source1(bytes, device), d_source2(bytes, device),
+      d_state(bytes, device), d_u(bytes, device), d_cond(bytes, device), d_condinv(bytes, device),
+      d_inverse(bytes, device), d_inverse_u(bytes, device);
+  copy_host_to_device_async(d_source1, 0, source1.data(), bytes, execution);
+  copy_host_to_device_async(d_source2, 0, source2.data(), bytes, execution);
+  copy_host_to_device_async(d_condinv, 0, condinv.data(), bytes, execution);
+  copy_host_to_device_async(d_inverse, 0, inverse.data(), bytes, execution);
+  copy_host_to_device_async(d_inverse_u, 0, inverse_u.data(), bytes, execution);
+
+  bool exercised_exceptional_branch = false, exercised_source_swap = false,
+       exercised_zero_k = false;
+  for (unsigned int variant = 0; variant < 8; ++variant)
+    for (int source_shape = 0; source_shape < 3; ++source_shape) {
+      const bool main_pml = (variant & 1) != 0;
+      const bool auxiliary_pml = (variant & 2) != 0;
+      const bool conductive = (variant & 4) != 0;
+      copy_host_to_device_async(d_target, 0, initial.data(), bytes, execution);
+      copy_host_to_device_async(d_state, 0, initial_state.data(), bytes, execution);
+      copy_host_to_device_async(d_u, 0, initial_u.data(), bytes, execution);
+      copy_host_to_device_async(d_cond, 0, initial_cond.data(), bytes, execution);
+
+      bfast_launch update = {};
+      update.region.base = 8;
+      update.region.counts[0] = 1;
+      update.region.counts[1] = 1;
+      update.region.counts[2] = 257;
+      update.region.strides[2] = 1;
+      update.target = d_target.opaque_handle();
+      update.source1 = source_shape == 2 ? NULL : d_source1.opaque_handle();
+      update.source2 = source_shape == 1 ? NULL : d_source2.opaque_handle();
+      update.stride1 = 2;
+      update.stride2 = -3;
+      update.f_bfast = d_state.opaque_handle();
+      update.k1 = (variant & 1) ? -0.0375 : 0.0375;
+      update.k2 = (source_shape == 2 && variant == 0) ? 0.0 : -0.02125;
+      update.precision = precision;
+      if (main_pml) {
+        update.pml.inverse = d_inverse.opaque_handle();
+        update.pml.base = 0;
+        update.pml.strides[2] = 1;
+      }
+      if (auxiliary_pml) {
+        update.target_u = d_u.opaque_handle();
+        update.pml_u.inverse = d_inverse_u.opaque_handle();
+        update.pml_u.base = 0;
+        update.pml_u.strides[2] = 1;
+      }
+      if (conductive) update.conductivity_inverse = d_condinv.opaque_handle();
+      if (main_pml && conductive) update.target_conductivity = d_cond.opaque_handle();
+
+      std::vector<T> expected = initial;
+      std::vector<T> expected_state = initial_state;
+      std::vector<T> expected_u = initial_u;
+      std::vector<T> expected_cond = initial_cond;
+      for (int repeat = 0; repeat < 2; ++repeat) {
+        launch_bfast(update, execution);
+        for (size_t n = 0; n < update.region.counts[2]; ++n) {
+          const ptrdiff_t i = ptrdiff_t(update.region.base + n);
+          const T *g1 = source_shape == 2 ? NULL : source1.data();
+          const T *g2 = source_shape == 1 ? NULL : source2.data();
+          ptrdiff_t s1 = update.stride1, s2 = update.stride2;
+          T k1 = T(update.k1), k2 = T(update.k2);
+          if (!g1) {
+            std::swap(g1, g2);
+            std::swap(s1, s2);
+            std::swap(k1, k2);
+          }
+          const T previous = expected_state[i];
+          T next;
+          if (g2)
+            next = (k1 * (g1[i + s1] + g1[i]) - k2 * (g2[i + s2] + g2[i])) - previous;
+          else if (!main_pml && !auxiliary_pml && !conductive)
+            next = k1 * (g1[i + s1] + g1[i]);
+          else
+            next = k1 * (g1[i + s1] + g1[i]) - previous;
+          expected_state[i] = next;
+          T delta = next - previous;
+          if (conductive) delta *= condinv[i];
+          if (main_pml) {
+            if (conductive) expected_cond[i] += delta;
+            delta *= inverse[n];
+          }
+          if (auxiliary_pml) {
+            expected_u[i] += delta;
+            delta *= inverse_u[n];
+          }
+          expected[i] += delta;
+        }
+      }
+      exercised_exceptional_branch |= variant == 0 && source_shape == 1;
+      exercised_source_swap |= source_shape == 2;
+      exercised_zero_k |= source_shape == 2 && variant == 0;
+
+      copy_device_to_host_async(observed.data(), d_target, 0, bytes, execution);
+      copy_device_to_host_async(observed_state.data(), d_state, 0, bytes, execution);
+      copy_device_to_host_async(observed_u.data(), d_u, 0, bytes, execution);
+      copy_device_to_host_async(observed_cond.data(), d_cond, 0, bytes, execution);
+      execution.synchronize();
+      for (size_t i = 0; i < elements; ++i) {
+        require(observed[i] == expected[i],
+                "BFAST target differs from host recurrence or sentinel");
+        require(observed_state[i] == expected_state[i],
+                "BFAST persistent state differs from host recurrence or sentinel");
+        require(observed_u[i] == expected_u[i],
+                "BFAST auxiliary state differs from host recurrence or sentinel");
+        require(observed_cond[i] == expected_cond[i],
+                "BFAST conductivity state differs from host recurrence or sentinel");
+      }
+    }
+  require(exercised_exceptional_branch, "BFAST exceptional one-source branch was not covered");
+  require(exercised_source_swap, "BFAST missing-first-source swap was not covered");
+  require(exercised_zero_k, "BFAST zero-k one-source row was not covered");
+
+  bfast_launch malformed = {};
+  malformed.region.counts[0] = malformed.region.counts[1] = malformed.region.counts[2] = 1;
+  malformed.target = d_target.opaque_handle();
+  malformed.source1 = d_source1.opaque_handle();
+  malformed.f_bfast = d_state.opaque_handle();
+  malformed.precision = precision;
+  bool rejected = false;
+  try {
+    bfast_launch missing = malformed;
+    missing.f_bfast = NULL;
+    launch_bfast(missing, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "BFAST launch accepted missing persistent state");
+  rejected = false;
+  try {
+    bfast_launch missing = malformed;
+    missing.source1 = NULL;
+    launch_bfast(missing, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "BFAST launch accepted missing sources");
+  rejected = false;
+  try {
+    bfast_launch aliased = malformed;
+    aliased.f_bfast = aliased.target;
+    launch_bfast(aliased, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "BFAST launch accepted aliased mutable state");
+  rejected = false;
+  try {
+    bfast_launch empty = malformed;
+    empty.region.counts[1] = 0;
+    launch_bfast(empty, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "BFAST launch accepted an empty region");
+  rejected = false;
+  try {
+    bfast_launch overflow = malformed;
+    overflow.region.counts[0] = std::numeric_limits<size_t>::max();
+    overflow.region.counts[1] = 2;
+    launch_bfast(overflow, execution);
+  }
+  catch (const std::overflow_error &) { rejected = true; }
+  require(rejected, "BFAST launch accepted an overflowing region");
+  rejected = false;
+  try {
+    bfast_launch grid_overflow = malformed;
+    grid_overflow.region.counts[0] = std::numeric_limits<size_t>::max();
+    launch_bfast(grid_overflow, execution);
+  }
+  catch (const std::overflow_error &) { rejected = true; }
+  require(rejected, "BFAST launch accepted a wrapping grid size");
+  rejected = false;
+  try {
+    bfast_launch invalid_precision = malformed;
+    invalid_precision.precision = static_cast<scalar_precision>(99);
+    launch_bfast(invalid_precision, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "BFAST launch accepted an invalid precision");
+}
+
 template <typename T> static void check_device(int device) {
   device_scope selected(device);
   stream execution;
@@ -247,6 +448,8 @@ template <typename T> static void check_device(int device) {
   region.strides[2] = 1;
   const scalar_precision precision =
       sizeof(T) == sizeof(float) ? scalar_precision::f32 : scalar_precision::f64;
+  check_bfast_variants<T>(device, execution, precision);
+  if (std::getenv("MEEP_NVIDIA_STEP_BFAST_ONLY")) return;
   check_beta_variants<T>(device, execution, precision);
   if (std::getenv("MEEP_NVIDIA_STEP_BETA_ONLY")) return;
 

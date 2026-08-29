@@ -7,6 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/nvidia_coordinates.hpp"
 
 #include <stdint.h>
 #include <string.h>
@@ -430,6 +431,7 @@ public:
                    uint64_t state_token,
                    const std::vector<NvidiaCompiledOperation> &operations,
                    const std::vector<nvidia::curl_launch> &curl_updates,
+                   const std::vector<nvidia::bfast_launch> &bfast_updates,
                    const std::vector<nvidia::beta_launch> &beta_updates,
                    const std::vector<nvidia::constitutive_launch> &constitutive_updates,
                    const std::vector<nvidia::zero_launch> &zero_updates,
@@ -450,7 +452,8 @@ public:
                    NvidiaBackendState &state)
       : owner_(owner), state_token_(state_token), signature_(signature),
         storage_fingerprint_(storage_fingerprint),
-        operations_(operations), curl_updates_(curl_updates), beta_updates_(beta_updates),
+        operations_(operations), curl_updates_(curl_updates), bfast_updates_(bfast_updates),
+        beta_updates_(beta_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
@@ -525,6 +528,7 @@ public:
   uint64_t storage_fingerprint_;
   std::vector<NvidiaCompiledOperation> operations_;
   std::vector<nvidia::curl_launch> curl_updates_;
+  std::vector<nvidia::bfast_launch> bfast_updates_;
   std::vector<nvidia::beta_launch> beta_updates_;
   std::vector<nvidia::constitutive_launch> constitutive_updates_;
   std::vector<nvidia::zero_launch> zero_updates_;
@@ -1245,9 +1249,10 @@ nvidia::dft_launch compile_dft(const DftDescriptor &source, const fields &f,
 
 nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &state) {
   const uint32_t supported_variants =
-      curl_has_second_derivative | curl_has_pml | curl_has_pml_aux | curl_has_conductivity;
+      curl_has_second_derivative | curl_has_pml | curl_has_pml_aux | curl_has_conductivity |
+      curl_has_bfast;
   if (source.region.variant_key & ~supported_variants)
-    throw std::invalid_argument("curl descriptor requires BFAST");
+    throw std::invalid_argument("curl descriptor has an unsupported variant bit");
 
   const bool have_pml = (source.region.variant_key & curl_has_pml) != 0;
   const bool have_pml_u = (source.region.variant_key & curl_has_pml_aux) != 0;
@@ -1285,6 +1290,7 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
                                      "curl auxiliary PML");
   result.dtdx = source.dtdx;
   result.dt = source.dt;
+  result.bfast_update_index = UINT32_MAX;
 
   const ptrdiff_t region_max = checked_region_max(result.region);
   validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
@@ -1311,6 +1317,184 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
   if (is_valid(source.target_cond))
     validate_index_range(state.plan_, source.target_cond, ptrdiff_t(result.region.base), region_max,
                          "curl conductivity target");
+  return result;
+}
+
+nvidia::bfast_launch compile_bfast(const BfastUpdate &source, NvidiaBackendState &state,
+                                   const fields &f) {
+  const uint32_t supported_variants =
+      bfast_has_pml | bfast_has_pml_aux | bfast_has_conductivity;
+  if (source.region.variant_key & ~supported_variants)
+    throw std::invalid_argument("BFAST descriptor has an unsupported variant bit");
+
+  const bool have_pml = (source.region.variant_key & bfast_has_pml) != 0;
+  const bool have_pml_u = (source.region.variant_key & bfast_has_pml_aux) != 0;
+  const bool have_conductivity =
+      (source.region.variant_key & bfast_has_conductivity) != 0;
+  const bool complete_pml = is_valid(source.pml.sig) && is_valid(source.pml.kap) &&
+                            is_valid(source.pml.siginv);
+  const bool complete_pml_u = is_valid(source.pml_u.sig) && is_valid(source.pml_u.kap) &&
+                              is_valid(source.pml_u.siginv);
+  if (have_pml != complete_pml || have_pml_u != complete_pml_u ||
+      have_pml_u != is_valid(source.target_u) ||
+      have_conductivity != is_valid(source.condinv) ||
+      (have_pml && have_conductivity) != is_valid(source.target_cond))
+    throw std::invalid_argument("BFAST descriptor variant bits and auxiliary arrays disagree");
+  if ((!have_pml && (is_valid(source.pml.sig) || is_valid(source.pml.kap) ||
+                     is_valid(source.pml.siginv))) ||
+      (!have_pml_u && (is_valid(source.pml_u.sig) || is_valid(source.pml_u.kap) ||
+                       is_valid(source.pml_u.siginv))))
+    throw std::invalid_argument("BFAST descriptor has a partial disabled PML profile");
+  if (!std::isfinite(source.k1) || !std::isfinite(source.k2))
+    throw std::invalid_argument("BFAST descriptor coefficient is non-finite");
+  if (!is_valid(source.source1) && !is_valid(source.source2))
+    throw std::invalid_argument("BFAST descriptor has no source field");
+  if (source.region.chunk < 0 || source.region.chunk >= f.num_chunks ||
+      !(is_D(source.region.c) || is_B(source.region.c)) || source.region.cmp < 0 ||
+      source.region.cmp > 1)
+    throw std::invalid_argument("BFAST descriptor has invalid target identity");
+  if (!f.chunks[source.region.chunk] || !f.chunks[source.region.chunk]->is_mine())
+    throw std::invalid_argument("BFAST descriptor references a nonlocal chunk");
+  const fields_chunk &fc = *f.chunks[source.region.chunk];
+  const StorageKey expected_target{source.region.chunk, int(array_kind::f), int(source.region.c),
+                                   source.region.cmp, 0};
+  const StorageKey expected_state{source.region.chunk, int(array_kind::f_bfast),
+                                  int(source.region.c), source.region.cmp, 0};
+  if (!is_valid(source.target) || source.target.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.target.value] == expected_target) ||
+      !is_valid(source.f_bfast) || source.f_bfast.value >= state.plan_.keys.size() ||
+      !(state.plan_.keys[source.f_bfast.value] == expected_state) ||
+      is_valid(state.plan_.arrays[source.f_bfast.value].alias_of))
+    throw std::invalid_argument("BFAST target or persistent-state identity is invalid");
+
+  const component target = source.region.c;
+  bool have_plus = false, have_minus = false;
+  component plus = NO_COMPONENT, minus = NO_COMPONENT;
+  direction plus_direction = NO_DIRECTION, minus_direction = NO_DIRECTION;
+  const direction target_direction = component_direction(target);
+  FOR_COMPONENTS(candidate) {
+    if (!((is_electric(target) && is_magnetic(candidate)) ||
+          (is_D(target) && is_magnetic(candidate)) ||
+          (is_magnetic(target) && is_electric(candidate)) ||
+          (is_B(target) && is_electric(candidate))))
+      continue;
+    direction candidate_direction = component_direction(candidate);
+    if (target_direction == candidate_direction || !fc.gv.has_field(candidate) ||
+        !fc.gv.has_field(target))
+      continue;
+    direction target_xyz = target_direction >= R ? direction(target_direction - 3) : target_direction;
+    direction candidate_xyz =
+        candidate_direction >= R ? direction(candidate_direction - 3) : candidate_direction;
+    direction derivative = direction((3 + 2 * target_xyz - candidate_xyz) % 3);
+    if ((target_direction >= R || candidate_direction >= R) && derivative < Z)
+      derivative = direction(derivative + 3);
+    if (!(has_direction(fc.gv.dim, derivative) ||
+          (fc.gv.dim == Dcyl && has_field_direction(fc.gv.dim, derivative))))
+      continue;
+    const bool negative = ((3 + target_xyz - candidate_xyz) % 3) == 2;
+    if (negative) {
+      have_minus = true;
+      minus = candidate;
+      minus_direction = derivative;
+    }
+    else {
+      have_plus = true;
+      plus = candidate;
+      plus_direction = derivative;
+    }
+  }
+  const ArrayId expected_source1 =
+      have_plus ? f.array_catalog->find(StorageKey{source.region.chunk, int(array_kind::f),
+                                                   int(plus), source.region.cmp, 0})
+                : invalid_array();
+  const ArrayId expected_source2 =
+      have_minus ? f.array_catalog->find(StorageKey{source.region.chunk, int(array_kind::f),
+                                                    int(minus), source.region.cmp, 0})
+                 : invalid_array();
+  if (source.source1 != expected_source1 || source.source2 != expected_source2)
+    throw std::invalid_argument(
+        "BFAST source identity does not match its curl target (got " +
+        std::to_string(source.source1.value) + "/" + std::to_string(source.source2.value) +
+        ", expected " + std::to_string(expected_source1.value) + "/" +
+        std::to_string(expected_source2.value) + ")");
+  ptrdiff_t expected_stride1 = have_plus ? fc.gv.stride(plus_direction) : 0;
+  ptrdiff_t expected_stride2 = have_minus ? fc.gv.stride(minus_direction) : 0;
+  if (is_D(target)) {
+    expected_stride1 = -expected_stride1;
+    expected_stride2 = -expected_stride2;
+  }
+  if (source.stride1 != expected_stride1 || source.stride2 != expected_stride2)
+    throw std::invalid_argument("BFAST source stride does not match its curl target");
+  realnum expected_k1 = have_minus ? f.bfast_scaled_k[component_index(minus)] : 0;
+  realnum expected_k2 = have_plus ? f.bfast_scaled_k[component_index(plus)] : 0;
+  if (is_D(target)) {
+    expected_k1 = -expected_k1;
+    expected_k2 = -expected_k2;
+  }
+  if (source.k1 != double(expected_k1) || source.k2 != double(expected_k2))
+    throw std::invalid_argument("BFAST coefficients do not match live coordinate routing");
+  const ArrayId mutable_arrays[] = {source.target, source.f_bfast, source.target_u,
+                                    source.target_cond};
+  const ArrayId input_arrays[] = {source.source1, source.source2};
+  for (size_t i = 0; i < sizeof(mutable_arrays) / sizeof(mutable_arrays[0]); ++i) {
+    if (!is_valid(mutable_arrays[i])) continue;
+    for (size_t j = 0; j < sizeof(input_arrays) / sizeof(input_arrays[0]); ++j)
+      if (mutable_arrays[i] == input_arrays[j])
+        throw std::invalid_argument("BFAST descriptor aliases mutable and input state");
+    for (size_t j = i + 1; j < sizeof(mutable_arrays) / sizeof(mutable_arrays[0]); ++j)
+      if (is_valid(mutable_arrays[j]) && mutable_arrays[i] == mutable_arrays[j])
+        throw std::invalid_argument("BFAST descriptor aliases mutable state");
+  }
+
+  nvidia::bfast_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.target, "BFAST target");
+  result.target = device_address(state, source.target, "BFAST target");
+  result.source1 =
+      optional_device_address(state, source.source1, result.precision, "BFAST first source");
+  result.source2 =
+      optional_device_address(state, source.source2, result.precision, "BFAST second source");
+  result.stride1 = source.stride1;
+  result.stride2 = source.stride2;
+  result.f_bfast = optional_mutable_device_address(state, source.f_bfast, result.precision,
+                                                    "BFAST persistent state");
+  if (!result.f_bfast)
+    throw std::invalid_argument("BFAST descriptor has no persistent state");
+  result.target_u = optional_mutable_device_address(state, source.target_u, result.precision,
+                                                     "BFAST auxiliary target");
+  result.conductivity_inverse = optional_device_address(
+      state, source.condinv, result.precision, "BFAST conductivity inverse");
+  result.target_conductivity = optional_mutable_device_address(
+      state, source.target_cond, result.precision, "BFAST conductivity target");
+  result.pml =
+      compile_pml_profile(source.pml, result.region, result.precision, state, "BFAST main PML");
+  result.pml_u = compile_pml_profile(source.pml_u, result.region, result.precision, state,
+                                     "BFAST auxiliary PML");
+  result.k1 = source.k1;
+  result.k2 = source.k2;
+
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
+                       "BFAST target");
+  validate_index_range(state.plan_, source.f_bfast, ptrdiff_t(result.region.base), region_max,
+                       "BFAST persistent state");
+  if (is_valid(source.source1))
+    validate_shifted_index_range(state.plan_, source.source1, ptrdiff_t(result.region.base),
+                                 region_max, 0, source.stride1, 0, 0,
+                                 "BFAST first source");
+  if (is_valid(source.source2))
+    validate_shifted_index_range(state.plan_, source.source2, ptrdiff_t(result.region.base),
+                                 region_max, 0, source.stride2, 0, 0,
+                                 "BFAST second source");
+  if (is_valid(source.target_u))
+    validate_index_range(state.plan_, source.target_u, ptrdiff_t(result.region.base), region_max,
+                         "BFAST auxiliary target");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, ptrdiff_t(result.region.base), region_max,
+                         "BFAST conductivity inverse");
+  if (is_valid(source.target_cond))
+    validate_index_range(state.plan_, source.target_cond, ptrdiff_t(result.region.base), region_max,
+                         "BFAST conductivity target");
   return result;
 }
 
@@ -1848,8 +2032,16 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA nonzero beta requires a 2-D Cartesian grid");
     if (plan.beta != f_.beta)
       throw std::invalid_argument("NVIDIA beta coordinate fingerprint is stale");
+    if (plan.bfast_scaled_k != f_.bfast_scaled_k)
+      throw std::invalid_argument("NVIDIA BFAST coordinate fingerprint is stale");
     if (f_.beta != 0.0 && plan.beta_updates.empty())
       throw std::invalid_argument("NVIDIA nonzero-beta plan has no beta descriptors");
+    if (f_.bfast_scaled_k.size() != 3)
+      throw std::invalid_argument("NVIDIA BFAST coordinate must contain exactly three values");
+    const bool use_bfast = std::any_of(f_.bfast_scaled_k.begin(), f_.bfast_scaled_k.end(),
+                                      [](double k) { return k != 0.0; });
+    if (use_bfast != !plan.bfast_updates.empty())
+      throw std::invalid_argument("NVIDIA BFAST coordinate and descriptor state disagree");
     if (f_.is_phasing())
       throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
     if (f_.fluxes)
@@ -1906,6 +2098,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
 
     std::vector<NvidiaCompiledOperation> operations;
     std::vector<nvidia::curl_launch> curl_updates;
+    std::vector<nvidia::bfast_launch> bfast_updates;
     std::vector<nvidia::beta_launch> beta_updates;
     std::vector<nvidia::constitutive_launch> constitutive_updates;
     std::vector<nvidia::zero_launch> zero_updates;
@@ -1924,6 +2117,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<double> dft_omega;
     size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
+    bfast_updates.reserve(plan.bfast_updates.size());
+    for (const BfastUpdate &update : plan.bfast_updates)
+      bfast_updates.push_back(compile_bfast(update, state, f_));
+    std::vector<unsigned int> bfast_references(plan.bfast_updates.size(), 0);
 
     /* Capability validation is deliberately fail-fast. The first local reason
        is stable and actionable; the collective below only establishes that no
@@ -1941,8 +2138,63 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           }
           compiled.first = curl_updates.size();
           for (size_t i = op.descriptor_index;
-               i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
-            curl_updates.push_back(compile_curl(plan.db_updates[i], state));
+               i < size_t(op.descriptor_index) + op.descriptor_count; ++i) {
+            const CurlUpdate &source = plan.db_updates[i];
+            nvidia::curl_launch curl = compile_curl(source, state);
+            const bool has_bfast_bit = (source.region.variant_key & curl_has_bfast) != 0;
+            const bool has_bfast_index = source.bfast_update_index != UINT32_MAX;
+            if (use_bfast && !has_bfast_index) {
+              set_reason(local_error, oi, "live BFAST coordinate has an unpaired curl row");
+              break;
+            }
+            if (has_bfast_bit != has_bfast_index) {
+              set_reason(local_error, oi, "curl BFAST bit and paired index disagree");
+              break;
+            }
+            if (has_bfast_index) {
+              if (source.bfast_update_index >= plan.bfast_updates.size()) {
+                set_reason(local_error, oi, "curl BFAST paired index is out of range");
+                break;
+              }
+              const BfastUpdate &bfast = plan.bfast_updates[source.bfast_update_index];
+              bool same_region = source.region.chunk == bfast.region.chunk &&
+                                 source.region.c == bfast.region.c &&
+                                 source.region.cmp == bfast.region.cmp &&
+                                 source.region.base == bfast.region.base;
+              bool same_profiles = source.pml.sig == bfast.pml.sig &&
+                                   source.pml.kap == bfast.pml.kap &&
+                                   source.pml.siginv == bfast.pml.siginv &&
+                                   source.pml.base == bfast.pml.base &&
+                                   source.pml_u.sig == bfast.pml_u.sig &&
+                                   source.pml_u.kap == bfast.pml_u.kap &&
+                                   source.pml_u.siginv == bfast.pml_u.siginv &&
+                                   source.pml_u.base == bfast.pml_u.base;
+              for (int axis = 0; axis < 3; ++axis)
+                same_region = same_region &&
+                              source.region.begin.yucky_val(axis) ==
+                                  bfast.region.begin.yucky_val(axis) &&
+                              source.region.end.yucky_val(axis) ==
+                                  bfast.region.end.yucky_val(axis) &&
+                              source.region.counts[axis] == bfast.region.counts[axis] &&
+                              source.region.strides[axis] == bfast.region.strides[axis];
+              for (int axis = 0; axis < 3; ++axis)
+                same_profiles = same_profiles &&
+                                source.pml.strides[axis] == bfast.pml.strides[axis] &&
+                                source.pml_u.strides[axis] == bfast.pml_u.strides[axis];
+              if (!same_region || !same_profiles || source.target != bfast.target ||
+                  source.plus_source != bfast.source1 || source.minus_source != bfast.source2 ||
+                  source.plus_stride != bfast.stride1 || source.minus_stride != bfast.stride2 ||
+                  source.target_u != bfast.target_u || source.condinv != bfast.condinv ||
+                  source.target_cond != bfast.target_cond) {
+                set_reason(local_error, oi, "curl and paired BFAST descriptors disagree");
+                break;
+              }
+              curl.bfast_update_index = source.bfast_update_index;
+              ++bfast_references[source.bfast_update_index];
+            }
+            curl_updates.push_back(curl);
+          }
+          if (!local_error.empty()) break;
           compiled.count = curl_updates.size() - compiled.first;
           if (!compiled.count) set_reason(local_error, oi, "curl descriptor span is empty");
           if (size_t(op.beta_descriptor_index) + op.beta_descriptor_count >
@@ -2186,9 +2438,16 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     }
 
     if (local_error.empty())
+      for (size_t i = 0; i < bfast_references.size(); ++i)
+        if (bfast_references[i] != 1) {
+          local_error = "NVIDIA BFAST descriptor is not paired with exactly one curl";
+          break;
+        }
+
+    if (local_error.empty())
       executable.reset(new NvidiaExecutable(
           this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
-          beta_updates,
+          bfast_updates, beta_updates,
           constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
           halo_scratch_bytes, finite_checks, source_batches, source_points, source_copies,
           polarization_updates,
@@ -2232,8 +2491,12 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         const NvidiaCompiledOperation &op = executable.operations_[oi];
         switch (op.kind) {
           case OpKind::update_db:
-            for (size_t i = op.first; i < op.first + op.count; ++i)
+            for (size_t i = op.first; i < op.first + op.count; ++i) {
               nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
+              const uint32_t bfast = executable.curl_updates_[i].bfast_update_index;
+              if (bfast != UINT32_MAX)
+                nvidia::launch_bfast(executable.bfast_updates_[bfast], *state.transfer_);
+            }
             for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i)
               nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
             break;
