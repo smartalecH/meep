@@ -142,12 +142,23 @@ void fields::dump(const char *filename, bool single_parallel_file) {
       &file, single_parallel_file, "f_w_prev",
       [](fields_chunk *chunk, int c, int d) { return &(chunk->f_w_prev[c][d]); });
 
+  /* Sharded checkpoint traversal is rank-local: different ranks may own
+     different numbers of chunks. Refresh every local DFT chain first, then
+     reconcile exactly once while all ranks are still at the same boundary. */
+  std::string dft_dump_error;
+  if (!single_parallel_file) {
+    for (int i = 0; i < num_chunks; ++i)
+      if (chunks[i]->is_mine()) backend_read_dft_chain(chunks[i]->dft_chunks, dft_dump_error);
+    backend_reconcile_host_access(dft_dump_error, "fields::dump DFT storage");
+  }
+
   // Dump DFT chunks.
   for (int i = 0; i < num_chunks; i++) {
     if (single_parallel_file || chunks[i]->is_mine()) {
       char dataname[1024];
       snprintf(dataname, 1024, "chunk%02d", i);
-      save_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file);
+      save_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file,
+                    !single_parallel_file);
     }
   }
 }
@@ -280,14 +291,21 @@ void fields::load(const char *filename, bool single_parallel_file) {
       &file, single_parallel_file, "f_w_prev",
       [](fields_chunk *chunk, int c, int d) { return &(chunk->f_w_prev[c][d]); });
 
+  /* Defer sharded publication failures until every rank has completed its
+     rank-local loop, then reconcile once at the common outer boundary. */
+  std::string dft_load_error;
+
   // Load DFT chunks.
   for (int i = 0; i < num_chunks; i++) {
     if (single_parallel_file || chunks[i]->is_mine()) {
       char dataname[1024];
       snprintf(dataname, 1024, "chunk%02d", i);
-      load_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file);
+      load_dft_hdf5(chunks[i]->dft_chunks, dataname, &file, 0, single_parallel_file,
+                    single_parallel_file ? NULL : &dft_load_error);
     }
   }
+  if (!single_parallel_file)
+    backend_reconcile_host_access(dft_load_error, "fields::load DFT storage");
 }
 
 } // namespace meep
