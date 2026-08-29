@@ -123,6 +123,7 @@ bool connections_are_current(const fields &f);
    use_bloch, use_real_fields -- deliberately do not mark it. */
 void mark_local_invalidation(fields &f);
 bool needs_connection_sync(const fields &f);
+bool legacy_material_change_pending(const fields &f);
 void note_connection_sync_done(fields &f);
 
 /* --- PR 1 shadow assertions -----------------------------------------------
