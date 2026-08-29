@@ -113,6 +113,8 @@ bool backend_read_host_range(const fields &f, const void *host_address, size_t e
   if (!local_error.empty()) return false;
   try {
     if (!host_address || !elements || !backend_host_refresh_required(f)) return true;
+    if (f.backend->is_poisoned())
+      throw std::logic_error("resident backend is poisoned by a failed transition");
     if (!f.array_catalog)
       throw std::logic_error("resident backend access requires a storage catalog");
 
@@ -144,6 +146,8 @@ bool backend_write_host_range(fields &f, const void *host_address, size_t elemen
   if (!local_error.empty()) return false;
   try {
     if (!host_address || !elements || !backend_host_refresh_required(f)) return true;
+    if (f.backend->is_poisoned())
+      throw std::logic_error("resident backend is poisoned by a failed transition");
     if (!f.array_catalog)
       throw std::logic_error("resident backend access requires a storage catalog");
 
@@ -180,8 +184,14 @@ void backend_reconcile_host_access(const std::string &local_error, const char *s
 
 void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const char *site) {
   std::string local_error;
+  if (f.backend_state && f.backend && f.backend->requires_full_storage_preparation()) {
+    if (f.backend->is_poisoned())
+      local_error = "cannot change field layout after the resident backend was poisoned";
+    else if (f.synchronized_magnetic_fields)
+      local_error = "cannot change resident field layout while magnetic fields are synchronized";
+  }
   if (f.backend_state) try {
-      f.backend->prepare_state_rebuild(*f.backend_state, reasons);
+      if (local_error.empty()) f.backend->prepare_state_rebuild(*f.backend_state, reasons);
     }
     catch (const std::exception &e) {
       local_error = e.what();
@@ -287,9 +297,87 @@ void backend_publish_dft_chains(fields &owner, int count, dft_chunk *const *head
 }
 
 void backend_require_magnetic_synchronization(const fields &f, const char *site) {
-  if (!f.backend || !f.backend_state || f.backend->supports_magnetic_synchronization()) return;
-  throw std::runtime_error(std::string(site) +
-                           ": magnetic synchronization is not supported by the resident backend");
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
+  const bool poisoned = f.backend->is_poisoned();
+  const bool unsupported = !f.backend->supports_magnetic_synchronization();
+  if (!or_to_all(poisoned || unsupported)) return;
+  throw std::runtime_error(
+      std::string(site) +
+      (poisoned      ? ": resident backend is poisoned by a failed magnetic transition"
+       : unsupported ? ": magnetic synchronization is not supported by the resident backend"
+                     : ": magnetic synchronization is unavailable on another MPI rank"));
+}
+
+static void reconcile_magnetic_dispatch(fields &f, const std::string &local_error,
+                                        const char *site) {
+  if (!or_to_all(!local_error.empty())) return;
+  f.backend->poison();
+  if (local_error.empty())
+    throw std::runtime_error(std::string(site) +
+                             ": magnetic transition failed on another MPI rank; resident backend "
+                             "is poisoned");
+  throw std::runtime_error(std::string(site) + ": " + local_error +
+                           "; resident backend is poisoned");
+}
+
+bool backend_try_synchronize_magnetic_fields(fields &f, const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return false;
+  backend_require_magnetic_synchronization(f, site);
+  std::string local_error;
+  try {
+    f.init_backend();
+    f.ensure_backend_executable();
+    f.backend->preflight_magnetic_transition(*f.executable, *f.backend_state, true);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident magnetic synchronize failure";
+  }
+  backend_reconcile_host_access(local_error, site);
+  local_error.clear();
+  try {
+    f.backend->synchronize_magnetic_fields(*f.executable, *f.backend_state);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident magnetic synchronize failure";
+  }
+  reconcile_magnetic_dispatch(f, local_error, site);
+  return true;
+}
+
+bool backend_try_restore_magnetic_fields(fields &f, const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return false;
+  backend_require_magnetic_synchronization(f, site);
+  std::string local_error;
+  try {
+    if (!f.backend_state || !f.executable)
+      throw std::logic_error("resident magnetic restore has no prepared executable");
+    f.backend->preflight_magnetic_transition(*f.executable, *f.backend_state, false);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident magnetic restore failure";
+  }
+  backend_reconcile_host_access(local_error, site);
+  local_error.clear();
+  try {
+    f.backend->restore_magnetic_fields(*f.executable, *f.backend_state);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident magnetic restore failure";
+  }
+  reconcile_magnetic_dispatch(f, local_error, site);
+  return true;
 }
 
 bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
@@ -298,6 +386,8 @@ bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
   if (!backend_host_refresh_required(owner) || !owner.backend->supports_compact_dft_reductions())
     return false;
 
+  if (local_error.empty() && owner.backend->is_poisoned())
+    local_error = "resident backend is poisoned by a failed transition";
   if (local_error.empty()) try {
       if (!local_result && result_count)
         throw std::invalid_argument("compact DFT reduction has no result buffer");
@@ -356,6 +446,14 @@ void fields::select_backend(const execution_options &opts) {
      replacement has been selected, and do not leak the replacement if the old
      backend refuses or fails migration. */
   try {
+    std::string local_error;
+    if (backend_state && backend && backend->requires_full_storage_preparation()) {
+      if (backend->is_poisoned())
+        local_error = "cannot replace a poisoned resident backend";
+      else if (synchronized_magnetic_fields)
+        local_error = "cannot replace resident backend while magnetic fields are synchronized";
+    }
+    backend_reconcile_host_access(local_error, "fields::select_backend");
     release_backend_state_for_rebuild(*this,
                                       DirtyMask(dirty_mask | dirty_storage | dirty_executable));
   }
@@ -367,6 +465,12 @@ void fields::select_backend(const execution_options &opts) {
   backend = b;
   delete initialization_plan;
   initialization_plan = NULL;
+  /* Backend selection changes the storage representation even when the host
+     field layout is unchanged (for example CPU native -> NVIDIA mixed).  The
+     old backend has been retired successfully at this point, so invalidate
+     only now: a failed replacement must leave both the old state and lifecycle
+     bookkeeping untouched. */
+  invalidate(*this, MutationKind::precision_policy, "fields::select_backend");
 }
 
 void fields::init_backend() {
@@ -374,6 +478,8 @@ void fields::init_backend() {
     execution_options opts;
     select_backend(opts);
   }
+  if (or_to_all(backend->is_poisoned()))
+    throw std::runtime_error("fields::init_backend: resident backend is poisoned");
   if (!backend->requires_full_storage_preparation()) {
     /* On the initial CPU step the lazy storage pass below the executor builds
        descriptors after the catalog is complete. Once storage is current,
@@ -399,7 +505,13 @@ void fields::init_backend() {
 
   const bool rebuild_state = !backend_state || is_dirty(*this, dirty_storage);
   if (rebuild_state) {
-    if (backend_state) release_backend_state_for_rebuild(*this, DirtyMask(dirty_mask));
+    if (backend_state) {
+      std::string local_error;
+      if (synchronized_magnetic_fields)
+        local_error = "cannot rebuild resident state while magnetic fields are synchronized";
+      backend_reconcile_host_access(local_error, "fields::init_backend");
+      release_backend_state_for_rebuild(*this, DirtyMask(dirty_mask));
+    }
 
     /* Unlike the CPU path, a resident backend needs the complete catalog before
        it allocates. This is intentionally gated by the backend capability so

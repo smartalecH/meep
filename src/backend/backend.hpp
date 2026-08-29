@@ -82,6 +82,7 @@ struct DftReductionRequest {
 
 class ExecutionBackend {
 public:
+  ExecutionBackend() : poisoned_(false) {}
   virtual ~ExecutionBackend() {}
 
   virtual BackendState *create_state(const StoragePlan &) = 0;
@@ -102,6 +103,21 @@ public:
   virtual bool supports_magnetic_synchronization() const {
     return !requires_full_storage_preparation();
   }
+  /* Validate and reserve everything required by the following transition
+     without mutating live fields or the backend-private snapshot. All ranks
+     reconcile this preflight before any rank enters the dispatch hook. A
+     dispatch must therefore contain no recoverable validation or allocation;
+     an exception after it starts is a poisoned-backend failure, not a
+     retryable transition. */
+  virtual void preflight_magnetic_transition(Executable &, BackendState &, bool) {}
+  virtual void synchronize_magnetic_fields(Executable &, BackendState &) {
+    throw std::logic_error("backend does not implement magnetic synchronization");
+  }
+  virtual void restore_magnetic_fields(Executable &, BackendState &) {
+    throw std::logic_error("backend does not implement magnetic restoration");
+  }
+  void poison() { poisoned_ = true; }
+  bool is_poisoned() const { return poisoned_; }
   virtual bool supports_compact_dft_reductions() const { return false; }
   virtual void reduce_dft(const DftReductionRequest &, std::complex<double> *, size_t) {
     throw std::logic_error("backend does not support compact DFT reductions");
@@ -126,6 +142,9 @@ public:
      reach the same verdict, or the ones that accept will wait forever on the
      ones that abort. */
   virtual bool accepts(const execution_options &opts, std::string &why) const = 0;
+
+private:
+  bool poisoned_;
 };
 
 /* Selects and constructs a backend, or fails with a clear collective error.
@@ -185,6 +204,8 @@ void backend_publish_dft_chain(dft_chunk *head, const char *site);
 /* Refuse legacy magnetic synchronization before it changes its nesting
    counter or allocates backup arrays on an unsupported resident backend. */
 void backend_require_magnetic_synchronization(const fields &f, const char *site);
+bool backend_try_synchronize_magnetic_fields(fields &f, const char *site);
+bool backend_try_restore_magnetic_fields(fields &f, const char *site);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI
