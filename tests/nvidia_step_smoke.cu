@@ -9,7 +9,9 @@
 #include "backend/nvidia/nvidia_step.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -50,13 +52,21 @@ static void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
 }
 
+template <typename T>
+static T nonlinear_reference(T dsqr, T di, T chi1inv, T chi2, T chi3) {
+  const T c2 = di * chi2 * (chi1inv * chi1inv);
+  const T c3 = dsqr * chi3 * (chi1inv * chi1inv * chi1inv);
+  return (T(1) + c2 + T(2) * c3) / (T(1) + T(2) * c2 + T(3) * c3);
+}
+
 template <typename T> static void check_device(int device) {
   device_scope selected(device);
   stream execution;
   const size_t elements = 96;
   const size_t bytes = elements * sizeof(T);
   std::vector<T> target(elements), plus(elements), minus(elements), primary(elements),
-      diagonal(elements), offdiagonal1(elements), offdiagonal2(elements),
+      diagonal(elements), offdiagonal1(elements), offdiagonal2(elements), chi2(elements),
+      chi3(elements),
       output(elements, T(-17.25)), observed(elements);
   for (size_t i = 0; i < elements; ++i) {
     target[i] = T(0.01 * double(i + 1));
@@ -66,11 +76,14 @@ template <typename T> static void check_device(int device) {
     diagonal[i] = T(0.5 + 0.002 * double(i));
     offdiagonal1[i] = T(0.03 - 0.0001 * double(i));
     offdiagonal2[i] = T(-0.02 + 0.00015 * double(i));
+    chi2[i] = T(0.07 + 0.0002 * double(i));
+    chi3[i] = T(0.11 - 0.0003 * double(i));
   }
 
   device_buffer d_target(bytes, device), d_plus(bytes, device), d_minus(bytes, device),
       d_primary(bytes, device), d_diagonal(bytes, device), d_offdiagonal1(bytes, device),
-      d_offdiagonal2(bytes, device), d_output(bytes, device);
+      d_offdiagonal2(bytes, device), d_chi2(bytes, device), d_chi3(bytes, device),
+      d_output(bytes, device);
   copy_host_to_device_async(d_target, 0, target.data(), bytes, execution);
   copy_host_to_device_async(d_plus, 0, plus.data(), bytes, execution);
   copy_host_to_device_async(d_minus, 0, minus.data(), bytes, execution);
@@ -78,6 +91,8 @@ template <typename T> static void check_device(int device) {
   copy_host_to_device_async(d_diagonal, 0, diagonal.data(), bytes, execution);
   copy_host_to_device_async(d_offdiagonal1, 0, offdiagonal1.data(), bytes, execution);
   copy_host_to_device_async(d_offdiagonal2, 0, offdiagonal2.data(), bytes, execution);
+  copy_host_to_device_async(d_chi2, 0, chi2.data(), bytes, execution);
+  copy_host_to_device_async(d_chi3, 0, chi3.data(), bytes, execution);
   copy_host_to_device_async(d_output, 0, output.data(), bytes, execution);
 
   flat_region region;
@@ -440,6 +455,146 @@ template <typename T> static void check_device(int device) {
                 "anisotropic constitutive PML auxiliary or sentinel differs");
       }
     }
+
+  struct nonlinear_case {
+    unsigned int nonlinear_crosses;
+    unsigned int offdiagonals;
+    bool pml;
+    bool use_chi2;
+    bool use_chi3;
+  };
+  const nonlinear_case nonlinear_cases[] = {
+      {0, 0, false, true, false}, {2, 0, false, false, true},
+      {1, 0, false, true, true},  {2, 0, true, true, true},
+      {2, 1, false, true, true},  {2, 1, true, true, true},
+      {2, 2, false, true, true},  {2, 2, true, true, true}};
+  for (size_t c = 0; c < sizeof(nonlinear_cases) / sizeof(nonlinear_cases[0]); ++c) {
+    const nonlinear_case &test = nonlinear_cases[c];
+    std::vector<T> case_chi2 = chi2, case_chi3 = chi3;
+    if (!test.use_chi2) std::fill(case_chi2.begin(), case_chi2.end(), T(0));
+    if (!test.use_chi3) std::fill(case_chi3.begin(), case_chi3.end(), T(0));
+    copy_host_to_device_async(d_chi2, 0, case_chi2.data(), bytes, execution);
+    copy_host_to_device_async(d_chi3, 0, case_chi3.data(), bytes, execution);
+    copy_host_to_device_async(d_output, 0, output.data(), bytes, execution);
+    copy_host_to_device_async(d_pml_u, 0, pml_u.data(), bytes, execution);
+
+    constitutive_launch nonlinear = {};
+    nonlinear.region = anisotropic_region;
+    nonlinear.target = d_output.opaque_handle();
+    nonlinear.primary = d_primary.opaque_handle();
+    nonlinear.diagonal = d_diagonal.opaque_handle();
+    nonlinear.chi2 = d_chi2.opaque_handle();
+    nonlinear.chi3 = d_chi3.opaque_handle();
+    nonlinear.primary_stride = primary_stride;
+    nonlinear.cross1_stride = cross1_stride;
+    nonlinear.cross2_stride = cross2_stride;
+    if (test.nonlinear_crosses >= 1) nonlinear.cross1 = d_plus.opaque_handle();
+    if (test.nonlinear_crosses >= 2) nonlinear.cross2 = d_minus.opaque_handle();
+    if (test.offdiagonals >= 1) {
+      nonlinear.cross1 = d_plus.opaque_handle();
+      nonlinear.offdiagonal1 = d_offdiagonal1.opaque_handle();
+    }
+    if (test.offdiagonals >= 2) {
+      nonlinear.cross2 = d_minus.opaque_handle();
+      nonlinear.offdiagonal2 = d_offdiagonal2.opaque_handle();
+    }
+    if (test.pml) {
+      nonlinear.target_w = d_pml_u.opaque_handle();
+      nonlinear.pml.sigma = d_sigma.opaque_handle();
+      nonlinear.pml.kappa = d_kappa.opaque_handle();
+      nonlinear.pml.inverse = d_inverse.opaque_handle();
+      nonlinear.pml.base = 3;
+      nonlinear.pml.strides[2] = 1;
+    }
+    nonlinear.precision = precision;
+    launch_constitutive(nonlinear, execution);
+
+    std::vector<T> nonlinear_expected = output;
+    std::vector<T> nonlinear_w_expected = pml_u;
+    for (size_t n = 0; n < anisotropic_region.counts[2]; ++n) {
+      const ptrdiff_t i = ptrdiff_t(anisotropic_region.base + n);
+      T value = primary[i] * diagonal[i];
+      if (test.offdiagonals >= 1)
+        value += T(0.25) *
+                 ((plus[i] + plus[i - cross1_stride]) * offdiagonal1[i] +
+                  (plus[i + primary_stride] + plus[i + primary_stride - cross1_stride]) *
+                      offdiagonal1[i + primary_stride]);
+      if (test.offdiagonals >= 2)
+        value += T(0.25) *
+                 ((minus[i] + minus[i - cross2_stride]) * offdiagonal2[i] +
+                  (minus[i + primary_stride] + minus[i + primary_stride - cross2_stride]) *
+                      offdiagonal2[i + primary_stride]);
+      T dsqr;
+      if (test.nonlinear_crosses == 2) {
+        const T g1s = plus[i] + plus[i + primary_stride] + plus[i - cross1_stride] +
+                      plus[i + primary_stride - cross1_stride];
+        const T g2s = minus[i] + minus[i + primary_stride] + minus[i - cross2_stride] +
+                      minus[i + primary_stride - cross2_stride];
+        dsqr = primary[i] * primary[i] + T(0.0625) * (g1s * g1s + g2s * g2s);
+      }
+      else if (test.nonlinear_crosses == 1) {
+        const T g1s = plus[i] + plus[i + primary_stride] + plus[i - cross1_stride] +
+                      plus[i + primary_stride - cross1_stride];
+        dsqr = primary[i] * primary[i] + T(0.0625) * (g1s * g1s);
+      }
+      else
+        dsqr = primary[i] * primary[i];
+      value *=
+          nonlinear_reference(dsqr, primary[i], diagonal[i], case_chi2[i], case_chi3[i]);
+      if (test.pml) {
+        const ptrdiff_t k = 3 + ptrdiff_t(n);
+        const T previous = nonlinear_w_expected[i];
+        nonlinear_w_expected[i] = value;
+        nonlinear_expected[i] +=
+            (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * previous;
+      }
+      else
+        nonlinear_expected[i] = value;
+    }
+
+    copy_device_to_host_async(observed.data(), d_output, 0, bytes, execution);
+    copy_device_to_host_async(observed_w.data(), d_pml_u, 0, bytes, execution);
+    execution.synchronize();
+    const double tolerance = 64.0 * std::numeric_limits<T>::epsilon();
+    for (size_t i = 0; i < elements; ++i) {
+      require(std::fabs(double(observed[i] - nonlinear_expected[i])) <=
+                  tolerance * (1.0 + std::fabs(double(nonlinear_expected[i]))),
+              "nonlinear constitutive target or sentinel differs");
+      require(std::fabs(double(observed_w[i] - nonlinear_w_expected[i])) <=
+                  tolerance * (1.0 + std::fabs(double(nonlinear_w_expected[i]))),
+              "nonlinear constitutive PML auxiliary or sentinel differs");
+    }
+  }
+
+  {
+    constitutive_launch invalid = {};
+    invalid.region = anisotropic_region;
+    invalid.target = d_output.opaque_handle();
+    invalid.primary = d_primary.opaque_handle();
+    invalid.diagonal = d_diagonal.opaque_handle();
+    invalid.chi3 = d_chi3.opaque_handle();
+    invalid.precision = precision;
+    bool rejected = false;
+    try {
+      launch_constitutive(invalid, execution);
+    }
+    catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "constitutive launch accepted a partial nonlinear descriptor");
+
+    invalid.chi2 = d_chi2.opaque_handle();
+    invalid.cross2 = d_minus.opaque_handle();
+    rejected = false;
+    try {
+      launch_constitutive(invalid, execution);
+    }
+    catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    require(rejected, "constitutive launch accepted nonlinear cross2 without cross1");
+  }
+  if (std::getenv("MEEP_NVIDIA_STEP_NONLINEAR_ONLY")) return;
 
   std::vector<T> finite_values(elements);
   for (size_t i = 0; i < elements; ++i) finite_values[i] = T(0.125 * double(i) - 3.0);
