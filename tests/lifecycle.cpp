@@ -71,6 +71,7 @@ static void test_closure_table() {
       {MutationKind::boundary_topology, dirty_regions | dirty_halos | dirty_executable},
       {MutationKind::chunk_topology,
        dirty_storage | dirty_regions | dirty_halos | dirty_executable},
+      {MutationKind::coordinate_definition, dirty_executable},
       {MutationKind::precision_policy,
        dirty_storage | dirty_initialization | dirty_executable},
   };
@@ -272,6 +273,28 @@ static void test_mutation_lifecycle() {
   CHECK(!connections_are_current(f), "use_bloch must invalidate chunk connections");
   CHECK(f.connections_generation > built, "connection generation did not advance");
   CHECK(is_dirty(f, dirty_halos), "boundary_topology must dirty the halos");
+
+  grid_volume cyl_gv = volcyl(1.0, 1.0, a);
+  structure cyl_s(cyl_gv, one, no_pml());
+  fields cyl_f(&cyl_s, 1.0);
+  clear_dirty(cyl_f, ~DirtyMask(0));
+  const uint64_t coordinate_before = generation(cyl_f, MutationKind::coordinate_definition);
+  cyl_f.change_m(-1.0);
+  CHECK(generation(cyl_f, MutationKind::coordinate_definition) == coordinate_before + 1,
+        "change_m must advance the coordinate-state generation");
+  CHECK(is_dirty(cyl_f, dirty_executable), "change_m must dirty the executable");
+  CHECK(!is_dirty(cyl_f, dirty_storage), "same-layout change_m must preserve storage");
+  for (int i = 0; i < cyl_f.num_chunks; ++i)
+    CHECK(cyl_f.chunks[i]->m == -1.0, "change_m did not propagate to chunk %d", i);
+
+  clear_dirty(cyl_f, ~DirtyMask(0));
+  const uint64_t unchanged_generation =
+      generation(cyl_f, MutationKind::coordinate_definition);
+  cyl_f.change_m(-1.0);
+  CHECK(generation(cyl_f, MutationKind::coordinate_definition) == unchanged_generation,
+        "repeating change_m with the live value must not advance its generation");
+  CHECK(cyl_f.dirty_mask == dirty_none,
+        "repeating change_m with the live value must not dirty prepared state");
 }
 
 int main(int argc, char **argv) {

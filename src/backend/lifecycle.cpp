@@ -68,6 +68,8 @@ DirtyMask invalidation_closure(MutationKind cause) {
     case MutationKind::chunk_topology:
       return dirty_storage | dirty_regions | dirty_halos | dirty_executable;
 
+    case MutationKind::coordinate_definition: return dirty_executable;
+
     case MutationKind::precision_policy:
       return dirty_storage | dirty_initialization | dirty_executable;
   }
@@ -87,6 +89,7 @@ const char *mutation_kind_name(MutationKind cause) {
     case MutationKind::field_layout: return "field_layout";
     case MutationKind::boundary_topology: return "boundary_topology";
     case MutationKind::chunk_topology: return "chunk_topology";
+    case MutationKind::coordinate_definition: return "coordinate_definition";
     case MutationKind::precision_policy: return "precision_policy";
   }
   return "?";

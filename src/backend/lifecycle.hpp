@@ -51,12 +51,13 @@ enum class MutationKind {
   field_layout,        // component, real/complex mode, or optional array changed
   boundary_topology,   // boundary, Bloch phase, symmetry, or user volume changed
   chunk_topology,      // decomposition or chunk ownership changed
+  coordinate_definition, // cylindrical m/origin rules changed without changing storage
   precision_policy     // storage precision changed; state must be converted or rebuilt
 };
 
 /* Keep in sync with fields::num_mutation_kinds in meep.hpp; lifecycle.cpp
    static_asserts that they agree. */
-const int mutation_kind_count = 12;
+const int mutation_kind_count = 13;
 
 typedef uint32_t DirtyMask;
 enum DirtyBit : DirtyMask {

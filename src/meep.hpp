@@ -1881,7 +1881,7 @@ public:
      which must not be included from meep.hpp (global rule 5: meep.hpp is the
      SWIG surface). Treat these as internal; use meep::invalidate() rather than
      writing them directly. */
-  static const int num_mutation_kinds = 12;
+  static const int num_mutation_kinds = 13;
   uint32_t dirty_mask;
   uint64_t mutation_generation[num_mutation_kinds];
   /* Shadows `chunk_connections_valid`: connectivity is current iff these two
