@@ -759,11 +759,15 @@ structure_chunk::structure_chunk(const structure_chunk *o) : v(o->v) {
       if (o->conductivity[c][d]) {
         conductivity[c][d] = new realnum[gv.ntot()];
         memcpy(conductivity[c][d], o->conductivity[c][d], gv.ntot() * sizeof(realnum));
+      }
+      else
+        conductivity[c][d] = NULL;
+      if (o->condinv[c][d]) {
         condinv[c][d] = new realnum[gv.ntot()];
         memcpy(condinv[c][d], o->condinv[c][d], gv.ntot() * sizeof(realnum));
       }
       else
-        conductivity[c][d] = condinv[c][d] = NULL;
+        condinv[c][d] = NULL;
     }
   }
   condinv_stale = o->condinv_stale;

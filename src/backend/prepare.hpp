@@ -34,6 +34,9 @@
 #ifndef MEEP_BACKEND_PREPARE_HPP
 #define MEEP_BACKEND_PREPARE_HPP
 
+#include <memory>
+#include <vector>
+
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
 #include "backend/storage_plan.hpp"
@@ -47,6 +50,52 @@ bool prepare_step_db(fields_chunk &fc, field_type ft, StoragePlan &plan);
 bool prepare_update_eh(fields_chunk &fc, field_type ft, bool skip_w_components, StoragePlan &plan);
 bool prepare_polarizations(fields_chunk &fc, field_type ft, StoragePlan &plan);
 void prepare_dfts(fields &f, StoragePlan &plan);
+
+/* Resident material phasing must freeze a current-storage superset before the
+   backend catalog is built.  The target remains host-only: this helper
+   transactionally detaches each owned current structure chunk, realizes the
+   current/target chi1inv and conductivity union using the CPU defaults, and
+   materializes any diagonal condinv row that can be needed during the phase. */
+class PreparedMaterialPhaseStorage {
+public:
+  PreparedMaterialPhaseStorage(fields &f, const structure &target);
+  explicit PreparedMaterialPhaseStorage(fields &f);
+  ~PreparedMaterialPhaseStorage();
+  void commit();
+
+private:
+  PreparedMaterialPhaseStorage(fields &f, const structure *target);
+  PreparedMaterialPhaseStorage(const PreparedMaterialPhaseStorage &);
+  PreparedMaterialPhaseStorage &operator=(const PreparedMaterialPhaseStorage &);
+  fields &owner_;
+  std::vector<std::unique_ptr<structure_chunk> > chunks_;
+  bool committed_;
+};
+
+std::unique_ptr<PreparedMaterialPhaseStorage> prepare_material_phase_storage(
+    fields &f, const structure &target);
+std::unique_ptr<PreparedMaterialPhaseStorage> prepare_material_phase_storage(fields &f);
+
+/* Resident storage must catalog every material coefficient consumed by its
+   compiled program.  This transaction detaches only owned current structure
+   chunks whose diagonal conductivity inverse is still CPU-lazy, realizes the
+   inverse on the clone, and publishes no pointer until commit(). */
+class PreparedMaterialCoefficientStorage {
+public:
+  explicit PreparedMaterialCoefficientStorage(fields &f);
+  ~PreparedMaterialCoefficientStorage();
+  void commit();
+
+private:
+  PreparedMaterialCoefficientStorage(const PreparedMaterialCoefficientStorage &);
+  PreparedMaterialCoefficientStorage &operator=(const PreparedMaterialCoefficientStorage &);
+  fields &owner_;
+  std::vector<std::unique_ptr<structure_chunk> > chunks_;
+  bool committed_;
+};
+
+std::unique_ptr<PreparedMaterialCoefficientStorage>
+prepare_material_coefficient_storage(fields &f);
 
 /* Debug-only: assert the lazy paths have nothing left to do. Compiled out with
    NDEBUG; the assertions-on CI configuration is what gives these value. */
