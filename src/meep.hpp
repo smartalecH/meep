@@ -77,6 +77,15 @@ double pml_quadratic_profile(double, void *);
 
 /* generic base class, only used by subclassing: represents susceptibility
    polarizability vector P = chi(omega) W  (where W = E or H). */
+struct InternalArrayLayout {
+  const char *name;
+  enum value_type { realnum_value, complex_realnum } element_type;
+  size_t offset_elements;
+  size_t elements;
+  component c;
+  int cmp;
+};
+
 class susceptibility {
 public:
   susceptibility() {
@@ -198,6 +207,14 @@ public:
      internal fields that need to be multiplied by the same phase
      factor as the fields at boundaries.  Note: we assume internal fields
      are complex if and only if !is_real (i.e. if EM fields are complex) */
+  virtual bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &gv,
+                               void *P_internal_data) const {
+    (void)out;
+    (void)gv;
+    (void)P_internal_data;
+    return false;
+  }
+
   virtual int num_cinternal_notowned_needed(component c, void *P_internal_data) const {
     (void)c;
     (void)P_internal_data;
@@ -269,6 +286,8 @@ public:
   virtual int num_cinternal_notowned_needed(component c, void *P_internal_data) const;
   virtual realnum *cinternal_notowned_ptr(int inotowned, component c, int cmp, int n,
                                           void *P_internal_data) const;
+  virtual bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &gv,
+                               void *P_internal_data) const;
 
   virtual void dump_params(h5file *h5f, size_t *start);
   virtual int get_num_params() { return 4; }
