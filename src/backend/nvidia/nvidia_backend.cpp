@@ -16,6 +16,7 @@
 #include <complex>
 #include <limits>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -363,7 +364,8 @@ public:
                    const std::vector<nvidia::halo_gather_entry> &halo_gathers,
                    const std::vector<nvidia::halo_scatter_entry> &halo_scatters,
                    size_t halo_scratch_bytes, const std::vector<NvidiaFiniteCheck> &finite_checks,
-                   const std::vector<nvidia::point_source_launch> &point_sources,
+                   const std::vector<nvidia::source_batch_launch> &source_batches,
+                   const std::vector<nvidia::source_point> &source_points,
                    const std::vector<nvidia::array_copy_launch> &source_copies,
                    const std::vector<nvidia::dft_launch> &dft_updates,
                    const std::vector<double> &dft_omega,
@@ -373,7 +375,7 @@ public:
         storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
-        halo_plans_(halo_plans), finite_checks_(finite_checks), point_sources_(point_sources),
+        halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), dft_updates_(dft_updates),
         source_scalar_count_(source_scalar_count) {
     try {
@@ -406,6 +408,17 @@ public:
                                                  sizeof(nvidia::source_scalar),
                                                  "allocating NVIDIA source-scalar staging"));
       }
+      if (!source_points.empty()) {
+        source_points_.allocate(checked_product(source_points.size(), sizeof(source_points[0]),
+                                                "allocating NVIDIA source points"),
+                                state.device_);
+        nvidia::copy_host_to_device_async(source_points_, 0, source_points.data(),
+                                          source_points_.size(), *state.transfer_);
+        const nvidia::source_point *point_base =
+            static_cast<const nvidia::source_point *>(source_points_.opaque_handle());
+        for (size_t i = 0; i < source_batches_.size(); ++i)
+          source_batches_[i].points = point_base + source_batches_[i].point_offset;
+      }
       if (!dft_omega.empty()) {
         dft_omega_.allocate(checked_product(dft_omega.size(), sizeof(double),
                                             "allocating NVIDIA DFT frequencies"),
@@ -416,7 +429,8 @@ public:
         for (size_t i = 0; i < dft_updates_.size(); ++i)
           dft_updates_[i].omega = omega_base;
       }
-      if (!halo_gathers.empty() || !halo_scatters.empty() || !dft_omega.empty())
+      if (!halo_gathers.empty() || !halo_scatters.empty() || !source_points.empty() ||
+          !dft_omega.empty())
         state.transfer_->synchronize();
     }
     catch (...) {
@@ -437,7 +451,7 @@ public:
   std::vector<nvidia::zero_launch> zero_updates_;
   std::vector<NvidiaCompiledHalo> halo_plans_;
   std::vector<NvidiaFiniteCheck> finite_checks_;
-  std::vector<nvidia::point_source_launch> point_sources_;
+  std::vector<nvidia::source_batch_launch> source_batches_;
   std::vector<nvidia::array_copy_launch> source_copies_;
   std::vector<nvidia::dft_launch> dft_updates_;
   size_t source_scalar_count_;
@@ -448,6 +462,7 @@ public:
   nvidia::pinned_buffer finite_result_host_;
   nvidia::device_buffer source_scalars_;
   nvidia::pinned_buffer source_staging_;
+  nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
 };
 
@@ -562,13 +577,12 @@ void validate_ref_index_range(const StoragePlan &plan, const ArrayRef &ref, ptrd
     throw std::out_of_range(std::string(what) + " index range exceeds its declared span");
 }
 
-nvidia::point_source_launch compile_point_source(const SourceDescriptor &source,
-                                                 const SourcePlan &source_plan, size_t point,
-                                                 const fields &f, NvidiaBackendState &state) {
+nvidia::source_batch_launch compile_source_batch(const SourceDescriptor &source,
+                                                 const SourcePlan &source_plan,
+                                                 const fields &f, NvidiaBackendState &state,
+                                                 std::vector<nvidia::source_point> &points) {
   if (source.indices.empty() || source.indices.size() != source.complex_amplitudes.size())
     throw std::invalid_argument("NVIDIA source descriptor has invalid spatial data");
-  if (point >= source.indices.size())
-    throw std::out_of_range("NVIDIA source point is out of range");
   if (source.source_time_id >= source_plan.source_times.size())
     throw std::out_of_range("source descriptor has an invalid source-time ID");
   const SourceTimeDescriptor &time = source_plan.source_times[source.source_time_id];
@@ -578,7 +592,7 @@ nvidia::point_source_launch compile_point_source(const SourceDescriptor &source,
   if (time.is_integrated != source.integrated)
     throw std::invalid_argument("source descriptor and source-time integration modes disagree");
 
-  nvidia::point_source_launch result = {};
+  nvidia::source_batch_launch result = {};
   const ArrayId target = source.integrated ? source.integrated_destination : source.destination;
   const ArrayId target_imag =
       source.integrated ? source.integrated_destination_imag : source.destination_imag;
@@ -590,23 +604,34 @@ nvidia::point_source_launch compile_point_source(const SourceDescriptor &source,
       source.integrated ? NULL
                         : optional_device_address(state, source.condinv, result.precision,
                                                   "source conductivity inverse");
-  result.index = source.indices[point];
+  result.point_offset = points.size();
+  result.point_count = source.indices.size();
   result.scalar_slot = time.scalar_slot;
-  result.amplitude_real = source.complex_amplitudes[point].real();
-  result.amplitude_imag = source.complex_amplitudes[point].imag();
   result.dt = f.dt;
   result.integrated = source.integrated;
-  validate_index_range(state.plan_, target, result.index, result.index, "source target");
+  const std::pair<std::vector<ptrdiff_t>::const_iterator,
+                  std::vector<ptrdiff_t>::const_iterator> bounds =
+      std::minmax_element(source.indices.begin(), source.indices.end());
+  validate_index_range(state.plan_, target, *bounds.first, *bounds.second, "source target");
   if (is_valid(target_imag))
-    validate_index_range(state.plan_, target_imag, result.index, result.index,
+    validate_index_range(state.plan_, target_imag, *bounds.first, *bounds.second,
                          "source imaginary target");
   if (!source.integrated && is_valid(source.condinv))
-    validate_index_range(state.plan_, source.condinv, result.index, result.index,
+    validate_index_range(state.plan_, source.condinv, *bounds.first, *bounds.second,
                          "source conductivity inverse");
   if (f.is_real && result.target_imag)
     throw std::invalid_argument("real NVIDIA fields have an imaginary source target");
   if (!f.is_real && !result.target_imag)
     throw std::invalid_argument("complex NVIDIA fields have no imaginary source target");
+  std::set<ptrdiff_t> unique_indices;
+  for (size_t point = 0; point < source.indices.size(); ++point) {
+    nvidia::source_point packed = {};
+    packed.index = source.indices[point];
+    packed.amplitude_real = source.complex_amplitudes[point].real();
+    packed.amplitude_imag = source.complex_amplitudes[point].imag();
+    points.push_back(packed);
+    if (!unique_indices.insert(packed.index).second) result.sequential = true;
+  }
   return result;
 }
 
@@ -1440,7 +1465,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<NvidiaFiniteCheck> finite_checks;
     size_t halo_scratch_bytes = 0;
     uint64_t finite_elements = 0;
-    std::vector<nvidia::point_source_launch> point_sources;
+    std::vector<nvidia::source_batch_launch> source_batches;
+    std::vector<nvidia::source_point> source_points;
     std::vector<nvidia::array_copy_launch> source_copies;
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
@@ -1513,7 +1539,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
               set_reason(local_error, oi, "integrated source descriptor span is out of range");
               break;
             }
-            compiled.source_first = point_sources.size();
+            compiled.source_first = source_batches.size();
             const field_type source_ft = op.ft == E_stuff ? D_stuff : B_stuff;
             for (size_t i = op.source_descriptor_index;
                  i < size_t(op.source_descriptor_index) + op.source_descriptor_count; ++i) {
@@ -1521,11 +1547,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
               if (!source.integrated || source.ft != source_ft)
                 throw std::invalid_argument(
                     "integrated source descriptor span has the wrong field type");
-              for (size_t point = 0; point < source.indices.size(); ++point)
-                point_sources.push_back(
-                    compile_point_source(source, *source_plan, point, f_, state));
+              source_batches.push_back(
+                  compile_source_batch(source, *source_plan, f_, state, source_points));
             }
-            compiled.source_count = point_sources.size() - compiled.source_first;
+            compiled.source_count = source_batches.size() - compiled.source_first;
           }
           /* Vacuum H==B and E==D aliases legitimately produce no E/H work. */
           break;
@@ -1601,16 +1626,16 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
             set_reason(local_error, oi, "source descriptor span is out of range");
             break;
           }
-          compiled.first = point_sources.size();
+          compiled.first = source_batches.size();
           for (size_t i = op.source_descriptor_index;
                i < size_t(op.source_descriptor_index) + op.source_descriptor_count; ++i) {
             if (source_plan->sources[i].ft != op.ft)
               throw std::invalid_argument("source descriptor span has the wrong field type");
             const SourceDescriptor &source = source_plan->sources[i];
-            for (size_t point = 0; point < source.indices.size(); ++point)
-              point_sources.push_back(compile_point_source(source, *source_plan, point, f_, state));
+            source_batches.push_back(
+                compile_source_batch(source, *source_plan, f_, state, source_points));
           }
-          compiled.count = point_sources.size() - compiled.first;
+          compiled.count = source_batches.size() - compiled.first;
           break;
         }
         case OpKind::evaluate_source_scalars: {
@@ -1673,7 +1698,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       executable.reset(new NvidiaExecutable(
           this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
           constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
-          halo_scratch_bytes, finite_checks, point_sources, source_copies, dft_updates, dft_omega,
+          halo_scratch_bytes, finite_checks, source_batches, source_points, source_copies,
+          dft_updates, dft_omega,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, state));
   }
@@ -1720,7 +1746,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i)
               nvidia::launch_array_copy(executable.source_copies_[i], *state.transfer_);
             for (size_t i = op.source_first; i < op.source_first + op.source_count; ++i)
-              nvidia::launch_point_source(executable.point_sources_[i],
+              nvidia::launch_source_batch(executable.source_batches_[i],
                                           executable.source_scalars_.opaque_handle(),
                                           *state.transfer_);
             for (size_t i = op.first; i < op.first + op.count; ++i)
@@ -1766,7 +1792,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
           }
           case OpKind::apply_sources:
             for (size_t i = op.first; i < op.first + op.count; ++i)
-              nvidia::launch_point_source(executable.point_sources_[i],
+              nvidia::launch_source_batch(executable.source_batches_[i],
                                           executable.source_scalars_.opaque_handle(),
                                           *state.transfer_);
             break;

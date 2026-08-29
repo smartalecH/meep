@@ -26,16 +26,23 @@ struct source_scalar {
   double dipole_imag;
 };
 
-struct point_source_launch {
+struct source_point {
+  ptrdiff_t index;
+  double amplitude_real;
+  double amplitude_imag;
+};
+
+struct source_batch_launch {
   void *target_real;
   void *target_imag;
   const void *conductivity_inverse;
-  ptrdiff_t index;
+  const source_point *points;
+  size_t point_offset;
+  size_t point_count;
   uint32_t scalar_slot;
-  double amplitude_real;
-  double amplitude_imag;
   double dt;
   bool integrated;
+  bool sequential;
   scalar_precision precision;
 };
 
@@ -46,9 +53,11 @@ struct array_copy_launch {
   scalar_precision precision;
 };
 
-/* One launch applies one point descriptor. Calling these in descriptor order
-   on one stream preserves the legacy ordering when points alias. */
-void launch_point_source(const point_source_launch &source, const void *device_scalars,
+/* One launch applies one spatial descriptor. Descriptors with unique indices
+   use a grid-stride kernel. A descriptor containing duplicate indices uses a
+   one-thread ordered fallback so its floating-point association is unchanged.
+   Calling descriptors in order on one stream preserves inter-descriptor order. */
+void launch_source_batch(const source_batch_launch &source, const void *device_scalars,
                          const stream &execution_stream);
 void launch_array_copy(const array_copy_launch &copy, const stream &execution_stream);
 
