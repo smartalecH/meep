@@ -19,6 +19,8 @@
 #include <string.h>
 
 #include <algorithm>
+#include <limits>
+#include <stdexcept>
 
 #include "backend/step_plan.hpp"
 #include "backend/halo_plan.hpp"
@@ -165,6 +167,181 @@ void add_access(fields &f, Operation &op, ArrayId id, AccessMode mode) {
   }
   const ArraySpec &spec = f.array_catalog->spec(id);
   op.accesses.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
+}
+
+size_t checked_product(size_t a, size_t b, const char *what) {
+  if (a && b > std::numeric_limits<size_t>::max() / a) throw std::overflow_error(what);
+  return a * b;
+}
+
+size_t checked_sum(size_t a, size_t b, const char *what) {
+  if (b > std::numeric_limits<size_t>::max() - a) throw std::overflow_error(what);
+  return a + b;
+}
+
+ArrayId canonical_array(const CpuArrayCatalog &catalog, ArrayId id) {
+  if (!is_valid(id) || id.value >= catalog.size())
+    throw std::invalid_argument("solve_cw state row names an invalid array");
+  for (size_t depth = 0; depth <= catalog.size(); ++depth) {
+    const ArrayId next = catalog.spec(id).alias_of;
+    if (!is_valid(next)) return id;
+    if (next.value >= catalog.size())
+      throw std::invalid_argument("solve_cw state row names an invalid alias");
+    if (catalog.resolve_untyped(id) != catalog.resolve_untyped(next))
+      throw std::invalid_argument("solve_cw state row contains a stale alias binding");
+    id = next;
+  }
+  throw std::invalid_argument("solve_cw state row contains an alias cycle");
+}
+
+bool same_region(const UpdateRegion &a, const UpdateRegion &b) {
+  if (a.chunk != b.chunk || a.c != b.c || a.cmp != b.cmp || a.base != b.base ||
+      a.variant_key != b.variant_key)
+    return false;
+  for (int axis = 0; axis < 3; ++axis)
+    if (a.begin.yucky_val(axis) != b.begin.yucky_val(axis) ||
+        a.end.yucky_val(axis) != b.end.yucky_val(axis) || a.counts[axis] != b.counts[axis] ||
+        a.strides[axis] != b.strides[axis])
+      return false;
+  return true;
+}
+
+bool same_array_ref(const ArrayRef &a, const ArrayRef &b) {
+  return a.id == b.id && a.offset == b.offset && a.elements == b.elements;
+}
+
+bool same_access(const BufferAccess &a, const BufferAccess &b) {
+  return same_array_ref(a.array, b.array) && a.mode == b.mode;
+}
+
+void hash_array_spec(uint64_t &sig, const StorageKey &key, const ArraySpec &spec) {
+  target_fingerprint_mix(sig, uint64_t(key.chunk));
+  target_fingerprint_mix(sig, uint64_t(key.kind));
+  target_fingerprint_mix(sig, uint64_t(key.component_));
+  target_fingerprint_mix(sig, uint64_t(key.cmp));
+  target_fingerprint_mix(sig, uint64_t(key.aux));
+  target_fingerprint_mix(sig, uint64_t(spec.id.value));
+  target_fingerprint_mix(sig, uint64_t(spec.role));
+  target_fingerprint_mix(sig, uint64_t(spec.element_type));
+  target_fingerprint_mix(sig, uint64_t(spec.storage));
+  target_fingerprint_mix(sig, uint64_t(spec.elements));
+  target_fingerprint_mix(sig, uint64_t(spec.alignment));
+  target_fingerprint_mix(sig, uint64_t(spec.alias_of.value));
+  target_fingerprint_mix(sig, uint64_t(spec.classification_provisional));
+}
+
+uint64_t storage_fingerprint(const fields &f, const CwStateLayout &layout) {
+  uint64_t sig = 0xcbf29ce484222325ull;
+  if (!f.array_catalog) return sig;
+  std::vector<ArrayId> ids;
+  for (const CwStateRow &row : layout.rows) {
+    ids.push_back(row.real_array);
+    ids.push_back(row.imag_array);
+  }
+  for (const ArrayRef &ref : layout.zero_arrays)
+    ids.push_back(ref.id);
+  std::sort(ids.begin(), ids.end(), [](ArrayId a, ArrayId b) { return a.value < b.value; });
+  ids.erase(std::unique(ids.begin(), ids.end(), [](ArrayId a, ArrayId b) { return a == b; }),
+            ids.end());
+  target_fingerprint_mix(sig, uint64_t(ids.size()));
+  for (ArrayId id : ids)
+    hash_array_spec(sig, f.array_catalog->key(id), f.array_catalog->spec(id));
+  return sig;
+}
+
+void fingerprint_double(uint64_t &sig, double value) {
+  uint64_t bits = 0;
+  static_assert(sizeof(bits) == sizeof(value), "double is not 64-bit");
+  memcpy(&bits, &value, sizeof(bits));
+  target_fingerprint_mix(sig, bits);
+}
+
+uint64_t coordinate_fingerprint(const fields &f) {
+  uint64_t sig = 0xcbf29ce484222325ull;
+  target_fingerprint_mix(sig, uint64_t(f.num_chunks));
+  fingerprint_double(sig, f.beta);
+  fingerprint_double(sig, f.m);
+  for (double k : f.bfast_scaled_k)
+    fingerprint_double(sig, k);
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    const fields_chunk &fc = *f.chunks[chunk];
+    target_fingerprint_mix(sig, uint64_t(chunk));
+    target_fingerprint_mix(sig, uint64_t(fc.is_mine()));
+    target_fingerprint_mix(sig, uint64_t(fc.gv.dim));
+    target_fingerprint_mix(sig, uint64_t(fc.gv.ntot()));
+    for (int axis = 0; axis < 3; ++axis) {
+      target_fingerprint_mix(sig, uint64_t(fc.gv.yucky_direction(axis)));
+      target_fingerprint_mix(sig, uint64_t(fc.gv.little_corner().yucky_val(axis)));
+      target_fingerprint_mix(sig, uint64_t(fc.gv.big_corner().yucky_val(axis)));
+      target_fingerprint_mix(sig,
+                             uint64_t(fc.gv.stride(fc.gv.yucky_direction(axis))));
+    }
+    fingerprint_double(sig, fc.gv.origin_r());
+    target_fingerprint_mix(sig, uint64_t(fc.zero_fields_near_cylorigin));
+  }
+  return sig;
+}
+
+uint64_t material_fingerprint(const fields &f) {
+  uint64_t sig = 0xcbf29ce484222325ull;
+  target_fingerprint_mix(sig, material_phase_target_signature(f));
+  return sig;
+}
+
+uint64_t cw_layout_signature(const CwStateLayout &layout) {
+  uint64_t sig = 0xcbf29ce484222325ull;
+  for (const CwStateRow &row : layout.rows) {
+    target_fingerprint_mix(sig, uint64_t(row.chunk));
+    target_fingerprint_mix(sig, uint64_t(row.traversal_component));
+    target_fingerprint_mix(sig, uint64_t(row.storage_component));
+    target_fingerprint_mix(sig, uint64_t(row.family));
+    target_fingerprint_mix(sig, uint64_t(row.real_array.value));
+    target_fingerprint_mix(sig, uint64_t(row.imag_array.value));
+    target_fingerprint_mix(sig, uint64_t(row.owned_region.chunk));
+    target_fingerprint_mix(sig, uint64_t(row.owned_region.c));
+    target_fingerprint_mix(sig, uint64_t(row.owned_region.cmp));
+    for (int axis = 0; axis < 3; ++axis) {
+      target_fingerprint_mix(sig, uint64_t(row.owned_region.begin.yucky_val(axis)));
+      target_fingerprint_mix(sig, uint64_t(row.owned_region.end.yucky_val(axis)));
+    }
+    target_fingerprint_mix(sig, uint64_t(row.owned_region.base));
+    for (int axis = 0; axis < 3; ++axis) {
+      target_fingerprint_mix(sig, uint64_t(row.owned_region.counts[axis]));
+      target_fingerprint_mix(sig, uint64_t(row.owned_region.strides[axis]));
+    }
+    target_fingerprint_mix(sig, uint64_t(row.owned_region.variant_key));
+    target_fingerprint_mix(sig, uint64_t(row.complex_offset));
+    target_fingerprint_mix(sig, uint64_t(row.complex_count));
+  }
+  for (const ArrayRef &ref : layout.zero_arrays) {
+    target_fingerprint_mix(sig, uint64_t(ref.id.value));
+    target_fingerprint_mix(sig, uint64_t(ref.offset));
+    target_fingerprint_mix(sig, uint64_t(ref.elements));
+  }
+  for (const BufferAccess &access : layout.pack_accesses) {
+    target_fingerprint_mix(sig, uint64_t(access.array.id.value));
+    target_fingerprint_mix(sig, uint64_t(access.array.offset));
+    target_fingerprint_mix(sig, uint64_t(access.array.elements));
+    target_fingerprint_mix(sig, uint64_t(access.mode));
+  }
+  for (const BufferAccess &access : layout.unpack_accesses) {
+    target_fingerprint_mix(sig, uint64_t(access.array.id.value));
+    target_fingerprint_mix(sig, uint64_t(access.array.offset));
+    target_fingerprint_mix(sig, uint64_t(access.array.elements));
+    target_fingerprint_mix(sig, uint64_t(access.mode));
+  }
+  target_fingerprint_mix(sig, uint64_t(layout.unpack_prelude.first_boundary));
+  target_fingerprint_mix(sig, uint64_t(layout.unpack_prelude.constitutive));
+  target_fingerprint_mix(sig, uint64_t(layout.unpack_prelude.second_boundary));
+  target_fingerprint_mix(sig, uint64_t(layout.unpack_prelude.skip_w_components));
+  target_fingerprint_mix(sig, uint64_t(layout.unpack_prelude.invalidate_field_values));
+  target_fingerprint_mix(sig, uint64_t(layout.complex_count));
+  target_fingerprint_mix(sig, uint64_t(layout.real_count));
+  target_fingerprint_mix(sig, uint64_t(layout.vector_precision));
+  target_fingerprint_mix(sig, layout.storage_fingerprint);
+  target_fingerprint_mix(sig, layout.coordinate_fingerprint);
+  target_fingerprint_mix(sig, layout.material_fingerprint);
+  return sig;
 }
 
 struct CurlSources {
@@ -383,6 +560,18 @@ public:
     }
   }
 
+  void set_cw_state_layout(const CwStateLayout &layout) { plan_.cw_state_layout = layout; }
+
+  void add_cw_state_marker(OpKind kind) {
+    if (plan_.cw_state_layout.rows.size() > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("solve_cw state row span overflow");
+    Operation &op = add(kind);
+    op.descriptor_index = 0;
+    op.descriptor_count = uint32_t(plan_.cw_state_layout.rows.size());
+    op.accesses = kind == OpKind::pack_state ? plan_.cw_state_layout.pack_accesses
+                                             : plan_.cw_state_layout.unpack_accesses;
+  }
+
   void add_if(bool present, OpKind k, field_type ft = field_type(NUM_FIELD_TYPES),
               double src_offset = 0.0) {
     if (present) add(k, ft, guard_static(true), src_offset);
@@ -482,6 +671,8 @@ public:
       hash_magnetic_state(sig, d);
     for (const MaterialRefreshArray &d : plan.material_refresh_arrays)
       hash_material_refresh(sig, d);
+    if (plan.program == StepProgram::solve_cw)
+      mix(sig, cw_layout_signature(plan.cw_state_layout));
     hash_magnetic_half_step(sig, plan.magnetic_half_step);
     mix(sig, plan.material_phase_target_signature);
     return sig;
@@ -1291,6 +1482,247 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
 
 } // namespace
 
+bool operator==(const CwStateRow &a, const CwStateRow &b) {
+  return a.chunk == b.chunk && a.traversal_component == b.traversal_component &&
+         a.storage_component == b.storage_component && a.family == b.family &&
+         a.real_array == b.real_array && a.imag_array == b.imag_array &&
+         same_region(a.owned_region, b.owned_region) && a.complex_offset == b.complex_offset &&
+         a.complex_count == b.complex_count;
+}
+
+bool operator==(const CwUnpackPrelude &a, const CwUnpackPrelude &b) {
+  return a.first_boundary == b.first_boundary && a.constitutive == b.constitutive &&
+         a.second_boundary == b.second_boundary &&
+         a.skip_w_components == b.skip_w_components &&
+         a.invalidate_field_values == b.invalidate_field_values;
+}
+
+bool operator==(const CwStateLayout &a, const CwStateLayout &b) {
+  if (a.rows != b.rows || a.zero_arrays.size() != b.zero_arrays.size() ||
+      a.pack_accesses.size() != b.pack_accesses.size() ||
+      a.unpack_accesses.size() != b.unpack_accesses.size() ||
+      a.unpack_prelude != b.unpack_prelude || a.complex_count != b.complex_count ||
+      a.real_count != b.real_count || a.vector_precision != b.vector_precision ||
+      a.storage_fingerprint != b.storage_fingerprint ||
+      a.coordinate_fingerprint != b.coordinate_fingerprint ||
+      a.material_fingerprint != b.material_fingerprint || a.signature != b.signature)
+    return false;
+  for (size_t i = 0; i < a.zero_arrays.size(); ++i)
+    if (!same_array_ref(a.zero_arrays[i], b.zero_arrays[i])) return false;
+  for (size_t i = 0; i < a.pack_accesses.size(); ++i)
+    if (!same_access(a.pack_accesses[i], b.pack_accesses[i])) return false;
+  for (size_t i = 0; i < a.unpack_accesses.size(); ++i)
+    if (!same_access(a.unpack_accesses[i], b.unpack_accesses[i])) return false;
+  return true;
+}
+
+uint64_t compute_cw_state_layout_signature(const CwStateLayout &layout) {
+  return cw_layout_signature(layout);
+}
+
+CwStateLayout build_cw_state_layout(fields &f) {
+  CwStateLayout layout;
+  layout.unpack_prelude.first_boundary = D_stuff;
+  layout.unpack_prelude.constitutive = E_stuff;
+  layout.unpack_prelude.second_boundary = E_stuff;
+  layout.unpack_prelude.skip_w_components = true;
+  layout.unpack_prelude.invalidate_field_values = true;
+  layout.coordinate_fingerprint = coordinate_fingerprint(f);
+  layout.material_fingerprint = material_fingerprint(f);
+
+  if (!f.array_catalog) {
+    layout.signature = compute_cw_state_layout_signature(layout);
+    return layout;
+  }
+
+  std::vector<ArrayId> used_allocations;
+  auto add_access_once = [&](std::vector<BufferAccess> &accesses, ArrayId id, AccessMode mode) {
+    for (const BufferAccess &access : accesses)
+      if (access.array.id == id) return;
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    accesses.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
+  };
+
+  auto validate_array = [&](ArrayId id, const realnum *raw, int chunk, array_kind kind, component c,
+                            int cmp, const UpdateRegion &region) {
+    if (!is_valid(id) || id.value >= f.array_catalog->size())
+      throw std::invalid_argument("solve_cw state row is absent from the array catalog");
+    const StorageKey &key = f.array_catalog->key(id);
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (key.chunk != chunk || key.kind != int(kind) || key.component_ != int(c) || key.cmp != cmp ||
+        key.aux != 0)
+      throw std::invalid_argument("solve_cw state row has the wrong catalog identity");
+    if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+        spec.storage != layout.vector_precision)
+      throw std::invalid_argument("solve_cw state row has incompatible storage");
+    if (f.array_catalog->resolve_untyped(id) != raw)
+      throw std::invalid_argument("solve_cw state row has a stale catalog binding");
+    if (spec.elements != size_t(f.chunks[chunk]->gv.ntot()))
+      throw std::invalid_argument("solve_cw state row has the wrong allocation extent");
+
+    size_t last = region.base;
+    for (int axis = 0; axis < 3; ++axis) {
+      if (region.strides[axis] < 0)
+        throw std::invalid_argument("solve_cw state row has a negative stride");
+      if (!region.counts[axis]) continue;
+      const size_t tail = checked_product(region.counts[axis] - 1,
+                                          size_t(region.strides[axis]),
+                                          "solve_cw state region extent overflow");
+      last = checked_sum(last, tail, "solve_cw state region extent overflow");
+    }
+    if (region.counts[0] && region.counts[1] && region.counts[2] && last >= spec.elements)
+      throw std::invalid_argument("solve_cw state region exceeds its backing allocation");
+  };
+
+  auto append_pair = [&](int chunk, fields_chunk &fc, component traversal, component storage,
+                         CwStateFamily family, array_kind kind, realnum *raw_real,
+                         realnum *raw_imag, bool primary_present) {
+    if ((raw_real != NULL) != (raw_imag != NULL))
+      throw std::invalid_argument("solve_cw state contains a real/imaginary half-pair");
+    if (!raw_real) return;
+    if (!primary_present)
+      throw std::invalid_argument("solve_cw optional state exists without its primary field");
+    const ArrayId real_id = find_array(f, chunk, kind, int(storage), 0, 0);
+    const ArrayId imag_id = find_array(f, chunk, kind, int(storage), 1, 0);
+    if ((!is_valid(real_id) || !is_valid(imag_id)) && is_dirty(f, dirty_storage)) return;
+    if (!is_valid(real_id) || !is_valid(imag_id))
+      throw std::invalid_argument("solve_cw live state is absent from the array catalog");
+
+    const ivec begin = fc.gv.little_owned_corner(traversal);
+    const ivec end = fc.gv.big_corner();
+    const UpdateRegion region = make_region(fc.gv, chunk, traversal, -1, begin, end);
+    size_t count = 1;
+    for (int axis = 0; axis < 3; ++axis)
+      count = checked_product(count, region.counts[axis], "solve_cw state row count overflow");
+    if (count != size_t(fc.gv.nowned(traversal)))
+      throw std::invalid_argument("solve_cw state row does not match LOOP_OVER_VOL_OWNED");
+
+    validate_array(real_id, raw_real, chunk, kind, storage, 0, region);
+    validate_array(imag_id, raw_imag, chunk, kind, storage, 1, region);
+    const ArrayId canonical_real = canonical_array(*f.array_catalog, real_id);
+    const ArrayId canonical_imag = canonical_array(*f.array_catalog, imag_id);
+    if (canonical_real == canonical_imag)
+      throw std::invalid_argument("solve_cw state real and imaginary arrays alias");
+    for (ArrayId used : used_allocations)
+      if (used == canonical_real || used == canonical_imag)
+        throw std::invalid_argument("solve_cw state rows alias the same allocation");
+
+    if (!count) return;
+    used_allocations.push_back(canonical_real);
+    used_allocations.push_back(canonical_imag);
+    CwStateRow row;
+    row.chunk = chunk;
+    row.traversal_component = traversal;
+    row.storage_component = storage;
+    row.family = family;
+    row.real_array = real_id;
+    row.imag_array = imag_id;
+    row.owned_region = region;
+    row.complex_offset = layout.complex_count;
+    row.complex_count = count;
+    layout.complex_count = checked_sum(layout.complex_count, count,
+                                       "solve_cw state vector length overflow");
+    layout.rows.push_back(row);
+    add_access_once(layout.pack_accesses, real_id, AccessMode::read);
+    add_access_once(layout.pack_accesses, imag_id, AccessMode::read);
+    add_access_once(layout.unpack_accesses, real_id, AccessMode::write);
+    add_access_once(layout.unpack_accesses, imag_id, AccessMode::write);
+  };
+
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f.chunks[chunk];
+    FOR_COMPONENTS(c) {
+      if (!is_D(c) && !is_B(c)) continue;
+      realnum *const primary_real = fc.f[c][0];
+      realnum *const primary_imag = fc.f[c][1];
+      if ((primary_real != NULL) != (primary_imag != NULL))
+        throw std::invalid_argument("solve_cw primary state contains a real/imaginary half-pair");
+      const bool primary_present = primary_real && primary_imag;
+      append_pair(chunk, fc, c, c, CwStateFamily::primary, array_kind::f, primary_real,
+                  primary_imag, primary_present);
+      append_pair(chunk, fc, c, c, CwStateFamily::pml_u, array_kind::f_u, fc.f_u[c][0],
+                  fc.f_u[c][1], primary_present);
+      append_pair(chunk, fc, c, c, CwStateFamily::conductivity, array_kind::f_cond,
+                  fc.f_cond[c][0], fc.f_cond[c][1], primary_present);
+      append_pair(chunk, fc, c, c, CwStateFamily::bfast, array_kind::f_bfast,
+                  fc.f_bfast[c][0], fc.f_bfast[c][1], primary_present);
+
+      const component paired = field_type_component(is_D(c) ? E_stuff : H_stuff, c);
+      realnum *const w_real = fc.f_w[paired][0];
+      realnum *const w_imag = fc.f_w[paired][1];
+      if ((w_real != NULL) != (w_imag != NULL))
+        throw std::invalid_argument("solve_cw constitutive state contains a real/imaginary half-pair");
+      append_pair(chunk, fc, c, paired, CwStateFamily::constitutive_w, array_kind::f_w,
+                  w_real, w_imag, primary_present);
+      if (w_real)
+        append_pair(chunk, fc, c, paired, CwStateFamily::paired_primary, array_kind::f,
+                    fc.f[paired][0], fc.f[paired][1], primary_present);
+    }
+  }
+
+  layout.real_count = checked_product(layout.complex_count, size_t(2),
+                                      "solve_cw real vector length overflow");
+
+  const int zero_kinds[] = {
+      int(array_kind::f),           int(array_kind::f_u),          int(array_kind::f_w),
+      int(array_kind::f_cond),      int(array_kind::f_bfast),      int(array_kind::f_backup),
+      int(array_kind::f_u_backup),  int(array_kind::f_w_backup),   int(array_kind::f_cond_backup),
+      int(array_kind::f_bfast_backup)};
+  std::vector<ArrayId> zero_ids;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f.chunks[chunk];
+    realnum *(*families[])[2] = {fc.f,          fc.f_u,          fc.f_w,          fc.f_cond,
+                                 fc.f_bfast,    fc.f_backup,     fc.f_u_backup,   fc.f_w_backup,
+                                 fc.f_cond_backup, fc.f_bfast_backup};
+    for (size_t family = 0; family < sizeof(zero_kinds) / sizeof(zero_kinds[0]); ++family)
+      FOR_COMPONENTS(c) for (int cmp = 0; cmp < 2; ++cmp) {
+        realnum *const raw = families[family][c][cmp];
+        if (!raw) continue;
+        const ArrayId id = find_array(f, chunk, array_kind(zero_kinds[family]), int(c), cmp, 0);
+        if (!is_valid(id) && is_dirty(f, dirty_storage)) continue;
+        if (!is_valid(id))
+          throw std::invalid_argument("solve_cw zeroed field is absent from the array catalog");
+        const ArraySpec &spec = f.array_catalog->spec(id);
+        if (f.array_catalog->resolve_untyped(id) != raw || spec.role != array_role::field ||
+            spec.element_type != ElementType::realnum_value ||
+            spec.storage != layout.vector_precision || spec.elements != size_t(fc.gv.ntot()))
+          throw std::invalid_argument("solve_cw zero set has incompatible catalog storage");
+        zero_ids.push_back(canonical_array(*f.array_catalog, id));
+      }
+  }
+  std::sort(zero_ids.begin(), zero_ids.end(),
+            [](ArrayId a, ArrayId b) { return a.value < b.value; });
+  zero_ids.erase(std::unique(zero_ids.begin(), zero_ids.end(),
+                             [](ArrayId a, ArrayId b) { return a == b; }),
+                 zero_ids.end());
+  for (ArrayId id : zero_ids) {
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+        spec.storage != layout.vector_precision)
+      throw std::invalid_argument("solve_cw canonical zero allocation has incompatible storage");
+    layout.zero_arrays.push_back(ArrayRef{id, 0, spec.elements});
+  }
+
+  layout.storage_fingerprint = storage_fingerprint(f, layout);
+  layout.signature = compute_cw_state_layout_signature(layout);
+  return layout;
+}
+
+bool validate_cw_state_layout(fields &f, const CwStateLayout &layout, std::string *error) {
+  if (error) error->clear();
+  try {
+    const CwStateLayout expected = build_cw_state_layout(f);
+    if (layout == expected) return true;
+    if (error) *error = "solve_cw state layout differs from the canonical layout";
+  }
+  catch (const std::exception &e) {
+    if (error) *error = e.what();
+  }
+  return false;
+}
+
 uint64_t compute_material_phase_target_signature(const fields &f) {
   return material_phase_target_signature(f);
 }
@@ -1307,6 +1739,10 @@ uint64_t compute_step_plan_signature(const StepPlan &plan) {
 StepPlan build_step_plan(fields &f, StepProgram program) {
   StepPlanBuilder p(f, program);
   const bool cw = program == StepProgram::solve_cw;
+  if (cw) {
+    p.set_cw_state_layout(build_cw_state_layout(f));
+    p.add_cw_state_marker(OpKind::unpack_state);
+  }
 
   const bool has_sources = f.sources != NULL;
   const bool has_fluxes = f.fluxes != NULL;
@@ -1363,8 +1799,11 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   }
   const uint32_t magnetic_update_b = p.operation_count();
   p.add_db(B_stuff);
-  const uint32_t magnetic_apply_b = p.operation_count();
-  p.add(OpKind::apply_sources, B_stuff);
+  uint32_t magnetic_apply_b = UINT32_MAX;
+  if (!cw) {
+    magnetic_apply_b = p.operation_count();
+    p.add(OpKind::apply_sources, B_stuff);
+  }
   const uint32_t magnetic_transfer_b = p.operation_count();
   p.add_boundaries(B_stuff);
 
@@ -1385,7 +1824,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
   p.add_db(D_stuff);
-  p.add(OpKind::apply_sources, D_stuff);
+  if (!cw) p.add(OpKind::apply_sources, D_stuff);
   p.add_boundaries(D_stuff);
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 1.0);
@@ -1397,16 +1836,6 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
 
   p.add_if(has_fluxes, OpKind::update_flux);
   p.add(OpKind::increment_time);
-  /* solve_cw flattens all D/B state plus f_u, f_cond, f_bfast, the f_w
-     companion and (where f_w exists) the E/H array into one contiguous
-     complex<realnum> vector on every BiCGSTAB matrix-vector product. The ops
-     are recorded so Phase 2 can lower them; on CPU the packing stays in
-     fields_to_array / array_to_fields, whose element ordering these ops must
-     match exactly. */
-  if (cw) {
-    p.add(OpKind::unpack_state);
-    p.add(OpKind::pack_state);
-  }
   /* The decimation predicate is a device_predicate: the node stays in the
      graph and the kernel returns early when the step is not due. */
   if (has_dfts && !cw) p.add(OpKind::update_dft, field_type(NUM_FIELD_TYPES), guard_device(0));
@@ -1415,6 +1844,10 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
                            magnetic_transfer_h);
   p.add_magnetic_marker(OpKind::synchronize_magnetic_fields, AccessMode::read_write);
   p.add_finite_value_check();
+  /* The state markers bracket one complete source-suppressed matrix
+     application.  CPU continues to perform the actual gather/scatter in
+     cw_fields.cpp; resident backends consume these descriptors. */
+  if (cw) p.add_cw_state_marker(OpKind::pack_state);
 
   return p.finish();
 }

@@ -31,6 +31,8 @@
  */
 
 #include <algorithm>
+#include <exception>
+#include <limits>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -88,6 +90,33 @@ static const BufferAccess *find_access(const Operation &op, ArrayId id) {
   for (const BufferAccess &access : op.accesses)
     if (access.array.id == id) return &access;
   return NULL;
+}
+
+static ArrayId canonical_id(const fields &f, ArrayId id) {
+  for (size_t depth = 0; is_valid(id) && depth <= f.array_catalog->size(); ++depth) {
+    const ArrayId next = f.array_catalog->spec(id).alias_of;
+    if (!is_valid(next)) return id;
+    id = next;
+  }
+  return invalid_array();
+}
+
+static bool same_ref(const ArrayRef &a, const ArrayRef &b) {
+  return a.id == b.id && a.offset == b.offset && a.elements == b.elements;
+}
+
+static bool same_access(const BufferAccess &a, const BufferAccess &b) {
+  return same_ref(a.array, b.array) && a.mode == b.mode;
+}
+
+static std::vector<ptrdiff_t> expand_region(const UpdateRegion &region) {
+  std::vector<ptrdiff_t> indices;
+  for (size_t i0 = 0; i0 < region.counts[0]; ++i0)
+    for (size_t i1 = 0; i1 < region.counts[1]; ++i1)
+      for (size_t i2 = 0; i2 < region.counts[2]; ++i2)
+        indices.push_back(ptrdiff_t(region.base) + ptrdiff_t(i0) * region.strides[0] +
+                          ptrdiff_t(i1) * region.strides[1] + ptrdiff_t(i2) * region.strides[2]);
+  return indices;
 }
 
 static AccessMode merge_access_mode(AccessMode a, AccessMode b) {
@@ -565,6 +594,425 @@ static void test_empty_plan() {
   }
 }
 
+static void test_cw_state_layout() {
+  grid_volume gv = vol2d(3.1, 2.7, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  s.set_conductivity(Bx, magnetic_conductivity);
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields f(&s, 0, 0, true, 0, 0, scaled_k);
+  continuous_src_time src(0.3);
+  f.add_point_source(Ez, src, vec(0.11, 0.13));
+  f.advance(2);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::solve_cw);
+  const CwStateLayout &layout = plan.cw_state_layout;
+  const CwStateLayout rebuilt = build_cw_state_layout(f);
+  CHECK(layout == rebuilt && rebuilt == layout, "independently rebuilt CW layouts differ");
+  CHECK(layout.signature == compute_cw_state_layout_signature(layout),
+        "stored CW layout signature differs from structural signature");
+  std::string validation_error;
+  CHECK(validate_cw_state_layout(f, layout, &validation_error),
+        "canonical CW layout failed validation: %s", validation_error.c_str());
+
+  struct ExpectedRow {
+    int chunk;
+    component traversal;
+    component storage;
+    CwStateFamily family;
+    array_kind kind;
+    ArrayId real_array;
+    ArrayId imag_array;
+  };
+  std::vector<ExpectedRow> expected;
+  bool family_seen[6] = {false, false, false, false, false, false};
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f.chunks[chunk];
+    auto append = [&](component traversal, component storage, CwStateFamily family,
+                      array_kind kind, realnum *real, realnum *imag) {
+      CHECK((real != NULL) == (imag != NULL), "fixture contains a real/imaginary half-pair");
+      if (!real || !imag) return;
+      const ArrayId real_id = f.array_catalog->find({chunk, int(kind), int(storage), 0, 0});
+      const ArrayId imag_id = f.array_catalog->find({chunk, int(kind), int(storage), 1, 0});
+      CHECK(is_valid(real_id) && is_valid(imag_id), "fixture live pair is absent from catalog");
+      expected.push_back(ExpectedRow{chunk, traversal, storage, family, kind, real_id, imag_id});
+      family_seen[uint32_t(family)] = true;
+    };
+    FOR_COMPONENTS(c) {
+      if (!is_D(c) && !is_B(c)) continue;
+      append(c, c, CwStateFamily::primary, array_kind::f, fc.f[c][0], fc.f[c][1]);
+      append(c, c, CwStateFamily::pml_u, array_kind::f_u, fc.f_u[c][0], fc.f_u[c][1]);
+      append(c, c, CwStateFamily::conductivity, array_kind::f_cond, fc.f_cond[c][0],
+             fc.f_cond[c][1]);
+      append(c, c, CwStateFamily::bfast, array_kind::f_bfast, fc.f_bfast[c][0],
+             fc.f_bfast[c][1]);
+      const component paired = field_type_component(is_D(c) ? E_stuff : H_stuff, c);
+      append(c, paired, CwStateFamily::constitutive_w, array_kind::f_w, fc.f_w[paired][0],
+             fc.f_w[paired][1]);
+      if (fc.f_w[paired][0])
+        append(c, paired, CwStateFamily::paired_primary, array_kind::f, fc.f[paired][0],
+               fc.f[paired][1]);
+    }
+  }
+
+  CHECK(layout.rows.size() == expected.size(), "CW layout has %zu rows, expected %zu",
+        layout.rows.size(), expected.size());
+  size_t offset = 0;
+  std::vector<BufferAccess> expected_pack, expected_unpack;
+  const size_t compared = std::min(layout.rows.size(), expected.size());
+  for (size_t i = 0; i < compared; ++i) {
+    const CwStateRow &row = layout.rows[i];
+    const ExpectedRow &want = expected[i];
+    CHECK(row.chunk == want.chunk && row.traversal_component == want.traversal &&
+              row.storage_component == want.storage && row.family == want.family &&
+              row.real_array == want.real_array && row.imag_array == want.imag_array,
+          "CW row %zu has the wrong identity or family order", i);
+    CHECK(f.chunks[row.chunk]->is_mine(), "CW row %zu names a non-owned chunk", i);
+    CHECK(row.owned_region.chunk == row.chunk &&
+              row.owned_region.c == row.traversal_component && row.owned_region.cmp == -1 &&
+              row.owned_region.begin == f.chunks[row.chunk]->gv.little_owned_corner(want.traversal) &&
+              row.owned_region.end == f.chunks[row.chunk]->gv.big_corner(),
+          "CW row %zu does not use the traversal component's owned region", i);
+    CHECK(row.complex_offset == offset, "CW row %zu has a gap or overlap", i);
+    CHECK(row.complex_count == size_t(f.chunks[row.chunk]->gv.nowned(want.traversal)),
+          "CW row %zu has the wrong complex count", i);
+    offset += row.complex_count;
+
+    std::vector<ptrdiff_t> from_macro;
+    LOOP_OVER_VOL_OWNED(f.chunks[row.chunk]->gv, want.traversal, idx) {
+      from_macro.push_back(idx);
+    }
+    CHECK(expand_region(row.owned_region) == from_macro,
+          "CW row %zu does not flatten in LOOP_OVER_VOL_OWNED order", i);
+
+    const ArrayId ids[] = {row.real_array, row.imag_array};
+    for (ArrayId id : ids) {
+      bool already = false;
+      for (const BufferAccess &access : expected_pack)
+        already = already || access.array.id == id;
+      if (already) continue;
+      const size_t elements = f.array_catalog->spec(id).elements;
+      expected_pack.push_back(BufferAccess{ArrayRef{id, 0, elements}, AccessMode::read});
+      expected_unpack.push_back(BufferAccess{ArrayRef{id, 0, elements}, AccessMode::write});
+    }
+  }
+  CHECK(layout.complex_count == offset && layout.real_count == 2 * offset,
+        "CW layout totals do not match the row prefix sum");
+  CHECK(layout.vector_precision ==
+            (sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64),
+        "CW layout has the wrong vector precision");
+  CHECK(layout.pack_accesses.size() == expected_pack.size() &&
+            layout.unpack_accesses.size() == expected_unpack.size(),
+        "CW pack/unpack access counts are wrong");
+  for (size_t i = 0; i < expected_pack.size() && i < layout.pack_accesses.size(); ++i) {
+    CHECK(same_access(layout.pack_accesses[i], expected_pack[i]),
+          "CW pack access %zu is not the exact full-allocation read", i);
+    CHECK(same_access(layout.unpack_accesses[i], expected_unpack[i]),
+          "CW unpack access %zu is not the exact full-allocation write", i);
+  }
+  CHECK(layout.unpack_prelude.first_boundary == D_stuff &&
+            layout.unpack_prelude.constitutive == E_stuff &&
+            layout.unpack_prelude.second_boundary == E_stuff &&
+            layout.unpack_prelude.skip_w_components &&
+            layout.unpack_prelude.invalidate_field_values,
+        "CW unpack prelude does not match array_to_fields");
+
+  std::vector<ArrayId> expected_zero_ids;
+  const array_kind zero_kinds[] = {
+      array_kind::f,           array_kind::f_u,          array_kind::f_w,
+      array_kind::f_cond,      array_kind::f_bfast,      array_kind::f_backup,
+      array_kind::f_u_backup,  array_kind::f_w_backup,   array_kind::f_cond_backup,
+      array_kind::f_bfast_backup};
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f.chunks[chunk];
+    realnum *(*families[])[2] = {fc.f,          fc.f_u,          fc.f_w,          fc.f_cond,
+                                 fc.f_bfast,    fc.f_backup,     fc.f_u_backup,   fc.f_w_backup,
+                                 fc.f_cond_backup, fc.f_bfast_backup};
+    for (size_t family = 0; family < sizeof(zero_kinds) / sizeof(zero_kinds[0]); ++family)
+      FOR_COMPONENTS(c) for (int cmp = 0; cmp < 2; ++cmp) {
+        if (!families[family][c][cmp]) continue;
+        const ArrayId id =
+            f.array_catalog->find({chunk, int(zero_kinds[family]), int(c), cmp, 0});
+        CHECK(is_valid(id), "zero_fields live array is absent from catalog");
+        if (is_valid(id)) expected_zero_ids.push_back(canonical_id(f, id));
+      }
+  }
+  std::sort(expected_zero_ids.begin(), expected_zero_ids.end(),
+            [](ArrayId a, ArrayId b) { return a.value < b.value; });
+  expected_zero_ids.erase(
+      std::unique(expected_zero_ids.begin(), expected_zero_ids.end(),
+                  [](ArrayId a, ArrayId b) { return a == b; }),
+      expected_zero_ids.end());
+  CHECK(layout.zero_arrays.size() == expected_zero_ids.size(),
+        "CW zero set has %zu arrays, expected %zu", layout.zero_arrays.size(),
+        expected_zero_ids.size());
+  for (size_t i = 0; i < layout.zero_arrays.size() && i < expected_zero_ids.size(); ++i) {
+    const ArrayRef &ref = layout.zero_arrays[i];
+    CHECK(ref.id == expected_zero_ids[i] && ref.offset == 0 &&
+              ref.elements == f.array_catalog->spec(ref.id).elements,
+          "CW zero-set entry %zu is not canonical and full-allocation", i);
+    const int kind = f.array_catalog->key(ref.id).kind;
+    CHECK(kind != int(array_kind::f_w_prev) && kind != int(array_kind::f_minus_p) &&
+              kind != int(array_kind::f_rderiv_int),
+          "CW zero set contains an excluded family");
+  }
+
+  const Operation *unpack = NULL, *pack = NULL;
+  size_t unpack_index = plan.operations.size(), pack_index = plan.operations.size();
+  std::vector<double> source_offsets;
+  for (size_t i = 0; i < plan.operations.size(); ++i) {
+    const Operation &op = plan.operations[i];
+    CHECK(op.kind != OpKind::apply_sources, "CW schedule retained ordinary source application");
+    CHECK(op.kind != OpKind::update_dft, "CW schedule retained an inner DFT update");
+    if (op.kind == OpKind::evaluate_source_scalars) source_offsets.push_back(op.source_time_offset);
+    if (op.kind == OpKind::unpack_state) {
+      CHECK(!unpack, "CW schedule contains multiple unpack markers");
+      unpack = &op;
+      unpack_index = i;
+    }
+    if (op.kind == OpKind::pack_state) {
+      CHECK(!pack, "CW schedule contains multiple pack markers");
+      pack = &op;
+      pack_index = i;
+    }
+  }
+  CHECK(unpack && pack && unpack_index == 0 && pack_index + 1 == plan.operations.size(),
+        "CW state markers do not bracket the complete timestep");
+  if (unpack && pack) {
+    CHECK(unpack->descriptor_index == 0 && unpack->descriptor_count == layout.rows.size() &&
+              pack->descriptor_index == 0 && pack->descriptor_count == layout.rows.size(),
+          "CW state markers do not cover the complete row span");
+    CHECK(unpack->accesses.size() == layout.unpack_accesses.size() &&
+              pack->accesses.size() == layout.pack_accesses.size(),
+          "CW marker access counts do not match the layout");
+    for (size_t i = 0; i < unpack->accesses.size(); ++i)
+      CHECK(same_access(unpack->accesses[i], layout.unpack_accesses[i]),
+            "unpack marker access %zu differs from the layout", i);
+    for (size_t i = 0; i < pack->accesses.size(); ++i)
+      CHECK(same_access(pack->accesses[i], layout.pack_accesses[i]),
+            "pack marker access %zu differs from the layout", i);
+  }
+  const double expected_offsets[] = {0.0, 0.5, 0.5, 1.0};
+  CHECK(source_offsets.size() == sizeof(expected_offsets) / sizeof(expected_offsets[0]),
+        "CW schedule has %zu source evaluations, expected four", source_offsets.size());
+  for (size_t i = 0; i < source_offsets.size() && i < 4; ++i)
+    CHECK(source_offsets[i] == expected_offsets[i], "CW source evaluation %zu has wrong time", i);
+  CHECK(plan.magnetic_half_step.apply_b_sources == UINT32_MAX,
+        "CW magnetic half-step references a suppressed source application");
+
+  const uint64_t plan_signature = plan.signature;
+#define CHECK_CW_PLAN_MUTATION(mutation, message)                                                  \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    mutation;                                                                                      \
+    CHECK(compute_step_plan_signature(changed) != plan_signature, message);                        \
+  } while (0)
+  CHECK_CW_PLAN_MUTATION(changed.operations.erase(changed.operations.begin()),
+                         "signature ignored a missing unpack marker");
+  CHECK_CW_PLAN_MUTATION(changed.operations.pop_back(),
+                         "signature ignored a missing pack marker");
+  CHECK_CW_PLAN_MUTATION(changed.operations[1].kind = OpKind::apply_sources,
+                         "signature ignored an injected source application");
+  CHECK_CW_PLAN_MUTATION(changed.operations[1].kind = OpKind::update_dft,
+                         "signature ignored an injected DFT update");
+  if (!source_offsets.empty()) {
+    size_t source_index = 0;
+    while (source_index < plan.operations.size() &&
+           plan.operations[source_index].kind != OpKind::evaluate_source_scalars)
+      ++source_index;
+    if (source_index < plan.operations.size())
+      CHECK_CW_PLAN_MUTATION(changed.operations.erase(changed.operations.begin() + source_index),
+                             "signature ignored a missing source evaluation");
+  }
+#undef CHECK_CW_PLAN_MUTATION
+
+  const bool owns_rows = !layout.rows.empty();
+  bool owns_chunk = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+  CHECK(or_to_all(owns_rows), "CW fixture produced no rows on any rank");
+  if (!owns_chunk)
+    CHECK(layout.rows.empty() && layout.zero_arrays.empty() && layout.pack_accesses.empty() &&
+              layout.unpack_accesses.empty() && layout.complex_count == 0 && layout.real_count == 0,
+          "idle rank retained local CW state");
+  else
+    CHECK(!layout.rows.empty() && !layout.zero_arrays.empty() && !layout.pack_accesses.empty() &&
+              !layout.unpack_accesses.empty() && layout.complex_count && layout.real_count,
+          "owner rank is missing CW state metadata");
+  if (count_processors() > 2)
+    CHECK(or_to_all(!owns_chunk), "np>2 CW fixture did not exercise a genuinely idle rank");
+  for (size_t family = 0; family < 6; ++family)
+    CHECK(or_to_all(family_seen[family]), "CW fixture did not exercise state family %zu", family);
+
+  if (!layout.rows.empty()) {
+    const CwStateLayout original = layout;
+#define CHECK_CW_MUTATION(mutation, message)                                                       \
+  do {                                                                                             \
+    CwStateLayout changed = original;                                                              \
+    mutation;                                                                                      \
+    changed.signature = compute_cw_state_layout_signature(changed);                                \
+    CHECK(changed != original, message " did not affect equality");                               \
+    CHECK(changed.signature != original.signature, message " did not affect signature");          \
+    std::string error;                                                                             \
+    CHECK(!validate_cw_state_layout(f, changed, &error), message " passed canonical validation");  \
+  } while (0)
+    CHECK_CW_MUTATION(changed.rows.erase(changed.rows.begin()), "row deletion");
+    CHECK_CW_MUTATION(changed.rows.insert(changed.rows.begin(), changed.rows[0]), "row insertion");
+    if (original.rows.size() > 1)
+      CHECK_CW_MUTATION(std::swap(changed.rows[0], changed.rows[1]), "row ordering");
+    CHECK_CW_MUTATION(++changed.rows[0].chunk, "row chunk");
+    CHECK_CW_MUTATION(changed.rows[0].traversal_component = Bx, "row traversal component");
+    CHECK_CW_MUTATION(changed.rows[0].storage_component = Hx, "row storage component");
+    CHECK_CW_MUTATION(changed.rows[0].family = CwStateFamily::bfast, "row family");
+    CHECK_CW_MUTATION(++changed.rows[0].real_array.value, "row real ArrayId");
+    CHECK_CW_MUTATION(++changed.rows[0].imag_array.value, "row imaginary ArrayId");
+    CHECK_CW_MUTATION(changed.rows[0].real_array = invalid_array(), "invalid row ArrayId");
+    CHECK_CW_MUTATION(changed.rows[0].imag_array = changed.rows[0].real_array,
+                      "same-ID real/imaginary pair");
+    CHECK_CW_MUTATION(changed.rows[0].owned_region.begin = ivec(1, 3, 5), "row region begin");
+    CHECK_CW_MUTATION(changed.rows[0].owned_region.end = ivec(7, 9, 11), "row region end");
+    CHECK_CW_MUTATION(++changed.rows[0].owned_region.base, "row region base");
+    CHECK_CW_MUTATION(++changed.rows[0].owned_region.counts[0], "row region count");
+    CHECK_CW_MUTATION(++changed.rows[0].owned_region.strides[0], "row region stride");
+    CHECK_CW_MUTATION(++changed.rows[0].owned_region.variant_key, "row region variant");
+    CHECK_CW_MUTATION(++changed.rows[0].complex_offset, "row vector offset");
+    CHECK_CW_MUTATION(++changed.rows[0].complex_count, "row vector count");
+    CHECK_CW_MUTATION(changed.zero_arrays.erase(changed.zero_arrays.begin()), "zero-set deletion");
+    CHECK_CW_MUTATION(++changed.zero_arrays[0].id.value, "zero-set identity");
+    CHECK_CW_MUTATION(changed.zero_arrays.push_back(changed.zero_arrays[0]),
+                      "zero-set duplication");
+    if (original.zero_arrays.size() > 1)
+      CHECK_CW_MUTATION(std::swap(changed.zero_arrays[0], changed.zero_arrays[1]),
+                        "zero-set ordering");
+    CHECK_CW_MUTATION(++changed.zero_arrays[0].offset, "zero-set offset");
+    CHECK_CW_MUTATION(--changed.zero_arrays[0].elements, "zero-set extent");
+    CHECK_CW_MUTATION(changed.pack_accesses.erase(changed.pack_accesses.begin()),
+                      "pack access deletion");
+    CHECK_CW_MUTATION(++changed.pack_accesses[0].array.id.value, "pack access identity");
+    CHECK_CW_MUTATION(changed.pack_accesses[0].mode = AccessMode::write, "pack access mode");
+    CHECK_CW_MUTATION(++changed.pack_accesses[0].array.offset, "pack access offset");
+    CHECK_CW_MUTATION(--changed.pack_accesses[0].array.elements, "pack access extent");
+    if (original.pack_accesses.size() > 1)
+      CHECK_CW_MUTATION(std::swap(changed.pack_accesses[0], changed.pack_accesses[1]),
+                        "pack access ordering");
+    CHECK_CW_MUTATION(++changed.unpack_accesses[0].array.id.value, "unpack access identity");
+    CHECK_CW_MUTATION(changed.unpack_accesses[0].mode = AccessMode::read, "unpack access mode");
+    CHECK_CW_MUTATION(++changed.unpack_accesses[0].array.offset, "unpack access offset");
+    CHECK_CW_MUTATION(--changed.unpack_accesses[0].array.elements, "unpack access extent");
+    if (original.unpack_accesses.size() > 1)
+      CHECK_CW_MUTATION(std::swap(changed.unpack_accesses[0], changed.unpack_accesses[1]),
+                        "unpack access ordering");
+    CHECK_CW_MUTATION(changed.unpack_prelude.first_boundary = B_stuff,
+                      "unpack prelude first boundary");
+    CHECK_CW_MUTATION(changed.unpack_prelude.constitutive = H_stuff,
+                      "unpack prelude constitutive update");
+    CHECK_CW_MUTATION(changed.unpack_prelude.second_boundary = H_stuff,
+                      "unpack prelude second boundary");
+    CHECK_CW_MUTATION(changed.unpack_prelude.skip_w_components = false,
+                      "unpack prelude skip-W flag");
+    CHECK_CW_MUTATION(changed.unpack_prelude.invalidate_field_values = false,
+                      "unpack prelude invalidation flag");
+    CHECK_CW_MUTATION(++changed.complex_count, "complex total");
+    CHECK_CW_MUTATION(++changed.real_count, "real total");
+    CHECK_CW_MUTATION(changed.vector_precision = changed.vector_precision == Precision::f32
+                                                     ? Precision::f64
+                                                     : Precision::f32,
+                      "vector precision");
+    CHECK_CW_MUTATION(++changed.storage_fingerprint, "storage fingerprint");
+    CHECK_CW_MUTATION(++changed.coordinate_fingerprint, "coordinate fingerprint");
+    CHECK_CW_MUTATION(++changed.material_fingerprint, "material fingerprint");
+#undef CHECK_CW_MUTATION
+
+    StepPlan changed_plan = plan;
+    ++changed_plan.cw_state_layout.rows[0].complex_count;
+    changed_plan.cw_state_layout.signature =
+        compute_cw_state_layout_signature(changed_plan.cw_state_layout);
+    CHECK(compute_step_plan_signature(changed_plan) != plan.signature,
+          "StepPlan signature ignored a re-signed CW layout mutation");
+
+    CwStateLayout cleared = original;
+    cleared.clear();
+    const CwStateLayout empty;
+    CHECK(cleared == empty, "CwStateLayout::clear retained state");
+    StepPlan cleared_plan = plan;
+    cleared_plan.clear();
+    CHECK(cleared_plan.cw_state_layout == empty,
+          "StepPlan::clear retained the CW state layout");
+
+    CpuArrayCatalog saved = *f.array_catalog;
+    CpuArrayCatalog broken;
+    const ArrayId omitted = original.rows[0].real_array;
+    for (size_t i = 0; i < saved.size(); ++i) {
+      const ArrayId id{uint32_t(i)};
+      if (id == omitted) continue;
+      const ArraySpec &spec = saved.spec(id);
+      broken.register_array(saved.key(id), saved.resolve_untyped(id), spec.elements, spec.role,
+                            spec.element_type);
+    }
+    *f.array_catalog = broken;
+    bool rejected_missing = false;
+    try {
+      build_cw_state_layout(f);
+    }
+    catch (const std::exception &) { rejected_missing = true; }
+    CHECK(rejected_missing, "live state missing from the catalog was silently omitted");
+    *f.array_catalog = saved;
+
+    *f.array_catalog = broken;
+    invalidate(f, MutationKind::field_layout);
+    bool accepted_dirty_partial_catalog = true;
+    CwStateLayout dirty_layout;
+    try {
+      dirty_layout = build_cw_state_layout(f);
+    }
+    catch (const std::exception &) { accepted_dirty_partial_catalog = false; }
+    CHECK(accepted_dirty_partial_catalog,
+          "dirty-storage CW layout rejected a transient partial catalog");
+    if (accepted_dirty_partial_catalog)
+      CHECK(dirty_layout.rows.size() < original.rows.size(),
+            "dirty-storage CW layout did not omit the partial-catalog pair");
+    *f.array_catalog = saved;
+    clear_dirty(f, dirty_storage);
+
+    auto rebuilt_catalog = [&](ArrayId rebound, void *replacement) {
+      CpuArrayCatalog result;
+      for (size_t i = 0; i < saved.size(); ++i) {
+        const ArrayId id{uint32_t(i)};
+        const ArraySpec &spec = saved.spec(id);
+        void *address = id == rebound ? replacement : saved.resolve_untyped(id);
+        result.register_array(saved.key(id), address, spec.elements, spec.role, spec.element_type);
+      }
+      for (size_t i = 0; i < saved.size(); ++i) {
+        const ArrayId id{uint32_t(i)};
+        if (is_valid(saved.spec(id).alias_of)) result.set_alias(id, saved.spec(id).alias_of);
+      }
+      return result;
+    };
+    realnum *const raw_real =
+        static_cast<realnum *>(saved.resolve_untyped(original.rows[0].real_array));
+    *f.array_catalog = rebuilt_catalog(original.rows[0].real_array, raw_real + 1);
+    bool rejected_binding = false;
+    try {
+      build_cw_state_layout(f);
+    }
+    catch (const std::exception &) { rejected_binding = true; }
+    CHECK(rejected_binding, "stale CW catalog binding was accepted");
+    *f.array_catalog = saved;
+
+    CpuArrayCatalog aliased = saved;
+    aliased.set_alias(original.rows[0].real_array, original.rows[0].imag_array);
+    *f.array_catalog = aliased;
+    bool rejected_alias = false;
+    try {
+      build_cw_state_layout(f);
+    }
+    catch (const std::exception &) { rejected_alias = true; }
+    CHECK(rejected_alias, "incompatible CW row alias was accepted");
+    *f.array_catalog = saved;
+  }
+}
+
 /* The CW program must exist and must differ from the ordinary one. A stale or
    missing CW plan is the one failure in this stack that produces wrong physics
    rather than a crash. */
@@ -580,6 +1028,8 @@ static void test_solve_cw_plan() {
 
   const StepPlan ord = build_step_plan(f, StepProgram::ordinary);
   const StepPlan cw = build_step_plan(f, StepProgram::solve_cw);
+  CHECK(ord.cw_state_layout == CwStateLayout(),
+        "ordinary plan unexpectedly retained CW state metadata");
   CHECK(cw.program == StepProgram::solve_cw, "CW plan is not marked as such");
   CHECK(cw.signature != ord.signature, "the CW plan is identical to the ordinary plan");
 
@@ -596,6 +1046,52 @@ static void test_solve_cw_plan() {
      doing_solve_cw set, so this exercises program selection end to end. */
   const bool ok = f.solve_cw(1e-6, 200, 2);
   CHECK(ok, "solve_cw did not converge");
+}
+
+static void test_lazy_cw_layout_before_storage_refresh() {
+  {
+    grid_volume direct_gv = vol2d(2.0, 2.0, 8.0);
+    structure direct_s(direct_gv, one, no_pml());
+    fields direct(&direct_s);
+    continuous_src_time direct_source(0.23);
+    direct_source.is_integrated = false;
+    direct.add_point_source(Ez, direct_source, vec(0.11, 0.13));
+    CHECK(direct.solve_cw(1e-6, 200, 2),
+          "solve_cw before the first ordinary step did not converge");
+  }
+
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+  f.step(); // freeze an empty catalog before adding the first field component
+
+  continuous_src_time source(0.23);
+  source.is_integrated = false;
+  f.add_point_source(Ez, source, vec(0.11, 0.13));
+  CHECK(is_dirty(f, dirty_storage), "late source did not invalidate prepared storage");
+
+  size_t raw_pairs = 0;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    FOR_COMPONENTS(c) if ((is_D(c) || is_B(c)) && f.chunks[chunk]->f[c][0] &&
+                          f.chunks[chunk]->f[c][1]) {
+      ++raw_pairs;
+    }
+  }
+  const CwStateLayout transient = build_cw_state_layout(f);
+  CHECK(!raw_pairs || transient.rows.size() < raw_pairs,
+        "dirty-storage CW layout did not omit uncataloged live rows");
+
+  const bool ok = f.solve_cw(1e-6, 200, 2);
+  CHECK(ok, "solve_cw after a late first source did not converge");
+  const CwStateLayout prepared = build_cw_state_layout(f);
+  std::string error;
+  CHECK(validate_cw_state_layout(f, prepared, &error),
+        "prepared CW layout after lazy omission is invalid: %s", error.c_str());
+  CHECK(!raw_pairs || prepared.rows.size() >= raw_pairs,
+        "prepared CW layout did not restore omitted live rows");
+  CHECK(or_to_all(!prepared.rows.empty()),
+        "late-source solve_cw fixture produced no prepared rows on any rank");
 }
 
 /* Material phasing adds a segment_boundary-guarded reconciliation block whose
@@ -1325,7 +1821,9 @@ int main(int argc, char **argv) {
 
   test_full_plan();
   test_empty_plan();
+  test_cw_state_layout();
   test_solve_cw_plan();
+  test_lazy_cw_layout_before_storage_refresh();
   test_phasing_plan();
   test_material_schema_signature();
   test_magnetic_schema_signature();
