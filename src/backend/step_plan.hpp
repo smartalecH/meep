@@ -415,6 +415,95 @@ struct MaterialRefreshArray {
   size_t elements;
 };
 
+/* One complex-valued row in the vector used by solve_cw.  The traversal
+   component is always D/B and determines the owned Yee-point sequence.  The
+   storage component may instead be its paired E/H component for the two
+   constitutive-state rows at the end of each component group. */
+enum class CwStateFamily : uint32_t {
+  primary = 0,
+  pml_u = 1,
+  conductivity = 2,
+  bfast = 3,
+  constitutive_w = 4,
+  paired_primary = 5
+};
+
+struct CwStateRow {
+  int chunk;
+  component traversal_component;
+  component storage_component;
+  CwStateFamily family;
+  ArrayId real_array;
+  ArrayId imag_array;
+  UpdateRegion owned_region;
+  size_t complex_offset;
+  size_t complex_count;
+};
+
+/* array_to_fields performs this reconciliation immediately after scattering a
+   vector.  Descriptor references for lowering the three actions are added by
+   PR6; PR5 records only the semantics available at the StepPlan layer. */
+struct CwUnpackPrelude {
+  field_type first_boundary;
+  field_type constitutive;
+  field_type second_boundary;
+  bool skip_w_components;
+  bool invalidate_field_values;
+
+  CwUnpackPrelude()
+      : first_boundary(field_type(NUM_FIELD_TYPES)),
+        constitutive(field_type(NUM_FIELD_TYPES)),
+        second_boundary(field_type(NUM_FIELD_TYPES)), skip_w_components(false),
+        invalidate_field_values(false) {}
+};
+
+/* Canonical, source-independent layout of the solve_cw state vector.  This is
+   catalog metadata only: source and DFT descriptors first exist in PR6 and do
+   not belong here.  BufferAccess entries conservatively cover whole backing
+   allocations; CwStateRow::owned_region is the exact strided gather/scatter
+   domain. */
+struct CwStateLayout {
+  std::vector<CwStateRow> rows;
+  std::vector<ArrayRef> zero_arrays;
+  std::vector<BufferAccess> pack_accesses;
+  std::vector<BufferAccess> unpack_accesses;
+  CwUnpackPrelude unpack_prelude;
+  size_t complex_count;
+  size_t real_count;
+  Precision vector_precision;
+  uint64_t storage_fingerprint;
+  uint64_t coordinate_fingerprint;
+  uint64_t material_fingerprint;
+  uint64_t signature;
+
+  CwStateLayout()
+      : complex_count(0), real_count(0),
+        vector_precision(sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64),
+        storage_fingerprint(0), coordinate_fingerprint(0), material_fingerprint(0), signature(0) {}
+
+  void clear() {
+    rows.clear();
+    zero_arrays.clear();
+    pack_accesses.clear();
+    unpack_accesses.clear();
+    unpack_prelude = CwUnpackPrelude();
+    complex_count = 0;
+    real_count = 0;
+    vector_precision = sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+    storage_fingerprint = 0;
+    coordinate_fingerprint = 0;
+    material_fingerprint = 0;
+    signature = 0;
+  }
+};
+
+bool operator==(const CwStateRow &a, const CwStateRow &b);
+inline bool operator!=(const CwStateRow &a, const CwStateRow &b) { return !(a == b); }
+bool operator==(const CwUnpackPrelude &a, const CwUnpackPrelude &b);
+inline bool operator!=(const CwUnpackPrelude &a, const CwUnpackPrelude &b) { return !(a == b); }
+bool operator==(const CwStateLayout &a, const CwStateLayout &b);
+inline bool operator!=(const CwStateLayout &a, const CwStateLayout &b) { return !(a == b); }
+
 /* Exact operation indices for the restricted B/H half-step used by magnetic
    synchronization.  UINT32_MAX denotes an omitted source-evaluation node. */
 struct MagneticHalfStep {
@@ -462,6 +551,7 @@ struct StepPlan {
   std::vector<PolarizationSubtraction> polarization_subtractions;
   std::vector<MagneticStateArray> magnetic_state_arrays;
   std::vector<MaterialRefreshArray> material_refresh_arrays;
+  CwStateLayout cw_state_layout;
   MagneticHalfStep magnetic_half_step;
   /* Structural identity of the host-only phase target.  Values are excluded:
      changing them is the purpose of material phasing. */
@@ -492,6 +582,7 @@ struct StepPlan {
     polarization_subtractions.clear();
     magnetic_state_arrays.clear();
     material_refresh_arrays.clear();
+    cw_state_layout.clear();
     magnetic_half_step = MagneticHalfStep();
     material_phase_target_signature = 0;
     signature = 0;
@@ -503,6 +594,17 @@ struct StepPlan {
    equations from array dependencies: if a reviewer cannot line this up against
    fields::step_once by eye, it is wrong. */
 StepPlan build_step_plan(fields &f, StepProgram program);
+
+/* Direct transcription of fields_to_array/array_to_fields.  Construction is
+   rank-local and performs no collective operation. */
+CwStateLayout build_cw_state_layout(fields &f);
+
+/* Structural identity and exact comparison used by later backend preflight.
+   Validation compares against a freshly rebuilt canonical layout rather than
+   accepting a matching hash as proof of equality. */
+uint64_t compute_cw_state_layout_signature(const CwStateLayout &layout);
+bool validate_cw_state_layout(fields &f, const CwStateLayout &layout,
+                              std::string *error = NULL);
 
 /* Structural identity used by device executables and tests. */
 uint64_t compute_step_plan_signature(const StepPlan &plan);
