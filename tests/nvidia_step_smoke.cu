@@ -40,6 +40,7 @@ using meep::nvidia::launch_source_batch;
 using meep::nvidia::launch_zero;
 using meep::nvidia::scalar_precision;
 using meep::nvidia::source_batch_launch;
+using meep::nvidia::source_indices_require_sequential;
 using meep::nvidia::source_point;
 using meep::nvidia::source_scalar;
 using meep::nvidia::stream;
@@ -551,13 +552,19 @@ template <typename T> static void check_device(int device) {
     source_points[i].amplitude_imag = -0.002 * double((i % 13) + 1);
   }
   const ptrdiff_t overlap_indices[] = {3, 127, 258};
+  const ptrdiff_t duplicate_indices[] = {41, 41, 41};
+  require(!source_indices_require_sequential(overlap_indices, 3),
+          "source compiler classified unique indices as sequential");
+  require(source_indices_require_sequential(duplicate_indices, 3),
+          "source compiler missed duplicate indices");
   for (size_t i = 0; i < 3; ++i) {
     source_points[259 + i].index = overlap_indices[i];
     source_points[259 + i].amplitude_real = -0.11 * double(i + 1);
     source_points[259 + i].amplitude_imag = 0.07 * double(i + 1);
-    source_points[262 + i].index = 41;
-    source_points[262 + i].amplitude_real = 0.125 * double(1u << i);
-    source_points[262 + i].amplitude_imag = -0.0625 * double(1u << i);
+    source_points[262 + i].index = duplicate_indices[i];
+    source_points[262 + i].amplitude_real =
+        i == 0 ? 8.0e19 : (i == 1 ? -8.0e19 : 2.5132741228718345);
+    source_points[262 + i].amplitude_imag = 0.0;
   }
   device_buffer d_source_points(source_points.size() * sizeof(source_points[0]), device);
   copy_host_to_device_async(d_source_real, 0, source_real.data(),
@@ -586,7 +593,8 @@ template <typename T> static void check_device(int device) {
   source_batch_launch duplicate = batch;
   duplicate.points += 262;
   duplicate.point_count = 3;
-  duplicate.sequential = true;
+  duplicate.sequential =
+      source_indices_require_sequential(duplicate_indices, duplicate.point_count);
   launch_source_batch(duplicate, d_source_scalar.opaque_handle(), execution);
   copy_device_to_host_async(source_observed.data(), d_source_real, 0,
                             source_observed.size() * sizeof(T), execution);
@@ -631,7 +639,8 @@ template <typename T> static void check_device(int device) {
   integrated.point_count = 3;
   integrated.scalar_slot = 0;
   integrated.integrated = true;
-  integrated.sequential = true;
+  integrated.sequential =
+      source_indices_require_sequential(duplicate_indices, integrated.point_count);
   integrated.precision = precision;
   launch_source_batch(integrated, d_source_scalar.opaque_handle(), execution);
   copy_device_to_host_async(source_observed.data(), d_source_real, 0,
@@ -650,6 +659,16 @@ template <typename T> static void check_device(int device) {
             "integrated-source copy/application result or sentinel differs");
   require(source_observed[41] == integrated_expected[41],
           "ordered duplicate-source fallback changed sequential floating-point behavior");
+  T reordered = source_imag_observed[41];
+  const size_t reordered_points[] = {262, 264, 263};
+  for (size_t i = 0; i < 3; ++i) {
+    const source_point &point = source_points[reordered_points[i]];
+    const double dipole_real =
+        point.amplitude_real * scalar.dipole_real - point.amplitude_imag * scalar.dipole_imag;
+    reordered -= T(dipole_real);
+  }
+  require(source_observed[41] != reordered,
+          "duplicate-source test values do not distinguish descriptor order");
 }
 
 int main() {
