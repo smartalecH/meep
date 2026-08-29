@@ -1700,7 +1700,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
   op.polarization_subtraction_index = uint32_t(plan_.polarization_subtractions.size());
   const field_type ft2 = ft == E_stuff ? D_stuff : B_stuff;
 
-  if (f_.descriptors) {
+  if (f_.descriptors && plan_.program != StepProgram::solve_cw) {
     for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
       const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
       if (descriptor.ft != ft) continue;
@@ -1767,12 +1767,16 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
           d.region =
               make_region(fc.gv, chunk, ec, cmp, sub.little_owned_corner0(ec), sub.big_corner());
           d.target = find_array(f_, chunk, array_kind::f, int(ec), cmp, 0);
+          const bool use_minus_p = plan_.program != StepProgram::solve_cw;
           const ArrayId primary_minus_p =
-              find_array(f_, chunk, array_kind::f_minus_p, int(dc), cmp, 0);
+              use_minus_p ? find_array(f_, chunk, array_kind::f_minus_p, int(dc), cmp, 0)
+                          : invalid_array();
           const ArrayId cross1_minus_p =
-              find_array(f_, chunk, array_kind::f_minus_p, int(dc1), cmp, 0);
+              use_minus_p ? find_array(f_, chunk, array_kind::f_minus_p, int(dc1), cmp, 0)
+                          : invalid_array();
           const ArrayId cross2_minus_p =
-              find_array(f_, chunk, array_kind::f_minus_p, int(dc2), cmp, 0);
+              use_minus_p ? find_array(f_, chunk, array_kind::f_minus_p, int(dc2), cmp, 0)
+                          : invalid_array();
           d.base_primary = find_array(f_, chunk, array_kind::f, int(dc), cmp, 0);
           d.base_cross1 = find_array(f_, chunk, array_kind::f, int(dc1), cmp, 0);
           d.base_cross2 = find_array(f_, chunk, array_kind::f, int(dc2), cmp, 0);
@@ -1873,7 +1877,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
     }
   }
   op.descriptor_count = uint32_t(plan_.eh_updates.size()) - op.descriptor_index;
-  attach_source_span(op, ft2, true);
+  if (plan_.program != StepProgram::solve_cw) attach_source_span(op, ft2, true);
 }
 
 } // namespace
@@ -2112,6 +2116,638 @@ bool validate_cw_state_layout(fields &f, const CwStateLayout &layout, std::strin
     const CwStateLayout expected = build_cw_state_layout(f);
     if (layout == expected) return true;
     if (error) *error = "solve_cw state layout differs from the canonical layout";
+  }
+  catch (const std::exception &e) {
+    if (error) *error = e.what();
+  }
+  return false;
+}
+
+void CwPlan::clear() {
+  state_layout_signature = 0;
+  step_plan_signature = 0;
+  rhs_stages.clear();
+  rhs_sources.clear();
+  unpack = CwUnpackDescriptorRefs();
+  final_dfts.clear();
+  rhs_accesses.clear();
+  unpack_accesses.clear();
+  final_dft_accesses.clear();
+  source_time_count = 0;
+  rhs_source_count = 0;
+  final_dft_count = 0;
+  source_fingerprint = 0;
+  monitor_fingerprint = 0;
+  signature = 0;
+}
+
+bool operator==(const CwRhsSourceDescriptor &a, const CwRhsSourceDescriptor &b) {
+  return a.source_descriptor_index == b.source_descriptor_index &&
+         a.source_ordinal == b.source_ordinal && a.mode == b.mode;
+}
+
+bool operator==(const CwStepOperationRef &a, const CwStepOperationRef &b) {
+  return a.operation_index == b.operation_index && a.kind == b.kind && a.ft == b.ft &&
+         a.descriptor_index == b.descriptor_index && a.descriptor_count == b.descriptor_count &&
+         a.polarization_subtraction_index == b.polarization_subtraction_index &&
+         a.polarization_subtraction_count == b.polarization_subtraction_count;
+}
+
+bool operator==(const CwRhsStage &a, const CwRhsStage &b) {
+  return a.ft == b.ft && a.source_time_offset == b.source_time_offset &&
+         a.source_time_index == b.source_time_index &&
+         a.source_time_count == b.source_time_count &&
+         a.source_index == b.source_index && a.source_count == b.source_count &&
+         a.boundary == b.boundary && a.constitutive == b.constitutive &&
+         a.accesses.size() == b.accesses.size() &&
+         std::equal(a.accesses.begin(), a.accesses.end(), b.accesses.begin(), same_access);
+}
+
+bool operator==(const CwUnpackDescriptorRefs &a, const CwUnpackDescriptorRefs &b) {
+  return a.first_boundary == b.first_boundary && a.constitutive == b.constitutive &&
+         a.second_boundary == b.second_boundary &&
+         a.skip_w_components == b.skip_w_components &&
+         a.invalidate_field_values == b.invalidate_field_values;
+}
+
+bool operator==(const CwDftDescriptorRef &a, const CwDftDescriptorRef &b) {
+  return a.descriptor_index == b.descriptor_index && a.chunk == b.chunk && a.c == b.c &&
+         a.decimation_factor == b.decimation_factor && a.due_scalar_slot == b.due_scalar_slot;
+}
+
+bool operator==(const CwPlan &a, const CwPlan &b) {
+  if (a.state_layout_signature != b.state_layout_signature ||
+      a.step_plan_signature != b.step_plan_signature || a.rhs_stages != b.rhs_stages ||
+      a.rhs_sources != b.rhs_sources || a.unpack != b.unpack || a.final_dfts != b.final_dfts ||
+      a.rhs_accesses.size() != b.rhs_accesses.size() ||
+      a.unpack_accesses.size() != b.unpack_accesses.size() ||
+      a.final_dft_accesses.size() != b.final_dft_accesses.size() ||
+      a.source_time_count != b.source_time_count || a.rhs_source_count != b.rhs_source_count ||
+      a.final_dft_count != b.final_dft_count ||
+      a.source_fingerprint != b.source_fingerprint ||
+      a.monitor_fingerprint != b.monitor_fingerprint || a.signature != b.signature)
+    return false;
+  for (size_t i = 0; i < a.rhs_accesses.size(); ++i)
+    if (!same_access(a.rhs_accesses[i], b.rhs_accesses[i])) return false;
+  for (size_t i = 0; i < a.unpack_accesses.size(); ++i)
+    if (!same_access(a.unpack_accesses[i], b.unpack_accesses[i])) return false;
+  for (size_t i = 0; i < a.final_dft_accesses.size(); ++i)
+    if (!same_access(a.final_dft_accesses[i], b.final_dft_accesses[i])) return false;
+  return true;
+}
+
+namespace {
+
+void cw_hash_ref(uint64_t &sig, const ArrayRef &ref) {
+  target_fingerprint_mix(sig, ref.id.value);
+  target_fingerprint_mix(sig, ref.offset);
+  target_fingerprint_mix(sig, ref.elements);
+}
+
+void cw_hash_access(uint64_t &sig, const BufferAccess &access) {
+  cw_hash_ref(sig, access.array);
+  target_fingerprint_mix(sig, uint64_t(access.mode));
+}
+
+void cw_hash_operation_ref(uint64_t &sig, const CwStepOperationRef &ref) {
+  target_fingerprint_mix(sig, ref.operation_index);
+  target_fingerprint_mix(sig, uint64_t(ref.kind));
+  target_fingerprint_mix(sig, uint64_t(ref.ft));
+  target_fingerprint_mix(sig, ref.descriptor_index);
+  target_fingerprint_mix(sig, ref.descriptor_count);
+  target_fingerprint_mix(sig, ref.polarization_subtraction_index);
+  target_fingerprint_mix(sig, ref.polarization_subtraction_count);
+}
+
+CwStepOperationRef cw_operation_ref(const StepPlan &plan, uint32_t operation_index,
+                                    OpKind kind, field_type ft) {
+  if (operation_index >= plan.operations.size())
+    throw std::invalid_argument("CW operation reference is out of range");
+  const Operation &op = plan.operations[operation_index];
+  if (op.kind != kind || op.ft != ft)
+    throw std::invalid_argument("CW operation reference has the wrong kind or field type");
+  CwStepOperationRef ref;
+  ref.operation_index = operation_index;
+  ref.kind = op.kind;
+  ref.ft = op.ft;
+  ref.descriptor_index = op.descriptor_index;
+  ref.descriptor_count = op.descriptor_count;
+  ref.polarization_subtraction_index = op.polarization_subtraction_index;
+  ref.polarization_subtraction_count = op.polarization_subtraction_count;
+  return ref;
+}
+
+uint32_t cw_find_operation(const StepPlan &plan, uint32_t begin, OpKind kind, field_type ft) {
+  for (size_t i = begin; i < plan.operations.size(); ++i)
+    if (plan.operations[i].kind == kind && plan.operations[i].ft == ft) {
+      if (i > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("CW operation index overflow");
+      return uint32_t(i);
+    }
+  throw std::invalid_argument("canonical solve_cw plan is missing a required operation");
+}
+
+void cw_add_access(fields &f, std::vector<BufferAccess> &accesses, ArrayId id, AccessMode mode) {
+  if (!is_valid(id)) return;
+  if (!f.array_catalog || id.value >= f.array_catalog->size())
+    throw std::invalid_argument("CW plan access names an invalid array");
+  id = canonical_array(*f.array_catalog, id);
+  const ArraySpec &spec = f.array_catalog->spec(id);
+  for (BufferAccess &access : accesses) {
+    if (access.array.id != id) continue;
+    if (access.array.offset != 0 || access.array.elements != spec.elements)
+      throw std::invalid_argument("CW plan contains inconsistent access spans");
+    if (access.mode != mode) access.mode = AccessMode::read_write;
+    return;
+  }
+  accesses.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
+}
+
+void cw_add_access_ref(fields &f, std::vector<BufferAccess> &accesses, const ArrayRef &ref,
+                       AccessMode mode) {
+  if (!is_valid(ref.id)) return;
+  if (!f.array_catalog || ref.id.value >= f.array_catalog->size())
+    throw std::invalid_argument("CW final DFT access names an invalid array");
+  const ArraySpec &original_spec = f.array_catalog->spec(ref.id);
+  if (ref.offset != 0 || ref.elements != original_spec.elements)
+    throw std::invalid_argument("CW plan access is not a full catalog allocation");
+  ArrayRef canonical = ref;
+  canonical.id = canonical_array(*f.array_catalog, ref.id);
+  const ArraySpec &canonical_spec = f.array_catalog->spec(canonical.id);
+  if (canonical_spec.elements != original_spec.elements || canonical.offset != 0 ||
+      canonical.elements != canonical_spec.elements)
+    throw std::invalid_argument("CW final DFT alias has an incompatible extent");
+  for (BufferAccess &access : accesses) {
+    if (access.array.id != canonical.id) continue;
+    if (!same_array_ref(access.array, canonical))
+      throw std::invalid_argument("CW final DFT contains inconsistent access spans");
+    if (access.mode != mode) access.mode = AccessMode::read_write;
+    return;
+  }
+  accesses.push_back(BufferAccess{canonical, mode});
+}
+
+void cw_merge_accesses(fields &f, std::vector<BufferAccess> &destination,
+                       const std::vector<BufferAccess> &source) {
+  for (const BufferAccess &access : source) {
+    if (!is_valid(access.array.id) || access.array.id.value >= f.array_catalog->size())
+      throw std::invalid_argument("referenced CW operation has an invalid access");
+    const ArraySpec &spec = f.array_catalog->spec(access.array.id);
+    if (access.array.offset != 0 || access.array.elements != spec.elements)
+      throw std::invalid_argument("referenced CW operation access is not full-allocation");
+    cw_add_access(f, destination, access.array.id, access.mode);
+  }
+}
+
+uint32_t cw_source_time_id(const fields &f, const src_time *wanted) {
+  size_t id = 0;
+  for (const src_time *st = f.sources; st; st = st->next, ++id)
+    if (st == wanted) {
+      if (id > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("CW source-time index overflow");
+      return uint32_t(id);
+    }
+  throw std::invalid_argument("CW source is absent from the source-time list");
+}
+
+size_t cw_find_source_descriptor(const SourcePlan &plan, int chunk, field_type ft,
+                                 uint32_t ordinal) {
+  size_t found = plan.sources.size();
+  for (size_t i = 0; i < plan.sources.size(); ++i) {
+    const SourceDescriptor &d = plan.sources[i];
+    if (d.chunk != chunk || d.ft != ft || d.source_ordinal != ordinal) continue;
+    if (found != plan.sources.size())
+      throw std::invalid_argument("CW source plan contains a duplicate source ordinal");
+    found = i;
+  }
+  if (found == plan.sources.size())
+    throw std::invalid_argument("CW source plan is missing a live source ordinal");
+  return found;
+}
+
+bool cw_same_source_time(const SourceTimeDescriptor &a, const SourceTimeDescriptor &b) {
+  return a.source_time_id == b.source_time_id && a.kind == b.kind &&
+         a.parameters == b.parameters && a.scalar_slot == b.scalar_slot &&
+         a.host_callback_id == b.host_callback_id && a.is_integrated == b.is_integrated;
+}
+
+bool cw_same_source_descriptor(const SourceDescriptor &a, const SourceDescriptor &b) {
+  return a.destination == b.destination && a.destination_imag == b.destination_imag &&
+         a.integrated_destination == b.integrated_destination &&
+         a.integrated_destination_imag == b.integrated_destination_imag && a.chunk == b.chunk &&
+         a.c == b.c && a.indices == b.indices && a.complex_amplitudes == b.complex_amplitudes &&
+         a.condinv == b.condinv && a.source_time_id == b.source_time_id &&
+         a.source_ordinal == b.source_ordinal && a.integrated == b.integrated && a.ft == b.ft;
+}
+
+bool cw_same_source_plan_recipe(const SourcePlan &a, const SourcePlan &b) {
+  if (a.source_times.size() != b.source_times.size() || a.sources.size() != b.sources.size())
+    return false;
+  for (size_t i = 0; i < a.source_times.size(); ++i)
+    if (!cw_same_source_time(a.source_times[i], b.source_times[i])) return false;
+  for (size_t i = 0; i < a.sources.size(); ++i)
+    if (!cw_same_source_descriptor(a.sources[i], b.sources[i])) return false;
+  return true;
+}
+
+bool cw_same_ivec(const ivec &a, const ivec &b) {
+  if (a.dim != b.dim) return false;
+  LOOP_OVER_DIRECTIONS(a.dim, d) {
+    if (a.in_direction(d) != b.in_direction(d)) return false;
+  }
+  return true;
+}
+
+bool cw_same_vec(const vec &a, const vec &b) {
+  if (a.dim != b.dim) return false;
+  LOOP_OVER_DIRECTIONS(a.dim, d) {
+    if (a.in_direction(d) != b.in_direction(d)) return false;
+  }
+  return true;
+}
+
+bool cw_same_dft(const DftDescriptor &a, const DftDescriptor &b) {
+  return a.accumulator == b.accumulator && a.phase_scratch == b.phase_scratch &&
+         same_array_ref(a.source_field, b.source_field) &&
+         same_array_ref(a.source_field_imag, b.source_field_imag) && a.omega == b.omega &&
+         a.scale == b.scale && a.chunk == b.chunk && a.c == b.c && a.avg1 == b.avg1 &&
+         a.avg2 == b.avg2 && cw_same_ivec(a.is, b.is) && cw_same_ivec(a.ie, b.ie) &&
+         cw_same_ivec(a.is_old, b.is_old) && cw_same_ivec(a.ie_old, b.ie_old) &&
+         a.persist == b.persist && a.decimation_factor == b.decimation_factor &&
+         a.due_scalar_slot == b.due_scalar_slot && cw_same_vec(a.weights.s0, b.weights.s0) &&
+         cw_same_vec(a.weights.s1, b.weights.s1) && cw_same_vec(a.weights.e0, b.weights.e0) &&
+         cw_same_vec(a.weights.e1, b.weights.e1) && a.dV0 == b.dV0 && a.dV1 == b.dV1 &&
+         a.include_dV_and_interp_weights == b.include_dV_and_interp_weights &&
+         a.sqrt_dV_and_interp_weights == b.sqrt_dV_and_interp_weights && a.N == b.N &&
+         a.Nomega == b.Nomega;
+}
+
+void cw_validate_dft_storage(fields &f, const fields_chunk &fc, int chunk, int local_index,
+                             const dft_chunk &live, const DftDescriptor &d) {
+  const Precision native =
+      sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+  const size_t accumulator_elements =
+      checked_product(live.N, live.omega.size(), "CW final DFT extent overflow");
+  const ArrayId accumulator =
+      f.array_catalog->find({chunk, int(array_kind::dft), int(live.c), -1, local_index});
+  const ArrayId phase =
+      f.array_catalog->find({chunk, int(array_kind::dft_phase), int(live.c), -1, local_index});
+  const ArrayId source =
+      f.array_catalog->find({chunk, int(array_kind::f), int(live.c), 0, 0});
+  const ArrayId source_imag =
+      f.array_catalog->find({chunk, int(array_kind::f), int(live.c), 1, 0});
+  if (!is_valid(accumulator) || !is_valid(phase) || d.accumulator != accumulator ||
+      d.phase_scratch != phase || d.source_field.id != source ||
+      d.source_field_imag.id != source_imag)
+    throw std::invalid_argument("CW final DFT has the wrong catalog identity");
+  const ArraySpec &accumulator_spec = f.array_catalog->spec(accumulator);
+  const ArraySpec &phase_spec = f.array_catalog->spec(phase);
+  if (accumulator_spec.role != array_role::dft ||
+      accumulator_spec.element_type != ElementType::complex_realnum ||
+      accumulator_spec.storage != native || accumulator_spec.elements != accumulator_elements ||
+      phase_spec.role != array_role::dft ||
+      phase_spec.element_type != ElementType::complex_realnum || phase_spec.storage != native ||
+      phase_spec.elements != live.omega.size())
+    throw std::invalid_argument("CW final DFT has incompatible catalog storage");
+  if (f.array_catalog->resolve_untyped(accumulator) != live.dft ||
+      f.array_catalog->resolve_untyped(phase) != live.dft_phase)
+    throw std::invalid_argument("CW final DFT has a stale catalog binding");
+
+  const ArrayRef fields[] = {d.source_field, d.source_field_imag};
+  realnum *const raw[] = {fc.f[live.c][0], fc.f[live.c][1]};
+  for (size_t cmp = 0; cmp < 2; ++cmp) {
+    if (!raw[cmp]) {
+      if (is_valid(fields[cmp].id) || fields[cmp].elements != 0)
+        throw std::invalid_argument("CW final DFT has a spurious source-field reference");
+      continue;
+    }
+    if (!is_valid(fields[cmp].id) || fields[cmp].offset != 0 ||
+        fields[cmp].elements != size_t(fc.gv.ntot()))
+      throw std::invalid_argument("CW final DFT has the wrong source-field extent");
+    const ArraySpec &spec = f.array_catalog->spec(fields[cmp].id);
+    if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+        spec.storage != native || spec.elements != size_t(fc.gv.ntot()) ||
+        f.array_catalog->resolve_untyped(fields[cmp].id) != raw[cmp])
+      throw std::invalid_argument("CW final DFT source field has incompatible storage");
+  }
+}
+
+void cw_validate_source_descriptor(fields &f, const fields_chunk &fc, int chunk, field_type ft,
+                                   uint32_t ordinal, const src_vol &sv,
+                                   const SourceDescriptor &d) {
+  const component c = direction_component(first_field_component(ft), component_direction(sv.c));
+  const ArrayId destination =
+      f.array_catalog->find({chunk, int(array_kind::f), int(c), 0, 0});
+  const ArrayId destination_imag =
+      f.array_catalog->find({chunk, int(array_kind::f), int(c), 1, 0});
+  const ArrayId condinv = f.array_catalog->find(
+      {chunk, int(array_kind::condinv), int(c), -1, int(component_direction(sv.c))});
+  const ArrayId integrated_destination =
+      sv.t()->is_integrated
+          ? f.array_catalog->find({chunk, int(array_kind::f_minus_p), int(c), 0, 0})
+          : invalid_array();
+  const ArrayId integrated_destination_imag =
+      sv.t()->is_integrated
+          ? f.array_catalog->find({chunk, int(array_kind::f_minus_p), int(c), 1, 0})
+          : invalid_array();
+  const Precision native =
+      sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+  if (d.chunk != chunk || d.ft != ft || d.source_ordinal != ordinal || d.c != c ||
+      d.integrated != sv.t()->is_integrated || d.destination != destination ||
+      d.destination_imag != destination_imag || d.condinv != condinv ||
+      d.integrated_destination != integrated_destination ||
+      d.integrated_destination_imag != integrated_destination_imag ||
+      d.source_time_id != cw_source_time_id(f, sv.t()) || d.indices.size() != sv.num_points() ||
+      d.complex_amplitudes.size() != sv.num_points())
+    throw std::invalid_argument("CW source descriptor differs from its live source");
+  for (size_t i = 0; i < sv.num_points(); ++i)
+    if (d.indices[i] != sv.index_at(i) || d.complex_amplitudes[i] != sv.amplitude_at(i))
+      throw std::invalid_argument("CW source spatial table differs from its live source");
+  const ArrayId destinations[] = {destination, destination_imag};
+  realnum *const raw_destinations[] = {fc.f[c][0], fc.f[c][1]};
+  for (size_t cmp = 0; cmp < 2; ++cmp) {
+    if (is_valid(destinations[cmp]) != (raw_destinations[cmp] != NULL))
+      throw std::invalid_argument("CW source destination catalog presence differs from live storage");
+    if (!is_valid(destinations[cmp])) continue;
+    const ArraySpec &spec = f.array_catalog->spec(destinations[cmp]);
+    if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+        spec.storage != native || spec.elements != size_t(fc.gv.ntot()) ||
+        f.array_catalog->resolve_untyped(destinations[cmp]) != raw_destinations[cmp])
+      throw std::invalid_argument("CW source destination has incompatible catalog storage");
+  }
+  const realnum *raw_condinv = fc.s->condinv[c][component_direction(sv.c)];
+  if (is_valid(condinv) != (raw_condinv != NULL))
+    throw std::invalid_argument("CW source conductivity catalog presence differs from live storage");
+  if (is_valid(condinv)) {
+    const ArraySpec &spec = f.array_catalog->spec(condinv);
+    if (spec.role != array_role::material ||
+        spec.element_type != ElementType::realnum_value || spec.storage != native ||
+        spec.elements != size_t(fc.gv.ntot()) ||
+        f.array_catalog->resolve_untyped(condinv) != raw_condinv)
+      throw std::invalid_argument("CW source conductivity has incompatible catalog storage");
+  }
+}
+
+} // namespace
+
+uint64_t compute_cw_plan_signature(const CwPlan &plan) {
+  uint64_t sig = 0xcbf29ce484222325ull;
+  target_fingerprint_mix(sig, plan.state_layout_signature);
+  target_fingerprint_mix(sig, plan.step_plan_signature);
+  target_fingerprint_mix(sig, plan.rhs_stages.size());
+  for (const CwRhsStage &stage : plan.rhs_stages) {
+    target_fingerprint_mix(sig, uint64_t(stage.ft));
+    fingerprint_double(sig, stage.source_time_offset);
+    target_fingerprint_mix(sig, stage.source_time_index);
+    target_fingerprint_mix(sig, stage.source_time_count);
+    target_fingerprint_mix(sig, stage.source_index);
+    target_fingerprint_mix(sig, stage.source_count);
+    cw_hash_operation_ref(sig, stage.boundary);
+    cw_hash_operation_ref(sig, stage.constitutive);
+    target_fingerprint_mix(sig, stage.accesses.size());
+    for (const BufferAccess &access : stage.accesses)
+      cw_hash_access(sig, access);
+  }
+  target_fingerprint_mix(sig, plan.rhs_sources.size());
+  for (const CwRhsSourceDescriptor &source : plan.rhs_sources) {
+    target_fingerprint_mix(sig, source.source_descriptor_index);
+    target_fingerprint_mix(sig, source.source_ordinal);
+    target_fingerprint_mix(sig, uint64_t(source.mode));
+  }
+  cw_hash_operation_ref(sig, plan.unpack.first_boundary);
+  cw_hash_operation_ref(sig, plan.unpack.constitutive);
+  cw_hash_operation_ref(sig, plan.unpack.second_boundary);
+  target_fingerprint_mix(sig, plan.unpack.skip_w_components);
+  target_fingerprint_mix(sig, plan.unpack.invalidate_field_values);
+  target_fingerprint_mix(sig, plan.final_dfts.size());
+  for (const CwDftDescriptorRef &dft : plan.final_dfts) {
+    target_fingerprint_mix(sig, dft.descriptor_index);
+    target_fingerprint_mix(sig, uint64_t(dft.chunk));
+    target_fingerprint_mix(sig, uint64_t(dft.c));
+    target_fingerprint_mix(sig, uint64_t(dft.decimation_factor));
+    target_fingerprint_mix(sig, dft.due_scalar_slot);
+  }
+  target_fingerprint_mix(sig, plan.rhs_accesses.size());
+  for (const BufferAccess &access : plan.rhs_accesses)
+    cw_hash_access(sig, access);
+  target_fingerprint_mix(sig, plan.unpack_accesses.size());
+  for (const BufferAccess &access : plan.unpack_accesses)
+    cw_hash_access(sig, access);
+  target_fingerprint_mix(sig, plan.final_dft_accesses.size());
+  for (const BufferAccess &access : plan.final_dft_accesses)
+    cw_hash_access(sig, access);
+  target_fingerprint_mix(sig, plan.source_fingerprint);
+  target_fingerprint_mix(sig, plan.monitor_fingerprint);
+  target_fingerprint_mix(sig, plan.source_time_count);
+  target_fingerprint_mix(sig, plan.rhs_source_count);
+  target_fingerprint_mix(sig, plan.final_dft_count);
+  return sig;
+}
+
+CwPlan build_cw_plan(fields &f, const StepPlan &step_plan) {
+  if (step_plan.program != StepProgram::solve_cw)
+    throw std::invalid_argument("CwPlan requires a solve_cw StepPlan");
+  if (step_plan.signature != compute_step_plan_signature(step_plan))
+    throw std::invalid_argument("CwPlan received a stale solve_cw StepPlan signature");
+  const StepPlan canonical_step_plan = build_step_plan(f, StepProgram::solve_cw);
+  if (step_plan.signature != canonical_step_plan.signature)
+    throw std::invalid_argument("CwPlan received a noncanonical solve_cw StepPlan");
+  std::string layout_error;
+  if (!validate_cw_state_layout(f, step_plan.cw_state_layout, &layout_error))
+    throw std::invalid_argument(layout_error);
+  if (!f.descriptors || !f.array_catalog)
+    throw std::invalid_argument("CwPlan requires prepared source/DFT descriptors and storage");
+
+  SourcePlan canonical_sources;
+  build_source_descriptors(f, canonical_sources);
+  if (!cw_same_source_plan_recipe(f.descriptors->sources, canonical_sources))
+    throw std::invalid_argument("CW source descriptors differ from the live source objects");
+  std::vector<DftDescriptor> canonical_dfts;
+  build_dft_descriptors(f, canonical_dfts);
+  if (canonical_dfts.size() != f.descriptors->dfts.size())
+    throw std::invalid_argument("CW DFT descriptor count differs from the live monitors");
+  for (size_t i = 0; i < canonical_dfts.size(); ++i)
+    if (!cw_same_dft(f.descriptors->dfts[i], canonical_dfts[i]))
+      throw std::invalid_argument("CW DFT descriptor differs from its live monitor");
+
+  CwPlan plan;
+  plan.state_layout_signature = step_plan.cw_state_layout.signature;
+  plan.step_plan_signature = step_plan.signature;
+  plan.source_fingerprint = source_plan_signature(f.descriptors->sources);
+  plan.monitor_fingerprint = dft_plan_signature(f.descriptors->dfts);
+  if (f.descriptors->sources.source_times.size() > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("CW source-time span overflow");
+  plan.source_time_count = uint32_t(f.descriptors->sources.source_times.size());
+  for (const ArrayRef &zero : step_plan.cw_state_layout.zero_arrays)
+    cw_add_access(f, plan.rhs_accesses, zero.id, AccessMode::write);
+
+  const uint32_t b_update = cw_find_operation(step_plan, 0, OpKind::update_db, B_stuff);
+  const uint32_t b_boundary =
+      cw_find_operation(step_plan, b_update + 1, OpKind::transfer_halo, B_stuff);
+  const uint32_t h_update =
+      cw_find_operation(step_plan, b_boundary + 1, OpKind::update_eh, H_stuff);
+  const uint32_t d_update =
+      cw_find_operation(step_plan, h_update + 1, OpKind::update_db, D_stuff);
+  const uint32_t d_boundary =
+      cw_find_operation(step_plan, d_update + 1, OpKind::transfer_halo, D_stuff);
+  const uint32_t e_update =
+      cw_find_operation(step_plan, d_boundary + 1, OpKind::update_eh, E_stuff);
+  const uint32_t e_boundary =
+      cw_find_operation(step_plan, e_update + 1, OpKind::transfer_halo, E_stuff);
+
+  const field_type stage_ft[] = {B_stuff, D_stuff};
+  const double stage_offset[] = {0.0, 0.5};
+  const uint32_t stage_boundary[] = {b_boundary, d_boundary};
+  const uint32_t stage_constitutive[] = {h_update, e_update};
+  std::vector<uint8_t> consumed(f.descriptors->sources.sources.size(), 0);
+  for (size_t stage_index = 0; stage_index < 2; ++stage_index) {
+    CwRhsStage stage;
+    stage.ft = stage_ft[stage_index];
+    stage.source_time_offset = stage_offset[stage_index];
+    stage.source_time_index = 0;
+    stage.source_time_count = plan.source_time_count;
+    if (plan.rhs_sources.size() > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("CW RHS source index overflow");
+    stage.source_index = uint32_t(plan.rhs_sources.size());
+    stage.boundary = cw_operation_ref(step_plan, stage_boundary[stage_index],
+                                      OpKind::transfer_halo, stage.ft);
+    const field_type constitutive_ft = stage.ft == B_stuff ? H_stuff : E_stuff;
+    stage.constitutive = cw_operation_ref(step_plan, stage_constitutive[stage_index],
+                                          OpKind::update_eh, constitutive_ft);
+
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk]->is_mine()) continue;
+      fields_chunk &fc = *f.chunks[chunk];
+      const std::vector<src_vol> &sources = fc.get_sources(stage.ft);
+      if (sources.size() > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("CW per-chunk source ordinal overflow");
+      for (uint32_t ordinal = 0; ordinal < sources.size(); ++ordinal) {
+        const src_vol &sv = sources[ordinal];
+        const size_t descriptor_index =
+            cw_find_source_descriptor(f.descriptors->sources, chunk, stage.ft, ordinal);
+        if (descriptor_index > std::numeric_limits<uint32_t>::max())
+          throw std::overflow_error("CW source descriptor index overflow");
+        const SourceDescriptor &d = f.descriptors->sources.sources[descriptor_index];
+        cw_validate_source_descriptor(f, fc, chunk, stage.ft, ordinal, sv, d);
+        consumed[descriptor_index] = 1;
+
+        const bool family_matches =
+            (stage.ft == B_stuff && is_magnetic(sv.c)) ||
+            (stage.ft == D_stuff && is_electric(sv.c));
+        if (!family_matches || !fc.f[d.c][0]) continue;
+        if (!is_valid(d.destination))
+          throw std::invalid_argument("CW RHS source has no primary D/B destination");
+
+        CwRhsSourceDescriptor rhs;
+        rhs.source_descriptor_index = uint32_t(descriptor_index);
+        rhs.source_ordinal = ordinal;
+        rhs.mode = CwRhsSourceMode::primary_subtract_current_dt_including_integrated;
+        plan.rhs_sources.push_back(rhs);
+        cw_add_access(f, stage.accesses, d.destination, AccessMode::read_write);
+        cw_add_access(f, stage.accesses, d.destination_imag, AccessMode::read_write);
+        cw_add_access(f, stage.accesses, d.condinv, AccessMode::read);
+      }
+    }
+    const size_t source_count = plan.rhs_sources.size() - stage.source_index;
+    if (source_count > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("CW RHS source span overflow");
+    stage.source_count = uint32_t(source_count);
+    cw_merge_accesses(f, stage.accesses, step_plan.operations[stage_boundary[stage_index]].accesses);
+    cw_merge_accesses(f, stage.accesses,
+                      step_plan.operations[stage_constitutive[stage_index]].accesses);
+    cw_merge_accesses(f, plan.rhs_accesses, stage.accesses);
+    plan.rhs_stages.push_back(stage);
+  }
+
+  /* SourcePlan also contains empty/non-applicable field-family rows. Validate
+     those against the live vectors so a stale descriptor cannot hide outside
+     the two emitted RHS spans. */
+  FOR_FIELD_TYPES(ft) {
+    if (ft == B_stuff || ft == D_stuff) continue;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk]->is_mine()) continue;
+      fields_chunk &fc = *f.chunks[chunk];
+      const std::vector<src_vol> &sources = fc.get_sources(ft);
+      if (sources.size() > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("CW per-chunk source ordinal overflow");
+      for (uint32_t ordinal = 0; ordinal < sources.size(); ++ordinal) {
+        const size_t descriptor_index =
+            cw_find_source_descriptor(f.descriptors->sources, chunk, ft, ordinal);
+        cw_validate_source_descriptor(f, fc, chunk, ft, ordinal, sources[ordinal],
+                                      f.descriptors->sources.sources[descriptor_index]);
+        consumed[descriptor_index] = 1;
+      }
+    }
+  }
+  for (uint8_t row_consumed : consumed)
+    if (!row_consumed)
+      throw std::invalid_argument("CW source plan contains a non-live source descriptor");
+
+  plan.unpack.first_boundary =
+      cw_operation_ref(step_plan, d_boundary, OpKind::transfer_halo, D_stuff);
+  plan.unpack.constitutive =
+      cw_operation_ref(step_plan, e_update, OpKind::update_eh, E_stuff);
+  plan.unpack.second_boundary =
+      cw_operation_ref(step_plan, e_boundary, OpKind::transfer_halo, E_stuff);
+  plan.unpack.skip_w_components = step_plan.cw_state_layout.unpack_prelude.skip_w_components;
+  plan.unpack.invalidate_field_values =
+      step_plan.cw_state_layout.unpack_prelude.invalidate_field_values;
+  for (const BufferAccess &access : step_plan.cw_state_layout.unpack_accesses)
+    cw_add_access(f, plan.unpack_accesses, access.array.id, access.mode);
+  cw_merge_accesses(f, plan.unpack_accesses, step_plan.operations[d_boundary].accesses);
+  cw_merge_accesses(f, plan.unpack_accesses, step_plan.operations[e_update].accesses);
+  cw_merge_accesses(f, plan.unpack_accesses, step_plan.operations[e_boundary].accesses);
+
+  if (f.descriptors->dfts.size() > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("CW final DFT descriptor span overflow");
+  size_t live_dft_index = 0;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    int local_index = 0;
+    for (dft_chunk *live = f.chunks[chunk]->dft_chunks; live;
+         live = live->next_in_chunk, ++local_index, ++live_dft_index)
+      cw_validate_dft_storage(f, *f.chunks[chunk], chunk, local_index, *live,
+                              f.descriptors->dfts[live_dft_index]);
+  }
+  if (live_dft_index != f.descriptors->dfts.size())
+    throw std::invalid_argument("CW final DFT order differs from the live monitor order");
+  for (size_t i = 0; i < f.descriptors->dfts.size(); ++i) {
+    const DftDescriptor &d = f.descriptors->dfts[i];
+    if (d.decimation_factor < 1)
+      throw std::invalid_argument("CW final DFT has an invalid decimation factor");
+    plan.final_dfts.push_back(CwDftDescriptorRef{uint32_t(i), d.chunk, d.c,
+                                                 d.decimation_factor, d.due_scalar_slot});
+    cw_add_access(f, plan.final_dft_accesses, d.accumulator, AccessMode::read_write);
+    cw_add_access(f, plan.final_dft_accesses, d.phase_scratch, AccessMode::write);
+    cw_add_access_ref(f, plan.final_dft_accesses, d.source_field, AccessMode::read);
+    cw_add_access_ref(f, plan.final_dft_accesses, d.source_field_imag, AccessMode::read);
+  }
+
+  if (plan.rhs_sources.size() > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("CW RHS source total overflow");
+  if (plan.final_dfts.size() > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("CW final DFT total overflow");
+  plan.rhs_source_count = uint32_t(plan.rhs_sources.size());
+  plan.final_dft_count = uint32_t(plan.final_dfts.size());
+
+  plan.signature = compute_cw_plan_signature(plan);
+  return plan;
+}
+
+bool validate_cw_plan(fields &f, const StepPlan &step_plan, const CwPlan &plan,
+                      std::string *error) {
+  if (error) error->clear();
+  try {
+    /* Validate the caller-supplied plan itself before replacing it with the
+       independently rebuilt canonical plan below. This catches both stale
+       signatures and structurally mutated/re-signed timestep plans. */
+    (void)build_cw_plan(f, step_plan);
+    const StepPlan canonical_step_plan = build_step_plan(f, StepProgram::solve_cw);
+    if (step_plan.signature != canonical_step_plan.signature)
+      throw std::invalid_argument("solve_cw StepPlan differs from the canonical live plan");
+    const CwPlan expected = build_cw_plan(f, canonical_step_plan);
+    if (plan == expected) return true;
+    if (error) *error = "CwPlan differs from the canonical source/monitor plan";
   }
   catch (const std::exception &e) {
     if (error) *error = e.what();

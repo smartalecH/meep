@@ -68,6 +68,15 @@ static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static double magnetic_conductivity(const vec &) { return 0.07; }
 
+class cw_custom_source : public continuous_src_time {
+public:
+  cw_custom_source(double frequency) : continuous_src_time(frequency) {}
+  virtual src_time *clone() const { return new cw_custom_source(*this); }
+  virtual std::complex<double> current(double time, double dt) const {
+    return continuous_src_time::current(time, dt) + std::complex<double>(0.0625, -0.03125);
+  }
+};
+
 static void compare(const char *name, const std::vector<std::string> &got, const char *const *want,
                     size_t nwant) {
   if (got.size() != nwant) {
@@ -88,6 +97,12 @@ static void compare(const char *name, const std::vector<std::string> &got, const
 
 static const BufferAccess *find_access(const Operation &op, ArrayId id) {
   for (const BufferAccess &access : op.accesses)
+    if (access.array.id == id) return &access;
+  return NULL;
+}
+
+static const BufferAccess *find_access(const std::vector<BufferAccess> &accesses, ArrayId id) {
+  for (const BufferAccess &access : accesses)
     if (access.array.id == id) return &access;
   return NULL;
 }
@@ -1100,6 +1115,446 @@ static void test_lazy_cw_layout_before_storage_refresh() {
         "late-source solve_cw fixture produced no prepared rows on any rank");
 }
 
+static void test_cw_composite_plan() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  s.set_conductivity(Dz, magnetic_conductivity);
+  fields f(&s, 0, 0, true);
+  continuous_src_time m0(0.21), mi(0.22), m2(0.23), e0(0.31), ei(0.32);
+  cw_custom_source e2(0.33);
+  m0.is_integrated = false;
+  mi.is_integrated = true;
+  m2.is_integrated = false;
+  e0.is_integrated = false;
+  ei.is_integrated = true;
+  e2.is_integrated = false;
+  const vec source_point(0.17, 0.19);
+  f.add_point_source(Hz, m0, source_point);
+  f.add_point_source(Hz, mi, source_point);
+  f.add_point_source(Hz, m2, source_point);
+  f.add_point_source(Ez, e0, source_point);
+  f.add_point_source(Ez, ei, source_point);
+  f.add_point_source(Ez, e2, source_point);
+  const volume ordinary_monitor(vec(-0.8, -0.6), vec(0.8, 0.6));
+  const volume persistent_monitor(vec(-0.8, -0.6), vec(0.8, 0.6));
+  f.add_dft(Ez, ordinary_monitor, 0.24, 0.34, 3, true, 1.0, 0, false, 1.0, true, 0,
+            2, false);
+  f.add_dft(Hz, persistent_monitor, 0.26, 0.36, 3, true, 1.0, 0, false, 1.0, true, 0,
+            3, true);
+  f.advance(2);
+
+  const StepPlan ordinary = build_step_plan(f, StepProgram::ordinary);
+  const StepPlan cw_step = build_step_plan(f, StepProgram::solve_cw);
+  const CwPlan plan = build_cw_plan(f, cw_step);
+  const CwPlan rebuilt = build_cw_plan(f, cw_step);
+  CHECK(plan == rebuilt && rebuilt == plan, "independently rebuilt CwPlans differ");
+  CHECK(plan.signature == compute_cw_plan_signature(plan),
+        "stored CwPlan signature differs from its structural signature");
+  std::string error;
+  CHECK(validate_cw_plan(f, cw_step, plan, &error), "canonical CwPlan failed validation: %s",
+        error.c_str());
+
+  CHECK(plan.rhs_stages.size() == 2, "CwPlan has %zu RHS stages", plan.rhs_stages.size());
+  if (plan.rhs_stages.size() == 2) {
+    CHECK(plan.rhs_stages[0].ft == B_stuff && plan.rhs_stages[0].source_time_offset == 0.0,
+          "first CW RHS stage is not B at offset 0");
+    CHECK(plan.rhs_stages[1].ft == D_stuff && plan.rhs_stages[1].source_time_offset == 0.5,
+          "second CW RHS stage is not D at offset 0.5");
+    for (const CwRhsStage &stage : plan.rhs_stages)
+      CHECK(stage.source_time_index == 0 &&
+                stage.source_time_count == f.descriptors->sources.source_times.size(),
+            "CW RHS stage does not evaluate all source times in canonical order");
+  }
+  CHECK(plan.source_time_count == f.descriptors->sources.source_times.size() &&
+            plan.rhs_source_count == plan.rhs_sources.size() &&
+            plan.final_dft_count == plan.final_dfts.size(),
+        "CwPlan checked totals differ from their descriptor vectors");
+  CHECK(plan.state_layout_signature == cw_step.cw_state_layout.signature &&
+            plan.step_plan_signature == cw_step.signature &&
+            plan.source_fingerprint == source_plan_signature(f.descriptors->sources) &&
+            plan.monitor_fingerprint == dft_plan_signature(f.descriptors->dfts),
+        "CwPlan fingerprints do not bind the canonical inputs");
+
+  size_t expected_source = 0;
+  for (size_t stage_index = 0; stage_index < plan.rhs_stages.size(); ++stage_index) {
+    const CwRhsStage &stage = plan.rhs_stages[stage_index];
+    CHECK(stage.source_index == expected_source, "CW RHS stage has a gap or overlap");
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk]->is_mine()) continue;
+      fields_chunk &fc = *f.chunks[chunk];
+      const std::vector<src_vol> &live = fc.get_sources(stage.ft);
+      for (size_t ordinal = 0; ordinal < live.size(); ++ordinal) {
+        const src_vol &sv = live[ordinal];
+        const component c =
+            direction_component(first_field_component(stage.ft), component_direction(sv.c));
+        const bool applies = ((stage.ft == B_stuff && is_magnetic(sv.c)) ||
+                              (stage.ft == D_stuff && is_electric(sv.c))) &&
+                             fc.f[c][0];
+        if (!applies) continue;
+        CHECK(expected_source < plan.rhs_sources.size(), "CW RHS omitted a live source");
+        if (expected_source >= plan.rhs_sources.size()) continue;
+        const CwRhsSourceDescriptor &rhs = plan.rhs_sources[expected_source++];
+        CHECK(rhs.source_ordinal == ordinal,
+              "CW RHS source order is not chunk then original ordinal");
+        CHECK(rhs.mode ==
+                  CwRhsSourceMode::primary_subtract_current_dt_including_integrated,
+              "CW RHS source has the wrong signed primary-current mode");
+        CHECK(rhs.source_descriptor_index < f.descriptors->sources.sources.size(),
+              "CW RHS source reference is out of range");
+        if (rhs.source_descriptor_index < f.descriptors->sources.sources.size()) {
+          const SourceDescriptor &d =
+              f.descriptors->sources.sources[rhs.source_descriptor_index];
+          CHECK(d.chunk == chunk && d.ft == stage.ft && d.source_ordinal == ordinal,
+                "CW RHS reference resolves to the wrong canonical source descriptor");
+          CHECK(d.indices.size() == sv.num_points() &&
+                    d.complex_amplitudes.size() == sv.num_points(),
+                "CW RHS referenced the wrong spatial source row");
+          CHECK(d.destination != d.integrated_destination &&
+                    d.destination_imag != d.integrated_destination_imag,
+                "CW RHS targets the integrated f_minus_p path");
+          const BufferAccess *destination_access =
+              find_access(stage.accesses, canonical_id(f, d.destination));
+          CHECK(destination_access && destination_access->mode == AccessMode::read_write,
+                "CW RHS stage lacks a primary destination read_write access");
+          if (is_valid(d.condinv)) {
+            const BufferAccess *condinv_access =
+                find_access(stage.accesses, canonical_id(f, d.condinv));
+            CHECK(condinv_access && condinv_access->mode == AccessMode::read,
+                  "CW RHS stage lacks a conductivity read access");
+          }
+        }
+      }
+    }
+    CHECK(expected_source == size_t(stage.source_index) + stage.source_count,
+          "CW RHS stage count differs from its exact source sequence");
+    const Operation &boundary = cw_step.operations[stage.boundary.operation_index];
+    const Operation &constitutive = cw_step.operations[stage.constitutive.operation_index];
+    CHECK(boundary.kind == OpKind::transfer_halo && boundary.ft == stage.ft,
+          "CW RHS boundary reference is wrong");
+    CHECK(constitutive.kind == OpKind::update_eh &&
+              constitutive.ft == (stage.ft == B_stuff ? H_stuff : E_stuff),
+          "CW RHS constitutive reference is wrong");
+    for (const BufferAccess &access : boundary.accesses)
+      CHECK(find_access(stage.accesses, canonical_id(f, access.array.id)),
+            "CW RHS stage omitted a boundary access");
+    for (const BufferAccess &access : constitutive.accesses)
+      CHECK(find_access(stage.accesses, canonical_id(f, access.array.id)),
+            "CW RHS stage omitted a constitutive access");
+  }
+  CHECK(expected_source == plan.rhs_sources.size(), "CW RHS contains an extra source row");
+
+  for (const BufferAccess &access : plan.rhs_accesses) {
+    const int kind = f.array_catalog->key(access.array.id).kind;
+    CHECK(kind != int(array_kind::f_minus_p), "CW RHS access union contains f_minus_p");
+    CHECK(access.array.offset == 0 &&
+              access.array.elements == f.array_catalog->spec(access.array.id).elements,
+          "CW RHS access is not a full allocation");
+  }
+  for (const ConstitutiveUpdate &d : cw_step.eh_updates)
+    CHECK(d.primary == d.base_primary && d.cross1 == d.base_cross1 &&
+              d.cross2 == d.base_cross2 &&
+              !(d.region.variant_key & constitutive_has_minus_p),
+          "solve_cw constitutive descriptors retained f_minus_p semantics");
+  for (const Operation &op : cw_step.operations)
+    if (op.kind == OpKind::update_eh)
+      CHECK(op.source_descriptor_count == 0 && op.polarization_subtraction_count == 0,
+            "solve_cw update_eh retained an integrated-source span");
+  bool ordinary_integrated_span = false;
+  for (const Operation &op : ordinary.operations)
+    ordinary_integrated_span =
+        ordinary_integrated_span || (op.kind == OpKind::update_eh && op.source_descriptor_count);
+  CHECK(or_to_all(ordinary_integrated_span),
+        "ordinary plan lost its integrated-source descriptor span");
+
+  CHECK(plan.unpack.skip_w_components && plan.unpack.invalidate_field_values,
+        "CW unpack reference lost skip-W or invalidation semantics");
+  const CwStepOperationRef unpack_refs[] = {plan.unpack.first_boundary,
+                                            plan.unpack.constitutive,
+                                            plan.unpack.second_boundary};
+  const OpKind unpack_kinds[] = {OpKind::transfer_halo, OpKind::update_eh,
+                                 OpKind::transfer_halo};
+  const field_type unpack_types[] = {D_stuff, E_stuff, E_stuff};
+  for (size_t i = 0; i < 3; ++i) {
+    CHECK(unpack_refs[i].operation_index < cw_step.operations.size(),
+          "CW unpack operation reference is out of range");
+    if (unpack_refs[i].operation_index < cw_step.operations.size()) {
+      const Operation &op = cw_step.operations[unpack_refs[i].operation_index];
+      CHECK(op.kind == unpack_kinds[i] && op.ft == unpack_types[i],
+            "CW unpack operation reference %zu has the wrong semantics", i);
+      CHECK(unpack_refs[i].descriptor_index == op.descriptor_index &&
+                unpack_refs[i].descriptor_count == op.descriptor_count,
+            "CW unpack operation reference %zu has the wrong descriptor span", i);
+    }
+  }
+  for (const BufferAccess &access : cw_step.cw_state_layout.unpack_accesses)
+    CHECK(find_access(plan.unpack_accesses, canonical_id(f, access.array.id)),
+          "CW unpack access union omitted a state write");
+
+  CHECK(plan.final_dfts.size() == f.descriptors->dfts.size(),
+        "CW final DFT reference count differs from the descriptor table");
+  bool saw_decimation_two = false, saw_decimation_three = false;
+  for (size_t i = 0; i < plan.final_dfts.size(); ++i) {
+    const CwDftDescriptorRef &ref = plan.final_dfts[i];
+    const DftDescriptor &d = f.descriptors->dfts[i];
+    CHECK(ref.descriptor_index == i && ref.chunk == d.chunk && ref.c == d.c &&
+              ref.decimation_factor == d.decimation_factor &&
+              ref.due_scalar_slot == d.due_scalar_slot,
+          "CW final DFT reference %zu differs from its canonical descriptor", i);
+    saw_decimation_two = saw_decimation_two || ref.decimation_factor == 2;
+    saw_decimation_three = saw_decimation_three || ref.decimation_factor == 3;
+    CHECK(find_access(plan.final_dft_accesses, canonical_id(f, d.accumulator)),
+          "CW final DFT accesses omit the accumulator");
+    CHECK(find_access(plan.final_dft_accesses, canonical_id(f, d.phase_scratch)),
+          "CW final DFT accesses omit phase scratch");
+    const BufferAccess *accumulator =
+        find_access(plan.final_dft_accesses, canonical_id(f, d.accumulator));
+    const BufferAccess *phase =
+        find_access(plan.final_dft_accesses, canonical_id(f, d.phase_scratch));
+    const BufferAccess *source =
+        find_access(plan.final_dft_accesses, canonical_id(f, d.source_field.id));
+    CHECK(accumulator && accumulator->mode == AccessMode::read_write,
+          "CW final DFT accumulator access has the wrong mode");
+    CHECK(phase && phase->mode == AccessMode::write,
+          "CW final DFT phase access has the wrong mode");
+    CHECK(source && source->mode == AccessMode::read,
+          "CW final DFT real source access has the wrong mode");
+    if (is_valid(d.source_field_imag.id)) {
+      const BufferAccess *source_imag =
+          find_access(plan.final_dft_accesses, canonical_id(f, d.source_field_imag.id));
+      CHECK(source_imag && source_imag->mode == AccessMode::read,
+            "CW final DFT imaginary source access has the wrong mode");
+    }
+  }
+  CHECK(or_to_all(saw_decimation_two) && or_to_all(saw_decimation_three),
+        "CW final DFT references did not preserve distinct decimation factors");
+
+#define CHECK_CW_COMPOSITE_MUTATION(mutation, message)                                             \
+  do {                                                                                             \
+    CwPlan changed = plan;                                                                         \
+    mutation;                                                                                      \
+    changed.signature = compute_cw_plan_signature(changed);                                       \
+    std::string changed_error;                                                                     \
+    CHECK(changed != plan, message " (equality)");                                                \
+    CHECK(!validate_cw_plan(f, cw_step, changed, &changed_error), message " (validation)");       \
+  } while (0)
+  CHECK_CW_COMPOSITE_MUTATION(changed.rhs_stages[0].source_time_offset = 0.25,
+                              "CwPlan accepted a changed RHS time offset");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_stages[0].source_time_index,
+                              "CwPlan accepted a changed source-time span");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_stages[0].source_time_count,
+                              "CwPlan accepted a changed source-time count");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_stages[0].source_index,
+                              "CwPlan accepted a changed RHS source span");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_stages[0].source_count,
+                              "CwPlan accepted a changed RHS source count");
+  CHECK_CW_COMPOSITE_MUTATION(std::swap(changed.rhs_stages[0], changed.rhs_stages[1]),
+                              "CwPlan accepted reordered RHS stages");
+  if (!plan.rhs_stages[0].accesses.empty())
+    CHECK_CW_COMPOSITE_MUTATION(changed.rhs_stages[0].accesses[0].mode = AccessMode::read,
+                                "CwPlan accepted a changed per-stage access");
+  CHECK_CW_COMPOSITE_MUTATION(changed.unpack.skip_w_components = false,
+                              "CwPlan accepted changed unpack skip-W semantics");
+  CHECK_CW_COMPOSITE_MUTATION(changed.unpack.invalidate_field_values = false,
+                              "CwPlan accepted changed unpack invalidation semantics");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.unpack.constitutive.descriptor_count,
+                              "CwPlan accepted a changed unpack descriptor span");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.unpack.first_boundary.operation_index,
+                              "CwPlan accepted a changed unpack operation index");
+  CHECK_CW_COMPOSITE_MUTATION(changed.unpack.second_boundary.kind = OpKind::update_eh,
+                              "CwPlan accepted a changed unpack operation kind");
+  CHECK_CW_COMPOSITE_MUTATION(changed.unpack.second_boundary.ft = D_stuff,
+                              "CwPlan accepted a changed unpack field type");
+  CHECK_CW_COMPOSITE_MUTATION(
+      std::swap(changed.unpack.first_boundary, changed.unpack.second_boundary),
+      "CwPlan accepted reordered unpack operations");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.source_fingerprint,
+                              "CwPlan accepted a changed source fingerprint");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.monitor_fingerprint,
+                              "CwPlan accepted a changed monitor fingerprint");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.state_layout_signature,
+                              "CwPlan accepted a changed layout signature");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.step_plan_signature,
+                              "CwPlan accepted a changed StepPlan signature");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_source_count,
+                              "CwPlan accepted a changed RHS total");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.source_time_count,
+                              "CwPlan accepted a changed source-time total");
+  CHECK_CW_COMPOSITE_MUTATION(++changed.final_dft_count,
+                              "CwPlan accepted a changed final-DFT total");
+  if (!plan.rhs_sources.empty()) {
+    CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_sources[0].source_ordinal,
+                                "CwPlan accepted a changed source ordinal");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_sources[0].source_descriptor_index,
+                                "CwPlan accepted a changed source reference");
+    CHECK_CW_COMPOSITE_MUTATION(
+        changed.rhs_sources[0].mode = static_cast<CwRhsSourceMode>(99),
+        "CwPlan accepted a changed RHS source mode");
+    size_t integrated_rhs = plan.rhs_sources.size();
+    for (size_t i = 0; i < plan.rhs_sources.size(); ++i)
+      if (f.descriptors->sources.sources[plan.rhs_sources[i].source_descriptor_index].integrated) {
+        integrated_rhs = i;
+        break;
+      }
+    CHECK(integrated_rhs < plan.rhs_sources.size(),
+          "mixed-source fixture produced no integrated CW RHS row");
+    if (integrated_rhs < plan.rhs_sources.size()) {
+      const SourceDescriptor &source = f.descriptors->sources.sources[
+          plan.rhs_sources[integrated_rhs].source_descriptor_index];
+      CHECK(is_valid(source.integrated_destination),
+            "integrated source descriptor has no f_minus_p destination");
+      if (is_valid(source.integrated_destination)) {
+        SourceDescriptor &mutable_source = f.descriptors->sources.sources[
+            plan.rhs_sources[integrated_rhs].source_descriptor_index];
+        const ArrayId saved_destination = mutable_source.destination;
+        mutable_source.destination = mutable_source.integrated_destination;
+        CHECK(!validate_cw_plan(f, cw_step, plan, NULL),
+              "CwPlan accepted an f_minus_p RHS destination");
+        mutable_source.destination = saved_destination;
+      }
+    }
+    CHECK_CW_COMPOSITE_MUTATION(changed.rhs_sources.erase(changed.rhs_sources.begin()),
+                                "CwPlan accepted a deleted RHS source");
+    CHECK_CW_COMPOSITE_MUTATION(changed.rhs_sources.push_back(plan.rhs_sources[0]),
+                                "CwPlan accepted a duplicate RHS source");
+    if (plan.rhs_sources.size() > 1)
+      CHECK_CW_COMPOSITE_MUTATION(std::swap(changed.rhs_sources[0], changed.rhs_sources[1]),
+                                  "CwPlan accepted reordered RHS sources");
+    size_t conductive_rhs = plan.rhs_sources.size();
+    for (size_t i = 0; i < plan.rhs_sources.size(); ++i)
+      if (is_valid(f.descriptors->sources.sources[plan.rhs_sources[i].source_descriptor_index]
+                       .condinv)) {
+        conductive_rhs = i;
+        break;
+      }
+    CHECK(conductive_rhs < plan.rhs_sources.size(),
+          "conductive fixture produced no CW RHS condinv reference");
+    if (conductive_rhs < plan.rhs_sources.size()) {
+      const uint32_t descriptor_index = plan.rhs_sources[conductive_rhs].source_descriptor_index;
+      SourceDescriptor &source = f.descriptors->sources.sources[descriptor_index];
+      const ArrayId saved_condinv = source.condinv;
+      source.condinv = invalid_array();
+      CHECK(!validate_cw_plan(f, cw_step, plan, NULL),
+            "CwPlan accepted a changed canonical RHS condinv identity");
+      source.condinv = saved_condinv;
+    }
+  }
+  if (!plan.rhs_accesses.empty()) {
+    CHECK_CW_COMPOSITE_MUTATION(changed.rhs_accesses[0].mode = AccessMode::read,
+                                "CwPlan accepted a changed RHS access mode");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.rhs_accesses[0].array.offset,
+                                "CwPlan accepted a changed RHS access range");
+    CHECK_CW_COMPOSITE_MUTATION(changed.rhs_accesses.pop_back(),
+                                "CwPlan accepted a missing RHS access");
+    CHECK_CW_COMPOSITE_MUTATION(changed.rhs_accesses.push_back(plan.rhs_accesses[0]),
+                                "CwPlan accepted a duplicate RHS access");
+  }
+  if (!plan.unpack_accesses.empty()) {
+    CHECK_CW_COMPOSITE_MUTATION(changed.unpack_accesses.pop_back(),
+                                "CwPlan accepted a missing unpack access");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.unpack_accesses[0].array.elements,
+                                "CwPlan accepted a changed unpack access range");
+  }
+  if (!plan.final_dfts.empty()) {
+    CHECK_CW_COMPOSITE_MUTATION(++changed.final_dfts[0].descriptor_index,
+                                "CwPlan accepted a changed final DFT reference");
+    CHECK_CW_COMPOSITE_MUTATION(changed.final_dfts.pop_back(),
+                                "CwPlan accepted a missing final DFT reference");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.final_dfts[0].decimation_factor,
+                                "CwPlan accepted a changed final DFT decimation factor");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.final_dfts[0].due_scalar_slot,
+                                "CwPlan accepted a changed final DFT due slot");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.final_dfts[0].chunk,
+                                "CwPlan accepted a changed final DFT chunk");
+    CHECK_CW_COMPOSITE_MUTATION(changed.final_dfts[0].c = Ex,
+                                "CwPlan accepted a changed final DFT component");
+    CHECK_CW_COMPOSITE_MUTATION(changed.final_dfts.push_back(plan.final_dfts[0]),
+                                "CwPlan accepted a duplicate final DFT reference");
+    if (plan.final_dfts.size() > 1)
+      CHECK_CW_COMPOSITE_MUTATION(std::swap(changed.final_dfts[0], changed.final_dfts[1]),
+                                  "CwPlan accepted reordered final DFT references");
+  }
+  if (!plan.final_dft_accesses.empty()) {
+    CHECK_CW_COMPOSITE_MUTATION(changed.final_dft_accesses[0].mode = AccessMode::read,
+                                "CwPlan accepted a changed final DFT access mode");
+    CHECK_CW_COMPOSITE_MUTATION(changed.final_dft_accesses.pop_back(),
+                                "CwPlan accepted a missing final DFT access");
+    CHECK_CW_COMPOSITE_MUTATION(++changed.final_dft_accesses[0].array.elements,
+                                "CwPlan accepted a changed final DFT access range");
+  }
+#undef CHECK_CW_COMPOSITE_MUTATION
+  {
+    CwPlan changed = plan;
+    ++changed.signature;
+    CHECK(!validate_cw_plan(f, cw_step, changed, NULL),
+          "CwPlan validator accepted a changed composite signature");
+  }
+
+  if (!f.descriptors->sources.sources.empty()) {
+    SourceDescriptor &source = f.descriptors->sources.sources[0];
+    const uint32_t saved_ordinal = source.source_ordinal;
+    ++source.source_ordinal;
+    bool rejected = false;
+    try {
+      build_cw_plan(f, build_step_plan(f, StepProgram::solve_cw));
+    }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "CwPlan builder accepted a non-live source ordinal");
+    source.source_ordinal = saved_ordinal;
+  }
+  if (!f.descriptors->sources.source_times.empty()) {
+    SourceTimeDescriptor &source_time = f.descriptors->sources.source_times[0];
+    ++source_time.source_time_id;
+    CHECK(!validate_cw_plan(f, cw_step, plan, NULL),
+          "CwPlan validator accepted a source-time descriptor unlike the live object");
+    --source_time.source_time_id;
+  }
+  if (!f.descriptors->dfts.empty()) {
+    DftDescriptor &dft = f.descriptors->dfts[0];
+    dft.omega[0] += 1e-6;
+    bool rejected = false;
+    try {
+      build_cw_plan(f, build_step_plan(f, StepProgram::solve_cw));
+    }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "CwPlan builder accepted a DFT descriptor unlike the live monitor");
+    dft.omega[0] -= 1e-6;
+  }
+  if (cw_step.operations.size() > 2) {
+    StepPlan changed_step = cw_step;
+    ++changed_step.operations[1].guard.variant_index;
+    CHECK(!validate_cw_plan(f, changed_step, plan, NULL),
+          "CwPlan validator accepted a mutated StepPlan with a stale signature");
+    changed_step.signature = compute_step_plan_signature(changed_step);
+    bool rejected = false;
+    try {
+      build_cw_plan(f, changed_step);
+    }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "CwPlan builder accepted a re-signed noncanonical solve_cw StepPlan");
+  }
+
+  CwPlan cleared = plan;
+  cleared.clear();
+  CHECK(cleared == CwPlan(), "CwPlan::clear retained descriptor or fingerprint state");
+
+  bool owns_chunk = false, owns_source = false, owns_dft = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+    owns_source = owns_source ||
+                  (f.chunks[chunk]->is_mine() &&
+                   (!f.chunks[chunk]->get_sources(B_stuff).empty() ||
+                    !f.chunks[chunk]->get_sources(D_stuff).empty()));
+    owns_dft = owns_dft || (f.chunks[chunk]->is_mine() && f.chunks[chunk]->dft_chunks);
+  }
+  CHECK(plan.rhs_stages.size() == 2, "idle/owner rank lost fixed-shape RHS stages");
+  CHECK(!owns_source || !plan.rhs_sources.empty(), "source owner has no CW RHS rows");
+  CHECK(!owns_dft || !plan.final_dfts.empty(), "monitor owner has no final DFT references");
+  if (!owns_chunk)
+    CHECK(plan.rhs_sources.empty() && plan.final_dfts.empty() && plan.rhs_accesses.empty() &&
+              plan.unpack_accesses.empty() && plan.final_dft_accesses.empty(),
+          "idle rank retained local CwPlan rows or accesses");
+}
+
 /* Material phasing adds a segment_boundary-guarded reconciliation block whose
    condition is a collective or_to_all. */
 static void test_phasing_plan() {
@@ -1976,6 +2431,7 @@ int main(int argc, char **argv) {
   test_cw_state_layout();
   test_solve_cw_plan();
   test_lazy_cw_layout_before_storage_refresh();
+  test_cw_composite_plan();
   test_phasing_plan();
   test_material_schema_signature();
   test_magnetic_schema_signature();
