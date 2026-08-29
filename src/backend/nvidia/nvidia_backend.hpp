@@ -23,6 +23,20 @@ namespace meep {
 class NvidiaBackendState;
 class NvidiaExecutable;
 
+namespace nvidia {
+
+struct polarization_coefficients {
+  double omega0dtsqr;
+  double gamma1inv;
+  double gamma1;
+  double omega0dtsqr_denom;
+};
+
+polarization_coefficients derive_polarization_coefficients(double omega_0, double gamma,
+                                                           double dt, bool drude);
+
+} // namespace nvidia
+
 class NvidiaBackend : public ExecutionBackend {
 public:
   NvidiaBackend(fields &f, const execution_options &options, int selected_device);
