@@ -907,6 +907,23 @@ static void test_material_phase_cpu_to_resident_preparation() {
       CHECK(!f.chunks[i]->s->conductivity[Dz][Z],
             "CPU-only material setup eagerly realized resident storage");
   }
+  {
+    fields copy(f);
+    for (int i = 0; i < copy.num_chunks; ++i) {
+      FOR_FIELD_TYPES(ft) CHECK(!copy.chunks[i]->pol[ft],
+                                "zero-node fields copy retained a polarization list");
+      DOCMP2 FOR_COMPONENTS(c) {
+        CHECK(!f.chunks[i]->f_minus_p[c][cmp] || copy.chunks[i]->f_minus_p[c][cmp],
+              "fields copy lost an allocated polarization-subtraction row");
+        CHECK(!f.chunks[i]->f_w_prev[c][cmp] || copy.chunks[i]->f_w_prev[c][cmp],
+              "fields copy lost an allocated previous-W row");
+        CHECK(f.chunks[i]->f_minus_p[c][cmp] || !copy.chunks[i]->f_minus_p[c][cmp],
+              "fields copy retained an uninitialized polarization-subtraction pointer");
+        CHECK(f.chunks[i]->f_w_prev[c][cmp] || !copy.chunks[i]->f_w_prev[c][cmp],
+              "fields copy retained an uninitialized previous-W pointer");
+      }
+    }
+  }
 
   lifetime_counts counts;
   f.backend = new tracking_backend(f, counts);
@@ -1445,6 +1462,23 @@ static void test_resident_polarization_preparation() {
   lorentzian_susceptibility susceptibility(1.1, 0.05);
   gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07, GYROTROPIC_SATURATED);
 
+  {
+    structure single_structure(gv, eps_slab, pml(0.5), identity(), 1);
+    single_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
+    fields single(&single_structure);
+    single.require_component(Ez);
+    single.advance(1);
+    fields copy(single);
+    for (int i = 0; i < single.num_chunks; ++i)
+      if (single.chunks[i]->is_mine()) {
+        polarization_state *source = single.chunks[i]->pol[E_stuff];
+        polarization_state *duplicate = copy.chunks[i]->pol[E_stuff];
+        CHECK(source && !source->next && source->data && duplicate && !duplicate->next &&
+                  duplicate->data && duplicate->data != source->data,
+              "one-node fields copy did not duplicate polarization state exactly");
+      }
+  }
+
   structure resident_structure(gv, eps_slab, pml(0.5), identity(), 2);
   resident_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
   resident_structure.add_susceptibility(eps_slab, E_stuff, gyro);
@@ -1460,6 +1494,24 @@ static void test_resident_polarization_preparation() {
   lifetime_counts counts;
   resident.backend = new tracking_backend(resident, counts);
   resident.advance(1);
+  {
+    fields copy(resident);
+    for (int i = 0; i < resident.num_chunks; ++i) {
+      polarization_state *source = resident.chunks[i]->pol[E_stuff];
+      polarization_state *duplicate = copy.chunks[i]->pol[E_stuff];
+      size_t copied = 0;
+      while (source && duplicate) {
+        CHECK(!source->data || (duplicate->data && duplicate->data != source->data),
+              "fields copy did not duplicate populated polarization state");
+        ++copied;
+        source = source->next;
+        duplicate = duplicate->next;
+      }
+      CHECK(!source && !duplicate, "fields copy changed the polarization-state list shape");
+      if (resident.chunks[i]->is_mine())
+        CHECK(copied == 2, "two-node fields copy did not retain both polarization states");
+    }
+  }
   bool owns_chunk = false;
   for (int i = 0; i < resident.num_chunks; ++i)
     owns_chunk = owns_chunk || resident.chunks[i]->is_mine();
