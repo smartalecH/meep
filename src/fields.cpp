@@ -462,14 +462,14 @@ fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv)
   gvs_tiled = thef.gvs_tiled;
   FOR_FIELD_TYPES(ft) { gvs_eh[ft] = thef.gvs_eh[ft]; }
   FOR_FIELD_TYPES(ft) {
+    pol[ft] = NULL;
     polarization_state *cur = NULL;
     for (polarization_state *ocur = thef.pol[ft]; ocur; ocur = ocur->next) {
       polarization_state *p = new polarization_state;
       p->data = NULL;
       p->s = ocur->s;
       p->next = NULL;
-      pol[ft] = NULL;
-      if (ocur->data) p->data = p->s->copy_internal_data(p->data);
+      if (ocur->data) p->data = p->s->copy_internal_data(ocur->data);
       if (cur) {
         cur->next = p;
         cur = p;
@@ -485,6 +485,8 @@ fields_chunk::fields_chunk(const fields_chunk &thef, int chunkidx) : gv(thef.gv)
     f_w[c][cmp] = NULL;
     f_cond[c][cmp] = NULL;
     f_bfast[c][cmp] = NULL;
+    f_minus_p[c][cmp] = NULL;
+    f_w_prev[c][cmp] = NULL;
     f_backup[c][cmp] = NULL;
     f_u_backup[c][cmp] = NULL;
     f_w_backup[c][cmp] = NULL;
