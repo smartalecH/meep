@@ -31,7 +31,8 @@ else
 endif
 
 if HAVE_NVIDIA_BACKEND
-  NVIDIA_PYTEST = $(TEST_DIR)/test_nvidia_callbacks.py
+  NVIDIA_PYTEST = $(TEST_DIR)/test_nvidia_callbacks.py \
+    $(TEST_DIR)/test_nvidia_gyrotropic.py
 else
   NVIDIA_PYTEST =
 endif

@@ -8,6 +8,7 @@
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <memory>
@@ -83,6 +84,55 @@ static void test_polarization_coefficient_rounding() {
           "native-single omega coefficient regressed by an ULP");
   require(float_bits(realnum(damping.gamma1inv)) == 0x3f7dacf2u,
           "native-single damping coefficient regressed by an ULP");
+#endif
+
+  const double tensor[3][3] = {{0.0, 0.31000000238418579, 0.23000000417232513},
+                               {-0.31000000238418579, 0.0, 0.17000000178813934},
+                               {-0.23000000417232513, -0.17000000178813934, 0.0}};
+  const direction order[3] = {Z, X, Y};
+  const nvidia::gyrotropic_coefficients gyro_lorentz =
+      nvidia::derive_gyrotropic_coefficients(0.73, 0.06, 0.19, tensor, double(dt),
+                                             GYROTROPIC_LORENTZIAN, order);
+  const realnum gyro_omega = 2 * pi * realnum(0.73) * dt;
+  const realnum gyro_gamma = 2 * pi * realnum(0.06) * dt;
+  const realnum gyro_a = gyro_omega * gyro_omega;
+  const realnum gyro_pt = pi * dt;
+  const realnum gyro_gd = 1 + gyro_gamma / 2;
+  const realnum gyro_gx = gyro_pt * realnum(tensor[Y][Z]);
+  const realnum gyro_gy = gyro_pt * realnum(tensor[Z][X]);
+  const realnum gyro_gz = gyro_pt * realnum(tensor[X][Y]);
+  const realnum gyro_invdet =
+      1.0 / gyro_gd /
+      (gyro_gd * gyro_gd + gyro_gx * gyro_gx + gyro_gy * gyro_gy + gyro_gz * gyro_gz);
+  require(gyro_lorentz.omega0dtsqr == double(gyro_a) &&
+              gyro_lorentz.gamma1 == double(realnum(1 - gyro_gamma / 2)) &&
+              gyro_lorentz.pt == double(gyro_pt) &&
+              gyro_lorentz.inverse[0][0] ==
+                  double(gyro_invdet * (gyro_gd * gyro_gd + gyro_gz * gyro_gz)),
+          "NVIDIA gyrotropic Lorentzian coefficients changed host realnum rounding");
+
+  const nvidia::gyrotropic_coefficients gyro_saturated =
+      nvidia::derive_gyrotropic_coefficients(0.73, 0.06, 0.19, tensor, double(dt),
+                                             GYROTROPIC_SATURATED, order);
+  const realnum sat_alpha = realnum(0.19), sat_gd = 0.5;
+  const realnum sat_gx = -0.5 * sat_alpha * realnum(tensor[Y][Z]);
+  const realnum sat_gy = -0.5 * sat_alpha * realnum(tensor[Z][X]);
+  const realnum sat_gz = -0.5 * sat_alpha * realnum(tensor[X][Y]);
+  const realnum sat_invdet =
+      1.0 / sat_gd /
+      (sat_gd * sat_gd + sat_gx * sat_gx + sat_gy * sat_gy + sat_gz * sat_gz);
+  require(gyro_saturated.alpha == double(sat_alpha) &&
+              gyro_saturated.dt2pi == double(realnum(2 * pi * dt)) &&
+              gyro_saturated.inverse[0][0] ==
+                  double(sat_invdet * (sat_gd * sat_gd + sat_gz * sat_gz)),
+          "NVIDIA saturated gyrotropic coefficients changed host realnum rounding");
+#if MEEP_SINGLE
+  require(float_bits(realnum(gyro_lorentz.omega0dtsqr)) == 0x3e159a9au &&
+              float_bits(realnum(gyro_lorentz.inverse[0][0])) == 0x3f7aafefu,
+          "native-single gyrotropic Lorentzian coefficient bits regressed");
+  require(float_bits(realnum(gyro_saturated.dt2pi)) == 0x3f060a92u &&
+              float_bits(realnum(gyro_saturated.inverse[0][0])) == 0x3fff3fb5u,
+          "native-single saturated gyrotropic coefficient bits regressed");
 #endif
 }
 
@@ -254,6 +304,56 @@ static void require_polarization_plan(fields &f, field_type ft, bool drude,
   }
   require((observed & required_halo_phases) == required_halo_phases,
           "required same-rank polarization halo transform was not prepared");
+}
+
+static void require_gyrotropic_plan(fields &f, field_type ft, gyrotropy_model model,
+                                    unsigned int required_w_halo_phases) {
+  require(f.descriptors && f.array_catalog && f.halos,
+          "gyrotropic test has no prepared backend-neutral state");
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t states = 0, updates = 0, subtractions = 0, p_halo_elements = 0;
+  bool saw_model = false, saw_negative_stride = false;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.ft != ft || descriptor.kind != SusceptibilityKind::gyrotropic) continue;
+    saw_model |= descriptor.gyrotropic.model == model;
+    states += descriptor.gyrotropic_states.size();
+    for (const GyrotropicStateArrays &state : descriptor.gyrotropic_states)
+      for (int dd = 0; dd < 3; ++dd)
+        require(is_valid(state.p[dd]) && is_valid(state.p_prev[dd]) &&
+                    state.p[dd] != state.p_prev[dd],
+                "gyrotropic descriptor lacks six distinct state arrays");
+  }
+  for (const PolarizationUpdate &update : plan.polarization_updates) {
+    if (update.kind != PolarizationUpdateKind::gyrotropic ||
+        is_electric(update.region.c) != (ft == E_stuff))
+      continue;
+    ++updates;
+    require(update.gyro_model == model && update.region.variant_key == 0,
+            "gyrotropic update lost its model or gained Lorentzian variants");
+    require(is_valid(update.p) && is_valid(update.p_prev) && is_valid(update.p_cross1) &&
+                is_valid(update.p_prev_cross1) && is_valid(update.p_cross2) &&
+                is_valid(update.p_prev_cross2) && is_valid(update.primary_w) &&
+                is_valid(update.diagonal_sigma),
+            "gyrotropic update lacks a required operand");
+    saw_negative_stride |= update.primary_stride < 0 && update.cross_stride1 < 0 &&
+                           update.cross_stride2 < 0;
+  }
+  for (const PolarizationSubtraction &subtraction : plan.polarization_subtractions)
+    if (is_electric(subtraction.c) == (ft == E_stuff)) ++subtractions;
+  require(saw_model && states && updates >= states && subtractions >= states,
+          "gyrotropic plan lacks recurrence or ordered subtraction rows");
+  if (ft == H_stuff)
+    require(saw_negative_stride, "magnetic gyrotropic plan lacks negative strides");
+
+  unsigned int observed_w = 0;
+  for (const HaloPlan &halo : f.halos->plans) {
+    if ((halo.ft == WE_stuff || halo.ft == WH_stuff) && halo.same_rank && halo.block_elements)
+      observed_w |= 1u << unsigned(halo.phase);
+    if (halo.ft == PE_stuff || halo.ft == PH_stuff) p_halo_elements += halo.block_elements;
+  }
+  require((observed_w & required_w_halo_phases) == required_w_halo_phases,
+          "required gyrotropic W halo transform was not prepared");
+  require(p_halo_elements == 0, "gyrotropic state incorrectly created PE/PH P halos");
 }
 
 static void require_halo_phases(const fields &f, unsigned int required) {
@@ -814,6 +914,72 @@ static void test_polarization_compile_rejections() {
   require(before == after, "rejected polarization descriptors mutated device storage");
 }
 
+static void test_gyrotropic_compile_rejections() {
+  const grid_volume gv = vol3d(2.0, 2.0, 2.0, 6.0);
+  linear_anisotropic_material material(false);
+  dispersion_sigma_material sigma(false);
+  structure s(gv, material, no_pml(), identity(), 2);
+  s.add_susceptibility(sigma, E_stuff,
+                       gyrotropic_susceptibility(vec(0.17, -0.23, 0.31), 0.73, 0.09));
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ex);
+  gpu.require_component(Ey);
+  gpu.require_component(Ez);
+  gpu.init_backend();
+
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  size_t index = baseline.polarization_updates.size();
+  for (size_t i = 0; i < baseline.polarization_updates.size(); ++i)
+    if (baseline.polarization_updates[i].kind == PolarizationUpdateKind::gyrotropic) {
+      index = i;
+      break;
+    }
+  require(index < baseline.polarization_updates.size(),
+          "gyrotropic rejection test has no update descriptor");
+  const ArrayId p = baseline.polarization_updates[index].p;
+  const size_t elements = gpu.storage_plan->arrays[p.value].elements;
+  std::vector<realnum> before(elements), after(elements);
+  gpu.backend->read(ArrayRef{p, 0, elements}, before.data(), before.size() * sizeof(realnum));
+
+  StepPlan malformed = baseline;
+  malformed.polarization_updates[index].p_prev_cross2 = invalid_array();
+  expect_compile_rejected(gpu, malformed, "incomplete state");
+  malformed = baseline;
+  malformed.polarization_updates[index].p_prev_cross2 =
+      malformed.polarization_updates[index].p;
+  expect_compile_rejected(gpu, malformed, "state arrays alias");
+  malformed = baseline;
+  malformed.polarization_updates[index].kind = static_cast<PolarizationUpdateKind>(99);
+  expect_compile_rejected(gpu, malformed, "invalid update kind");
+  malformed = baseline;
+  malformed.polarization_updates[index].gyro_model = static_cast<gyrotropy_model>(99);
+  expect_compile_rejected(gpu, malformed, "invalid model");
+  malformed = baseline;
+  malformed.polarization_updates[index].region.variant_key = polarization_drude;
+  expect_compile_rejected(gpu, malformed, "Lorentzian variant bits");
+  malformed = baseline;
+  malformed.polarization_updates[index].offdiagonal_sigma1 =
+      malformed.polarization_updates[index].diagonal_sigma;
+  expect_compile_rejected(gpu, malformed, "anisotropic sigma");
+  malformed = baseline;
+  malformed.polarization_updates[index].p_cross1 =
+      malformed.polarization_updates[index].primary_w;
+  expect_compile_rejected(gpu, malformed, "not polarization storage");
+  malformed = baseline;
+  malformed.polarization_updates[index].region.base = 0;
+  malformed.polarization_updates[index].region.counts[0] = 1;
+  malformed.polarization_updates[index].region.counts[1] = 1;
+  malformed.polarization_updates[index].region.counts[2] = 1;
+  expect_compile_rejected(gpu, malformed, "gyrotropic W1 index range exceeds its array");
+
+  gpu.backend->read(ArrayRef{p, 0, elements}, after.data(), after.size() * sizeof(realnum));
+  require(before == after, "rejected gyrotropic descriptors mutated device storage");
+}
+
 static void run_dispersion_case(const char *name, precision_policy_kind policy, bool real_fields,
                                 bool drude, bool anisotropic_sigma, bool magnetic,
                                 bool use_pml, int chunks, const vec *bloch,
@@ -913,6 +1079,66 @@ static void run_dispersion_case(const char *name, precision_policy_kind policy, 
     previous = checkpoints[i];
   }
   master_printf("nvidia_timestep: dispersion-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void run_gyrotropic_case(const char *name, precision_policy_kind policy, bool real_fields,
+                                gyrotropy_model model, bool magnetic, bool use_pml,
+                                const vec *bloch, bool negate_symmetry,
+                                unsigned int required_w_halo_phases) {
+  const grid_volume gv = vol3d(2.4, 2.0, 1.6, 6.0);
+  const boundary_region boundaries = use_pml ? pml(0.35, X) + pml(0.35, Y) : no_pml();
+  const symmetry sym = negate_symmetry ? -mirror(Y, gv) : identity();
+  linear_anisotropic_material material(false, magnetic);
+  dispersion_sigma_material sigma(false);
+  std::unique_ptr<structure> cpu_structure(new structure(gv, material, boundaries, sym, 2));
+  std::unique_ptr<structure> gpu_structure(new structure(gv, material, boundaries, sym, 2));
+  const field_type ft = magnetic ? H_stuff : E_stuff;
+  const gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.73, 0.06, 0.19, model);
+  cpu_structure->add_susceptibility(sigma, ft, gyro);
+  gpu_structure->add_susceptibility(sigma, ft, gyro);
+
+  fields cpu(cpu_structure.get());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(gpu_structure.get(), options);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  else if (bloch) {
+    cpu.use_bloch(*bloch);
+    gpu.use_bloch(*bloch);
+  }
+  const component requested[3] = {magnetic ? Hx : Ex, magnetic ? Hy : Ey,
+                                  magnetic ? Hz : Ez};
+  for (int i = 0; i < 3; ++i) {
+    cpu.require_component(requested[i]);
+    gpu.require_component(requested[i]);
+  }
+
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+  require_gyrotropic_plan(gpu, ft, model, required_w_halo_phases);
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.001);
+  const bool reduced_precision = sizeof(realnum) == sizeof(float) || narrowed;
+  const double tolerance = reduced_precision ? 2e-5 : 2e-13;
+  const int checkpoints[] = {1, 2, 100};
+  int previous = 0;
+  for (int checkpoint : checkpoints) {
+    const int delta = checkpoint - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    require(cpu.t == gpu.t, "NVIDIA gyrotropic timestep did not advance host time");
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoint;
+  }
+  master_printf("nvidia_timestep: gyrotropic-%s/%s PASS\n", name,
                 precision_policy_name(policy));
 }
 
@@ -1037,12 +1263,20 @@ static void test_compile_allocation_retry() {
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
+  if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
+    require(sizeof(realnum) == sizeof(float),
+            "native-single validation was built with double realnum");
   if (getenv("MEEP_NVIDIA_COMPILE_RETRY_ONLY")) {
     test_compile_allocation_retry();
     master_printf("nvidia_timestep: compile retry checks PASS\n");
     return 0;
   }
+  const bool gyro_only = getenv("MEEP_NVIDIA_TIMESTEP_GYRO_ONLY") != NULL;
   test_polarization_coefficient_rounding();
+  if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
+    master_printf("nvidia_timestep: coefficient checks PASS\n");
+    return 0;
+  }
   set_finite_check_mode(FiniteCheckMode::off);
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
   const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
@@ -1055,6 +1289,22 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    run_gyrotropic_case("lorentz-real-e-copy", policies[p], true, GYROTROPIC_LORENTZIAN,
+                        false, false, NULL, false, 1u << CONNECT_COPY);
+    run_gyrotropic_case("lorentz-complex-e-pml-phase", policies[p], false,
+                        GYROTROPIC_LORENTZIAN, false, true, &bloch3, false,
+                        (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+    run_gyrotropic_case("drude-real-h-negate", policies[p], true, GYROTROPIC_DRUDE, true,
+                        false, NULL, true, 1u << CONNECT_NEGATE);
+    run_gyrotropic_case("drude-complex-h-pml-phase", policies[p], false, GYROTROPIC_DRUDE,
+                        true, true, &bloch3, false,
+                        (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+    run_gyrotropic_case("saturated-real-e-copy", policies[p], true, GYROTROPIC_SATURATED,
+                        false, false, NULL, false, 1u << CONNECT_COPY);
+    run_gyrotropic_case("saturated-complex-h-pml-phase", policies[p], false,
+                        GYROTROPIC_SATURATED, true, true, &bloch3, false,
+                        (1u << CONNECT_COPY) | (1u << CONNECT_PHASE));
+    if (gyro_only) continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
     run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
@@ -1116,10 +1366,13 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   set_finite_check_mode(FiniteCheckMode::off);
-  test_compile_allocation_retry();
-  test_rejections();
-  test_nonlinear_compile_rejections();
-  test_polarization_compile_rejections();
+  test_gyrotropic_compile_rejections();
+  if (!gyro_only) {
+    test_compile_allocation_retry();
+    test_rejections();
+    test_nonlinear_compile_rejections();
+    test_polarization_compile_rejections();
+  }
   master_printf("nvidia_timestep: PASS\n");
   return 0;
 }
