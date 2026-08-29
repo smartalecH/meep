@@ -8,6 +8,7 @@
 
 #include "backend/nvidia/nvidia_step.hpp"
 #include "backend/nvidia/nvidia_coordinates.hpp"
+#include "backend/nvidia/nvidia_magnetic.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 
 #include <algorithm>
@@ -49,9 +50,13 @@ using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
 using meep::nvidia::launch_halo_scatter;
+using meep::nvidia::launch_magnetic_average;
+using meep::nvidia::launch_magnetic_backup;
+using meep::nvidia::launch_magnetic_restore;
 using meep::nvidia::launch_source_batch;
 using meep::nvidia::launch_zero;
 using meep::nvidia::scalar_precision;
+using meep::nvidia::magnetic_state_launch;
 using meep::nvidia::source_batch_launch;
 using meep::nvidia::source_indices_require_sequential;
 using meep::nvidia::source_point;
@@ -731,6 +736,95 @@ static void check_cylindrical_variants(int device, stream &execution,
   require(rejected, "cylindrical radial prefix accepted a zero denominator");
 }
 
+template <typename T>
+static void check_magnetic_state(int device, stream &execution, scalar_precision precision) {
+  const size_t count = 257;
+  const size_t bytes = count * sizeof(T);
+  std::vector<T> original(count), advanced(count), observed(count);
+  for (size_t i = 0; i < count; ++i) {
+    original[i] = T(-0.75 + 0.003 * double(i));
+    advanced[i] = T(0.25 - 0.002 * double(i));
+  }
+  device_buffer live(bytes, device), backup(bytes, device);
+  copy_host_to_device_async(live, 0, original.data(), bytes, execution);
+  magnetic_state_launch launch = {live.opaque_handle(), backup.opaque_handle(), count, precision};
+  launch_magnetic_backup(launch, execution);
+  copy_host_to_device_async(live, 0, advanced.data(), bytes, execution);
+  launch_magnetic_average(launch, execution);
+  copy_device_to_host_async(observed.data(), live, 0, bytes, execution);
+  execution.synchronize();
+  for (size_t i = 0; i < count; ++i)
+    require(observed[i] == T(0.5 * (advanced[i] + original[i])),
+            "magnetic average differs from host realnum order");
+
+  launch_magnetic_restore(launch, execution);
+  copy_device_to_host_async(observed.data(), live, 0, bytes, execution);
+  execution.synchronize();
+  for (size_t i = 0; i < count; ++i)
+    require(observed[i] == original[i], "magnetic restore differs from exact snapshot");
+
+  bool rejected = false;
+  try {
+    magnetic_state_launch invalid = launch;
+    invalid.elements = 0;
+    launch_magnetic_backup(invalid, execution);
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "magnetic launch accepted an empty range");
+  rejected = false;
+  try {
+    magnetic_state_launch invalid = launch;
+    invalid.live = NULL;
+    launch_magnetic_backup(invalid, execution);
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "magnetic launch accepted a null live array");
+  rejected = false;
+  try {
+    magnetic_state_launch invalid = launch;
+    invalid.backup = NULL;
+    launch_magnetic_average(invalid, execution);
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "magnetic launch accepted a null backup array");
+  rejected = false;
+  try {
+    magnetic_state_launch invalid = launch;
+    invalid.backup = invalid.live;
+    launch_magnetic_restore(invalid, execution);
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "magnetic launch accepted aliased live and backup storage");
+  rejected = false;
+  try {
+    magnetic_state_launch invalid = launch;
+    invalid.precision = scalar_precision(99);
+    launch_magnetic_average(invalid, execution);
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  require(rejected, "magnetic launch accepted an invalid precision");
+  rejected = false;
+  try {
+    magnetic_state_launch invalid = launch;
+    invalid.elements = std::numeric_limits<size_t>::max();
+    launch_magnetic_restore(invalid, execution);
+  }
+  catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  require(rejected, "magnetic launch accepted an overflowing grid");
+}
+
 template <typename T> static void check_device(int device) {
   device_scope selected(device);
   stream execution;
@@ -777,6 +871,8 @@ template <typename T> static void check_device(int device) {
   region.strides[2] = 1;
   const scalar_precision precision =
       sizeof(T) == sizeof(float) ? scalar_precision::f32 : scalar_precision::f64;
+  check_magnetic_state<T>(device, execution, precision);
+  if (std::getenv("MEEP_NVIDIA_STEP_MAGNETIC_ONLY")) return;
   check_bfast_variants<T>(device, execution, precision);
   if (std::getenv("MEEP_NVIDIA_STEP_BFAST_ONLY")) return;
   check_beta_variants<T>(device, execution, precision);

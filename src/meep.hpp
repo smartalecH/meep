@@ -1835,6 +1835,7 @@ struct HaloPlan;
 struct StepPlan;                 // src/backend/step_plan.hpp -- backend-private
 struct DescriptorSet;            // src/backend/descriptors.hpp -- backend-private
 class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
+class NvidiaBackend;             // src/backend/nvidia/nvidia_backend.hpp -- backend-private
 struct BackendState;
 struct Executable;
 struct InitializationPlan;
@@ -2463,6 +2464,7 @@ public:
   void unset_solve_cw_omega();
 
 private:
+  friend class NvidiaBackend;
   friend void backend_prepare_field_layout_change(fields &, uint32_t, const char *);
   friend bool backend_try_synchronize_magnetic_fields(fields &, const char *);
   friend bool backend_try_restore_magnetic_fields(fields &, const char *);

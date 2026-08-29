@@ -258,6 +258,48 @@ static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
   }
 }
 
+static bool is_magnetic_backup_kind(int kind) {
+  return kind == int(array_kind::f_backup) || kind == int(array_kind::f_u_backup) ||
+         kind == int(array_kind::f_w_backup) || kind == int(array_kind::f_cond_backup) ||
+         kind == int(array_kind::f_bfast_backup);
+}
+
+/* CPU magnetic synchronization may retain lazy legacy backup allocations that
+   a resident backend deliberately never catalogs.  Compare the physical live
+   state by semantic StorageKey rather than coincidental ArrayId numbering. */
+static void compare_live_fields_by_key(fields &cpu, fields &gpu, double tolerance) {
+  for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
+    const ArrayId cpu_id{uint32_t(i)};
+    const ArraySpec &cpu_spec = cpu.array_catalog->spec(cpu_id);
+    const StorageKey &key = cpu.array_catalog->key(cpu_id);
+    if (is_valid(cpu_spec.alias_of) || is_magnetic_backup_kind(key.kind) ||
+        (cpu_spec.role != array_role::field && cpu_spec.role != array_role::polarization) ||
+        cpu_spec.element_type != ElementType::realnum_value)
+      continue;
+    const ArrayId gpu_id = gpu.array_catalog->find(key);
+    require(is_valid(gpu_id), "NVIDIA live catalog is missing a CPU field key");
+    const ArraySpec &gpu_spec = gpu.array_catalog->spec(gpu_id);
+    require(gpu_spec.elements == cpu_spec.elements,
+            "NVIDIA live catalog field extent differs from CPU");
+    const realnum *expected = cpu.array_catalog->resolve<realnum>(cpu_id);
+    std::vector<realnum> observed(cpu_spec.elements);
+    gpu.backend->read(ArrayRef{gpu_id, 0, gpu_spec.elements}, observed.data(),
+                      observed.size() * sizeof(realnum));
+    for (size_t j = 0; j < observed.size(); ++j) {
+      const double error = fabs(double(observed[j]) - double(expected[j]));
+      const double scale = 1.0 + fabs(double(expected[j]));
+      if (error > tolerance * scale) {
+        fprintf(stderr,
+                "live array (%s,c=%d,cmp=%d,aux=%d) element %zu differs: cpu=%.17g "
+                "nvidia=%.17g error=%.3g tol=%.3g\n",
+                array_kind_name(array_kind(key.kind)), key.component_, key.cmp, key.aux, j,
+                double(expected[j]), double(observed[j]), error, tolerance * scale);
+        meep::abort("NVIDIA live timestep state differs from CPU");
+      }
+    }
+  }
+}
+
 static double max_field_difference(fields &cpu, fields &gpu, size_t &array, size_t &element,
                                    double &absolute) {
   double maximum = 0.0;
@@ -1213,6 +1255,219 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
 }
 
+static void run_magnetic_sync_case(const char *name, precision_policy_kind policy,
+                                   bool real_fields, bool use_bfast) {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  const boundary_region boundaries = pml(0.4, X) + pml(0.4, Y);
+  linear_anisotropic_material material(true, true);
+  structure cpu_structure(gv, material, boundaries, identity(), 2);
+  structure gpu_structure(gv, material, boundaries, identity(), 2);
+  set_uniform_conductivity(cpu_structure);
+  set_uniform_conductivity(gpu_structure);
+  const std::vector<double> scaled_k =
+      use_bfast ? std::vector<double>{0.17, -0.11, 0.07} : std::vector<double>(3, 0.0);
+
+  fields cpu(&cpu_structure, 0, 0, true, 0, 0, scaled_k);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options, 0, 0, true, 0, 0, scaled_k);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  else {
+    const vec bloch(0.17, 0.11);
+    cpu.use_bloch(bloch);
+    gpu.use_bloch(bloch);
+  }
+  gaussian_src_time source(0.31, 0.12);
+  cpu.add_point_source(Ez, source, vec(0.11, 0.13));
+  gpu.add_point_source(Ez, source, vec(0.11, 0.13));
+  custom_source_trace cpu_b_trace, gpu_b_trace, cpu_h_trace, gpu_h_trace;
+  custom_src_time cpu_b_source(custom_source_value, &cpu_b_trace);
+  custom_src_time gpu_b_source(custom_source_value, &gpu_b_trace);
+  custom_src_time cpu_h_source(custom_source_value, &cpu_h_trace);
+  custom_src_time gpu_h_source(custom_source_value, &gpu_h_trace);
+  cpu_b_source.is_integrated = gpu_b_source.is_integrated = false;
+  cpu_h_source.is_integrated = gpu_h_source.is_integrated = true;
+  cpu.add_point_source(Hz, cpu_b_source, vec(-0.31, 0.27),
+                       std::complex<double>(0.19, real_fields ? 0.0 : -0.07));
+  gpu.add_point_source(Hz, gpu_b_source, vec(-0.31, 0.27),
+                       std::complex<double>(0.19, real_fields ? 0.0 : -0.07));
+  cpu.add_point_source(Hy, cpu_h_source, vec(0.29, -0.23),
+                       std::complex<double>(-0.13, real_fields ? 0.0 : 0.09));
+  gpu.add_point_source(Hy, gpu_h_source, vec(0.29, -0.23),
+                       std::complex<double>(-0.13, real_fields ? 0.0 : 0.09));
+  cpu.require_component(Ez);
+  gpu.require_component(Ez);
+
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed);
+  cpu_b_trace.times.clear();
+  gpu_b_trace.times.clear();
+  cpu_h_trace.times.clear();
+  gpu_h_trace.times.clear();
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13;
+
+  cpu.advance(2);
+  gpu.advance(2);
+  compare_fields(cpu, gpu, tolerance);
+  require(cpu_b_trace.times == gpu_b_trace.times && cpu_h_trace.times == gpu_h_trace.times,
+          "NVIDIA magnetic ordinary source times differ from CPU");
+  cpu_b_trace.times.clear();
+  gpu_b_trace.times.clear();
+  cpu_h_trace.times.clear();
+  gpu_h_trace.times.clear();
+
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+  compare_fields(cpu, gpu, tolerance);
+  require(cpu_b_trace.times == gpu_b_trace.times && cpu_h_trace.times == gpu_h_trace.times &&
+              !cpu_b_trace.times.empty() && !cpu_h_trace.times.empty(),
+          "NVIDIA direct magnetic synchronization source times differ from CPU");
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  compare_fields(cpu, gpu, tolerance);
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  compare_fields(cpu, gpu, tolerance);
+
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+  cpu_b_trace.times.clear();
+  gpu_b_trace.times.clear();
+  cpu_h_trace.times.clear();
+  gpu_h_trace.times.clear();
+  cpu.advance(2);
+  gpu.advance(2);
+  compare_fields(cpu, gpu, tolerance);
+  require(cpu_b_trace.times == gpu_b_trace.times && cpu_h_trace.times == gpu_h_trace.times,
+          "NVIDIA trailing magnetic resynchronization source times differ from CPU");
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  compare_fields(cpu, gpu, tolerance);
+
+  master_printf("nvidia_timestep: magnetic-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void test_magnetic_pre_step_and_recompile() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  gaussian_src_time initial(0.29, 0.11);
+  initial.is_integrated = false;
+  cpu.add_point_source(Hz, initial, vec(0.17, -0.19), 0.23);
+  gpu.add_point_source(Hz, initial, vec(0.17, -0.19), 0.23);
+
+  /* This is intentionally the first backend operation: it proves the public
+     synchronization path prepares storage and compiles an ordinary plan. */
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+  require(gpu.backend_state && gpu.executable,
+          "NVIDIA pre-step magnetic synchronization did not prepare resident execution");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+
+  /* A non-integrated source changes only source descriptors/executable shape.
+     The live snapshot remains valid because its ordered storage layout did not
+     change, and restore must accept the replacement executable. */
+  gaussian_src_time added(0.37, 0.09);
+  added.is_integrated = false;
+  cpu.add_point_source(Hz, added, vec(-0.21, 0.25), -0.17);
+  gpu.add_point_source(Hz, added, vec(-0.21, 0.25), -0.17);
+  require(is_dirty(gpu, dirty_executable),
+          "NVIDIA source-only mutation did not invalidate the executable");
+  Executable *old_executable = gpu.executable;
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  require(gpu.executable == old_executable && is_dirty(gpu, dirty_executable),
+          "NVIDIA restore did not retain the snapshot-compatible executable");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  cpu.advance(2);
+  gpu.advance(2);
+  require(gpu.executable && gpu.executable != old_executable &&
+              !is_dirty(gpu, dirty_executable),
+          "NVIDIA source-only mutation did not recompile on subsequent advance");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+  gaussian_src_time trailing(0.41, 0.08);
+  trailing.is_integrated = false;
+  cpu.add_point_source(Hz, trailing, vec(0.23, 0.21), 0.11);
+  gpu.add_point_source(Hz, trailing, vec(0.23, 0.21), 0.11);
+  old_executable = gpu.executable;
+  cpu.advance(1);
+  gpu.advance(1);
+  require(gpu.executable && gpu.executable != old_executable &&
+              !is_dirty(gpu, dirty_executable),
+          "NVIDIA live-snapshot source mutation did not recompile for advance");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  master_printf("nvidia_timestep: magnetic pre-step/recompile PASS\n");
+}
+
+static void test_magnetic_historical_host_backups() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure reference_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure migrating_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields reference(&reference_structure);
+  fields migrating(&migrating_structure);
+  reference.use_real_fields();
+  migrating.use_real_fields();
+  gaussian_src_time source(0.31, 0.12);
+  reference.add_point_source(Ez, source, vec(0.11, 0.13));
+  migrating.add_point_source(Ez, source, vec(0.11, 0.13));
+  reference.advance(2);
+  migrating.advance(2);
+  migrating.synchronize_magnetic_fields();
+  migrating.restore_magnetic_fields();
+  bool saw_backup = false;
+  for (int chunk = 0; chunk < migrating.num_chunks; ++chunk)
+    if (migrating.chunks[chunk]->is_mine()) DOCMP2 FOR_COMPONENTS(c)
+      saw_backup = saw_backup || migrating.chunks[chunk]->f_backup[c][cmp] ||
+                   migrating.chunks[chunk]->f_u_backup[c][cmp] ||
+                   migrating.chunks[chunk]->f_w_backup[c][cmp] ||
+                   migrating.chunks[chunk]->f_cond_backup[c][cmp] ||
+                   migrating.chunks[chunk]->f_bfast_backup[c][cmp];
+  require(saw_backup, "CPU magnetic synchronization did not retain historical host backups");
+
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  migrating.select_backend(options);
+  migrating.init_backend();
+  reference.advance(2);
+  migrating.advance(2);
+  compare_live_fields_by_key(reference, migrating,
+                             sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  reference.synchronize_magnetic_fields();
+  migrating.synchronize_magnetic_fields();
+  compare_live_fields_by_key(reference, migrating,
+                             sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  reference.restore_magnetic_fields();
+  migrating.restore_magnetic_fields();
+  compare_live_fields_by_key(reference, migrating,
+                             sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  master_printf("nvidia_timestep: magnetic historical host backups PASS\n");
+}
+
 static void require_advance_rejected(fields &f, const char *expected) {
   bool rejected = false;
   try {
@@ -1239,6 +1494,137 @@ static void expect_compile_rejected(fields &gpu, StepPlan plan, const char *expe
   }
   delete unexpected;
   require(rejected, "malformed descriptor was not rejected as expected");
+}
+
+static void test_magnetic_compile_rejections() {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, pml(0.4), identity(), 2);
+  set_uniform_conductivity(s);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields gpu(&s, options, 0, 0, true, 0, 0, scaled_k);
+  gpu.use_bloch(vec(0.17, 0.11));
+  gaussian_src_time source(0.31, 0.12);
+  gpu.add_point_source(Ez, source, vec(0.11, 0.13));
+  gpu.require_component(Ez);
+  gpu.init_backend();
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(baseline.magnetic_state_arrays.size() > 2,
+          "magnetic rejection fixture has too few snapshot rows");
+
+  StepPlan malformed = baseline;
+  malformed.magnetic_state_arrays.erase(malformed.magnetic_state_arrays.begin());
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptor count");
+
+  malformed = baseline;
+  malformed.magnetic_state_arrays.push_back(malformed.magnetic_state_arrays[0]);
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptor count");
+
+  malformed = baseline;
+  std::swap(malformed.magnetic_state_arrays[0], malformed.magnetic_state_arrays[1]);
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  malformed.magnetic_state_arrays[0].live = malformed.magnetic_state_arrays[1].live;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  ++malformed.magnetic_state_arrays[0].chunk;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  malformed.magnetic_state_arrays[0].c = Ex;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  malformed.magnetic_state_arrays[0].cmp ^= 1;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  malformed.magnetic_state_arrays[0].family = MagneticStateFamily::bfast;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  --malformed.magnetic_state_arrays[0].elements;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  malformed.magnetic_state_arrays[0].average =
+      !malformed.magnetic_state_arrays[0].average;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot descriptors");
+
+  malformed = baseline;
+  ++malformed.magnetic_half_step.update_b;
+  expect_compile_rejected(gpu, malformed, "magnetic half-step schedule");
+
+  malformed = baseline;
+  malformed.operations[malformed.magnetic_half_step.update_b].kind = OpKind::update_eh;
+  expect_compile_rejected(gpu, malformed, "BFAST descriptor is not paired");
+
+  malformed = baseline;
+  malformed.operations[malformed.magnetic_half_step.update_b].ft = D_stuff;
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+
+  malformed = baseline;
+  malformed.operations[malformed.magnetic_half_step.evaluate_h_sources].source_time_offset = 1.0;
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+
+  size_t sync_index = baseline.operations.size();
+  for (size_t i = 0; i < baseline.operations.size(); ++i)
+    if (baseline.operations[i].kind == OpKind::synchronize_magnetic_fields) sync_index = i;
+  require(sync_index < baseline.operations.size(), "magnetic rejection fixture has no marker");
+  malformed = baseline;
+  --malformed.operations[sync_index].magnetic_state_count;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot span");
+
+  malformed = baseline;
+  ++malformed.operations[sync_index].magnetic_state_index;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot span");
+
+  malformed = baseline;
+  require(!malformed.operations[sync_index].accesses.empty(),
+          "magnetic rejection fixture has no marker access");
+  malformed.operations[sync_index].accesses.pop_back();
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+
+  size_t restore_index = baseline.operations.size();
+  for (size_t i = 0; i < baseline.operations.size(); ++i)
+    if (baseline.operations[i].kind == OpKind::restore_magnetic_fields) restore_index = i;
+  require(restore_index < baseline.operations.size(),
+          "magnetic rejection fixture has no restore marker");
+  malformed = baseline;
+  --malformed.operations[restore_index].magnetic_state_count;
+  expect_compile_rejected(gpu, malformed, "magnetic snapshot span");
+
+  malformed = baseline;
+  require(!malformed.operations[restore_index].accesses.empty(),
+          "magnetic rejection fixture has no restore access");
+  malformed.operations[restore_index].accesses.pop_back();
+  expect_compile_rejected(gpu, malformed, "incomplete or non-canonical");
+
+  Executable *valid = gpu.backend->compile(baseline, *gpu.backend_state);
+  require(valid != NULL, "valid magnetic plan did not compile after rejection checks");
+  delete valid;
+
+  structure source_free_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields source_free(&source_free_structure, options);
+  source_free.use_real_fields();
+  source_free.require_component(Ez);
+  source_free.init_backend();
+  const StepPlan source_free_baseline = build_step_plan(source_free, StepProgram::ordinary);
+  require(source_free_baseline.magnetic_half_step.evaluate_b_sources == UINT32_MAX &&
+              source_free_baseline.magnetic_half_step.evaluate_h_sources == UINT32_MAX,
+          "source-free magnetic schedule unexpectedly evaluates source scalars");
+  malformed = source_free_baseline;
+  malformed.magnetic_half_step.evaluate_b_sources = malformed.magnetic_half_step.update_b;
+  expect_compile_rejected(source_free, malformed, "magnetic half-step schedule");
+  malformed = source_free_baseline;
+  malformed.magnetic_half_step.evaluate_h_sources = malformed.magnetic_half_step.update_h;
+  expect_compile_rejected(source_free, malformed, "magnetic half-step schedule");
+
+  master_printf("nvidia_timestep: magnetic rejection checks PASS\n");
 }
 
 static void test_nonlinear_compile_rejections() {
@@ -1999,6 +2385,7 @@ int main(int argc, char **argv) {
   const bool beta_only = getenv("MEEP_NVIDIA_TIMESTEP_BETA_ONLY") != NULL;
   const bool bfast_only = getenv("MEEP_NVIDIA_TIMESTEP_BFAST_ONLY") != NULL;
   const bool cylindrical_only = getenv("MEEP_NVIDIA_TIMESTEP_CYLINDRICAL_ONLY") != NULL;
+  const bool magnetic_only = getenv("MEEP_NVIDIA_TIMESTEP_MAGNETIC_ONLY") != NULL;
   const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
@@ -2021,6 +2408,15 @@ int main(int argc, char **argv) {
     master_printf("nvidia_timestep: cylindrical change_m checks PASS\n");
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_MAGNETIC_REJECTIONS_ONLY")) {
+    test_magnetic_compile_rejections();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MAGNETIC_LIFECYCLE_ONLY")) {
+    test_magnetic_pre_step_and_recompile();
+    test_magnetic_historical_host_backups();
+    return 0;
+  }
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
   const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
   const vec bloch2(0.17, 0.11);
@@ -2032,6 +2428,11 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (magnetic_only) {
+      run_magnetic_sync_case("real-pml-conductive-bfast", policies[p], true, true);
+      run_magnetic_sync_case("complex-pml-conductive", policies[p], false, false);
+      continue;
+    }
     if (cylindrical_only) {
       if (!cylindrical_case || !strcmp(cylindrical_case, "m0-real-pml-conductive"))
         run_cylindrical_case("m0-real-pml-conductive", policies[p], 0.0, true, true, true, true,
@@ -2104,7 +2505,7 @@ int main(int argc, char **argv) {
       run_bfast_case("d2-beta-composed", gv2, policies[p], false, positive_k, false,
                      false, 2, &bloch2, 0.17);
     }
-    if (gyro_only || beta_only || bfast_only) continue;
+    if (gyro_only || beta_only || bfast_only || magnetic_only) continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
     run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
@@ -2165,6 +2566,11 @@ int main(int argc, char **argv) {
              &magnetic_two_offdiagonals, true, true, Hz);
     test_finite_diagnostics(policies[p]);
   }
+  if (magnetic_only) {
+    test_magnetic_pre_step_and_recompile();
+    test_magnetic_historical_host_backups();
+    test_magnetic_compile_rejections();
+  }
   set_finite_check_mode(FiniteCheckMode::off);
   if (cylindrical_only && !cylindrical_case) {
     test_nvidia_cylindrical_change_m(precision_policy_kind::native);
@@ -2175,7 +2581,7 @@ int main(int argc, char **argv) {
     if (!gyro_only && !bfast_only) test_beta_compile_rejections();
     if (!gyro_only && !beta_only) test_bfast_compile_rejections();
   }
-  if (!gyro_only && !beta_only && !bfast_only && !cylindrical_only) {
+  if (!gyro_only && !beta_only && !bfast_only && !cylindrical_only && !magnetic_only) {
     test_rejections();
     test_nonlinear_compile_rejections();
     test_polarization_compile_rejections();
