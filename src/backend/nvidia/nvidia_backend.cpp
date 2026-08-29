@@ -412,8 +412,11 @@ public:
 
 struct NvidiaCompiledOperation {
   OpKind kind;
+  Guard guard;
   size_t first;
   size_t count;
+  size_t material_first;
+  size_t material_count;
   size_t beta_first;
   size_t beta_count;
   size_t cylindrical_m_first;
@@ -458,6 +461,13 @@ struct NvidiaCompiledMagneticState {
   bool average;
 };
 
+struct NvidiaCompiledMaterialRefresh {
+  ArrayId current;
+  ArraySpec spec;
+  size_t staging_offset;
+  size_t bytes;
+};
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, uint64_t signature, uint64_t storage_fingerprint,
@@ -489,6 +499,8 @@ public:
                    const std::vector<NvidiaCompiledMagneticState> &magnetic_states,
                    size_t magnetic_snapshot_bytes, uint64_t magnetic_layout_fingerprint,
                    const MagneticHalfStep &magnetic_half_step,
+                   const std::vector<NvidiaCompiledMaterialRefresh> &material_refreshes,
+                   size_t material_staging_bytes, uint64_t material_target_signature,
                    size_t source_scalar_count, size_t source_staging_elements,
                    NvidiaBackendState &state)
       : owner_(owner), signature_(signature), storage_fingerprint_(storage_fingerprint),
@@ -504,7 +516,9 @@ public:
         polarization_subtractions_(polarization_subtractions), dft_updates_(dft_updates),
         magnetic_states_(magnetic_states), magnetic_snapshot_bytes_(magnetic_snapshot_bytes),
         magnetic_layout_fingerprint_(magnetic_layout_fingerprint),
-        magnetic_half_step_(magnetic_half_step), source_scalar_count_(source_scalar_count) {
+        magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
+        material_target_signature_(material_target_signature),
+        source_scalar_count_(source_scalar_count) {
     try {
       nvidia::device_scope scope(state.device_);
       if (!halo_gathers.empty()) {
@@ -535,6 +549,7 @@ public:
                                                  sizeof(nvidia::source_scalar),
                                                  "allocating NVIDIA source-scalar staging"));
       }
+      if (material_staging_bytes) material_staging_.allocate(material_staging_bytes);
       if (!source_points.empty()) {
         source_points_.allocate(checked_product(source_points.size(), sizeof(source_points[0]),
                                                 "allocating NVIDIA source points"),
@@ -590,6 +605,8 @@ public:
   size_t magnetic_snapshot_bytes_;
   uint64_t magnetic_layout_fingerprint_;
   MagneticHalfStep magnetic_half_step_;
+  std::vector<NvidiaCompiledMaterialRefresh> material_refreshes_;
+  uint64_t material_target_signature_;
   size_t source_scalar_count_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
@@ -598,6 +615,7 @@ public:
   nvidia::pinned_buffer finite_result_host_;
   nvidia::device_buffer source_scalars_;
   nvidia::pinned_buffer source_staging_;
+  nvidia::pinned_buffer material_staging_;
   nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
 };
@@ -710,8 +728,8 @@ array_kind magnetic_array_kind(MagneticStateFamily family) {
 }
 
 NvidiaCompiledMagneticState compile_magnetic_state(const MagneticStateArray &source,
-                                                   NvidiaBackendState &state, const fields &f,
-                                                   size_t &next_offset) {
+                                                    NvidiaBackendState &state, const fields &f,
+                                                    size_t &next_offset) {
   if (source.chunk < 0 || source.chunk >= f.num_chunks || !f.chunks[source.chunk] ||
       !f.chunks[source.chunk]->is_mine())
     throw std::out_of_range("NVIDIA magnetic state has an invalid chunk");
@@ -742,6 +760,59 @@ NvidiaCompiledMagneticState compile_magnetic_state(const MagneticStateArray &sou
       checked_product(source.elements, element_bytes, "sizing NVIDIA magnetic snapshot"),
       precision, source.average};
   next_offset = checked_add(next_offset, result.bytes, "laying out NVIDIA magnetic snapshot");
+  return result;
+}
+
+NvidiaCompiledMaterialRefresh compile_material_refresh(const MaterialRefreshArray &source,
+                                                        NvidiaBackendState &state,
+                                                        const fields &f, size_t &next_offset) {
+  if (source.chunk < 0 || source.chunk >= f.num_chunks || !f.chunks[source.chunk] ||
+      !f.chunks[source.chunk]->is_mine())
+    throw std::out_of_range("NVIDIA material refresh has an invalid chunk");
+  if (source.c < 0 || source.c >= NUM_FIELD_COMPONENTS || source.d < 0 || source.d >= 5)
+    throw std::invalid_argument("NVIDIA material refresh has an invalid component or direction");
+  const array_kind expected_kind = source.family == MaterialRefreshFamily::chi1inv
+                                       ? array_kind::chi1inv
+                                       : source.family == MaterialRefreshFamily::conductivity
+                                             ? array_kind::conductivity
+                                             : source.family == MaterialRefreshFamily::condinv
+                                                   ? array_kind::condinv
+                                                   : array_kind::num_kinds;
+  if (expected_kind == array_kind::num_kinds)
+    throw std::invalid_argument("NVIDIA material refresh has an invalid family");
+  if (source.family == MaterialRefreshFamily::condinv &&
+      source.d != component_direction(source.c))
+    throw std::invalid_argument("NVIDIA material refresh has a non-diagonal condinv row");
+  const nvidia::scalar_precision precision =
+      scalar_precision_for(state.plan_, source.current, "NVIDIA material refresh");
+  const ArraySpec &spec = state.plan_.arrays[source.current.value];
+  const StorageKey &key = state.plan_.keys[source.current.value];
+  if (spec.role != array_role::material || is_valid(spec.alias_of) || !source.elements ||
+      source.elements != spec.elements)
+    throw std::invalid_argument("NVIDIA material refresh has invalid storage metadata");
+  if (key.chunk != source.chunk || key.kind != int(expected_kind) ||
+      key.component_ != int(source.c) || key.cmp != -1 || key.aux != int(source.d))
+    throw std::invalid_argument("NVIDIA material refresh identity does not match its ArrayId");
+  const structure_chunk &sc = *f.chunks[source.chunk]->s;
+  const realnum *expected = source.family == MaterialRefreshFamily::chi1inv
+                                ? sc.chi1inv[source.c][source.d]
+                                : source.family == MaterialRefreshFamily::conductivity
+                                      ? sc.conductivity[source.c][source.d]
+                                      : sc.condinv[source.c][source.d];
+  if (!expected || !f.array_catalog ||
+      f.array_catalog->resolve<realnum>(source.current) != expected)
+    throw std::invalid_argument("NVIDIA material refresh does not name the current material row");
+
+  const size_t alignment =
+      precision == nvidia::scalar_precision::f32 ? alignof(float) : alignof(double);
+  const size_t padding = (alignment - next_offset % alignment) % alignment;
+  next_offset = checked_add(next_offset, padding, "aligning NVIDIA material refresh staging");
+  NvidiaCompiledMaterialRefresh result = {
+      source.current, spec, next_offset,
+      checked_product(source.elements,
+                      precision == nvidia::scalar_precision::f32 ? sizeof(float) : sizeof(double),
+                      "sizing NVIDIA material refresh")};
+  next_offset = checked_add(next_offset, result.bytes, "laying out NVIDIA material refresh staging");
   return result;
 }
 
@@ -2515,8 +2586,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                                       [](double k) { return k != 0.0; });
     if (use_bfast != !plan.bfast_updates.empty())
       throw std::invalid_argument("NVIDIA BFAST coordinate and descriptor state disagree");
-    if (f_.is_phasing())
-      throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
     if (f_.fluxes)
       throw std::invalid_argument("NVIDIA PR3 does not support legacy time-domain flux monitors");
     if (has_polarization(f_) && !f_.descriptors)
@@ -2593,7 +2662,9 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
     std::vector<NvidiaCompiledMagneticState> magnetic_states;
+    std::vector<NvidiaCompiledMaterialRefresh> material_refreshes;
     size_t magnetic_snapshot_bytes = 0;
+    size_t material_staging_bytes = 0;
     size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
     cylindrical_radial_prefixes.reserve(plan.cylindrical_radial_prefixes.size());
@@ -2612,6 +2683,36 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<unsigned int> bfast_references(plan.bfast_updates.size(), 0);
 
     const StepPlan canonical = build_step_plan(f_, plan.program);
+    if (plan.material_phase_target_signature != compute_material_phase_target_signature(f_))
+      throw std::invalid_argument("NVIDIA material phase target fingerprint is stale");
+    if (canonical.material_phase_target_signature != plan.material_phase_target_signature ||
+        canonical.material_refresh_arrays.size() != plan.material_refresh_arrays.size())
+      throw std::invalid_argument("NVIDIA material refresh descriptors are non-canonical");
+    for (size_t i = 0; i < plan.material_refresh_arrays.size(); ++i) {
+      const MaterialRefreshArray &got = plan.material_refresh_arrays[i];
+      const MaterialRefreshArray &want = canonical.material_refresh_arrays[i];
+      if (got.chunk != want.chunk || got.c != want.c || got.d != want.d ||
+          got.family != want.family || got.current != want.current ||
+          got.elements != want.elements)
+        throw std::invalid_argument("NVIDIA material refresh descriptors are non-canonical");
+      material_refreshes.push_back(
+          compile_material_refresh(got, state, f_, material_staging_bytes));
+    }
+    if (f_.array_catalog)
+      for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+        if (!f_.chunks[chunk] || !f_.chunks[chunk]->is_mine() || !f_.chunks[chunk]->new_s)
+          continue;
+        const structure_chunk &target = *f_.chunks[chunk]->new_s;
+        FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d) {
+          if ((target.chi1inv[c][d] &&
+               f_.array_catalog->contains_address(target.chi1inv[c][d])) ||
+              (target.conductivity[c][d] &&
+               f_.array_catalog->contains_address(target.conductivity[c][d])) ||
+              (target.condinv[c][d] &&
+               f_.array_catalog->contains_address(target.condinv[c][d])))
+            throw std::invalid_argument("NVIDIA material phase target entered the device catalog");
+        }
+      }
     if (canonical.magnetic_state_arrays.size() != plan.magnetic_state_arrays.size())
       throw std::invalid_argument("NVIDIA magnetic snapshot descriptor count is non-canonical");
     for (size_t i = 0; i < plan.magnetic_state_arrays.size(); ++i) {
@@ -2641,6 +2742,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       const Operation &op = plan.operations[oi];
       NvidiaCompiledOperation compiled = {};
       compiled.kind = op.kind;
+      compiled.guard = op.guard;
       compiled.source_time_offset = op.source_time_offset;
       switch (op.kind) {
         case OpKind::update_db: {
@@ -3136,11 +3238,31 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
               op.magnetic_state_count != plan.magnetic_state_arrays.size())
             set_reason(local_error, oi, "magnetic snapshot span is incomplete");
           break;
+        case OpKind::phase_material:
         case OpKind::update_material_coefficients:
+          if (size_t(op.material_refresh_index) + op.material_refresh_count >
+              plan.material_refresh_arrays.size()) {
+            set_reason(local_error, oi, "material refresh descriptor span is out of range");
+            break;
+          }
+          compiled.material_first = op.material_refresh_index;
+          compiled.material_count = op.material_refresh_count;
+          for (size_t i = compiled.material_first;
+               i < compiled.material_first + compiled.material_count; ++i) {
+            const MaterialRefreshFamily expected = op.kind == OpKind::phase_material
+                                                       ? MaterialRefreshFamily::chi1inv
+                                                       : plan.material_refresh_arrays[i].family;
+            if (plan.material_refresh_arrays[i].family != expected ||
+                (op.kind == OpKind::update_material_coefficients &&
+                 expected == MaterialRefreshFamily::chi1inv)) {
+              set_reason(local_error, oi, "material refresh span has the wrong family");
+              break;
+            }
+          }
+          break;
         case OpKind::increment_time:
           break;
 
-        case OpKind::phase_material:
         case OpKind::zero_boundary:
         case OpKind::pack_halo:
         case OpKind::exchange_local:
@@ -3199,7 +3321,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           polarization_subtractions, dft_updates, dft_omega,
           magnetic_states, magnetic_snapshot_bytes,
           magnetic_layout_fingerprint(state.fingerprint_, plan.magnetic_state_arrays),
-          plan.magnetic_half_step,
+          plan.magnetic_half_step, material_refreshes, material_staging_bytes,
+          plan.material_phase_target_signature,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, state));
   }
@@ -3401,22 +3524,67 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     throw std::logic_error("NVIDIA executable was compiled for a different storage layout");
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
+  const bool material_phase_active = f_.phasein_time > 0;
+  const bool every_rank_material_phase_active = and_to_all(material_phase_active);
+  const bool any_rank_material_phase_active = or_to_all(material_phase_active);
+  const bool local_material_target_matches =
+      !material_phase_active ||
+      executable.material_target_signature_ == compute_material_phase_target_signature(f_);
+  const bool every_material_target_matches = and_to_all(local_material_target_matches);
+  bool local_material_storage_detached = true;
+  if (material_phase_active)
+    for (int i = 0; i < f_.num_chunks; ++i)
+      if (f_.chunks[i] && f_.chunks[i]->is_mine() &&
+          (!f_.chunks[i]->s || f_.chunks[i]->s->refcount != 1)) {
+        local_material_storage_detached = false;
+        break;
+      }
+  const bool every_material_storage_detached = and_to_all(local_material_storage_detached);
+  if (any_rank_material_phase_active != every_rank_material_phase_active ||
+      !every_material_target_matches || !every_material_storage_detached)
+    throw std::logic_error(
+        "NVIDIA material phase state, target, or current storage changed after compilation on "
+        "an MPI rank");
 
   const FiniteCheckMode finite_mode = finite_check_mode();
   try {
     nvidia::device_scope scope(state.device_);
+    const auto upload_material = [&](const NvidiaCompiledOperation &op) {
+      char *staging = static_cast<char *>(executable.material_staging_.data());
+      for (size_t i = op.material_first; i < op.material_first + op.material_count; ++i) {
+        const NvidiaCompiledMaterialRefresh &row = executable.material_refreshes_[i];
+        const void *source = f_.array_catalog->resolve_untyped(row.current);
+        if (!source) throw std::logic_error("NVIDIA material refresh resolved a null host row");
+        host_to_storage(staging + row.staging_offset, source, row.spec, row.spec.elements);
+        state.arenas_->copy_from_host_async(row.current.value, 0,
+                                            staging + row.staging_offset, row.bytes,
+                                            *state.transfer_);
+      }
+      if (op.material_count) state.transfer_->synchronize();
+    };
     for (int step = 0; step < num_steps; ++step) {
+      bool segment_guard = false;
       f_.step_source_times[0] = f_.time();
       f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
       f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
       for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
         const NvidiaCompiledOperation &op = executable.operations_[oi];
+        if (op.guard.kind == GuardKind::segment_boundary && !segment_guard) continue;
         switch (op.kind) {
           case OpKind::restore_magnetic_fields:
             if (f_.synchronized_magnetic_fields) {
               preflight_magnetic_transition(executable, state, false);
               restore_magnetic_fields(executable, state);
             }
+            break;
+          case OpKind::phase_material:
+            segment_guard = f_.phase_material_mix();
+            upload_material(op);
+            break;
+          case OpKind::update_material_coefficients:
+            for (int i = 0; i < f_.num_chunks; ++i)
+              f_.chunks[i]->s->update_condinv();
+            upload_material(op);
             break;
           case OpKind::update_db:
             for (size_t i = op.first; i < op.first + op.count; ++i) {
