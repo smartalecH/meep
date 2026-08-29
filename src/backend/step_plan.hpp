@@ -167,6 +167,32 @@ struct CurlUpdate {
   PmlProfile pml_u;
   double dtdx;
   double dt;
+  /* BFAST is an ordered postpass for this exact curl row, not a chunk-level
+     tail. UINT32_MAX means that the ordinary curl has no paired postpass. */
+  uint32_t bfast_update_index;
+};
+
+enum BfastVariant : uint32_t {
+  bfast_has_pml = 1u << 0,
+  bfast_has_pml_aux = 1u << 1,
+  bfast_has_conductivity = 1u << 2
+};
+
+struct BfastUpdate {
+  UpdateRegion region;
+  ArrayId target;
+  ArrayId source1;
+  ArrayId source2;
+  ptrdiff_t stride1;
+  ptrdiff_t stride2;
+  ArrayId f_bfast;
+  ArrayId target_u;
+  ArrayId condinv;
+  ArrayId target_cond;
+  PmlProfile pml;
+  PmlProfile pml_u;
+  double k1;
+  double k2;
 };
 
 enum BetaVariant : uint32_t {
@@ -279,8 +305,10 @@ enum class StepProgram { ordinary, solve_cw };
 struct StepPlan {
   StepProgram program;
   double beta;
+  std::vector<double> bfast_scaled_k;
   std::vector<Operation> operations;
   std::vector<CurlUpdate> db_updates;
+  std::vector<BfastUpdate> bfast_updates;
   std::vector<BetaUpdate> beta_updates;
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
@@ -290,8 +318,10 @@ struct StepPlan {
   StepPlan() : program(StepProgram::ordinary), beta(0), signature(0) {}
   void clear() {
     beta = 0;
+    bfast_scaled_k.clear();
     operations.clear();
     db_updates.clear();
+    bfast_updates.clear();
     beta_updates.clear();
     eh_updates.clear();
     polarization_updates.clear();
