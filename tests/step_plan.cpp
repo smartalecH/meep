@@ -49,8 +49,8 @@ static int failures = 0;
 #define CHECK(cond, ...)                                                                           \
   do {                                                                                             \
     if (!(cond)) {                                                                                 \
-      /* printf, not master_printf: a failure on a non-master rank is exactly  \
-         the interesting kind, and master_printf would swallow it. */          \
+      /* printf, not master_printf: a failure on a non-master rank is exactly                      \
+         the interesting kind, and master_printf would swallow it. */                              \
       printf("[rank %d] FAIL (%s:%d): ", my_rank(), __FILE__, __LINE__);                           \
       printf(__VA_ARGS__);                                                                         \
       printf("\n");                                                                                \
@@ -62,8 +62,8 @@ static int failures = 0;
 static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 
-static void compare(const char *name, const std::vector<std::string> &got,
-                    const char *const *want, size_t nwant) {
+static void compare(const char *name, const std::vector<std::string> &got, const char *const *want,
+                    size_t nwant) {
   if (got.size() != nwant) {
     master_printf("FAIL: %s: plan has %zu operations, expected %zu\n", name, got.size(), nwant);
     for (size_t i = 0; i < got.size() || i < nwant; ++i)
@@ -85,22 +85,22 @@ static void compare(const char *name, const std::vector<std::string> &got,
 static const char *const expected_full[] = {
     "restore_magnetic_fields",
     "update_material_coefficients",
-    "evaluate_source_scalars",   // time()                 -- B sources
+    "evaluate_source_scalars", // time()                 -- B sources
     "update_db(B)",
     "apply_sources(B)",
     "transfer_halo(B)",
-    "evaluate_source_scalars",   // time() + 0.5*dt        -- integrated H
+    "evaluate_source_scalars", // time() + 0.5*dt        -- integrated H
     "update_eh(H)",
     "transfer_halo(WH)",
     "update_polarization(H)",
     "transfer_halo(PH)",
     "transfer_halo(H)",
     "update_flux_half",
-    "evaluate_source_scalars",   // time() + 0.5*dt        -- D sources
+    "evaluate_source_scalars", // time() + 0.5*dt        -- D sources
     "update_db(D)",
     "apply_sources(D)",
     "transfer_halo(D)",
-    "evaluate_source_scalars",   // time() + dt            -- integrated E
+    "evaluate_source_scalars", // time() + dt            -- integrated E
     "update_eh(E)",
     "transfer_halo(WE)",
     "update_polarization(E)",
@@ -164,8 +164,7 @@ static void test_full_plan() {
   for (int i = 0; i < f.num_chunks; ++i)
     if (f.chunks[i]->is_mine() && f.chunks[i]->dft_chunks) owns_dft = true;
   if (owns_dft)
-    compare("ordinary/full", got, expected_full,
-            sizeof(expected_full) / sizeof(expected_full[0]));
+    compare("ordinary/full", got, expected_full, sizeof(expected_full) / sizeof(expected_full[0]));
 
   /* Guard kinds are load-bearing for Phase 2 even though the CPU executor
      treats them all the same. */
@@ -174,12 +173,11 @@ static void test_full_plan() {
     CHECK(op.beta_descriptor_index == 0 && op.beta_descriptor_count == 0,
           "%s has a nonempty beta span in a zero-beta plan", op_kind_name(op.kind));
     CHECK(op.polarization_subtraction_index == 0 && op.polarization_subtraction_count == 0,
-          "%s has a nonempty PR6 polarization-subtraction span",
-          op_kind_name(op.kind));
+          "%s has a nonempty PR6 polarization-subtraction span", op_kind_name(op.kind));
     if (op.kind == OpKind::restore_magnetic_fields ||
         op.kind == OpKind::synchronize_magnetic_fields) {
-      CHECK(op.guard.kind == GuardKind::graph_variant,
-            "%s should be a graph_variant guard", op_kind_name(op.kind));
+      CHECK(op.guard.kind == GuardKind::graph_variant, "%s should be a graph_variant guard",
+            op_kind_name(op.kind));
       ++variants;
     }
     if (op.kind == OpKind::update_dft) {
@@ -189,8 +187,8 @@ static void test_full_plan() {
     }
   }
   CHECK(variants == 2, "expected 2 magnetic-sync variant guards, got %zu", variants);
-  CHECK(devices == (owns_dft ? 1u : 0u), "expected %d decimation guards, got %zu",
-        owns_dft ? 1 : 0, devices);
+  CHECK(devices == (owns_dft ? 1u : 0u), "expected %d decimation guards, got %zu", owns_dft ? 1 : 0,
+        devices);
 
   /* Rebuilding without touching anything gives the same plan. */
   const StepPlan again = build_step_plan(f, StepProgram::ordinary);
@@ -330,14 +328,18 @@ static void test_polarization_schema_signature() {
   CHECK(plan.operations[0].polarization_subtraction_index == 0 &&
             plan.operations[0].polarization_subtraction_count == 0 &&
             plan.operations[0].beta_descriptor_index == 0 &&
-            plan.operations[0].beta_descriptor_count == 0,
+            plan.operations[0].beta_descriptor_count == 0 &&
+            plan.operations[0].cylindrical_m_descriptor_index == 0 &&
+            plan.operations[0].cylindrical_m_descriptor_count == 0 &&
+            plan.operations[0].cylindrical_origin_action_index == 0 &&
+            plan.operations[0].cylindrical_origin_action_count == 0,
         "new operation spans are not zero-initialized");
 
 #define CHECK_SIGNATURE_FIELD(expr, message)                                                       \
   do {                                                                                             \
     StepPlan changed = plan;                                                                       \
-    expr;                                                                                           \
-    CHECK(compute_step_plan_signature(changed) != signature, message);                              \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
   } while (0)
   CHECK_SIGNATURE_FIELD(++changed.operations[0].polarization_subtraction_count,
                         "signature ignored polarization subtraction span");
@@ -346,8 +348,7 @@ static void test_polarization_schema_signature() {
                         "signature ignored polarization region begin");
   CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].p.value,
                         "signature ignored polarization ArrayId");
-  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].kind =
-                            PolarizationUpdateKind::lorentzian,
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].kind = PolarizationUpdateKind::lorentzian,
                         "signature ignored polarization update kind");
   CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].p_cross1.value,
                         "signature ignored gyrotropic state ArrayId");
@@ -409,8 +410,8 @@ static void test_beta_schema_signature() {
 #define CHECK_BETA_SIGNATURE(expr, message)                                                        \
   do {                                                                                             \
     StepPlan changed = plan;                                                                       \
-    expr;                                                                                           \
-    CHECK(compute_step_plan_signature(changed) != signature, message);                              \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
   } while (0)
   CHECK_BETA_SIGNATURE(++changed.operations[0].beta_descriptor_index,
                        "signature ignored beta descriptor index");
@@ -419,8 +420,7 @@ static void test_beta_schema_signature() {
                        "signature ignored beta descriptor count");
   CHECK_BETA_SIGNATURE(++changed.beta_updates[0].region.variant_key,
                        "signature ignored beta variant");
-  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].source.value,
-                       "signature ignored beta source");
+  CHECK_BETA_SIGNATURE(++changed.beta_updates[0].source.value, "signature ignored beta source");
   CHECK_BETA_SIGNATURE(++changed.beta_updates[0].target_u.value,
                        "signature ignored beta auxiliary target");
   CHECK_BETA_SIGNATURE(++changed.beta_updates[0].condinv.value,
@@ -480,8 +480,8 @@ static void test_bfast_schema_signature() {
 #define CHECK_BFAST_SIGNATURE(expr, message)                                                       \
   do {                                                                                             \
     StepPlan changed = plan;                                                                       \
-    expr;                                                                                           \
-    CHECK(compute_step_plan_signature(changed) != signature, message);                              \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
   } while (0)
   CHECK_BFAST_SIGNATURE(++changed.db_updates[0].bfast_update_index,
                         "signature ignored paired BFAST index");
@@ -489,10 +489,8 @@ static void test_bfast_schema_signature() {
                         "signature ignored prepared BFAST coordinate");
   CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].region.variant_key,
                         "signature ignored BFAST variant");
-  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].source1.value,
-                        "signature ignored BFAST source");
-  CHECK_BFAST_SIGNATURE(--changed.bfast_updates[0].stride2,
-                        "signature ignored BFAST stride");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].source1.value, "signature ignored BFAST source");
+  CHECK_BFAST_SIGNATURE(--changed.bfast_updates[0].stride2, "signature ignored BFAST stride");
   CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].f_bfast.value,
                         "signature ignored BFAST persistent state");
   CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].target_u.value,
@@ -503,15 +501,244 @@ static void test_bfast_schema_signature() {
                         "signature ignored BFAST primary PML profile");
   CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].pml_u.base,
                         "signature ignored BFAST auxiliary PML profile");
-  CHECK_BFAST_SIGNATURE(changed.bfast_updates[0].k1 = 0.17,
-                        "signature ignored BFAST k1");
-  CHECK_BFAST_SIGNATURE(changed.bfast_updates[0].k2 = -0.11,
-                        "signature ignored BFAST k2");
+  CHECK_BFAST_SIGNATURE(changed.bfast_updates[0].k1 = 0.17, "signature ignored BFAST k1");
+  CHECK_BFAST_SIGNATURE(changed.bfast_updates[0].k2 = -0.11, "signature ignored BFAST k2");
 #undef CHECK_BFAST_SIGNATURE
 
   plan.clear();
   CHECK(plan.bfast_scaled_k.empty() && plan.bfast_updates.empty(),
         "StepPlan::clear retained BFAST coordinate state");
+}
+
+static void test_cylindrical_schema_signature() {
+  StepPlan plan;
+  plan.coordinate_generation = 7;
+  plan.cylindrical_m = -1.0;
+  plan.cylindrical_origin_r.push_back(0.0);
+  plan.cylindrical_zero_near_origin.push_back(1);
+
+  Operation op = {};
+  op.kind = OpKind::update_db;
+  op.ft = D_stuff;
+  op.guard = guard_always();
+  op.cylindrical_m_descriptor_index = 1;
+  op.cylindrical_m_descriptor_count = 1;
+  op.cylindrical_origin_action_index = 2;
+  op.cylindrical_origin_action_count = 2;
+  plan.operations.push_back(op);
+
+  CurlUpdate curl = {};
+  curl.radial_prefix_index = 0;
+  plan.db_updates.push_back(curl);
+
+  CylindricalRadialPrefix prefix = {};
+  prefix.chunk = 1;
+  prefix.target_component = Dz;
+  prefix.source_component = Hp;
+  prefix.cmp = 1;
+  prefix.source = ArrayId{1};
+  prefix.scratch = ArrayId{2};
+  prefix.nr = 5;
+  prefix.nz = 256;
+  prefix.row_stride = 257;
+  prefix.source_elements = prefix.scratch_elements = 1542;
+  prefix.ir0 = 0.5;
+  plan.cylindrical_radial_prefixes.push_back(prefix);
+
+  CylindricalMOverRUpdate mr = {};
+  mr.region.chunk = 1;
+  mr.region.c = Dz;
+  mr.region.cmp = 1;
+  mr.region.variant_key =
+      cylindrical_m_has_pml | cylindrical_m_has_pml_aux | cylindrical_m_has_conductivity;
+  mr.target = ArrayId{3};
+  mr.source = ArrayId{4};
+  mr.target_u = ArrayId{9};
+  mr.condinv = ArrayId{10};
+  mr.target_cond = ArrayId{11};
+  mr.pml.siginv = ArrayId{12};
+  mr.pml.base = 3;
+  mr.pml.strides[0] = 2;
+  mr.pml_u.siginv = ArrayId{13};
+  mr.pml_u.base = 5;
+  mr.pml_u.strides[1] = 2;
+  mr.numerator = -0.35;
+  mr.raw_radial_start = 1;
+  plan.cylindrical_m_updates.push_back(mr);
+
+  CylindricalAxisUpdate axis = {};
+  axis.kind = CylindricalAxisKind::abs_m1;
+  axis.region.chunk = 1;
+  axis.region.c = Dp;
+  axis.region.cmp = 1;
+  axis.region.variant_key =
+      cylindrical_axis_has_pml | cylindrical_axis_has_pml_aux | cylindrical_axis_has_conductivity;
+  axis.target = ArrayId{14};
+  axis.source1 = ArrayId{15};
+  axis.source2 = ArrayId{16};
+  axis.source1_neighbor_offset = -1;
+  axis.source2_offset = 257;
+  axis.target_u = ArrayId{17};
+  axis.conductivity = ArrayId{18};
+  axis.condinv = ArrayId{19};
+  axis.target_cond = ArrayId{20};
+  axis.pml.sig = ArrayId{21};
+  axis.pml.kap = ArrayId{22};
+  axis.pml.siginv = ArrayId{23};
+  axis.pml.base = 7;
+  axis.pml.strides[0] = 2;
+  axis.pml_u.sig = ArrayId{24};
+  axis.pml_u.kap = ArrayId{25};
+  axis.pml_u.siginv = ArrayId{26};
+  axis.pml_u.base = 9;
+  axis.pml_u.strides[1] = 2;
+  axis.source2_multiplier = 2;
+  axis.scale = 0.25;
+  axis.dt = 0.125;
+  plan.cylindrical_axis_updates.push_back(axis);
+
+  SlabRef slab = {};
+  slab.array = ArrayId{27};
+  slab.base = 257;
+  slab.counts[0] = 257;
+  slab.counts[1] = slab.counts[2] = 1;
+  slab.strides[0] = 1;
+  plan.cylindrical_zero_slabs.push_back(slab);
+  plan.cylindrical_origin_actions.push_back(
+      CylindricalOriginAction{CylindricalOriginActionKind::axis_update, 0});
+  plan.cylindrical_origin_actions.push_back(
+      CylindricalOriginAction{CylindricalOriginActionKind::zero_slab, 0});
+
+  ConstitutiveUpdate constitutive = {};
+  constitutive.region.variant_key = constitutive_axis_override;
+  plan.eh_updates.push_back(constitutive);
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+  StepPlan next_generation = plan;
+  ++next_generation.coordinate_generation;
+  CHECK(compute_step_plan_signature(next_generation) == signature,
+        "coordinate lifecycle generation changed the executable content signature");
+#define CHECK_CYL_SIGNATURE(expr, message)                                                         \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
+  } while (0)
+  CHECK_CYL_SIGNATURE(changed.cylindrical_m = 1.0, "signature ignored cylindrical m");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_origin_r[0] = 0.5,
+                      "signature ignored cylindrical origin");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_zero_near_origin[0] = 0,
+                      "signature ignored cylindrical origin policy");
+  CHECK_CYL_SIGNATURE(++changed.operations[0].cylindrical_m_descriptor_index,
+                      "signature ignored cylindrical m span start");
+  CHECK_CYL_SIGNATURE(++changed.operations[0].cylindrical_m_descriptor_count,
+                      "signature ignored cylindrical m span");
+  CHECK_CYL_SIGNATURE(++changed.operations[0].cylindrical_origin_action_index,
+                      "signature ignored cylindrical origin span start");
+  CHECK_CYL_SIGNATURE(++changed.operations[0].cylindrical_origin_action_count,
+                      "signature ignored cylindrical origin span");
+  CHECK_CYL_SIGNATURE(++changed.db_updates[0].radial_prefix_index,
+                      "signature ignored radial-prefix pairing");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].scratch.value,
+                      "signature ignored radial scratch identity");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].chunk,
+                      "signature ignored radial-prefix chunk");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_radial_prefixes[0].target_component = Dp,
+                      "signature ignored radial-prefix target component");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_radial_prefixes[0].source_component = Hr,
+                      "signature ignored radial-prefix source component");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_radial_prefixes[0].cmp = 0,
+                      "signature ignored radial-prefix cmp");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].source.value,
+                      "signature ignored radial-prefix source identity");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].nr,
+                      "signature ignored radial-prefix nr");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].nz,
+                      "signature ignored radial-prefix nz");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].row_stride,
+                      "signature ignored radial-prefix row stride");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].source_elements,
+                      "signature ignored radial-prefix source extent");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_radial_prefixes[0].scratch_elements,
+                      "signature ignored radial-prefix scratch extent");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_radial_prefixes[0].ir0 = 1.5,
+                      "signature ignored radial-prefix coefficient");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_m_updates[0].numerator = 0.35,
+                      "signature ignored cylindrical m/r coefficient");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].region.variant_key,
+                      "signature ignored cylindrical m/r variant");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].target.value,
+                      "signature ignored cylindrical m/r target");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].source.value,
+                      "signature ignored cylindrical m/r source");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].target_u.value,
+                      "signature ignored cylindrical m/r auxiliary target");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].condinv.value,
+                      "signature ignored cylindrical m/r conductivity inverse");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].target_cond.value,
+                      "signature ignored cylindrical m/r conductivity target");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].pml.base,
+                      "signature ignored cylindrical m/r primary PML");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].pml_u.siginv.value,
+                      "signature ignored cylindrical m/r auxiliary PML");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_m_updates[0].raw_radial_start,
+                      "signature ignored cylindrical radial coordinate");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].source2.value,
+                      "signature ignored cylindrical axis source");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_axis_updates[0].kind = CylindricalAxisKind::m0_dz,
+                      "signature ignored cylindrical axis kind");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].region.variant_key,
+                      "signature ignored cylindrical axis variant");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].target.value,
+                      "signature ignored cylindrical axis target");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].source1.value,
+                      "signature ignored cylindrical axis first source");
+  CHECK_CYL_SIGNATURE(--changed.cylindrical_axis_updates[0].source1_neighbor_offset,
+                      "signature ignored cylindrical axis neighbor offset");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].source2_offset,
+                      "signature ignored cylindrical axis second-source offset");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].target_u.value,
+                      "signature ignored cylindrical axis auxiliary target");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].conductivity.value,
+                      "signature ignored cylindrical axis conductivity");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].condinv.value,
+                      "signature ignored cylindrical axis conductivity inverse");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].target_cond.value,
+                      "signature ignored cylindrical axis conductivity target");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].pml.kap.value,
+                      "signature ignored cylindrical axis primary PML");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_axis_updates[0].pml_u.base,
+                      "signature ignored cylindrical axis auxiliary PML");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_axis_updates[0].scale = -0.25,
+                      "signature ignored cylindrical axis scale");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_axis_updates[0].source2_multiplier = -2,
+                      "signature ignored cylindrical axis multiplier");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_axis_updates[0].dt = 0.25,
+                      "signature ignored cylindrical axis timestep");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_zero_slabs[0].array.value,
+                      "signature ignored cylindrical zero-slab array");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_zero_slabs[0].base,
+                      "signature ignored cylindrical zero slab");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_zero_slabs[0].counts[0],
+                      "signature ignored cylindrical zero-slab count");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_zero_slabs[0].strides[0],
+                      "signature ignored cylindrical zero-slab stride");
+  CHECK_CYL_SIGNATURE(++changed.cylindrical_origin_actions[0].index,
+                      "signature ignored cylindrical origin action");
+  CHECK_CYL_SIGNATURE(changed.cylindrical_origin_actions[0].kind =
+                          CylindricalOriginActionKind::zero_slab,
+                      "signature ignored cylindrical origin action kind");
+  CHECK_CYL_SIGNATURE(changed.eh_updates[0].region.variant_key = 0,
+                      "signature ignored constitutive axis marker");
+#undef CHECK_CYL_SIGNATURE
+
+  plan.clear();
+  CHECK(plan.coordinate_generation == 0 && plan.cylindrical_m == 0 &&
+            plan.cylindrical_origin_r.empty() && plan.cylindrical_zero_near_origin.empty() &&
+            plan.cylindrical_radial_prefixes.empty() && plan.cylindrical_m_updates.empty() &&
+            plan.cylindrical_axis_updates.empty() && plan.cylindrical_zero_slabs.empty() &&
+            plan.cylindrical_origin_actions.empty(),
+        "StepPlan::clear retained cylindrical coordinate state");
 }
 
 int main(int argc, char **argv) {
@@ -525,6 +752,7 @@ int main(int argc, char **argv) {
   test_polarization_schema_signature();
   test_beta_schema_signature();
   test_bfast_schema_signature();
+  test_cylindrical_schema_signature();
 
   if (failures) {
     master_printf("step_plan: %d FAILURE(S)\n", failures);
