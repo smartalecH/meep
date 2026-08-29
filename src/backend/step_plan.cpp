@@ -194,7 +194,10 @@ CurlSources curl_sources_for(const fields_chunk &fc, component target) {
 
 class StepPlanBuilder {
 public:
-  explicit StepPlanBuilder(fields &f, StepProgram program) : f_(f) { plan_.program = program; }
+  explicit StepPlanBuilder(fields &f, StepProgram program) : f_(f) {
+    plan_.program = program;
+    plan_.beta = f.beta;
+  }
 
   Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
                  double src_offset = 0.0) {
@@ -202,6 +205,8 @@ public:
     op.kind = k;
     op.descriptor_index = 0;
     op.descriptor_count = 0;
+    op.beta_descriptor_index = 0;
+    op.beta_descriptor_count = 0;
     op.polarization_subtraction_index = 0;
     op.polarization_subtraction_count = 0;
     op.guard = g;
@@ -263,6 +268,7 @@ public:
   static uint64_t signature_for(const StepPlan &plan) {
     uint64_t sig = 0xcbf29ce484222325ull;
     mix(sig, uint64_t(plan.program));
+    mix_double(sig, plan.beta);
     for (const Operation &op : plan.operations) {
       sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.ft) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
@@ -271,6 +277,10 @@ public:
       sig ^= uint64_t(op.guard.variant_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      sig ^= uint64_t(op.beta_descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
+             (sig >> 2);
+      sig ^= uint64_t(op.beta_descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
+             (sig >> 2);
       sig ^= uint64_t(op.polarization_subtraction_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
              (sig >> 2);
       sig ^= uint64_t(op.polarization_subtraction_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
@@ -287,6 +297,7 @@ public:
       }
     }
     for (const CurlUpdate &d : plan.db_updates) hash_curl(sig, d);
+    for (const BetaUpdate &d : plan.beta_updates) hash_beta(sig, d);
     for (const ConstitutiveUpdate &d : plan.eh_updates) hash_constitutive(sig, d);
     for (const PolarizationUpdate &d : plan.polarization_updates) hash_polarization(sig, d);
     for (const PolarizationSubtraction &d : plan.polarization_subtractions)
@@ -341,6 +352,17 @@ private:
     hash_pml(sig, d.pml_u);
     mix_double(sig, d.dtdx);
     mix_double(sig, d.dt);
+  }
+  static void hash_beta(uint64_t &sig, const BetaUpdate &d) {
+    hash_region(sig, d.region);
+    hash_id(sig, d.target);
+    hash_id(sig, d.source);
+    hash_id(sig, d.target_u);
+    hash_id(sig, d.condinv);
+    hash_id(sig, d.target_cond);
+    hash_pml(sig, d.pml);
+    hash_pml(sig, d.pml_u);
+    mix_double(sig, d.betadt);
   }
   static void hash_constitutive(uint64_t &sig, const ConstitutiveUpdate &d) {
     hash_region(sig, d.region);
@@ -408,6 +430,7 @@ private:
 void StepPlanBuilder::add_db(field_type ft) {
   Operation &op = add(OpKind::update_db, ft);
   op.descriptor_index = uint32_t(plan_.db_updates.size());
+  op.beta_descriptor_index = uint32_t(plan_.beta_updates.size());
 
   for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
     if (!f_.chunks[chunk]->is_mine()) continue;
@@ -478,6 +501,67 @@ void StepPlanBuilder::add_db(field_type ft) {
     }
   }
   op.descriptor_count = uint32_t(plan_.db_updates.size()) - op.descriptor_index;
+
+  /* Match step_db.cpp exactly: special-kz rows run only after every ordinary
+     curl tile in this half-step has completed, and cover the full chunk rather
+     than an individual tile. */
+  for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+    if (!f_.chunks[chunk]->is_mine()) continue;
+    fields_chunk &fc = *f_.chunks[chunk];
+    if (fc.gv.dim != D2 || fc.beta == 0) continue;
+    const int components = fc.is_real ? 1 : 2;
+    for (int cmp = 0; cmp < components; ++cmp)
+      for (direction dc = X; dc <= Y; dc = direction(dc + 1)) {
+        const component target_component =
+            direction_component(first_field_component(ft), dc);
+        const component source_component =
+            direction_component(ft == D_stuff ? Hx : Ex, dc == X ? Y : X);
+        const ArrayId target =
+            find_array(f_, chunk, array_kind::f, int(target_component), cmp, 0);
+        const ArrayId opposite_source =
+            find_array(f_, chunk, array_kind::f, int(source_component), 1 - cmp, 0);
+        const ArrayId same_source =
+            find_array(f_, chunk, array_kind::f, int(source_component), cmp, 0);
+        const ArrayId source = is_valid(opposite_source) ? opposite_source : same_source;
+        /* step_beta is a no-op without either operand. Do not turn such a row
+           into executable backend work. */
+        if (!is_valid(target) || !is_valid(source)) continue;
+
+        const direction dsig0 = cycle_direction(fc.gv.dim, dc, 1);
+        const direction dsig = fc.s->sigsize[dsig0] > 1 ? dsig0 : NO_DIRECTION;
+        const direction dsigu0 = cycle_direction(fc.gv.dim, dc, 2);
+        const direction dsigu = fc.s->sigsize[dsigu0] > 1 ? dsigu0 : NO_DIRECTION;
+
+        BetaUpdate d;
+        d.region = make_region(fc.gv, chunk, target_component, cmp,
+                               fc.gv.little_owned_corner0(target_component), fc.gv.big_corner());
+        d.target = target;
+        d.source = source;
+        d.target_u = find_array(f_, chunk, array_kind::f_u, int(target_component), cmp, 0);
+        d.condinv = find_array(f_, chunk, array_kind::condinv, int(target_component), -1, int(dc));
+        d.target_cond =
+            find_array(f_, chunk, array_kind::f_cond, int(target_component), cmp, 0);
+        d.pml = make_pml_profile(f_, fc, chunk, dsig, d.region.begin);
+        d.pml_u = make_pml_profile(f_, fc, chunk, dsigu, d.region.begin);
+        const realnum betadt =
+            2 * pi * fc.beta * fc.dt * (dc == X ? +1 : -1) *
+            (is_valid(opposite_source) ? (ft == D_stuff ? -1 : +1) * (2 * cmp - 1) : 1);
+        d.betadt = betadt;
+        if (dsig != NO_DIRECTION) d.region.variant_key |= beta_has_pml;
+        if (dsigu != NO_DIRECTION) d.region.variant_key |= beta_has_pml_aux;
+        if (is_valid(d.condinv)) d.region.variant_key |= beta_has_conductivity;
+
+        plan_.beta_updates.push_back(d);
+        add_access(f_, op, d.target, AccessMode::read_write);
+        add_access(f_, op, d.source, AccessMode::read);
+        add_access(f_, op, d.target_u, AccessMode::read_write);
+        add_access(f_, op, d.condinv, AccessMode::read);
+        add_access(f_, op, d.target_cond, AccessMode::read_write);
+        add_access(f_, op, d.pml.siginv, AccessMode::read);
+        add_access(f_, op, d.pml_u.siginv, AccessMode::read);
+      }
+  }
+  op.beta_descriptor_count = uint32_t(plan_.beta_updates.size()) - op.beta_descriptor_index;
 }
 
 void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
