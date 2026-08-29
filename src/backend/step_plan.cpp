@@ -74,6 +74,41 @@ static const char *ft_name(field_type ft) {
 
 namespace {
 
+void target_fingerprint_mix(uint64_t &sig, uint64_t value) {
+  sig ^= value + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+}
+
+uint64_t material_phase_target_signature(const fields &f) {
+  if (f.phasein_time <= 0) return 0;
+  uint64_t sig = 0xcbf29ce484222325ull;
+  target_fingerprint_mix(sig, uint64_t(f.num_chunks));
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    const fields_chunk &fc = *f.chunks[chunk];
+    const bool owned = fc.is_mine();
+    const structure_chunk *target = fc.new_s;
+    target_fingerprint_mix(sig, uint64_t(chunk));
+    target_fingerprint_mix(sig, uint64_t(owned));
+    target_fingerprint_mix(sig, uint64_t(target != NULL));
+    if (!owned || !target) continue;
+    target_fingerprint_mix(sig, uint64_t(target->gv.dim));
+    target_fingerprint_mix(sig, uint64_t(target->gv.ntot()));
+    for (int axis = 0; axis < 3; ++axis) {
+      target_fingerprint_mix(sig, uint64_t(target->gv.yucky_direction(axis)));
+      target_fingerprint_mix(sig, uint64_t(target->gv.little_corner().yucky_val(axis)));
+      target_fingerprint_mix(sig, uint64_t(target->gv.big_corner().yucky_val(axis)));
+    }
+    FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d) {
+      const bool has_chi = target->chi1inv[c][d] != NULL;
+      target_fingerprint_mix(sig, uint64_t(c));
+      target_fingerprint_mix(sig, uint64_t(d));
+      target_fingerprint_mix(sig, uint64_t(has_chi));
+      target_fingerprint_mix(sig, uint64_t(has_chi && target->trivial_chi1inv[c][d]));
+      target_fingerprint_mix(sig, uint64_t(target->conductivity[c][d] != NULL));
+    }
+  }
+  return sig;
+}
+
 ArrayId find_array(fields &f, int chunk, array_kind kind, int c, int cmp, int aux) {
   if (!f.array_catalog) return invalid_array();
   return f.array_catalog->find(StorageKey{chunk, int(kind), c, cmp, aux});
@@ -204,6 +239,7 @@ public:
       plan_.cylindrical_origin_r.push_back(fc.gv.origin_r());
       plan_.cylindrical_zero_near_origin.push_back(fc.zero_fields_near_cylorigin ? 1 : 0);
     }
+    plan_.material_phase_target_signature = material_phase_target_signature(f);
   }
 
   Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
@@ -212,6 +248,8 @@ public:
     op.kind = k;
     op.descriptor_index = 0;
     op.descriptor_count = 0;
+    op.material_refresh_index = 0;
+    op.material_refresh_count = 0;
     op.beta_descriptor_index = 0;
     op.beta_descriptor_count = 0;
     op.cylindrical_m_descriptor_index = 0;
@@ -231,6 +269,53 @@ public:
 
   void add_db(field_type ft);
   void add_eh(field_type ft, Guard guard = guard_always());
+
+  Operation &add_material_refresh(OpKind op_kind) {
+    Operation &op = add(op_kind, field_type(NUM_FIELD_TYPES),
+                        op_kind == OpKind::phase_material ? guard_static(true) : guard_always());
+    op.material_refresh_index = uint32_t(plan_.material_refresh_arrays.size());
+    if (f_.phasein_time <= 0) return op;
+
+    const MaterialRefreshFamily first = op_kind == OpKind::phase_material
+                                            ? MaterialRefreshFamily::chi1inv
+                                            : MaterialRefreshFamily::conductivity;
+    const MaterialRefreshFamily last = op_kind == OpKind::phase_material
+                                           ? MaterialRefreshFamily::chi1inv
+                                           : MaterialRefreshFamily::condinv;
+    for (uint32_t family_value = uint32_t(first); family_value <= uint32_t(last);
+         ++family_value) {
+      const MaterialRefreshFamily family = MaterialRefreshFamily(family_value);
+      const array_kind storage_kind = family == MaterialRefreshFamily::chi1inv
+                                          ? array_kind::chi1inv
+                                          : family == MaterialRefreshFamily::conductivity
+                                                ? array_kind::conductivity
+                                                : array_kind::condinv;
+      for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+        if (!f_.chunks[chunk]->is_mine()) continue;
+        const structure_chunk &sc = *f_.chunks[chunk]->s;
+        FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d) {
+          if (family == MaterialRefreshFamily::condinv && d != int(component_direction(c)))
+            continue;
+          const realnum *row = family == MaterialRefreshFamily::chi1inv
+                                   ? sc.chi1inv[c][d]
+                                   : family == MaterialRefreshFamily::conductivity
+                                         ? sc.conductivity[c][d]
+                                         : sc.condinv[c][d];
+          if (!row) continue;
+          const ArrayId current = find_array(f_, chunk, storage_kind, int(c), -1, d);
+          if (!is_valid(current))
+            meep::abort("material refresh row is absent from the current array catalog");
+          const ArraySpec &spec = f_.array_catalog->spec(current);
+          plan_.material_refresh_arrays.push_back(MaterialRefreshArray{
+              chunk, c, direction(d), family, current, spec.elements});
+          add_access(f_, op, current, AccessMode::write);
+        }
+      }
+    }
+    op.material_refresh_count =
+        uint32_t(plan_.material_refresh_arrays.size()) - op.material_refresh_index;
+    return op;
+  }
 
   uint32_t operation_count() const { return uint32_t(plan_.operations.size()); }
 
@@ -337,6 +422,8 @@ public:
       sig ^= uint64_t(op.guard.variant_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
+      mix(sig, uint64_t(op.material_refresh_index));
+      mix(sig, uint64_t(op.material_refresh_count));
       sig ^= uint64_t(op.beta_descriptor_index) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       sig ^= uint64_t(op.beta_descriptor_count) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       mix(sig, uint64_t(op.cylindrical_m_descriptor_index));
@@ -386,7 +473,10 @@ public:
       hash_polarization_subtraction(sig, d);
     for (const MagneticStateArray &d : plan.magnetic_state_arrays)
       hash_magnetic_state(sig, d);
+    for (const MaterialRefreshArray &d : plan.material_refresh_arrays)
+      hash_material_refresh(sig, d);
     hash_magnetic_half_step(sig, plan.magnetic_half_step);
+    mix(sig, plan.material_phase_target_signature);
     return sig;
   }
 
@@ -587,6 +677,15 @@ private:
     hash_id(sig, d.live);
     mix(sig, uint64_t(d.elements));
     mix(sig, uint64_t(d.average));
+  }
+
+  static void hash_material_refresh(uint64_t &sig, const MaterialRefreshArray &d) {
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.c));
+    mix(sig, uint64_t(d.d));
+    mix(sig, uint64_t(d.family));
+    hash_id(sig, d.current);
+    mix(sig, uint64_t(d.elements));
   }
 
   static void hash_magnetic_half_step(uint64_t &sig, const MagneticHalfStep &d) {
@@ -1185,6 +1284,10 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
 
 } // namespace
 
+uint64_t compute_material_phase_target_signature(const fields &f) {
+  return material_phase_target_signature(f);
+}
+
 uint64_t compute_step_plan_signature(const StepPlan &plan) {
   return StepPlanBuilder::signature_for(plan);
 }
@@ -1235,7 +1338,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
      condition is an or_to_all over all chunks, so the host has to evaluate it
      between device segments. */
   if (phasing) {
-    p.add(OpKind::phase_material, field_type(NUM_FIELD_TYPES), guard_static(true));
+    p.add_material_refresh(OpKind::phase_material);
     p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_segment(0), 0.5);
     p.add_eh(H_stuff, guard_segment(0));
     p.add_boundaries(H_stuff, guard_segment(0));
@@ -1244,7 +1347,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
     p.add_boundaries(E_stuff, guard_segment(0));
   }
 
-  p.add(OpKind::update_material_coefficients);
+  p.add_material_refresh(OpKind::update_material_coefficients);
 
   uint32_t magnetic_evaluate_b = UINT32_MAX;
   if (has_sources) {
