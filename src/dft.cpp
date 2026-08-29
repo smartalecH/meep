@@ -271,6 +271,8 @@ void dft_chunk::sync_dft_to_host() const {
   if (!owner || !owner->backend || !owner->backend_state ||
       !owner->backend->requires_full_storage_preparation())
     return;
+  if (owner->backend->is_poisoned())
+    throw std::runtime_error("cannot read DFT data from a poisoned resident backend");
 
   ArrayId id = invalid_array();
   ptrdiff_t offset = 0;
@@ -290,6 +292,8 @@ void dft_chunk::publish_dft_from_host() {
   if (!owner || !owner->backend || !owner->backend_state ||
       !owner->backend->requires_full_storage_preparation())
     return;
+  if (owner->backend->is_poisoned())
+    throw std::runtime_error("cannot write DFT data to a poisoned resident backend");
 
   ArrayId id = invalid_array();
   ptrdiff_t offset = 0;
@@ -313,14 +317,9 @@ void begin_dft_monitor_removal(const std::shared_ptr<dft_monitor_lifetime> &life
      accumulator values. Migrate and retire it while every DFT allocation is
      alive; invalidating first and freeing first would make the rebuild's
      migration write through dangling host destinations. */
-  if (owner->backend_state)
-    owner->backend->prepare_state_rebuild(
-        *owner->backend_state,
-        DirtyMask(owner->dirty_mask | invalidation_closure(MutationKind::monitor_definition)));
-  delete owner->executable;
-  owner->executable = NULL;
-  delete owner->backend_state;
-  owner->backend_state = NULL;
+  backend_prepare_field_layout_change(
+      *owner, DirtyMask(owner->dirty_mask | invalidation_closure(MutationKind::monitor_definition)),
+      site);
   invalidate(*owner, MutationKind::monitor_definition, site);
 }
 
