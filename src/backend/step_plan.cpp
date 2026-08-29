@@ -857,9 +857,12 @@ public:
     mix(sig, uint64_t(plan.program));
     mix_double(sig, plan.beta);
     mix_double(sig, plan.cylindrical_m);
-    for (double k : plan.bfast_scaled_k) mix_double(sig, k);
-    for (double origin : plan.cylindrical_origin_r) mix_double(sig, origin);
-    for (uint8_t zero : plan.cylindrical_zero_near_origin) mix(sig, uint64_t(zero));
+    for (double k : plan.bfast_scaled_k)
+      mix_double(sig, k);
+    for (double origin : plan.cylindrical_origin_r)
+      mix_double(sig, origin);
+    for (uint8_t zero : plan.cylindrical_zero_near_origin)
+      mix(sig, uint64_t(zero));
     mix(sig, plan.source_signature);
     for (const Operation &op : plan.operations) {
       sig ^= uint64_t(op.kind) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
@@ -936,7 +939,8 @@ public:
       mix(sig, cw_layout_signature(plan.cw_state_layout));
     hash_magnetic_half_step(sig, plan.magnetic_half_step);
     mix(sig, plan.material_phase_target_signature);
-    for (const DftDescriptor &d : plan.dft_updates) hash_dft(sig, d);
+    for (const DftDescriptor &d : plan.dft_updates)
+      hash_dft(sig, d);
     return sig;
   }
 
@@ -1150,7 +1154,8 @@ private:
     hash_ref(sig, d.source_field);
     hash_ref(sig, d.source_field_imag);
     mix(sig, uint64_t(d.omega.size()));
-    for (size_t i = 0; i < d.omega.size(); ++i) mix_double(sig, d.omega[i]);
+    for (size_t i = 0; i < d.omega.size(); ++i)
+      mix_double(sig, d.omega[i]);
     mix_double(sig, d.scale.real());
     mix_double(sig, d.scale.imag());
     mix(sig, uint64_t(d.chunk));
@@ -1312,10 +1317,9 @@ private:
 };
 
 void StepPlanBuilder::add_source_evaluation(Guard guard, double src_offset) {
-  Operation &op = add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard,
-                      src_offset);
-  if (f_.descriptors)
-    op.descriptor_count = uint32_t(f_.descriptors->sources.source_times.size());
+  Operation &op =
+      add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard, src_offset);
+  if (f_.descriptors) op.descriptor_count = uint32_t(f_.descriptors->sources.source_times.size());
 }
 
 void StepPlanBuilder::add_sources(field_type ft) {
@@ -1384,33 +1388,31 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       update.p_prev_cross1 = invalid_array();
       update.p_cross2 = invalid_array();
       update.p_prev_cross2 = invalid_array();
-      update.primary_w = find_array(f_, descriptor.chunk, array_kind::f_w, int(state.c),
-                                    state.cmp, 0);
+      update.primary_w =
+          find_array(f_, descriptor.chunk, array_kind::f_w, int(state.c), state.cmp, 0);
       if (!is_valid(update.primary_w))
         update.primary_w =
             find_array(f_, descriptor.chunk, array_kind::f, int(state.c), state.cmp, 0);
-      update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f_w,
-                                   int(cross_component1), state.cmp, 0);
+      update.cross_w1 =
+          find_array(f_, descriptor.chunk, array_kind::f_w, int(cross_component1), state.cmp, 0);
       if (!is_valid(update.cross_w1))
-        update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f,
-                                     int(cross_component1), state.cmp, 0);
-      update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f_w,
-                                   int(cross_component2), state.cmp, 0);
+        update.cross_w1 =
+            find_array(f_, descriptor.chunk, array_kind::f, int(cross_component1), state.cmp, 0);
+      update.cross_w2 =
+          find_array(f_, descriptor.chunk, array_kind::f_w, int(cross_component2), state.cmp, 0);
       if (!is_valid(update.cross_w2))
-        update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f,
-                                     int(cross_component2), state.cmp, 0);
+        update.cross_w2 =
+            find_array(f_, descriptor.chunk, array_kind::f, int(cross_component2), state.cmp, 0);
       update.diagonal_sigma = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
                                          int(primary_direction), sigma_aux);
-      update.offdiagonal_sigma1 =
-          is_valid(update.cross_w1)
-              ? find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
-                           int(cross_direction1), sigma_aux)
-              : invalid_array();
-      update.offdiagonal_sigma2 =
-          is_valid(update.cross_w2)
-              ? find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
-                           int(cross_direction2), sigma_aux)
-              : invalid_array();
+      update.offdiagonal_sigma1 = is_valid(update.cross_w1)
+                                      ? find_array(f_, descriptor.chunk, array_kind::sigma,
+                                                   int(state.c), int(cross_direction1), sigma_aux)
+                                      : invalid_array();
+      update.offdiagonal_sigma2 = is_valid(update.cross_w2)
+                                      ? find_array(f_, descriptor.chunk, array_kind::sigma,
+                                                   int(state.c), int(cross_direction2), sigma_aux)
+                                      : invalid_array();
       const ptrdiff_t stride_sign = is_magnetic(state.c) ? -1 : 1;
       update.primary_stride = stride_sign * fc.gv.stride(primary_direction);
       update.cross_stride1 = stride_sign * fc.gv.stride(cross_direction1);
@@ -1500,20 +1502,18 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       if (!is_valid(update.primary_w))
         update.primary_w =
             find_array(f_, descriptor.chunk, array_kind::f, int(state.c), state.cmp, 0);
-      update.cross_w1 =
-          find_array(f_, descriptor.chunk, array_kind::f_w, int(c1), state.cmp, 0);
+      update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f_w, int(c1), state.cmp, 0);
       if (!is_valid(update.cross_w1))
         update.cross_w1 = find_array(f_, descriptor.chunk, array_kind::f, int(c1), state.cmp, 0);
-      update.cross_w2 =
-          find_array(f_, descriptor.chunk, array_kind::f_w, int(c2), state.cmp, 0);
+      update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f_w, int(c2), state.cmp, 0);
       if (!is_valid(update.cross_w2))
         update.cross_w2 = find_array(f_, descriptor.chunk, array_kind::f, int(c2), state.cmp, 0);
-      update.diagonal_sigma = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
-                                         int(d0), sigma_aux);
-      update.offdiagonal_sigma1 = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
-                                             int(d1), sigma_aux);
-      update.offdiagonal_sigma2 = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
-                                             int(d2), sigma_aux);
+      update.diagonal_sigma =
+          find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c), int(d0), sigma_aux);
+      update.offdiagonal_sigma1 =
+          find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c), int(d1), sigma_aux);
+      update.offdiagonal_sigma2 =
+          find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c), int(d2), sigma_aux);
       const ptrdiff_t sign = is_magnetic(state.c) ? -1 : 1;
       update.primary_stride = sign * fc.gv.stride(d0);
       update.cross_stride1 = sign * fc.gv.stride(d1);
@@ -1521,8 +1521,7 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       update.omega_0 = descriptor.gyrotropic.omega_0;
       update.gamma = descriptor.gyrotropic.gamma;
       update.alpha = descriptor.gyrotropic.alpha;
-      memcpy(update.gyro_tensor, descriptor.gyrotropic.gyro_tensor,
-             sizeof(update.gyro_tensor));
+      memcpy(update.gyro_tensor, descriptor.gyrotropic.gyro_tensor, sizeof(update.gyro_tensor));
       update.gyro_model = descriptor.gyrotropic.model;
       update.dt = fc.dt;
       update.noise_amplitude = 0.0;
@@ -3030,10 +3029,29 @@ uint64_t compute_step_plan_signature(const StepPlan &plan) {
   return StepPlanBuilder::signature_for(plan);
 }
 
-bool beta_coordinate_state_matches(const fields &f, const StepPlan *prepared) {
-  if (prepared && prepared->beta != f.beta) return false;
-  for (int i = 0; i < f.num_chunks; ++i)
-    if (f.chunks[i]->beta != f.beta) return false;
+bool coordinate_state_matches(const fields &f, const StepPlan *prepared) {
+  const auto same_k = [](const std::vector<double> &a, const std::vector<double> &b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+  };
+  if (f.bfast_scaled_k.size() != 3) return false;
+  if (prepared) {
+    const uint64_t live_generation = generation(f, MutationKind::coordinate_definition);
+    if (prepared->beta != f.beta || !same_k(prepared->bfast_scaled_k, f.bfast_scaled_k) ||
+        prepared->coordinate_generation > live_generation ||
+        (prepared->coordinate_generation == live_generation && prepared->cylindrical_m != f.m) ||
+        prepared->cylindrical_origin_r.size() != size_t(f.num_chunks) ||
+        prepared->cylindrical_zero_near_origin.size() != size_t(f.num_chunks))
+      return false;
+  }
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i] || f.chunks[i]->bfast_scaled_k.size() != 3 || f.chunks[i]->beta != f.beta ||
+        f.chunks[i]->m != f.m || !same_k(f.chunks[i]->bfast_scaled_k, f.bfast_scaled_k))
+      return false;
+    if (prepared && (prepared->cylindrical_origin_r[i] != f.chunks[i]->gv.origin_r() ||
+                     bool(prepared->cylindrical_zero_near_origin[i]) !=
+                         f.chunks[i]->zero_fields_near_cylorigin))
+      return false;
+  }
   return true;
 }
 
