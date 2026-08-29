@@ -1760,6 +1760,22 @@ static void test_material_collective_preflight() {
   if (my_rank() == 0) --f.chunks[0]->s->refcount;
   nvidia::validate_material_phase_state(f, signature);
 
+  if (my_rank() == 0) f.phasein_time = countdown - 1;
+  rejected = false;
+  try {
+    nvidia::validate_material_phase_state(f, signature);
+  }
+  catch (const std::logic_error &) {
+    rejected = true;
+  }
+  require(and_to_all(rejected),
+          "rank-asymmetric positive material countdown was not rejected collectively");
+  require((my_rank() == 0 ? f.phasein_time == countdown - 1 : f.phasein_time == countdown) &&
+              (!current_row || current_row[0] == current_value),
+          "positive-countdown rejection changed countdown or current coefficients");
+  if (my_rank() == 0) f.phasein_time = countdown;
+  nvidia::validate_material_phase_state(f, signature);
+
   if (my_rank() == 0) f.phasein_time = 0;
   rejected = false;
   try {

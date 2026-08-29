@@ -3551,6 +3551,8 @@ void NvidiaBackend::restore_magnetic_fields(Executable &raw_executable,
 void nvidia::validate_material_phase_state(const fields &f,
                                            uint64_t expected_target_signature) {
   const bool local_active = f.phasein_time > 0;
+  const int minimum_countdown = min_to_all(f.phasein_time);
+  const int maximum_countdown = max_to_all(f.phasein_time);
   const bool every_active = and_to_all(local_active);
   const bool any_active = or_to_all(local_active);
   const bool local_target_matches =
@@ -3565,7 +3567,8 @@ void nvidia::validate_material_phase_state(const fields &f,
         break;
       }
   const bool every_storage_detached = and_to_all(local_storage_detached);
-  if (any_active != every_active || !every_target_matches || !every_storage_detached)
+  if (minimum_countdown != maximum_countdown || any_active != every_active ||
+      !every_target_matches || !every_storage_detached)
     throw std::logic_error(
         "NVIDIA material phase state, target, or current storage changed after compilation on "
         "an MPI rank");
