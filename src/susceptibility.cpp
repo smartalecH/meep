@@ -626,6 +626,36 @@ void gyrotropic_susceptibility::dump_params(h5file *h5f, size_t *start) {
   *start += num_params;
 }
 
+bool gyrotropic_susceptibility::internal_layout(std::vector<InternalArrayLayout> &out,
+                                                const grid_volume &gv,
+                                                void *P_internal_data) const {
+  out.clear();
+  if (!P_internal_data) return true;
+  gyrotropy_data *d = (gyrotropy_data *)P_internal_data;
+  const realnum *base = (const realnum *)P_internal_data;
+  const size_t ntot = gv.ntot();
+  static const char *p_names[3] = {"P_x", "P_y", "P_z"};
+  static const char *p_prev_names[3] = {"P_prev_x", "P_prev_y", "P_prev_z"};
+  FOR_COMPONENTS(c) DOCMP2 {
+    if (!d->P[c][cmp][X]) continue;
+    for (int dd = X; dd < R; ++dd) {
+      InternalArrayLayout p;
+      p.name = p_names[dd];
+      p.element_type = InternalArrayLayout::realnum_value;
+      p.offset_elements = size_t(d->P[c][cmp][dd] - base);
+      p.elements = ntot;
+      p.c = c;
+      p.cmp = cmp;
+      out.push_back(p);
+      InternalArrayLayout q = p;
+      q.name = p_prev_names[dd];
+      q.offset_elements = size_t(d->P_prev[c][cmp][dd] - base);
+      out.push_back(q);
+    }
+  }
+  return true;
+}
+
 } // namespace meep
 
 namespace meep {
