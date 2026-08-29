@@ -29,12 +29,14 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <algorithm>
 #include <vector>
 
 #include <meep.hpp>
 
 #include "backend/lifecycle.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/prepare.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -72,7 +74,9 @@ static void test_coverage(const char *name, structure &s, bool with_flux, const 
 
   const size_t problems = audit_storage_catalog(f, *f.array_catalog, true);
   CHECK(problems == 0, "%s: %zu arrays are reachable but not registered", name, problems);
-  CHECK(f.array_catalog->size() > 0, "%s: catalog is empty", name);
+  bool owns_chunk = false;
+  for (int i = 0; i < f.num_chunks; ++i) owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+  CHECK(!owns_chunk || f.array_catalog->size() > 0, "%s: owned catalog is empty", name);
   CHECK(f.storage_plan->arrays.size() == f.array_catalog->size(),
         "%s: storage plan/catalog sizes differ", name);
   for (size_t i = 0; i < f.array_catalog->size(); ++i)
@@ -247,6 +251,228 @@ static void test_mid_run_susceptibility() {
   CHECK(f.array_catalog->size() == before, "catalog changed size during steady-state stepping");
 }
 
+static void test_material_phase_storage_union() {
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure current(gv, eps_slab, no_pml(), identity(), 2);
+  structure target(gv, eps_slab, no_pml(), identity(), 2);
+  fields f(&current);
+
+  bool owns = false;
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    owns = true;
+    structure_chunk &src = *f.chunks[i]->s;
+    structure_chunk &dst = *target.chunks[i];
+    const size_t n = size_t(dst.gv.ntot());
+    delete[] src.conductivity[Dz][Z];
+    src.conductivity[Dz][Z] = new realnum[n];
+    std::fill(src.conductivity[Dz][Z], src.conductivity[Dz][Z] + n, realnum(0.1));
+    delete[] src.condinv[Dz][Z];
+    src.condinv[Dz][Z] = NULL;
+    /* Deliberately inconsistent but valid pre-step cache state: preparation
+       must repair the missing inverse even when the stale flag was cleared. */
+    src.condinv_stale = false;
+    delete[] dst.chi1inv[Ex][Y];
+    dst.chi1inv[Ex][Y] = new realnum[n];
+    std::fill(dst.chi1inv[Ex][Y], dst.chi1inv[Ex][Y] + n, realnum(0.25));
+    dst.trivial_chi1inv[Ex][Y] = false;
+    delete[] dst.conductivity[Dy][Y];
+    dst.conductivity[Dy][Y] = new realnum[n];
+    std::fill(dst.conductivity[Dy][Y], dst.conductivity[Dy][Y] + n, realnum(0.4));
+    dst.condinv_stale = true;
+    dst.update_condinv();
+  }
+
+  std::vector<structure_chunk *> before(size_t(f.num_chunks), NULL);
+  std::vector<structure_chunk *> targets(size_t(f.num_chunks), NULL);
+  std::vector<int> refcounts(size_t(f.num_chunks), 0);
+  std::vector<int> target_refcounts(size_t(f.num_chunks), 0);
+  for (int i = 0; i < f.num_chunks; ++i) {
+    before[size_t(i)] = f.chunks[i]->s;
+    targets[size_t(i)] = target.chunks[i];
+    target_refcounts[size_t(i)] = target.chunks[i]->refcount;
+  }
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (before[size_t(i)]) refcounts[size_t(i)] = before[size_t(i)]->refcount;
+  {
+    std::unique_ptr<PreparedMaterialPhaseStorage> discarded =
+        prepare_material_phase_storage(f, target);
+  }
+  for (int i = 0; i < f.num_chunks; ++i) {
+    CHECK(f.chunks[i]->s == before[size_t(i)],
+          "discarded material preparation rebound current storage");
+    CHECK(!before[size_t(i)] || before[size_t(i)]->refcount == refcounts[size_t(i)],
+          "discarded material preparation changed current refcounts");
+    CHECK(target.chunks[i] == targets[size_t(i)] &&
+              target.chunks[i]->refcount == target_refcounts[size_t(i)],
+          "discarded material preparation changed target ownership");
+  }
+  std::unique_ptr<PreparedMaterialPhaseStorage> prepared =
+      prepare_material_phase_storage(f, target);
+  prepared->commit();
+
+  for (int i = 0; i < f.num_chunks; ++i) {
+    CHECK(target.chunks[i] == targets[size_t(i)] &&
+              target.chunks[i]->refcount == target_refcounts[size_t(i)],
+          "committed material preparation changed target ownership");
+    if (!f.chunks[i]->is_mine()) continue;
+    structure_chunk &prepared = *f.chunks[i]->s;
+    CHECK(&prepared != before[size_t(i)],
+          "resident material preparation did not detach current structure storage");
+    CHECK(prepared.refcount == 1, "installed material clone does not have one owner");
+    CHECK(before[size_t(i)]->refcount == refcounts[size_t(i)] - 1,
+          "material commit did not release exactly one old current reference");
+    CHECK(prepared.chi1inv[Ex][Y] && !prepared.trivial_chi1inv[Ex][Y],
+          "material union did not realize a nontrivial off-diagonal row");
+    CHECK(prepared.conductivity[Dy][Y] && prepared.condinv[Dy][Y],
+          "material union did not realize conductivity and diagonal inverse rows");
+    CHECK(prepared.conductivity[Dz][Z] && prepared.condinv[Dz][Z],
+          "material union did not repair a stale current conductivity inverse");
+    const size_t n = size_t(prepared.gv.ntot());
+    for (size_t j = 0; j < n; ++j) {
+      CHECK(prepared.chi1inv[Ex][Y][j] == realnum(0),
+            "new current off-diagonal row did not start at the implicit zero");
+      CHECK(prepared.conductivity[Dy][Y][j] == realnum(0),
+            "new current conductivity row did not start at zero");
+      CHECK(prepared.condinv[Dy][Y][j] == realnum(1),
+            "new current conductivity inverse did not start at one");
+      CHECK(prepared.conductivity[Dz][Z][j] == realnum(0.1) &&
+                prepared.condinv[Dz][Z][j] ==
+                    realnum(1 / (1 + double(realnum(0.1)) * prepared.dt * 0.5)),
+            "stale current conductivity inverse was not realized on the clone");
+      CHECK(target.chunks[i]->chi1inv[Ex][Y][j] == realnum(0.25) &&
+                target.chunks[i]->conductivity[Dy][Y][j] == realnum(0.4),
+            "material union mutated target storage");
+    }
+  }
+  CHECK(or_to_all(owns), "material union fixture has no owned chunk");
+
+  CpuArrayCatalog catalog;
+  StoragePlan storage;
+  build_storage_catalog(f, catalog, storage);
+  CHECK(audit_storage_catalog(f, catalog, true) == 0,
+        "prepared material union failed storage-catalog audit");
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    structure_chunk &prepared = *f.chunks[i]->s;
+    const struct ExpectedRow {
+      array_kind kind;
+      component c;
+      direction d;
+      realnum *address;
+    } expected[] = {
+        {array_kind::chi1inv, Ex, Y, prepared.chi1inv[Ex][Y]},
+        {array_kind::conductivity, Dy, Y, prepared.conductivity[Dy][Y]},
+        {array_kind::condinv, Dy, Y, prepared.condinv[Dy][Y]},
+        {array_kind::conductivity, Dz, Z, prepared.conductivity[Dz][Z]},
+        {array_kind::condinv, Dz, Z, prepared.condinv[Dz][Z]},
+    };
+    for (const ExpectedRow &row : expected) {
+      const ArrayId id = catalog.find(StorageKey{i, int(row.kind), int(row.c), -1, int(row.d)});
+      CHECK(is_valid(id) && catalog.resolve<realnum>(id) == row.address,
+            "prepared current material row did not resolve through its canonical ArrayId");
+    }
+    structure_chunk &dst = *target.chunks[i];
+    FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+      if (dst.chi1inv[c][d])
+        CHECK(!catalog.contains_address(dst.chi1inv[c][d]),
+              "host-only target chi1inv row entered the current catalog");
+      if (dst.conductivity[c][d])
+        CHECK(!catalog.contains_address(dst.conductivity[c][d]),
+              "host-only target conductivity row entered the current catalog");
+      if (dst.condinv[c][d])
+        CHECK(!catalog.contains_address(dst.condinv[c][d]),
+              "host-only target condinv row entered the current catalog");
+    }
+  }
+
+  std::vector<structure_chunk *> committed(size_t(f.num_chunks), NULL);
+  for (int i = 0; i < f.num_chunks; ++i) committed[size_t(i)] = f.chunks[i]->s;
+  std::unique_ptr<PreparedMaterialPhaseStorage> repeated =
+      prepare_material_phase_storage(f, target);
+  repeated->commit();
+  for (int i = 0; i < f.num_chunks; ++i)
+    CHECK(f.chunks[i]->s == committed[size_t(i)],
+          "idempotent material preparation changed a stable current pointer");
+}
+
+static void test_material_coefficient_storage() {
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure current(gv, eps_slab, no_pml(), identity(), 2);
+  fields f(&current);
+  bool owns = false;
+  std::vector<structure_chunk *> before(size_t(f.num_chunks), NULL);
+  std::vector<int> refcounts(size_t(f.num_chunks), 0);
+  for (int i = 0; i < f.num_chunks; ++i) {
+    before[size_t(i)] = f.chunks[i]->s;
+    refcounts[size_t(i)] = before[size_t(i)]->refcount;
+    if (!f.chunks[i]->is_mine()) continue;
+    owns = true;
+    structure_chunk &chunk = *f.chunks[i]->s;
+    const size_t n = size_t(chunk.gv.ntot());
+    delete[] chunk.conductivity[Dz][Z];
+    chunk.conductivity[Dz][Z] = new realnum[n];
+    std::fill(chunk.conductivity[Dz][Z], chunk.conductivity[Dz][Z] + n, realnum(0.2));
+    delete[] chunk.condinv[Dz][Z];
+    chunk.condinv[Dz][Z] = NULL;
+    chunk.condinv_stale = false;
+  }
+
+  {
+    std::unique_ptr<PreparedMaterialCoefficientStorage> discarded =
+        prepare_material_coefficient_storage(f);
+  }
+  for (int i = 0; i < f.num_chunks; ++i) {
+    CHECK(f.chunks[i]->s == before[size_t(i)] &&
+              before[size_t(i)]->refcount == refcounts[size_t(i)],
+          "discarded coefficient preparation changed current storage ownership");
+    if (f.chunks[i]->is_mine())
+      CHECK(!f.chunks[i]->s->condinv[Dz][Z],
+            "discarded coefficient preparation published a diagonal inverse");
+  }
+
+  std::unique_ptr<PreparedMaterialCoefficientStorage> prepared =
+      prepare_material_coefficient_storage(f);
+  prepared->commit();
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    structure_chunk &chunk = *f.chunks[i]->s;
+    CHECK(&chunk != before[size_t(i)] && chunk.refcount == 1 &&
+              before[size_t(i)]->refcount == refcounts[size_t(i)] - 1,
+          "coefficient preparation did not detach and release current storage exactly once");
+    CHECK(chunk.condinv[Dz][Z] && !chunk.condinv_stale,
+          "coefficient preparation did not realize the diagonal inverse");
+    const realnum expected = realnum(1 / (1 + double(realnum(0.2)) * chunk.dt * 0.5));
+    for (size_t j = 0; j < size_t(chunk.gv.ntot()); ++j)
+      CHECK(chunk.condinv[Dz][Z][j] == expected,
+            "coefficient preparation changed CPU inverse rounding");
+  }
+  CHECK(or_to_all(owns), "coefficient preparation fixture has no owned chunk");
+
+  std::vector<structure_chunk *> committed(size_t(f.num_chunks), NULL);
+  for (int i = 0; i < f.num_chunks; ++i) committed[size_t(i)] = f.chunks[i]->s;
+  std::unique_ptr<PreparedMaterialCoefficientStorage> repeated =
+      prepare_material_coefficient_storage(f);
+  repeated->commit();
+  for (int i = 0; i < f.num_chunks; ++i)
+    CHECK(f.chunks[i]->s == committed[size_t(i)],
+          "idempotent coefficient preparation changed a stable current pointer");
+
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    delete[] f.chunks[i]->s->conductivity[Dz][Z];
+    f.chunks[i]->s->conductivity[Dz][Z] = NULL;
+    f.chunks[i]->s->condinv_stale = true;
+  }
+  std::unique_ptr<PreparedMaterialCoefficientStorage> removed =
+      prepare_material_coefficient_storage(f);
+  removed->commit();
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine())
+      CHECK(!f.chunks[i]->s->condinv[Dz][Z] && !f.chunks[i]->s->condinv_stale,
+            "coefficient preparation retained an inverse after conductivity removal");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -270,6 +496,8 @@ int main(int argc, char **argv) {
   test_mid_run_source();
   test_mid_run_susceptibility();
   test_polarization_halo_remap();
+  test_material_phase_storage_union();
+  test_material_coefficient_storage();
 
   if (failures) {
     master_printf("storage_plan: %d FAILURE(S)\n", failures);
