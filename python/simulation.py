@@ -3185,7 +3185,7 @@ class Simulation:
     def get_dft_data(self, dft_chunk):
         n = mp._get_dft_data_size(dft_chunk)
         arr = np.zeros(n, np.complex128)
-        mp._get_dft_data(dft_chunk, arr)
+        mp._get_dft_data(self.fields, dft_chunk, arr)
         return arr
 
     def add_near2far(self, *args, **kwargs):
@@ -3473,7 +3473,7 @@ class Simulation:
         dimensions (for both the cell and the flux regions) with the same number of
         processors and chunk layout.
         """
-        mp._load_dft_data(near2far.F, n2fdata.F)
+        mp._load_dft_data(self.fields, near2far.F, n2fdata.F)
 
     def load_minus_near2far_data(self, near2far, n2fdata):
         """
@@ -3584,9 +3584,9 @@ class Simulation:
         (for both the cell and the flux regions) with the same number of processors and
         chunk layout.
         """
-        mp._load_dft_data(force.offdiag1, fdata.offdiag1)
-        mp._load_dft_data(force.offdiag2, fdata.offdiag2)
-        mp._load_dft_data(force.diag, fdata.diag)
+        mp._load_dft_data(self.fields, force.offdiag1, fdata.offdiag1)
+        mp._load_dft_data(self.fields, force.offdiag2, fdata.offdiag2)
+        mp._load_dft_data(self.fields, force.diag, fdata.diag)
 
     def load_minus_force_data(self, force, fdata):
         """
@@ -3748,8 +3748,8 @@ class Simulation:
         (for both the cell and the flux regions) with the same number of processors and
         chunk layout.
         """
-        mp._load_dft_data(flux.E, fdata.E)
-        mp._load_dft_data(flux.H, fdata.H)
+        mp._load_dft_data(self.fields, flux.E, fdata.E)
+        mp._load_dft_data(self.fields, flux.H, fdata.H)
 
     load_mode_data = load_flux_data
 
