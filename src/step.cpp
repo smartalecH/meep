@@ -60,15 +60,44 @@ void fields::step() { advance(1); }
 void fields::advance(int n) {
   if (n <= 0) return;
   init_backend();
+  ensure_backend_executable();
+  backend->advance(*executable, *backend_state, n);
+}
+
+void fields::ensure_backend_executable() {
   /* step_plan_for clears dirty_executable, so remember whether the compiled
      backend artifact was stale before asking it to rebuild the data plan. */
-  const bool recompile = !executable || is_dirty(*this, dirty_executable);
+  const bool local_recompile = !executable || is_dirty(*this, dirty_executable);
+  const bool recompile =
+      backend->requires_full_storage_preparation() ? or_to_all(local_recompile) : local_recompile;
   const StepPlan &plan = step_plan_for(StepProgram::ordinary);
-  if (recompile) {
-    delete executable;
-    executable = backend->compile(plan, *backend_state);
+  if (!recompile) return;
+
+  Executable *previous = executable;
+  Executable *replacement = NULL;
+  std::string local_error;
+  try {
+    replacement = backend->compile(plan, *backend_state);
+    if (!replacement) throw std::runtime_error("backend returned no executable");
   }
-  backend->advance(*executable, *backend_state, n);
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown backend compilation failure";
+  }
+  const bool failed = backend->requires_full_storage_preparation() ? or_to_all(!local_error.empty())
+                                                                   : !local_error.empty();
+  if (failed) {
+    delete replacement;
+    executable = previous;
+    dirty_mask |= dirty_executable;
+    if (local_error.empty())
+      throw std::runtime_error("backend compilation failed on another MPI rank");
+    throw std::runtime_error(local_error);
+  }
+  executable = replacement;
+  delete previous;
 }
 
 void fields::advance_cpu(int n) {
@@ -339,7 +368,8 @@ void fields::step_boundaries(field_type ft) {
 
       realnum *outgoing_comm_block = comm_blocks[ft][pair_idx];
       for (connect_phase ip : all_connect_phases)
-        if (const HaloPlan *p = halos->find({ft, ip, comm_pair})) pack_halo(*p, outgoing_comm_block);
+        if (const HaloPlan *p = halos->find({ft, ip, comm_pair}))
+          pack_halo(*p, outgoing_comm_block);
       if (chunks[op.other_chunk_idx]->is_mine()) { continue; }
       manager->send_real_async(comm_blocks[ft][pair_idx], static_cast<int>(op.transfer_size),
                                op.other_proc_id, op.tag);
