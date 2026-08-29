@@ -14,6 +14,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <set>
+
 #include "backend/nvidia/nvidia_step.hpp"
 
 namespace meep {
@@ -52,6 +54,15 @@ struct array_copy_launch {
   size_t elements;
   scalar_precision precision;
 };
+
+/* This is part of descriptor compilation, not launch-time policy. Keeping the
+   classifier CUDA-free makes the exact lowering decision directly testable. */
+inline bool source_indices_require_sequential(const ptrdiff_t *indices, size_t count) {
+  std::set<ptrdiff_t> unique_indices;
+  for (size_t i = 0; i < count; ++i)
+    if (!unique_indices.insert(indices[i]).second) return true;
+  return false;
+}
 
 /* One launch applies one spatial descriptor. Descriptors with unique indices
    use a grid-stride kernel. A descriptor containing duplicate indices uses a
