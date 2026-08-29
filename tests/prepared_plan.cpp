@@ -25,9 +25,9 @@ static int failures = 0;
 #define CHECK(cond, ...)                                                                           \
   do {                                                                                             \
     if (!(cond)) {                                                                                 \
-      printf("[rank %d] FAIL (%s:%d): ", my_rank(), __FILE__, __LINE__);                          \
+      printf("[rank %d] FAIL (%s:%d): ", my_rank(), __FILE__, __LINE__);                           \
       printf(__VA_ARGS__);                                                                         \
-      printf("\n");                                                                               \
+      printf("\n");                                                                                \
       fflush(stdout);                                                                              \
       ++failures;                                                                                  \
     }                                                                                              \
@@ -65,6 +65,15 @@ static bool has_access(const Operation &op, ArrayId id, AccessMode mode) {
   if (!is_valid(id)) return true;
   for (size_t i = 0; i < op.accesses.size(); ++i)
     if (op.accesses[i].array.id == id && op.accesses[i].mode == mode) return true;
+  return false;
+}
+
+static bool covers_access(const Operation &op, ArrayId id, AccessMode mode) {
+  if (!is_valid(id)) return true;
+  for (size_t i = 0; i < op.accesses.size(); ++i)
+    if (op.accesses[i].array.id == id &&
+        (op.accesses[i].mode == mode || op.accesses[i].mode == AccessMode::read_write))
+      return true;
   return false;
 }
 
@@ -141,8 +150,7 @@ static void check_region(const fields &f, const UpdateRegion &region) {
     for (size_t i1 = 0; i1 < region.counts[1]; ++i1)
       for (size_t i2 = 0; i2 < region.counts[2]; ++i2)
         flattened.push_back(ptrdiff_t(region.base) + ptrdiff_t(i0) * region.strides[0] +
-                            ptrdiff_t(i1) * region.strides[1] +
-                            ptrdiff_t(i2) * region.strides[2]);
+                            ptrdiff_t(i1) * region.strides[1] + ptrdiff_t(i2) * region.strides[2]);
 
   CHECK(reference == flattened, "chunk %d component %d flattened region differs", region.chunk,
         int(region.c));
@@ -173,10 +181,10 @@ static void check_prepared_updates() {
         const CurlUpdate &d = plan.db_updates[i];
         check_region(f, d.region);
         CHECK(is_valid(d.target), "curl descriptor has no target");
-        CHECK((d.region.variant_key & ~(curl_has_second_derivative | curl_has_pml |
-                                        curl_has_pml_aux | curl_has_conductivity |
-                                        curl_has_bfast)) == 0,
-              "curl descriptor has an unbounded variant bit");
+        CHECK(
+            (d.region.variant_key & ~(curl_has_second_derivative | curl_has_pml | curl_has_pml_aux |
+                                      curl_has_conductivity | curl_has_bfast)) == 0,
+            "curl descriptor has an unbounded variant bit");
         CHECK(has_access(op, d.target) && has_access(op, d.plus_source) &&
                   has_access(op, d.minus_source) && has_access(op, d.target_u) &&
                   has_access(op, d.conductivity) && has_access(op, d.condinv) &&
@@ -204,20 +212,19 @@ static void check_prepared_updates() {
         check_region(f, d.region);
         CHECK(is_valid(d.target) && is_valid(d.primary),
               "constitutive descriptor lacks target or primary field");
-        CHECK((d.region.variant_key & ~(constitutive_one_offdiagonal |
-                                        constitutive_two_offdiagonals | constitutive_has_pml |
-                                        constitutive_has_nonlinearity | constitutive_has_minus_p |
-                                        constitutive_copy_w_previous)) == 0,
+        CHECK((d.region.variant_key &
+               ~(constitutive_one_offdiagonal | constitutive_two_offdiagonals |
+                 constitutive_has_pml | constitutive_has_nonlinearity | constitutive_has_minus_p |
+                 constitutive_copy_w_previous)) == 0,
               "constitutive descriptor has an unbounded variant bit");
         CHECK(has_access(op, d.target) && has_access(op, d.base_primary) &&
                   has_access(op, d.base_cross1) && has_access(op, d.base_cross2) &&
                   has_access(op, d.primary) && has_access(op, d.cross1) &&
                   has_access(op, d.cross2) && has_access(op, d.diagonal) &&
                   has_access(op, d.offdiagonal1) && has_access(op, d.offdiagonal2) &&
-                  has_access(op, d.chi2) && has_access(op, d.chi3) &&
-                  has_access(op, d.target_w) && has_access(op, d.previous_w) &&
-                  has_access(op, d.pml.sig) && has_access(op, d.pml.kap) &&
-                  has_access(op, d.pml.siginv),
+                  has_access(op, d.chi2) && has_access(op, d.chi3) && has_access(op, d.target_w) &&
+                  has_access(op, d.previous_w) && has_access(op, d.pml.sig) &&
+                  has_access(op, d.pml.kap) && has_access(op, d.pml.siginv),
               "constitutive descriptor access set is incomplete");
       }
     }
@@ -253,7 +260,8 @@ static void check_bfast_plan() {
   const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
   size_t rows = 0;
   bool owns_chunk = false;
-  for (int i = 0; i < f.num_chunks; ++i) owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+  for (int i = 0; i < f.num_chunks; ++i)
+    owns_chunk = owns_chunk || f.chunks[i]->is_mine();
   bool saw_one_source = false, saw_two_sources = false;
   bool saw_main_pml = false, saw_aux_pml = false, saw_conductivity = false;
   for (const Operation &op : plan.operations) {
@@ -325,8 +333,7 @@ static void check_bfast_plan() {
   for (const CurlUpdate &curl : zero_plan.db_updates) {
     CHECK((curl.region.variant_key & curl_has_bfast) == 0,
           "zero scaled k retained the BFAST curl bit");
-    CHECK(curl.bfast_update_index == UINT32_MAX,
-          "zero scaled k retained a paired BFAST index");
+    CHECK(curl.bfast_update_index == UINT32_MAX, "zero scaled k retained a paired BFAST index");
   }
 }
 
@@ -396,8 +403,8 @@ static void check_one_cross_normalization() {
             "normalized cross slot does not select its matching effective input");
       CHECK(has_access(op, d.base_cross1, AccessMode::read),
             "normalized cross base is not recorded read-only");
-      CHECK(has_access(op, d.cross1, is_valid(expected_minus_p) ? AccessMode::read_write
-                                                               : AccessMode::read),
+      CHECK(has_access(op, d.cross1,
+                       is_valid(expected_minus_p) ? AccessMode::read_write : AccessMode::read),
             "normalized cross has the wrong access mode");
       ++normalized;
     }
@@ -463,8 +470,7 @@ static void check_beta_plan(bool real_fields, double beta) {
       CHECK(op.beta_descriptor_count == 0, "non-update_db operation owns beta rows");
       continue;
     }
-    CHECK(size_t(op.beta_descriptor_index) + op.beta_descriptor_count <=
-              plan.beta_updates.size(),
+    CHECK(size_t(op.beta_descriptor_index) + op.beta_descriptor_count <= plan.beta_updates.size(),
           "beta descriptor span is out of range");
     for (size_t i = op.beta_descriptor_index;
          i < size_t(op.beta_descriptor_index) + op.beta_descriptor_count; ++i) {
@@ -473,8 +479,8 @@ static void check_beta_plan(bool real_fields, double beta) {
       check_region(f, d.region);
       CHECK(d.region.c == Bx || d.region.c == By || d.region.c == Dx || d.region.c == Dy,
             "beta row targets a non-transverse component");
-      CHECK((d.region.variant_key &
-             ~(beta_has_pml | beta_has_pml_aux | beta_has_conductivity)) == 0,
+      CHECK((d.region.variant_key & ~(beta_has_pml | beta_has_pml_aux | beta_has_conductivity)) ==
+                0,
             "beta descriptor has an unbounded variant bit");
       CHECK(is_valid(d.target) && is_valid(d.source), "beta row lacks a required operand");
       CHECK(has_access(op, d.target, AccessMode::read_write) &&
@@ -512,8 +518,8 @@ static void check_beta_plan(bool real_fields, double beta) {
       CHECK(d.betadt == double(expected), "beta coefficient differs from host realnum order");
     }
   }
-  CHECK(or_to_all(rows > 0), "%s beta=%g produced no beta rows",
-        real_fields ? "real" : "complex", beta);
+  CHECK(or_to_all(rows > 0), "%s beta=%g produced no beta rows", real_fields ? "real" : "complex",
+        beta);
   CHECK(or_to_all(saw_main_pml) && or_to_all(saw_aux_pml) && or_to_all(saw_conductivity),
         "beta plan did not cover primary PML, auxiliary PML, and conductivity");
   CHECK(or_to_all(saw_b) && or_to_all(saw_d) && or_to_all(saw_x) && or_to_all(saw_y),
@@ -536,6 +542,569 @@ static void check_zero_beta_plan() {
     CHECK(op.beta_descriptor_count == 0, "zero beta emitted a nonempty beta span");
 }
 
+static void require_cylindrical_components(fields &f) {
+  f.require_component(Er);
+  f.require_component(Ep);
+  f.require_component(Ez);
+  f.require_component(Hr);
+  f.require_component(Hp);
+  f.require_component(Hz);
+}
+
+struct ExpectedCylindricalOriginAction {
+  CylindricalOriginActionKind kind;
+  ArrayId array;
+  int radial_row;
+};
+
+static ArrayId cylindrical_array(const fields &f, int chunk, array_kind kind, component c,
+                                 int cmp) {
+  return f.array_catalog->find({chunk, int(kind), int(c), cmp, 0});
+}
+
+static component cylindrical_tail_source(field_type ft, direction dc) {
+  if (ft == D_stuff) return dc == R ? Hz : Hr;
+  return dc == R ? Ez : Er;
+}
+
+static void check_cylindrical_plan(double m, bool zero_near_origin, bool use_bfast,
+                                   bool force_complex = false, bool annular = false,
+                                   bool pure_conductivity = false) {
+  grid_volume gv = volcyl(3.0, 4.0, 8.0);
+  if (annular) gv.shift_origin(R, 12);
+  structure s(gv, eps_slab, pure_conductivity ? no_pml() : pml(0.5));
+  const component components[] = {Er, Ep, Ez, Hr, Hp, Hz};
+  for (component c : components)
+    s.set_conductivity(c, unit_conductivity);
+  const std::vector<double> scaled_k =
+      use_bfast ? std::vector<double>{0.17, -0.11, 0.07} : std::vector<double>{0, 0, 0};
+  fields f(&s, m, 0, zero_near_origin, 64, 64, scaled_k);
+  if (m == 0 && !force_complex) f.use_real_fields();
+  require_cylindrical_components(f);
+  f.advance(1);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  CHECK(plan.cylindrical_m == m, "plan did not retain cylindrical m=%g", m);
+  CHECK(plan.cylindrical_origin_r.size() == size_t(f.num_chunks) &&
+            plan.cylindrical_zero_near_origin.size() == size_t(f.num_chunks),
+        "plan did not retain one cylindrical fingerprint per chunk");
+  for (int i = 0; i < f.num_chunks; ++i) {
+    CHECK(plan.cylindrical_origin_r[i] == f.chunks[i]->gv.origin_r(),
+          "plan cylindrical origin fingerprint differs on chunk %d", i);
+    CHECK(bool(plan.cylindrical_zero_near_origin[i]) == f.chunks[i]->zero_fields_near_cylorigin,
+          "plan cylindrical origin policy differs on chunk %d", i);
+  }
+
+  size_t z_curls = 0, prefixes = 0, r_suppressed = 0, m_rows = 0;
+  size_t axis_actions = 0, zero_actions = 0, axis_replays = 0;
+  bool saw_prefix_before_bfast = false, saw_axis_then_zero = false;
+  bool saw_main_pml = false, saw_aux_pml = false, saw_conductivity = false;
+  bool owns_chunk = false, owns_origin_chunk = false;
+  for (int i = 0; i < f.num_chunks; ++i) {
+    owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+    owns_origin_chunk =
+        owns_origin_chunk || (f.chunks[i]->is_mine() && f.chunks[i]->gv.origin_r() == 0.0);
+  }
+  for (const Operation &op : plan.operations) {
+    if (op.kind == OpKind::update_db) {
+      CHECK(size_t(op.cylindrical_m_descriptor_index) + op.cylindrical_m_descriptor_count <=
+                plan.cylindrical_m_updates.size(),
+            "cylindrical m/r span is out of range");
+      CHECK(size_t(op.cylindrical_origin_action_index) + op.cylindrical_origin_action_count <=
+                plan.cylindrical_origin_actions.size(),
+            "cylindrical origin-action span is out of range");
+      size_t expected_curls = 0, expected_prefixes = 0;
+      std::vector<std::pair<ArrayId, ArrayId> > expected_m_rows;
+      std::vector<ExpectedCylindricalOriginAction> expected_origin_actions;
+      auto append_zero = [&](int chunk, component c, int cmp, int row) {
+        const array_kind kinds[] = {array_kind::f, array_kind::f_cond, array_kind::f_u};
+        for (array_kind kind : kinds) {
+          const ArrayId id = cylindrical_array(f, chunk, kind, c, cmp);
+          if (is_valid(id))
+            expected_origin_actions.push_back({CylindricalOriginActionKind::zero_slab, id, row});
+        }
+      };
+      for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+        const fields_chunk &fc = *f.chunks[chunk];
+        if (!fc.is_mine()) continue;
+        const int cmps = fc.is_real ? 1 : 2;
+        for (size_t tile = 0; tile < fc.gvs_tiled.size(); ++tile)
+          for (int cmp = 0; cmp < cmps; ++cmp)
+            FOR_FT_COMPONENTS(op.ft, cc) {
+              if (!is_valid(cylindrical_array(f, chunk, array_kind::f, cc, cmp))) continue;
+              ++expected_curls;
+              if (component_direction(cc) == Z) ++expected_prefixes;
+            }
+        if (m != 0)
+          for (int cmp = 0; cmp < cmps; ++cmp)
+            FOR_FT_COMPONENTS(op.ft, cc) {
+              const direction dc = component_direction(cc);
+              if (dc != R && dc != Z) continue;
+              const ArrayId target = cylindrical_array(f, chunk, array_kind::f, cc, cmp);
+              const ArrayId source = cylindrical_array(f, chunk, array_kind::f,
+                                                       cylindrical_tail_source(op.ft, dc), 1 - cmp);
+              if (is_valid(target) && is_valid(source)) expected_m_rows.push_back({target, source});
+            }
+        if (fc.gv.origin_r() != 0.0) continue;
+        for (int cmp = 0; cmp < cmps; ++cmp) {
+          if (m == 0 && op.ft == D_stuff) {
+            const ArrayId target = cylindrical_array(f, chunk, array_kind::f, Dz, cmp);
+            const ArrayId source = cylindrical_array(f, chunk, array_kind::f, Hp, cmp);
+            if (is_valid(target) && is_valid(source)) {
+              expected_origin_actions.push_back(
+                  {CylindricalOriginActionKind::axis_update, target, 0});
+              append_zero(chunk, Dp, cmp, 0);
+            }
+          }
+          else if (m == 0 && op.ft == B_stuff) {
+            if (is_valid(cylindrical_array(f, chunk, array_kind::f, Br, cmp)))
+              append_zero(chunk, Br, cmp, 0);
+          }
+          else if (fabs(m) == 1) {
+            const component target_component = op.ft == D_stuff ? Dp : Br;
+            const component source1_component = op.ft == D_stuff ? Hr : Ep;
+            const component source2_component = op.ft == D_stuff ? Hz : Ez;
+            const int source2_cmp = op.ft == D_stuff ? cmp : 1 - cmp;
+            const ArrayId target =
+                cylindrical_array(f, chunk, array_kind::f, target_component, cmp);
+            const ArrayId source1 =
+                cylindrical_array(f, chunk, array_kind::f, source1_component, cmp);
+            const ArrayId source2 =
+                cylindrical_array(f, chunk, array_kind::f, source2_component, source2_cmp);
+            if (is_valid(target) && is_valid(source1) && is_valid(source2)) {
+              expected_origin_actions.push_back(
+                  {CylindricalOriginActionKind::axis_update, target, 0});
+              if (op.ft == D_stuff) append_zero(chunk, Dz, cmp, 0);
+            }
+          }
+          else if (m != 0) {
+            int radial_rows = 1;
+            if (zero_near_origin) {
+              radial_rows = 0;
+              const double rmax = fabs(m) - int(fc.gv.origin_r() * fc.gv.a + 0.5);
+              while (radial_rows <= fc.gv.nr() && radial_rows < rmax)
+                ++radial_rows;
+            }
+            const array_kind kinds[] = {array_kind::f, array_kind::f_cond, array_kind::f_u};
+            for (int row = 0; row < radial_rows; ++row)
+              for (array_kind kind : kinds)
+                FOR_FT_COMPONENTS(op.ft, cc) {
+                  const ArrayId id = cylindrical_array(f, chunk, kind, cc, cmp);
+                  if (is_valid(id))
+                    expected_origin_actions.push_back(
+                        {CylindricalOriginActionKind::zero_slab, id, row});
+                }
+          }
+        }
+      }
+      CHECK(op.descriptor_count == expected_curls,
+            "cylindrical curl span has %u rows, expected %zu", op.descriptor_count, expected_curls);
+      CHECK(op.cylindrical_m_descriptor_count == expected_m_rows.size(),
+            "cylindrical m/r span has %u rows, expected %zu", op.cylindrical_m_descriptor_count,
+            expected_m_rows.size());
+      CHECK(op.cylindrical_origin_action_count == expected_origin_actions.size(),
+            "cylindrical origin span has %u actions, expected %zu",
+            op.cylindrical_origin_action_count, expected_origin_actions.size());
+      size_t op_prefixes = 0;
+      for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
+           ++i) {
+        const CurlUpdate &curl = plan.db_updates[i];
+        const direction dc = component_direction(curl.region.c);
+        CHECK(has_access(op, curl.target) && has_access(op, curl.plus_source) &&
+                  has_access(op, curl.minus_source) && has_access(op, curl.target_u) &&
+                  has_access(op, curl.conductivity) && has_access(op, curl.condinv) &&
+                  has_access(op, curl.target_cond) && has_access(op, curl.pml.sig) &&
+                  has_access(op, curl.pml.kap) && has_access(op, curl.pml.siginv) &&
+                  has_access(op, curl.pml_u.sig) && has_access(op, curl.pml_u.kap) &&
+                  has_access(op, curl.pml_u.siginv),
+              "cylindrical curl access set is incomplete");
+        saw_main_pml |= (curl.region.variant_key & curl_has_pml) != 0;
+        saw_aux_pml |= (curl.region.variant_key & curl_has_pml_aux) != 0;
+        saw_conductivity |= (curl.region.variant_key & curl_has_conductivity) != 0;
+        if (dc == Z) {
+          ++z_curls;
+          CHECK(curl.radial_prefix_index < plan.cylindrical_radial_prefixes.size(),
+                "cylindrical Z curl lacks its paired radial prefix");
+          if (curl.radial_prefix_index < plan.cylindrical_radial_prefixes.size()) {
+            const CylindricalRadialPrefix &prefix =
+                plan.cylindrical_radial_prefixes[curl.radial_prefix_index];
+            ++prefixes;
+            ++op_prefixes;
+            const ArrayId expected_scratch = f.array_catalog->find(
+                {curl.region.chunk, int(array_kind::f_rderiv_int), -1, -1, 0});
+            CHECK(prefix.scratch == expected_scratch && curl.plus_source == expected_scratch,
+                  "cylindrical Z curl does not consume its chunk radial scratch");
+            CHECK(!is_valid(curl.minus_source),
+                  "cylindrical Z curl did not suppress its minus pointer");
+            CHECK(prefix.nr == size_t(f.chunks[curl.region.chunk]->gv.nr()) &&
+                      prefix.nz == size_t(f.chunks[curl.region.chunk]->gv.nz()) &&
+                      prefix.row_stride == prefix.nz + 1,
+                  "cylindrical radial-prefix shape is wrong");
+            const fields_chunk &fc = *f.chunks[curl.region.chunk];
+            const realnum expected_ir0 =
+                fc.gv.origin_r() * fc.gv.a +
+                0.5 * fc.gv.iyee_shift(prefix.source_component).in_direction(R);
+            CHECK(prefix.ir0 == double(expected_ir0),
+                  "cylindrical radial-prefix ir0 differs from host realnum order");
+            CHECK(prefix.source_elements == f.array_catalog->spec(prefix.source).elements &&
+                      prefix.scratch_elements == f.array_catalog->spec(prefix.scratch).elements,
+                  "cylindrical radial-prefix extent does not match storage");
+            const StorageKey &source_key = f.array_catalog->key(prefix.source);
+            CHECK(source_key.component_ == int(prefix.source_component) &&
+                      source_key.cmp == prefix.cmp,
+                  "cylindrical radial-prefix source identity is wrong");
+            CHECK(has_access(op, prefix.source, AccessMode::read) &&
+                      has_access(op, prefix.scratch, AccessMode::read_write),
+                  "cylindrical radial-prefix accesses are incomplete");
+            if (use_bfast) {
+              CHECK(curl.bfast_update_index < plan.bfast_updates.size(),
+                    "cylindrical Z curl lacks paired BFAST work");
+              if (curl.bfast_update_index < plan.bfast_updates.size()) {
+                const BfastUpdate &bfast = plan.bfast_updates[curl.bfast_update_index];
+                CHECK(bfast.source1 == curl.plus_source && bfast.source2 == curl.minus_source,
+                      "cylindrical BFAST did not consume transformed curl sources");
+                CHECK(has_access(op, bfast.target) && has_access(op, bfast.source1) &&
+                          has_access(op, bfast.source2) && has_access(op, bfast.f_bfast) &&
+                          has_access(op, bfast.target_u) && has_access(op, bfast.condinv) &&
+                          has_access(op, bfast.target_cond) && has_access(op, bfast.pml.siginv) &&
+                          has_access(op, bfast.pml_u.siginv),
+                      "cylindrical BFAST access set is incomplete");
+                saw_prefix_before_bfast = true;
+              }
+            }
+          }
+        }
+        else {
+          CHECK(curl.radial_prefix_index == UINT32_MAX,
+                "non-Z cylindrical curl has a radial prefix");
+          if (dc == R) {
+            ++r_suppressed;
+            CHECK(!is_valid(curl.plus_source),
+                  "cylindrical R curl did not suppress its plus pointer");
+          }
+        }
+        if (use_bfast) {
+          CHECK(curl.bfast_update_index < plan.bfast_updates.size(),
+                "cylindrical curl lacks its paired BFAST row");
+          if (curl.bfast_update_index < plan.bfast_updates.size()) {
+            const BfastUpdate &bfast = plan.bfast_updates[curl.bfast_update_index];
+            component plus_component = NO_COMPONENT, minus_component = NO_COMPONENT;
+            const component source_base = op.ft == D_stuff ? Hx : Ex;
+            if (dc == R) {
+              plus_component = direction_component(source_base, Z);
+              minus_component = direction_component(source_base, P);
+            }
+            else if (dc == P) {
+              plus_component = direction_component(source_base, R);
+              minus_component = direction_component(source_base, Z);
+            }
+            else {
+              plus_component = direction_component(source_base, P);
+              minus_component = direction_component(source_base, R);
+            }
+            const fields_chunk &fc = *f.chunks[curl.region.chunk];
+            const ArrayId expected_minus = cylindrical_array(f, curl.region.chunk, array_kind::f,
+                                                             minus_component, curl.region.cmp);
+            const ArrayId expected_plus =
+                dc == Z ? f.array_catalog->find(
+                              {curl.region.chunk, int(array_kind::f_rderiv_int), -1, -1, 0})
+                : dc == R ? invalid_array()
+                          : cylindrical_array(f, curl.region.chunk, array_kind::f, plus_component,
+                                              curl.region.cmp);
+            const ArrayId transformed_minus = dc == Z ? invalid_array() : expected_minus;
+            CHECK(bfast.source1 == expected_plus && bfast.source2 == transformed_minus,
+                  "cylindrical BFAST source transform is wrong for component %d",
+                  int(curl.region.c));
+            const realnum expected_k1 = fc.bfast_scaled_k[component_index(minus_component)];
+            const realnum expected_k2 = fc.bfast_scaled_k[component_index(plus_component)];
+            const double sign = op.ft == D_stuff ? -1.0 : 1.0;
+            CHECK(bfast.k1 == sign * double(expected_k1) && bfast.k2 == sign * double(expected_k2),
+                  "cylindrical BFAST k routing differs from original curl geometry");
+            CHECK(bfast.stride1 == curl.plus_stride && bfast.stride2 == curl.minus_stride,
+                  "cylindrical BFAST did not preserve transformed curl strides");
+          }
+        }
+        else {
+          CHECK(curl.bfast_update_index == UINT32_MAX &&
+                    !(curl.region.variant_key & curl_has_bfast),
+                "zero-k cylindrical curl retained BFAST work");
+        }
+      }
+      CHECK(op_prefixes == expected_prefixes,
+            "cylindrical radial-prefix span has %zu rows, expected %zu", op_prefixes,
+            expected_prefixes);
+      size_t expected_m_index = 0;
+      for (size_t i = op.cylindrical_m_descriptor_index;
+           i < size_t(op.cylindrical_m_descriptor_index) + op.cylindrical_m_descriptor_count; ++i) {
+        const CylindricalMOverRUpdate &d = plan.cylindrical_m_updates[i];
+        ++m_rows;
+        CHECK(expected_m_index < expected_m_rows.size(),
+              "cylindrical m/r row exceeds the exact expected sequence");
+        if (expected_m_index < expected_m_rows.size())
+          CHECK(d.target == expected_m_rows[expected_m_index].first &&
+                    d.source == expected_m_rows[expected_m_index].second,
+                "cylindrical m/r row %zu has the wrong target/source identity", expected_m_index);
+        ++expected_m_index;
+        CHECK(component_direction(d.region.c) == R || component_direction(d.region.c) == Z,
+              "cylindrical m/r row targets phi");
+        CHECK(is_valid(d.target) && is_valid(d.source), "cylindrical m/r row lacks an operand");
+        CHECK(covers_access(op, d.target, AccessMode::read_write) &&
+                  covers_access(op, d.source, AccessMode::read) &&
+                  covers_access(op, d.target_u, AccessMode::read_write) &&
+                  covers_access(op, d.condinv, AccessMode::read) &&
+                  covers_access(op, d.target_cond, AccessMode::read_write) &&
+                  covers_access(op, d.pml.siginv, AccessMode::read) &&
+                  covers_access(op, d.pml_u.siginv, AccessMode::read),
+              "cylindrical m/r accesses are incomplete");
+        const fields_chunk &fc = *f.chunks[d.region.chunk];
+        const direction dc = component_direction(d.region.c);
+        const realnum expected_numerator = 2 * fc.m * (1 - 2 * d.region.cmp) *
+                                           (1 - 2 * (op.ft == B_stuff)) * (1 - 2 * (dc == R)) *
+                                           fc.Courant;
+        CHECK(d.numerator == double(expected_numerator),
+              "cylindrical m/r coefficient differs from host realnum order");
+        CHECK(d.raw_radial_start == d.region.begin.in_direction(R),
+              "cylindrical m/r row lost its raw radial coordinate");
+        CHECK(is_valid(d.target_cond) ==
+                  bool((d.region.variant_key & cylindrical_m_has_pml) &&
+                       (d.region.variant_key & cylindrical_m_has_conductivity)),
+              "cylindrical m/r conductivity target does not match the CPU PML branch");
+        const StorageKey &source_key = f.array_catalog->key(d.source);
+        CHECK(source_key.cmp == 1 - d.region.cmp,
+              "cylindrical m/r source is not the opposite complex component");
+      }
+      CHECK(expected_m_index == expected_m_rows.size(),
+            "cylindrical m/r sequence ended after %zu of %zu expected rows", expected_m_index,
+            expected_m_rows.size());
+      std::vector<int> previous_zero_order;
+      for (size_t i = op.cylindrical_origin_action_index;
+           i < size_t(op.cylindrical_origin_action_index) + op.cylindrical_origin_action_count;
+           ++i) {
+        const CylindricalOriginAction &action = plan.cylindrical_origin_actions[i];
+        const size_t expected_index = i - op.cylindrical_origin_action_index;
+        CHECK(expected_index < expected_origin_actions.size(),
+              "cylindrical origin action exceeds the exact expected sequence");
+        const ExpectedCylindricalOriginAction *expected =
+            expected_index < expected_origin_actions.size()
+                ? &expected_origin_actions[expected_index]
+                : NULL;
+        if (expected)
+          CHECK(action.kind == expected->kind, "cylindrical origin action %zu has the wrong kind",
+                expected_index);
+        if (action.kind == CylindricalOriginActionKind::axis_update) {
+          ++axis_actions;
+          CHECK(action.index < plan.cylindrical_axis_updates.size(),
+                "origin action references an invalid axis row");
+          if (action.index < plan.cylindrical_axis_updates.size()) {
+            const CylindricalAxisUpdate &d = plan.cylindrical_axis_updates[action.index];
+            if (expected)
+              CHECK(d.target == expected->array, "cylindrical axis action %zu has the wrong target",
+                    expected_index);
+            CHECK(d.region.begin.in_direction(R) == 0 && d.region.end.in_direction(R) == 0,
+                  "cylindrical axis arithmetic is not restricted to r=0");
+            CHECK(is_valid(d.target) && is_valid(d.source1),
+                  "cylindrical axis arithmetic lacks a required operand");
+            CHECK(has_access(op, d.target) && has_access(op, d.source1),
+                  "cylindrical axis accesses are incomplete");
+            CHECK(has_access(op, d.source2) && has_access(op, d.target_u) &&
+                      has_access(op, d.conductivity) && has_access(op, d.condinv) &&
+                      has_access(op, d.target_cond) && has_access(op, d.pml.sig) &&
+                      has_access(op, d.pml.kap) && has_access(op, d.pml.siginv) &&
+                      has_access(op, d.pml_u.sig) && has_access(op, d.pml_u.kap) &&
+                      has_access(op, d.pml_u.siginv),
+                  "cylindrical axis auxiliary/profile accesses are incomplete");
+            CHECK(is_valid(d.target_cond) ==
+                      bool(d.region.variant_key & cylindrical_axis_has_conductivity),
+                  "cylindrical axis conductivity bit does not follow f_cond");
+            CHECK(is_valid(d.target_cond) || (!is_valid(d.conductivity) && !is_valid(d.condinv)),
+                  "nonconductive cylindrical axis row retained conductivity operands");
+            if (d.kind == CylindricalAxisKind::m0_dz) {
+              const fields_chunk &fc = *f.chunks[d.region.chunk];
+              CHECK(d.region.c == Dz &&
+                        d.source1 ==
+                            cylindrical_array(f, d.region.chunk, array_kind::f, Hp, d.region.cmp) &&
+                        !is_valid(d.source2) && d.source1_neighbor_offset == 0 &&
+                        d.source2_offset == 0 && d.scale == double(realnum(fc.Courant * 4)) &&
+                        d.source2_multiplier == 0,
+                    "m=0 cylindrical axis row has the wrong identity/offset/coefficient");
+            }
+            else {
+              const fields_chunk &fc = *f.chunks[d.region.chunk];
+              const bool electric = op.ft == D_stuff;
+              const component target_component = electric ? Dp : Br;
+              const component source1_component = electric ? Hr : Ep;
+              const component source2_component = electric ? Hz : Ez;
+              const int source2_cmp = electric ? d.region.cmp : 1 - d.region.cmp;
+              CHECK(fabs(m) == 1 && d.region.c == target_component &&
+                        d.source1 == cylindrical_array(f, d.region.chunk, array_kind::f,
+                                                       source1_component, d.region.cmp) &&
+                        d.source2 == cylindrical_array(f, d.region.chunk, array_kind::f,
+                                                       source2_component, source2_cmp) &&
+                        d.source1_neighbor_offset == (electric ? -1 : +1) &&
+                        d.source2_offset == (electric ? 0 : fc.gv.nz() + 1) &&
+                        d.scale == double(realnum((electric ? +1 : -1) * fc.Courant)) &&
+                        d.source2_multiplier ==
+                            double(realnum(electric ? 2 : (1 - 2 * d.region.cmp) * m)),
+                    "|m|=1 cylindrical axis identity/offset/coefficient is wrong");
+            }
+            if (pure_conductivity) {
+              CHECK((d.region.variant_key & cylindrical_axis_has_conductivity) == 0 &&
+                        !(d.region.variant_key & cylindrical_axis_has_pml) &&
+                        !(d.region.variant_key & cylindrical_axis_has_pml_aux) &&
+                        !is_valid(d.target_cond) && !is_valid(d.conductivity) &&
+                        !is_valid(d.condinv) && !is_valid(d.pml.sig) && !is_valid(d.pml_u.sig),
+                    "no-PML conductivity case retained inactive axis operands");
+            }
+          }
+          if (op.ft == D_stuff && i + 1 < size_t(op.cylindrical_origin_action_index) +
+                                              op.cylindrical_origin_action_count)
+            saw_axis_then_zero |= plan.cylindrical_origin_actions[i + 1].kind ==
+                                  CylindricalOriginActionKind::zero_slab;
+        }
+        else {
+          ++zero_actions;
+          CHECK(action.index < plan.cylindrical_zero_slabs.size(),
+                "origin action references an invalid zero slab");
+          if (action.index < plan.cylindrical_zero_slabs.size()) {
+            const SlabRef &slab = plan.cylindrical_zero_slabs[action.index];
+            if (expected)
+              CHECK(slab.array == expected->array,
+                    "cylindrical zero action %zu has the wrong array identity", expected_index);
+            const StorageKey &key = f.array_catalog->key(slab.array);
+            const size_t row_stride = size_t(f.chunks[key.chunk]->gv.nz() + 1);
+            CHECK(slab.base >= 0 && size_t(slab.base) % row_stride == 0 &&
+                      slab.counts[0] == int(row_stride) && slab.strides[0] == 1,
+                  "origin zero action is not one complete raw z row");
+            if (expected)
+              CHECK(slab.base == ptrdiff_t(expected->radial_row) * ptrdiff_t(row_stride),
+                    "cylindrical zero action %zu has the wrong radial row", expected_index);
+            if (fabs(m) > 1) {
+              const int row = int(size_t(slab.base) / row_stride);
+              const int expected_rows = zero_near_origin ? int(ceil(fabs(m))) : 1;
+              CHECK(row >= 0 && row < expected_rows,
+                    "high-m origin zero slab has the wrong radial row");
+              int family = -1;
+              if (key.kind == int(array_kind::f)) family = 0;
+              if (key.kind == int(array_kind::f_cond)) family = 1;
+              if (key.kind == int(array_kind::f_u)) family = 2;
+              const std::vector<int> order = {key.chunk, key.cmp, row, family,
+                                              component_index(component(key.component_))};
+              CHECK(family >= 0 && (previous_zero_order.empty() || previous_zero_order <= order),
+                    "high-m origin zero slabs do not follow row/family/component order");
+              previous_zero_order = order;
+            }
+          }
+        }
+      }
+    }
+    else if (op.kind == OpKind::update_eh) {
+      std::vector<ArrayId> expected_axis_replays;
+      for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+        const fields_chunk &fc = *f.chunks[chunk];
+        if (!fc.is_mine()) continue;
+        const int cmps = fc.is_real ? 1 : 2;
+        for (size_t tile = 0; tile < fc.gvs_eh[op.ft].size(); ++tile) {
+          const grid_volume &sub = fc.gvs_eh[op.ft][tile];
+          for (int cmp = 0; cmp < cmps; ++cmp)
+            FOR_FT_COMPONENTS(op.ft, ec) {
+              const component dc = field_type_component(op.ft == E_stuff ? D_stuff : B_stuff, ec);
+              const ArrayId target = cylindrical_array(f, chunk, array_kind::f, ec, cmp);
+              if (!is_valid(target) || !fc.f[ec][cmp] || fc.f[ec][cmp] == fc.f[dc][cmp]) continue;
+              if (fc.gv.origin_r() == 0.0 && sub.little_owned_corner(ec).in_direction(R) == 0)
+                expected_axis_replays.push_back(target);
+            }
+        }
+      }
+      size_t replay_index = 0;
+      for (size_t i = op.descriptor_index; i < size_t(op.descriptor_index) + op.descriptor_count;
+           ++i) {
+        const ConstitutiveUpdate &d = plan.eh_updates[i];
+        if (!(d.region.variant_key & constitutive_axis_override)) continue;
+        ++axis_replays;
+        CHECK(replay_index < expected_axis_replays.size(),
+              "constitutive axis replay exceeds the exact expected sequence");
+        if (replay_index < expected_axis_replays.size())
+          CHECK(d.target == expected_axis_replays[replay_index],
+                "constitutive axis replay %zu has the wrong target", replay_index);
+        ++replay_index;
+        CHECK(i > op.descriptor_index, "axis constitutive replay has no ordinary predecessor");
+        if (i > op.descriptor_index) {
+          const ConstitutiveUpdate &ordinary = plan.eh_updates[i - 1];
+          CHECK(ordinary.target == d.target && ordinary.region.chunk == d.region.chunk &&
+                    ordinary.region.cmp == d.region.cmp,
+                "axis constitutive replay is not adjacent to its ordinary row");
+          uint32_t expected_variant =
+              ordinary.region.variant_key &
+              ~(constitutive_one_offdiagonal | constitutive_two_offdiagonals |
+                constitutive_has_minus_p | constitutive_copy_w_previous);
+          if (ordinary.primary != ordinary.base_primary)
+            expected_variant |= constitutive_has_minus_p;
+          CHECK(d.base_primary == ordinary.base_primary && d.primary == ordinary.primary &&
+                    d.diagonal == ordinary.diagonal && d.chi2 == ordinary.chi2 &&
+                    d.chi3 == ordinary.chi3 && d.target_w == ordinary.target_w &&
+                    d.primary_stride == ordinary.primary_stride && d.pml.sig == ordinary.pml.sig &&
+                    d.pml.kap == ordinary.pml.kap && d.pml.siginv == ordinary.pml.siginv &&
+                    d.pml.base == ordinary.pml.base &&
+                    d.pml.strides[0] == ordinary.pml.strides[0] &&
+                    d.pml.strides[1] == ordinary.pml.strides[1] &&
+                    d.pml.strides[2] == ordinary.pml.strides[2] &&
+                    d.region.variant_key == (expected_variant | constitutive_axis_override),
+                "axis constitutive replay did not inherit its diagonal operands exactly");
+        }
+        CHECK(!is_valid(d.cross1) && !is_valid(d.cross2) && !is_valid(d.offdiagonal1) &&
+                  !is_valid(d.offdiagonal2) && !is_valid(d.previous_w) && d.cross1_stride == 0 &&
+                  d.cross2_stride == 0 && !(d.region.variant_key & constitutive_copy_w_previous),
+              "axis constitutive replay retained cross/copy-W operands");
+        CHECK(covers_access(op, d.target, AccessMode::read_write) &&
+                  covers_access(op, d.base_primary, AccessMode::read) &&
+                  covers_access(op, d.primary,
+                                d.primary != d.base_primary ? AccessMode::read_write
+                                                            : AccessMode::read) &&
+                  covers_access(op, d.diagonal, AccessMode::read) &&
+                  covers_access(op, d.chi2, AccessMode::read) &&
+                  covers_access(op, d.chi3, AccessMode::read) &&
+                  covers_access(op, d.target_w, AccessMode::read_write) &&
+                  covers_access(op, d.pml.sig, AccessMode::read) &&
+                  covers_access(op, d.pml.kap, AccessMode::read) &&
+                  covers_access(op, d.pml.siginv, AccessMode::read),
+              "axis constitutive replay accesses are incomplete");
+        CHECK(d.region.begin.in_direction(R) == 0 && d.region.end.in_direction(R) == 0,
+              "axis constitutive replay is not restricted to r=0");
+      }
+      CHECK(replay_index == expected_axis_replays.size(),
+            "constitutive axis replay sequence ended after %zu of %zu expected rows", replay_index,
+            expected_axis_replays.size());
+    }
+  }
+
+  CHECK(and_to_all(!owns_chunk || (z_curls > 0 && prefixes == z_curls && r_suppressed > 0)),
+        "an owning rank lacks complete cylindrical curl routing");
+  CHECK(m == 0 ? and_to_all(m_rows == 0) : and_to_all(!owns_chunk || m_rows > 0),
+        "cylindrical m/r row presence does not match m=%g", m);
+  CHECK(and_to_all(!owns_origin_chunk || axis_actions + zero_actions > 0),
+        "cylindrical origin emitted no actions");
+  CHECK((m != 0 && fabs(m) != 1) || and_to_all(!owns_origin_chunk || saw_axis_then_zero),
+        "m=0/|m|=1 D origin actions do not preserve arithmetic-before-zero order");
+  CHECK(and_to_all(!owns_origin_chunk || axis_replays > 0),
+        "cylindrical plan emitted no constitutive axis replay");
+  CHECK(!use_bfast || and_to_all(!owns_chunk || saw_prefix_before_bfast),
+        "cylindrical prefix/curl/BFAST pairing was not exercised");
+  if (annular) {
+    CHECK(and_to_all(axis_actions == 0 && zero_actions == 0 && axis_replays == 0),
+          "annular cylindrical grid emitted origin work");
+  }
+  if (pure_conductivity) {
+    CHECK(and_to_all(!owns_chunk || saw_conductivity),
+          "pure-conductivity cylindrical plan lost its conductivity variants");
+    CHECK(and_to_all(!saw_main_pml && !saw_aux_pml),
+          "pure-conductivity cylindrical plan unexpectedly retained PML variants");
+  }
+  else {
+    CHECK(or_to_all(saw_main_pml) && or_to_all(saw_aux_pml),
+          "cylindrical plan did not cover primary and auxiliary PML variants");
+  }
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -549,6 +1118,15 @@ int main(int argc, char **argv) {
   check_beta_plan(true, -0.17);
   check_zero_beta_plan();
   check_bfast_plan();
+  check_cylindrical_plan(0.0, true, false);
+  check_cylindrical_plan(0.0, true, false, true);
+  check_cylindrical_plan(+1.0, true, true);
+  check_cylindrical_plan(-1.0, true, false);
+  check_cylindrical_plan(+0.5, true, false);
+  check_cylindrical_plan(+0.5, true, false, false, true);
+  check_cylindrical_plan(+1.0, true, false, false, false, true);
+  check_cylindrical_plan(+3.0, true, false);
+  check_cylindrical_plan(-3.0, false, false);
   if (failures) {
     master_printf("prepared_plan: %d FAILURE(S)\n", failures);
     return 1;
