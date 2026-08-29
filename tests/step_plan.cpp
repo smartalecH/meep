@@ -436,6 +436,84 @@ static void test_beta_schema_signature() {
 #undef CHECK_BETA_SIGNATURE
 }
 
+static void test_bfast_schema_signature() {
+  StepPlan plan;
+  plan.bfast_scaled_k = {0.17, -0.11, 0.07};
+  CurlUpdate curl = {};
+  curl.bfast_update_index = 0;
+  plan.db_updates.push_back(curl);
+
+  BfastUpdate update = {};
+  update.region.chunk = 2;
+  update.region.c = By;
+  update.region.cmp = 1;
+  update.region.begin = ivec(1, 3, 5);
+  update.region.end = ivec(7, 9, 11);
+  update.region.base = 13;
+  update.region.counts[0] = 2;
+  update.region.counts[1] = 3;
+  update.region.counts[2] = 4;
+  update.region.strides[0] = 1;
+  update.region.strides[1] = 17;
+  update.region.strides[2] = 37;
+  update.region.variant_key = bfast_has_pml | bfast_has_pml_aux | bfast_has_conductivity;
+  update.target = ArrayId{1};
+  update.source1 = ArrayId{2};
+  update.source2 = ArrayId{3};
+  update.stride1 = -7;
+  update.stride2 = 11;
+  update.f_bfast = ArrayId{4};
+  update.target_u = ArrayId{5};
+  update.condinv = ArrayId{6};
+  update.target_cond = ArrayId{7};
+  update.pml.siginv = ArrayId{8};
+  update.pml.base = 9;
+  update.pml.strides[1] = 2;
+  update.pml_u.siginv = ArrayId{10};
+  update.pml_u.base = 11;
+  update.pml_u.strides[0] = 2;
+  update.k1 = -0.17;
+  update.k2 = 0.11;
+  plan.bfast_updates.push_back(update);
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+#define CHECK_BFAST_SIGNATURE(expr, message)                                                       \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                           \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                              \
+  } while (0)
+  CHECK_BFAST_SIGNATURE(++changed.db_updates[0].bfast_update_index,
+                        "signature ignored paired BFAST index");
+  CHECK_BFAST_SIGNATURE(changed.bfast_scaled_k[1] = 0.11,
+                        "signature ignored prepared BFAST coordinate");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].region.variant_key,
+                        "signature ignored BFAST variant");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].source1.value,
+                        "signature ignored BFAST source");
+  CHECK_BFAST_SIGNATURE(--changed.bfast_updates[0].stride2,
+                        "signature ignored BFAST stride");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].f_bfast.value,
+                        "signature ignored BFAST persistent state");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].target_u.value,
+                        "signature ignored BFAST auxiliary target");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].condinv.value,
+                        "signature ignored BFAST conductivity inverse");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].pml.siginv.value,
+                        "signature ignored BFAST primary PML profile");
+  CHECK_BFAST_SIGNATURE(++changed.bfast_updates[0].pml_u.base,
+                        "signature ignored BFAST auxiliary PML profile");
+  CHECK_BFAST_SIGNATURE(changed.bfast_updates[0].k1 = 0.17,
+                        "signature ignored BFAST k1");
+  CHECK_BFAST_SIGNATURE(changed.bfast_updates[0].k2 = -0.11,
+                        "signature ignored BFAST k2");
+#undef CHECK_BFAST_SIGNATURE
+
+  plan.clear();
+  CHECK(plan.bfast_scaled_k.empty() && plan.bfast_updates.empty(),
+        "StepPlan::clear retained BFAST coordinate state");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -446,6 +524,7 @@ int main(int argc, char **argv) {
   test_phasing_plan();
   test_polarization_schema_signature();
   test_beta_schema_signature();
+  test_bfast_schema_signature();
 
   if (failures) {
     master_printf("step_plan: %d FAILURE(S)\n", failures);
