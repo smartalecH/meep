@@ -23,6 +23,26 @@ namespace meep {
 class NvidiaBackendState;
 class NvidiaExecutable;
 
+struct NvidiaCwStatistics {
+  CwSolveResult result;
+  size_t reduction_count;
+  size_t scalar_device_to_host_calls;
+  size_t scalar_device_to_host_bytes;
+  size_t vector_host_to_device_bytes;
+  size_t vector_device_to_host_bytes;
+  size_t final_dft_kernel_launches;
+  size_t kernel_launches;
+  size_t workspace_capacity_bytes;
+  size_t workspace_allocations;
+  bool valid;
+
+  NvidiaCwStatistics()
+      : reduction_count(0), scalar_device_to_host_calls(0), scalar_device_to_host_bytes(0),
+        vector_host_to_device_bytes(0), vector_device_to_host_bytes(0),
+        final_dft_kernel_launches(0), kernel_launches(0), workspace_capacity_bytes(0),
+        workspace_allocations(0), valid(false) {}
+};
+
 namespace nvidia {
 
 struct polarization_coefficients {
@@ -78,6 +98,14 @@ public:
   void synchronize_magnetic_fields(Executable &executable, BackendState &state) override;
   void restore_magnetic_fields(Executable &executable, BackendState &state) override;
 
+  bool supports_cw(const CwSolveRequest &request, std::string &why) const override;
+  Executable *preflight_cw(const CwSolveRequest &request, const StepPlan &step_plan,
+                           const CwPlan &cw_plan, Executable *cached,
+                           BackendState &state) override;
+  CwSolveResult solve_cw(const CwSolveRequest &request, const StepPlan &step_plan,
+                         const CwPlan &cw_plan, Executable &ordinary, Executable &cw,
+                         BackendState &state, CwSolveSession &session) override;
+
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override;
   void write(ArrayRef ref, const void *host_buffer, size_t bytes) override;
   bool supports_compact_dft_reductions() const override { return true; }
@@ -88,6 +116,7 @@ public:
   bool requires_full_storage_preparation() const override { return true; }
   void prepare_state_rebuild(BackendState &state, DirtyMask reasons) override;
   bool accepts(const execution_options &options, std::string &why) const override;
+  NvidiaCwStatistics cw_statistics_for_testing() const;
 
 private:
   friend class NvidiaBackendState;
@@ -97,7 +126,6 @@ private:
   NvidiaExecutable &checked_executable(Executable &executable,
                                        const NvidiaBackendState &state) const;
   void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
-
   fields &f_;
   execution_options options_;
   int device_;
