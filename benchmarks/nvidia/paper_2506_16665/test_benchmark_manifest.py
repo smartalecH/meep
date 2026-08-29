@@ -630,7 +630,7 @@ class ResultTests(unittest.TestCase):
         manifest_schema = bm.load_json_object(
             bm.DEFAULT_MANIFEST_SCHEMA, "run manifest schema"
         )
-        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 2)
+        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 3)
 
     def test_result_rejects_nonfinite_and_grid_mismatch(self):
         temporary, result, _manifest = self.template()
