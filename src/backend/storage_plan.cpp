@@ -88,7 +88,6 @@ int polarization_storage_state_index(uint64_t aux) {
 }
 
 uint32_t polarization_storage_layout_ordinal(uint64_t aux) { return uint32_t(aux); }
-
 static size_t element_bytes(ElementType t) {
   switch (t) {
     case ElementType::realnum_value: return sizeof(realnum);
