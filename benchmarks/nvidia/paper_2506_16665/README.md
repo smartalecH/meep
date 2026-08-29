@@ -9,7 +9,8 @@ diagnostic result with raw finite DFT flux and mode-power arrays.
 
 The executable scope is deliberately narrower than the paper: it uses fixed,
 nondispersive performance-adaptation media and does not claim paper-equivalent
-physics, two-GPU MPI scaling, or a speedup from a ten-step/profiled smoke run.
+physics, two-GPU MPI scaling, speedup, or publication-ready results. Every PR3
+runner output, including fixed-step output, is explicitly diagnostic-only.
 The PSR case is rejected because the paper-derived inputs do not define the
 Si3N4 top-cladding footprint and z bounds precisely enough to reproduce it.
 
@@ -222,6 +223,20 @@ geometry transform, exact media, module/build provenance, and finite DFT/mode
 arrays. It is separate from the PR7 result document below because a ten-step
 smoke cannot honestly satisfy the CPU-reference physics policy or the runtime
 counters that PR3 does not expose to Python.
+
+The runner reads and hashes the manifest bytes once before constructing the
+simulation; execution, result generation, and the in-process validation all use
+that same immutable snapshot. `--validate-only` rejects a result if the current
+manifest bytes differ. Validation requires the complete result shape and binds
+status, requested backend/precision/ranks, device cardinality, profile/fixed-step
+semantics, repetition and warmup counts, grid and timestep, manifest-derived
+geometry/material/sampling inputs, monitor port/band identity, observable policy,
+and all claim flags. Missing, duplicate, unknown, or inconsistent records are
+rejected rather than treated as optional metadata.
+
+No PR3 diagnostic permits a speedup or publication claim. Those flags can only
+be introduced through the authenticated CPU-native-baseline path below after it
+verifies compatible physics observables within the manifest's tolerances.
 
 ## Profiler window
 
