@@ -8,6 +8,7 @@
 
 #include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/nvidia/nvidia_coordinates.hpp"
+#include "backend/nvidia/nvidia_cw.hpp"
 
 #include <stdint.h>
 #include <string.h>
@@ -361,13 +362,57 @@ AccessRange checked_access(const StoragePlan &plan, ArrayRef ref, const void *ho
 
 } // namespace
 
+class NvidiaCwWorkspace {
+public:
+  NvidiaCwWorkspace(const nvidia::cw_workspace_shape &shape, nvidia::scalar_precision precision,
+                    int L, int device)
+      : shape_(shape), precision_(precision), L_(L), gamma_(size_t(L) + 1),
+        gamma_p_(size_t(L) + 1), gamma_pp_(size_t(L) + 1),
+        tau_(checked_product(size_t(L), size_t(L), "allocating solve_cw tau storage")),
+        sigma_(size_t(L) + 1), r_(size_t(L) + 1), u_(size_t(L) + 1),
+        operator_applications_(0), reduction_count_(0),
+        kernel_launches_(0) {
+    vectors_.allocate(shape_.vector_bytes, device);
+    reduction_partials_.allocate(shape_.reduction_partial_bytes, device);
+    reduction_result_.allocate(2 * sizeof(double), device);
+    reduction_host_.allocate(2 * sizeof(double));
+  }
+
+  bool accommodates(const nvidia::cw_workspace_shape &shape,
+                    nvidia::scalar_precision precision, int L) const {
+    return precision_ == precision && L_ >= L && shape_.vector_elements >= shape.vector_elements &&
+           shape_.vector_count >= shape.vector_count && shape_.vector_bytes >= shape.vector_bytes &&
+           shape_.reduction_partial_bytes >= shape.reduction_partial_bytes;
+  }
+
+  nvidia::cw_workspace_shape shape_;
+  nvidia::scalar_precision precision_;
+  int L_;
+  nvidia::device_buffer vectors_;
+  nvidia::device_buffer reduction_partials_;
+  nvidia::device_buffer reduction_result_;
+  nvidia::pinned_buffer reduction_host_;
+  std::vector<double> gamma_;
+  std::vector<double> gamma_p_;
+  std::vector<double> gamma_pp_;
+  std::vector<double> tau_;
+  std::vector<double> sigma_;
+  std::vector<void *> r_;
+  std::vector<void *> u_;
+  size_t operator_applications_;
+  size_t reduction_count_;
+  size_t kernel_launches_;
+};
+
 class NvidiaBackendState : public BackendState {
 public:
   NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device, uint64_t state_token)
       : owner_(owner), plan_(plan), layout_(allocation_requests_for(plan_)), device_(device),
         state_token_(state_token), fingerprint_(storage_fingerprint(plan_)), initialized_(false),
+        transfer_failed_(false),
         device_authoritative_(false), magnetic_snapshot_bytes_(0),
-        magnetic_snapshot_layout_fingerprint_(0), magnetic_snapshot_valid_(false) {
+        magnetic_snapshot_layout_fingerprint_(0), magnetic_snapshot_valid_(false),
+        cw_skip_source_evaluation_(false), cw_workspace_allocations_(0) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_));
@@ -405,6 +450,10 @@ public:
   size_t magnetic_snapshot_bytes_;
   uint64_t magnetic_snapshot_layout_fingerprint_;
   bool magnetic_snapshot_valid_;
+  bool cw_skip_source_evaluation_;
+  size_t cw_workspace_allocations_;
+  NvidiaCwStatistics cw_statistics_;
+  std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
 };
 
 struct NvidiaCompiledOperation {
@@ -467,8 +516,8 @@ struct NvidiaCompiledMaterialRefresh {
 
 class NvidiaExecutable : public Executable {
 public:
-  NvidiaExecutable(const NvidiaBackend *owner, uint64_t signature, uint64_t storage_fingerprint,
-                   uint64_t state_token,
+  NvidiaExecutable(const NvidiaBackend *owner, StepProgram program, uint64_t signature,
+                   uint64_t storage_fingerprint, uint64_t state_token,
                    const std::vector<NvidiaCompiledOperation> &operations,
                    const std::vector<nvidia::curl_launch> &curl_updates,
                    const std::vector<nvidia::cylindrical_radial_prefix_launch>
@@ -501,7 +550,7 @@ public:
                    size_t material_staging_bytes, uint64_t material_target_signature,
                    size_t source_scalar_count, size_t source_staging_elements,
                    NvidiaBackendState &state)
-      : owner_(owner), state_token_(state_token), signature_(signature),
+      : owner_(owner), state_token_(state_token), program_(program), signature_(signature),
         storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
         cylindrical_radial_prefixes_(cylindrical_radial_prefixes),
@@ -584,6 +633,7 @@ public:
 
   const NvidiaBackend *owner_;
   uint64_t state_token_;
+  StepProgram program_;
   uint64_t signature_;
   uint64_t storage_fingerprint_;
   std::vector<NvidiaCompiledOperation> operations_;
@@ -620,6 +670,83 @@ public:
   nvidia::pinned_buffer material_staging_;
   nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
+};
+
+class NvidiaCwExecutable : public Executable {
+public:
+  struct Stage {
+    double source_time_offset;
+    size_t source_first;
+    size_t source_count;
+    uint32_t boundary_operation;
+    uint32_t constitutive_operation;
+  };
+
+  NvidiaCwExecutable(const NvidiaBackend *owner, uint64_t layout_storage_fingerprint,
+                     uint64_t device_storage_fingerprint,
+                     uint64_t step_plan_signature, uint64_t cw_plan_signature,
+                     nvidia::scalar_precision precision, size_t real_count,
+                     const std::vector<nvidia::cw_state_row_launch> &rows,
+                     const std::vector<nvidia::cw_zero_launch> &zeroes,
+                     const std::vector<Stage> &rhs_stages,
+                     const std::vector<nvidia::cw_source_batch_launch> &rhs_sources,
+                     const std::vector<nvidia::source_point> &source_points,
+                     const std::vector<nvidia::dft_launch> &final_dfts,
+                     const std::vector<double> &dft_omega,
+                     const CwUnpackDescriptorRefs &unpack,
+                     std::unique_ptr<NvidiaExecutable> timestep, NvidiaBackendState &state)
+      : owner_(owner), layout_storage_fingerprint_(layout_storage_fingerprint),
+        device_storage_fingerprint_(device_storage_fingerprint),
+        state_token_(state.state_token_), step_plan_signature_(step_plan_signature),
+        cw_plan_signature_(cw_plan_signature),
+        precision_(precision), real_count_(real_count), rows_(rows), zeroes_(zeroes),
+        rhs_stages_(rhs_stages), rhs_sources_(rhs_sources), final_dfts_(final_dfts),
+        unpack_skip_w_components_(unpack.skip_w_components), timestep_(std::move(timestep)) {
+    unpack_operations_[0] = unpack.first_boundary.operation_index;
+    unpack_operations_[1] = unpack.constitutive.operation_index;
+    unpack_operations_[2] = unpack.second_boundary.operation_index;
+    nvidia::device_scope scope(state.device_);
+    if (!source_points.empty()) {
+      source_points_.allocate(checked_product(source_points.size(), sizeof(source_points[0]),
+                                              "allocating NVIDIA solve_cw source points"),
+                              state.device_);
+      nvidia::copy_host_to_device_async(source_points_, 0, source_points.data(),
+                                        source_points_.size(), *state.transfer_);
+      const nvidia::source_point *base =
+          static_cast<const nvidia::source_point *>(source_points_.opaque_handle());
+      for (nvidia::cw_source_batch_launch &source : rhs_sources_)
+        source.points = base + source.point_offset;
+    }
+    if (!dft_omega.empty()) {
+      dft_omega_.allocate(checked_product(dft_omega.size(), sizeof(dft_omega[0]),
+                                         "allocating NVIDIA solve_cw DFT frequencies"),
+                          state.device_);
+      nvidia::copy_host_to_device_async(dft_omega_, 0, dft_omega.data(), dft_omega_.size(),
+                                        *state.transfer_);
+      const double *base = static_cast<const double *>(dft_omega_.opaque_handle());
+      for (nvidia::dft_launch &dft : final_dfts_) dft.omega = base;
+    }
+    if (!source_points.empty() || !dft_omega.empty()) state.transfer_->synchronize();
+  }
+
+  const NvidiaBackend *owner_;
+  uint64_t layout_storage_fingerprint_;
+  uint64_t device_storage_fingerprint_;
+  uint64_t state_token_;
+  uint64_t step_plan_signature_;
+  uint64_t cw_plan_signature_;
+  nvidia::scalar_precision precision_;
+  size_t real_count_;
+  std::vector<nvidia::cw_state_row_launch> rows_;
+  std::vector<nvidia::cw_zero_launch> zeroes_;
+  std::vector<Stage> rhs_stages_;
+  std::vector<nvidia::cw_source_batch_launch> rhs_sources_;
+  std::vector<nvidia::dft_launch> final_dfts_;
+  uint32_t unpack_operations_[3];
+  bool unpack_skip_w_components_;
+  nvidia::device_buffer source_points_;
+  nvidia::device_buffer dft_omega_;
+  std::unique_ptr<NvidiaExecutable> timestep_;
 };
 
 namespace {
@@ -903,6 +1030,51 @@ nvidia::source_batch_launch compile_source_batch(const SourceDescriptor &source,
     packed.amplitude_imag = source.complex_amplitudes[point].imag();
     points.push_back(packed);
   }
+  return result;
+}
+
+nvidia::cw_source_batch_launch compile_cw_source_batch(
+    const SourceDescriptor &source, const SourcePlan &source_plan, const fields &f,
+    NvidiaBackendState &state, std::vector<nvidia::source_point> &points) {
+  if (source.indices.empty() || source.indices.size() != source.complex_amplitudes.size())
+    throw std::invalid_argument("NVIDIA solve_cw source has invalid spatial data");
+  if (source.source_time_id >= source_plan.source_times.size())
+    throw std::out_of_range("NVIDIA solve_cw source has an invalid source-time ID");
+  const SourceTimeDescriptor &time = source_plan.source_times[source.source_time_id];
+  if (time.source_time_id != source.source_time_id || time.scalar_slot >= source_plan.scalars.size())
+    throw std::invalid_argument("NVIDIA solve_cw source has a non-canonical scalar mapping");
+
+  nvidia::cw_source_batch_launch result = {};
+  result.precision = scalar_precision_for(state.plan_, source.destination,
+                                          "solve_cw primary source target");
+  result.target_real = device_address(state, source.destination,
+                                      "solve_cw primary source target");
+  result.target_imag = optional_mutable_device_address(
+      state, source.destination_imag, result.precision, "solve_cw imaginary source target");
+  result.conductivity_inverse = optional_device_address(
+      state, source.condinv, result.precision, "solve_cw source conductivity inverse");
+  if (!result.target_imag)
+    throw std::invalid_argument("complex NVIDIA solve_cw source has no imaginary target");
+  result.point_offset = points.size();
+  result.point_count = source.indices.size();
+  result.scalar_slot = time.scalar_slot;
+  result.dt = f.dt;
+  result.sequential =
+      nvidia::source_indices_require_sequential(source.indices.data(), source.indices.size());
+  const std::pair<std::vector<ptrdiff_t>::const_iterator,
+                  std::vector<ptrdiff_t>::const_iterator> bounds =
+      std::minmax_element(source.indices.begin(), source.indices.end());
+  validate_index_range(state.plan_, source.destination, *bounds.first, *bounds.second,
+                       "solve_cw primary source target");
+  validate_index_range(state.plan_, source.destination_imag, *bounds.first, *bounds.second,
+                       "solve_cw imaginary source target");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, *bounds.first, *bounds.second,
+                         "solve_cw source conductivity inverse");
+  for (size_t point = 0; point < source.indices.size(); ++point)
+    points.push_back(nvidia::source_point{source.indices[point],
+                                          source.complex_amplitudes[point].real(),
+                                          source.complex_amplitudes[point].imag()});
   return result;
 }
 
@@ -2556,8 +2728,14 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   try {
     if (plan.signature != compute_step_plan_signature(plan))
       throw std::invalid_argument("NVIDIA PR2 received a stale StepPlan signature");
-    if (plan.program != StepProgram::ordinary)
-      throw std::invalid_argument("NVIDIA PR2 does not support solve_cw");
+    if (plan.program != StepProgram::ordinary && plan.program != StepProgram::solve_cw)
+      throw std::invalid_argument("NVIDIA received an invalid timestep program");
+    if (plan.program == StepProgram::solve_cw) {
+      std::string layout_error;
+      if (!validate_cw_state_layout(f_, plan.cw_state_layout, &layout_error))
+        throw std::invalid_argument(layout_error.empty() ? "invalid solve_cw state layout"
+                                                         : layout_error);
+    }
     if (count_processors() != 1)
       throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
     if (f_.gv.dim != Dcyl && f_.m != 0.0)
@@ -3303,9 +3481,12 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         case OpKind::update_flux_half:
         case OpKind::update_flux:
         case OpKind::reduction:
-        case OpKind::host_callback:
+        case OpKind::host_callback: set_reason(local_error, oi, op_kind_name(op.kind)); break;
         case OpKind::pack_state:
         case OpKind::unpack_state:
+          if (plan.program != StepProgram::solve_cw)
+            set_reason(local_error, oi, "CW state marker in an ordinary timestep plan");
+          break;
         case OpKind::num_kinds: set_reason(local_error, oi, op_kind_name(op.kind)); break;
       }
       if (!local_error.empty()) break;
@@ -3346,7 +3527,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
 
     if (local_error.empty())
       executable.reset(new NvidiaExecutable(
-          this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
+          this, plan.program, plan.signature, state.fingerprint_, state.state_token_, operations,
+          curl_updates,
           cylindrical_radial_prefixes, bfast_updates, beta_updates, cylindrical_m_updates,
           cylindrical_axis_updates, cylindrical_origin_actions, constitutive_updates, zero_updates,
           halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, finite_checks,
@@ -3372,6 +3554,665 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     throw std::runtime_error(local_error);
   }
   return executable.release();
+}
+
+namespace {
+
+array_kind cw_array_kind(CwStateFamily family) {
+  switch (family) {
+    case CwStateFamily::primary:
+    case CwStateFamily::paired_primary: return array_kind::f;
+    case CwStateFamily::pml_u: return array_kind::f_u;
+    case CwStateFamily::conductivity: return array_kind::f_cond;
+    case CwStateFamily::bfast: return array_kind::f_bfast;
+    case CwStateFamily::constitutive_w: return array_kind::f_w;
+  }
+  throw std::invalid_argument("NVIDIA solve_cw row has an invalid state family");
+}
+
+const ArraySpec &validate_cw_field_array(const NvidiaBackendState &state, ArrayId id,
+                                         int chunk, array_kind kind, component c, int cmp,
+                                         const char *what) {
+  if (!is_valid(id) || id.value >= state.plan_.arrays.size() ||
+      id.value >= state.plan_.keys.size())
+    throw std::out_of_range(std::string(what) + " uses an invalid ArrayId");
+  const ArraySpec &spec = state.plan_.arrays[id.value];
+  const StorageKey &key = state.plan_.keys[id.value];
+  if (spec.id != id || spec.role != array_role::field ||
+      spec.element_type != ElementType::realnum_value || is_valid(spec.alias_of))
+    throw std::invalid_argument(std::string(what) + " has incompatible device storage");
+  if (key.chunk != chunk || key.kind != int(kind) || key.component_ != int(c) ||
+      key.cmp != cmp || key.aux != 0)
+    throw std::invalid_argument(std::string(what) + " has the wrong storage identity");
+  return spec;
+}
+
+nvidia::cw_workspace_shape cw_workspace_shape(size_t real_count, int L,
+                                              nvidia::scalar_precision precision) {
+  if (!real_count) throw std::invalid_argument("NVIDIA solve_cw state vector is empty");
+  if (L < 1) throw std::invalid_argument("NVIDIA solve_cw requires L >= 1");
+  const size_t two_l = checked_product(size_t(L), size_t(2),
+                                       "sizing NVIDIA solve_cw vector count");
+  const size_t vector_count = checked_add(two_l, size_t(5),
+                                          "sizing NVIDIA solve_cw vector count");
+  const size_t scalar_size = precision == nvidia::scalar_precision::f32 ? sizeof(float)
+                                                                        : sizeof(double);
+  const size_t vector_elements = checked_product(real_count, vector_count,
+                                                  "sizing NVIDIA solve_cw workspace");
+  const size_t blocks = std::min<size_t>(128, checked_add(real_count, size_t(255),
+                                                          "sizing solve_cw reduction grid") /
+                                                  256);
+  nvidia::cw_workspace_shape shape;
+  shape.vector_elements = real_count;
+  shape.vector_count = vector_count;
+  shape.vector_bytes = checked_product(vector_elements, scalar_size,
+                                       "sizing NVIDIA solve_cw workspace bytes");
+  shape.reduction_partial_bytes = checked_product(
+      checked_product(blocks, size_t(2), "sizing NVIDIA solve_cw reduction partials"),
+      sizeof(double), "sizing NVIDIA solve_cw reduction bytes");
+  return shape;
+}
+
+void ensure_cw_workspace(NvidiaBackendState &state, const nvidia::cw_workspace_shape &shape,
+                         nvidia::scalar_precision precision, int L) {
+  if (state.cw_workspace_ && state.cw_workspace_->accommodates(shape, precision, L)) return;
+  std::unique_ptr<NvidiaCwWorkspace> replacement(
+      new NvidiaCwWorkspace(shape, precision, L, state.device_));
+  state.cw_workspace_.swap(replacement);
+  ++state.cw_workspace_allocations_;
+}
+
+} // namespace
+
+bool NvidiaBackend::supports_cw(const CwSolveRequest &, std::string &why) const {
+  why.clear();
+  return true;
+}
+
+Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
+                                        const StepPlan &step_plan, const CwPlan &cw_plan,
+                                        Executable *cached, BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  if (!state.initialized_ || state.transfer_failed_)
+    throw std::logic_error("NVIDIA solve_cw requires an initialized usable state");
+  if (!std::isfinite(request.tolerance) || request.tolerance <= 0.0 || request.maxiters < 1 ||
+      request.L < 1 || !std::isfinite(request.frequency.real()) ||
+      !std::isfinite(request.frequency.imag()) || request.frequency == std::complex<double>() ||
+      request.eigfrequency)
+    throw std::invalid_argument("NVIDIA solve_cw request is unsupported or invalid");
+  if (request.entry_t != f_.t || request.entry_time != cw_source_time(f_.t, f_.dt, 0.0))
+    throw std::invalid_argument("NVIDIA solve_cw request has stale entry-time state");
+  if (count_processors() != 1)
+    throw std::invalid_argument("NVIDIA solve_cw does not support MPI decomposition");
+  if (f_.is_real || f_.gv.dim == Dcyl || f_.beta != 0.0 || f_.m != 0.0 ||
+      f_.phasein_time > 0 || f_.synchronized_magnetic_fields || f_.fluxes)
+    throw std::invalid_argument("NVIDIA solve_cw field state is outside the initial slice");
+  for (double value : f_.bfast_scaled_k)
+    if (value != 0.0)
+      throw std::invalid_argument("NVIDIA solve_cw does not support BFAST coordinates");
+  for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+    if (!f_.chunks[chunk] || !f_.chunks[chunk]->is_mine()) continue;
+    if (f_.chunks[chunk]->new_s || f_.chunks[chunk]->s->has_nonlinearities())
+      throw std::invalid_argument("NVIDIA solve_cw requires stable linear material storage");
+    FOR_FIELD_TYPES(ft) if (f_.chunks[chunk]->pol[ft])
+      throw std::invalid_argument("NVIDIA solve_cw does not support polarization state");
+  }
+  if (!step_plan.polarization_updates.empty() || !step_plan.polarization_subtractions.empty())
+    throw std::invalid_argument("NVIDIA solve_cw plan contains polarization work");
+  if (step_plan.program != StepProgram::solve_cw ||
+      step_plan.signature != compute_step_plan_signature(step_plan))
+    throw std::invalid_argument("NVIDIA solve_cw received a stale or ordinary StepPlan");
+  std::string validation_error;
+  if (!validate_cw_state_layout(f_, step_plan.cw_state_layout, &validation_error))
+    throw std::invalid_argument(validation_error.empty() ? "invalid NVIDIA solve_cw state layout"
+                                                         : validation_error);
+  if (cw_plan.signature != compute_cw_plan_signature(cw_plan) ||
+      !validate_cw_plan(f_, step_plan, cw_plan, &validation_error))
+    throw std::invalid_argument(validation_error.empty() ? "invalid NVIDIA solve_cw plan"
+                                                         : validation_error);
+  if (cw_plan.state_layout_signature != step_plan.cw_state_layout.signature ||
+      cw_plan.step_plan_signature != step_plan.signature)
+    throw std::invalid_argument("NVIDIA solve_cw plan fingerprints disagree");
+
+  const CwStateLayout &layout = step_plan.cw_state_layout;
+  std::vector<nvidia::cw_state_row_launch> rows;
+  rows.reserve(layout.rows.size());
+  size_t expected_complex_offset = 0;
+  bool have_precision = false;
+  nvidia::scalar_precision precision = nvidia::scalar_precision::f64;
+  for (const CwStateRow &row : layout.rows) {
+    if (row.chunk < 0 || row.chunk >= f_.num_chunks || !f_.chunks[row.chunk] ||
+        !f_.chunks[row.chunk]->is_mine())
+      throw std::invalid_argument("NVIDIA solve_cw row references an unowned chunk");
+    if (row.complex_offset != expected_complex_offset || !row.complex_count)
+      throw std::invalid_argument("NVIDIA solve_cw row offsets are not contiguous");
+    const array_kind kind = cw_array_kind(row.family);
+    const ArraySpec &real_spec = validate_cw_field_array(
+        state, row.real_array, row.chunk, kind, row.storage_component, 0,
+        "NVIDIA solve_cw real row");
+    const ArraySpec &imag_spec = validate_cw_field_array(
+        state, row.imag_array, row.chunk, kind, row.storage_component, 1,
+        "NVIDIA solve_cw imaginary row");
+    if (real_spec.storage != imag_spec.storage || real_spec.elements != imag_spec.elements)
+      throw std::invalid_argument("NVIDIA solve_cw row halves have incompatible storage");
+    const nvidia::scalar_precision row_precision =
+        real_spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
+                                            : nvidia::scalar_precision::f64;
+    if (have_precision && precision != row_precision)
+      throw std::invalid_argument("NVIDIA solve_cw state rows mix storage precision");
+    precision = row_precision;
+    have_precision = true;
+
+    nvidia::cw_state_row_launch compiled = {};
+    compiled.region = flat_region_for(row.owned_region);
+    const ptrdiff_t maximum = checked_region_max(compiled.region);
+    validate_index_range(state.plan_, row.real_array, ptrdiff_t(compiled.region.base), maximum,
+                         "NVIDIA solve_cw real row");
+    validate_index_range(state.plan_, row.imag_array, ptrdiff_t(compiled.region.base), maximum,
+                         "NVIDIA solve_cw imaginary row");
+    size_t region_count = 1;
+    for (int axis = 0; axis < 3; ++axis)
+      region_count = checked_product(region_count, compiled.region.counts[axis],
+                                     "counting NVIDIA solve_cw row points");
+    if (region_count != row.complex_count)
+      throw std::invalid_argument("NVIDIA solve_cw row region/count mismatch");
+    const size_t complex_end = checked_add(row.complex_offset, row.complex_count,
+                                           "validating NVIDIA solve_cw vector extent");
+    const size_t real_end = checked_product(complex_end, size_t(2),
+                                            "validating NVIDIA solve_cw real-vector extent");
+    if (real_end > layout.real_count)
+      throw std::out_of_range("NVIDIA solve_cw row exceeds the real-vector extent");
+    compiled.real_values = state.arenas_->resolve(row.real_array.value).address;
+    compiled.imaginary_values = state.arenas_->resolve(row.imag_array.value).address;
+    compiled.complex_offset = row.complex_offset;
+    compiled.complex_count = row.complex_count;
+    compiled.precision = row_precision;
+    rows.push_back(compiled);
+    expected_complex_offset = complex_end;
+  }
+  if (!have_precision || expected_complex_offset != layout.complex_count ||
+      layout.real_count != checked_product(layout.complex_count, size_t(2),
+                                           "validating NVIDIA solve_cw vector length"))
+    throw std::invalid_argument("NVIDIA solve_cw state vector totals are inconsistent");
+
+  std::vector<nvidia::cw_zero_launch> zeroes;
+  zeroes.reserve(layout.zero_arrays.size());
+  uint32_t previous_zero = 0;
+  bool have_previous_zero = false;
+  for (const ArrayRef &ref : layout.zero_arrays) {
+    if (!is_valid(ref.id) || ref.id.value >= state.plan_.arrays.size())
+      throw std::out_of_range("NVIDIA solve_cw zero set uses an invalid ArrayId");
+    const ArraySpec &spec = state.plan_.arrays[ref.id.value];
+    if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+        is_valid(spec.alias_of) ||
+        (spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
+                                        : nvidia::scalar_precision::f64) != precision ||
+        ref.offset != 0 ||
+        ref.elements != spec.elements)
+      throw std::invalid_argument("NVIDIA solve_cw zero set has incompatible storage");
+    if (have_previous_zero && ref.id.value <= previous_zero)
+      throw std::invalid_argument("NVIDIA solve_cw zero set is not canonical");
+    zeroes.push_back(nvidia::cw_zero_launch{state.arenas_->resolve(ref.id.value).address,
+                                           ref.elements, precision});
+    previous_zero = ref.id.value;
+    have_previous_zero = true;
+  }
+
+  if (!f_.descriptors)
+    throw std::logic_error("NVIDIA solve_cw requires prepared source/DFT descriptors");
+  const SourcePlan &source_plan = f_.descriptors->sources;
+  std::vector<NvidiaCwExecutable::Stage> rhs_stages;
+  std::vector<nvidia::cw_source_batch_launch> rhs_sources;
+  std::vector<nvidia::source_point> source_points;
+  rhs_stages.reserve(cw_plan.rhs_stages.size());
+  rhs_sources.reserve(cw_plan.rhs_sources.size());
+  for (const CwRhsStage &stage : cw_plan.rhs_stages) {
+    if (stage.source_time_index != 0 || stage.source_time_count != source_plan.source_times.size() ||
+        size_t(stage.source_index) + stage.source_count > cw_plan.rhs_sources.size() ||
+        stage.boundary.operation_index >= step_plan.operations.size() ||
+        stage.constitutive.operation_index >= step_plan.operations.size())
+      throw std::invalid_argument("NVIDIA solve_cw RHS stage has invalid descriptor spans");
+    const Operation &boundary = step_plan.operations[stage.boundary.operation_index];
+    const Operation &constitutive = step_plan.operations[stage.constitutive.operation_index];
+    if (boundary.kind != OpKind::transfer_halo || boundary.ft != stage.ft ||
+        constitutive.kind != OpKind::update_eh ||
+        constitutive.ft != (stage.ft == B_stuff ? H_stuff : E_stuff))
+      throw std::invalid_argument("NVIDIA solve_cw RHS stage references the wrong operations");
+    NvidiaCwExecutable::Stage compiled_stage = {stage.source_time_offset, rhs_sources.size(),
+                                                stage.source_count,
+                                                stage.boundary.operation_index,
+                                                stage.constitutive.operation_index};
+    for (size_t i = stage.source_index; i < size_t(stage.source_index) + stage.source_count; ++i) {
+      const CwRhsSourceDescriptor &reference = cw_plan.rhs_sources[i];
+      if (reference.mode !=
+              CwRhsSourceMode::primary_subtract_current_dt_including_integrated ||
+          reference.source_descriptor_index >= source_plan.sources.size())
+        throw std::invalid_argument("NVIDIA solve_cw RHS source reference is invalid");
+      const SourceDescriptor &source = source_plan.sources[reference.source_descriptor_index];
+      if (source.ft != stage.ft || source.source_ordinal != reference.source_ordinal)
+        throw std::invalid_argument("NVIDIA solve_cw RHS source order is non-canonical");
+      rhs_sources.push_back(
+          compile_cw_source_batch(source, source_plan, f_, state, source_points));
+    }
+    rhs_stages.push_back(compiled_stage);
+  }
+  if (rhs_sources.size() != cw_plan.rhs_sources.size())
+    throw std::invalid_argument("NVIDIA solve_cw RHS source coverage is incomplete");
+
+  std::vector<nvidia::dft_launch> final_dfts;
+  std::vector<double> dft_omega;
+  final_dfts.reserve(cw_plan.final_dfts.size());
+  for (size_t i = 0; i < cw_plan.final_dfts.size(); ++i) {
+    const CwDftDescriptorRef &reference = cw_plan.final_dfts[i];
+    if (reference.descriptor_index >= f_.descriptors->dfts.size())
+      throw std::out_of_range("NVIDIA solve_cw final DFT reference is out of range");
+    const DftDescriptor &descriptor = f_.descriptors->dfts[reference.descriptor_index];
+    if (reference.descriptor_index != i || reference.chunk != descriptor.chunk ||
+        reference.c != descriptor.c || reference.decimation_factor != descriptor.decimation_factor ||
+        reference.due_scalar_slot != descriptor.due_scalar_slot)
+      throw std::invalid_argument("NVIDIA solve_cw final DFT reference is non-canonical");
+    final_dfts.push_back(compile_dft(descriptor, f_, state, dft_omega));
+  }
+
+  const nvidia::cw_workspace_shape shape =
+      cw_workspace_shape(layout.real_count, request.L, precision);
+  if (cached) {
+    NvidiaCwExecutable *existing = dynamic_cast<NvidiaCwExecutable *>(cached);
+    if (!existing || existing->owner_ != this ||
+        existing->state_token_ != state.state_token_ ||
+        existing->layout_storage_fingerprint_ != layout.storage_fingerprint ||
+        existing->device_storage_fingerprint_ != state.fingerprint_ ||
+        existing->step_plan_signature_ != step_plan.signature ||
+        existing->cw_plan_signature_ != cw_plan.signature ||
+        existing->precision_ != precision || existing->real_count_ != layout.real_count)
+      throw std::invalid_argument("NVIDIA solve_cw cache entry has the wrong identity");
+    ensure_cw_workspace(state, shape, precision, request.L);
+    return existing;
+  }
+
+  std::unique_ptr<Executable> compiled_step(compile(step_plan, state));
+  NvidiaExecutable *timestep = dynamic_cast<NvidiaExecutable *>(compiled_step.get());
+  if (!timestep) throw std::logic_error("NVIDIA solve_cw compiler returned the wrong type");
+  std::unique_ptr<NvidiaExecutable> timestep_owner(timestep);
+  compiled_step.release();
+  std::unique_ptr<NvidiaCwExecutable> compiled_cw(new NvidiaCwExecutable(
+      this, layout.storage_fingerprint, state.fingerprint_, step_plan.signature,
+      cw_plan.signature, precision, layout.real_count, rows, zeroes, rhs_stages, rhs_sources,
+      source_points, final_dfts, dft_omega, cw_plan.unpack,
+      std::move(timestep_owner), state));
+  ensure_cw_workspace(state, shape, precision, request.L);
+  return compiled_cw.release();
+}
+
+CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepPlan &step_plan,
+                                      const CwPlan &cw_plan, Executable &raw_ordinary,
+                                      Executable &raw_cw, BackendState &raw_state,
+                                      CwSolveSession &session) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  (void)checked_executable(raw_ordinary, state);
+  nvidia::device_scope device_scope(state.device_);
+  NvidiaCwExecutable *cw = dynamic_cast<NvidiaCwExecutable *>(&raw_cw);
+  if (!cw || cw->owner_ != this || cw->state_token_ != state.state_token_ ||
+      !cw->timestep_ || cw->timestep_->state_token_ != state.state_token_ ||
+      !state.cw_workspace_)
+    throw std::invalid_argument("NVIDIA solve_cw received an invalid compiled artifact");
+  if (cw->layout_storage_fingerprint_ != step_plan.cw_state_layout.storage_fingerprint ||
+      cw->device_storage_fingerprint_ != state.fingerprint_ ||
+      cw->step_plan_signature_ != step_plan.signature ||
+      cw->cw_plan_signature_ != cw_plan.signature || cw->real_count_ == 0)
+    throw std::logic_error("NVIDIA solve_cw executable is stale");
+  NvidiaCwWorkspace &workspace = *state.cw_workspace_;
+  if (!workspace.accommodates(cw_workspace_shape(cw->real_count_, request.L, cw->precision_),
+                              cw->precision_, request.L))
+    throw std::logic_error("NVIDIA solve_cw workspace is too small");
+
+  const size_t n = cw->real_count_;
+  const size_t Ls = size_t(request.L);
+  const size_t two_l = checked_product(Ls, size_t(2), "indexing solve_cw workspace");
+  const size_t scalar_size = cw->precision_ == nvidia::scalar_precision::f32 ? sizeof(float)
+                                                                            : sizeof(double);
+  const size_t vector_bytes = checked_product(n, scalar_size, "indexing solve_cw workspace");
+  char *const workspace_base = static_cast<char *>(workspace.vectors_.opaque_handle());
+  const auto vector_at = [&](size_t slot) -> void * {
+    return workspace_base + checked_product(slot, vector_bytes, "indexing solve_cw vector");
+  };
+  for (int i = 0; i <= request.L; ++i) {
+    workspace.r_[i] = vector_at(size_t(i));
+    workspace.u_[i] = vector_at(checked_add(checked_add(Ls, size_t(1),
+                                                       "indexing solve_cw workspace"),
+                                            size_t(i), "indexing solve_cw workspace"));
+  }
+  void *const rtilde = vector_at(checked_add(two_l, size_t(2), "indexing solve_cw workspace"));
+  void *const x = vector_at(checked_add(two_l, size_t(3), "indexing solve_cw workspace"));
+  void *const b = vector_at(checked_add(two_l, size_t(4), "indexing solve_cw workspace"));
+  workspace.operator_applications_ = 0;
+  workspace.reduction_count_ = 0;
+  workspace.kernel_launches_ = 0;
+  state.cw_statistics_ = NvidiaCwStatistics();
+
+  const auto vector_op = [&](void *output, const void *left, const void *right, double coefficient,
+                             nvidia::cw_vector_operation operation) {
+    nvidia::cw_vector_launch launch = {output, left, right, n, coefficient, cw->precision_,
+                                       operation};
+    nvidia::launch_cw_vector(launch, *state.transfer_);
+    ++workspace.kernel_launches_;
+  };
+  const auto pack = [&](void *destination) {
+    for (const nvidia::cw_state_row_launch &row : cw->rows_) {
+      nvidia::launch_cw_pack(row, destination, n, *state.transfer_);
+      ++workspace.kernel_launches_;
+    }
+  };
+  const auto unpack = [&](const void *source) {
+    for (const nvidia::cw_state_row_launch &row : cw->rows_) {
+      nvidia::launch_cw_unpack(row, source, n, *state.transfer_);
+      ++workspace.kernel_launches_;
+    }
+  };
+  const auto upload_source_scalars = [&](double offset) {
+    f_.step_source_times[0] = cw_source_time(f_.t, f_.dt, 0.0);
+    f_.step_source_times[1] = cw_source_time(f_.t, f_.dt, 0.5);
+    f_.step_source_times[2] = cw_source_time(f_.t, f_.dt, 1.0);
+    evaluate_supported_source_scalars(f_, offset);
+    const SourcePlan &sources = f_.descriptors->sources;
+    if (sources.scalars.size() != cw->timestep_->source_scalar_count_)
+      throw std::logic_error("NVIDIA solve_cw source scalar count changed after compilation");
+    nvidia::source_scalar *staging =
+        static_cast<nvidia::source_scalar *>(cw->timestep_->source_staging_.data());
+    for (size_t i = 0; i < sources.scalars.size(); ++i) {
+      staging[i].current_real = sources.scalars[i].current.real();
+      staging[i].current_imag = sources.scalars[i].current.imag();
+      staging[i].dipole_real = sources.scalars[i].dipole.real();
+      staging[i].dipole_imag = sources.scalars[i].dipole.imag();
+    }
+    nvidia::copy_host_to_device_async(
+        cw->timestep_->source_scalars_, 0, staging,
+        checked_product(sources.scalars.size(), sizeof(nvidia::source_scalar),
+                        "uploading solve_cw source scalars"),
+        *state.transfer_);
+    /* The next RHS stage reuses this bounded pinned block after invoking more
+       host callbacks. Complete the compact upload before that overwrite. */
+    state.transfer_->synchronize();
+  };
+  const auto execute_reconciliation = [&](uint32_t operation_index, bool skip_w_components) {
+    if (operation_index >= cw->timestep_->operations_.size())
+      throw std::logic_error("NVIDIA solve_cw reconciliation operation is out of range");
+    const NvidiaCompiledOperation &op = cw->timestep_->operations_[operation_index];
+    if (op.kind == OpKind::transfer_halo) {
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        nvidia::launch_zero(cw->timestep_->zero_updates_[i], *state.transfer_);
+        ++workspace.kernel_launches_;
+      }
+      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+        nvidia::launch_halo_gather(cw->timestep_->halo_plans_[i].gather,
+                                   cw->timestep_->halo_gathers_.opaque_handle(),
+                                   cw->timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
+        ++workspace.kernel_launches_;
+      }
+      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+        nvidia::launch_halo_scatter(cw->timestep_->halo_plans_[i].scatter,
+                                    cw->timestep_->halo_scatters_.opaque_handle(),
+                                    cw->timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
+        ++workspace.kernel_launches_;
+      }
+      return;
+    }
+    if (op.kind == OpKind::update_eh) {
+      if (op.copy_count || op.subtraction_count || op.source_count)
+        throw std::logic_error("NVIDIA solve_cw constitutive operation retained source state");
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        const nvidia::constitutive_launch &update = cw->timestep_->constitutive_updates_[i];
+        /* array_to_fields alone calls update_eh(E_stuff, true): the packed CW
+           vector already carries both W and its paired primary field.  RHS
+           reconciliation and the full T_cw step use the ordinary false mode
+           and must retain these rows. */
+        if (skip_w_components && update.target_w) continue;
+        nvidia::launch_constitutive(update, *state.transfer_);
+        ++workspace.kernel_launches_;
+      }
+      return;
+    }
+    throw std::logic_error("NVIDIA solve_cw reconciliation reference has the wrong kind");
+  };
+  const std::complex<double> iomega =
+      (1.0 - std::exp(std::complex<double>(0.0, -1.0) *
+                      (2 * pi * request.frequency) * f_.dt)) *
+      (1.0 / f_.dt);
+  const auto apply_operator = [&](const void *input, void *output) {
+    unpack(input);
+    for (int i = 0; i < 3; ++i)
+      execute_reconciliation(cw->unpack_operations_[i],
+                             i == 1 && cw->unpack_skip_w_components_);
+    advance(*cw->timestep_, state, 1);
+    pack(output);
+    nvidia::cw_operator_launch launch = {output, output, input, n, 1.0 / f_.dt,
+                                         iomega.real(), iomega.imag(), cw->precision_};
+    nvidia::launch_cw_operator_finalize(launch, *state.transfer_);
+    ++workspace.kernel_launches_;
+    ++workspace.operator_applications_;
+  };
+  const size_t reduction_blocks = std::min<size_t>(128, (n + 255) / 256);
+  const auto reduce = [&](const void *left, const void *right, double scale, int operation) {
+    nvidia::cw_reduction_launch launch = {
+        left, right, workspace.reduction_partials_.opaque_handle(),
+        workspace.reduction_result_.opaque_handle(), n, reduction_blocks, scale, cw->precision_};
+    if (operation == 0) nvidia::launch_cw_dot(launch, *state.transfer_);
+    else if (operation == 1) nvidia::launch_cw_max_abs(launch, *state.transfer_);
+    else nvidia::launch_cw_scaled_norm_sum(launch, *state.transfer_);
+    nvidia::copy_device_to_host_async(workspace.reduction_host_.data(),
+                                      workspace.reduction_result_, 0, sizeof(double),
+                                      *state.transfer_);
+    state.transfer_->synchronize();
+    double result = 0.0;
+    memcpy(&result, workspace.reduction_host_.data(), sizeof(result));
+    if (!std::isfinite(result) || (operation != 0 && result < 0.0))
+      throw std::runtime_error("NVIDIA solve_cw reduction returned a nonfinite result");
+    ++workspace.reduction_count_;
+    ++state.cw_statistics_.scalar_device_to_host_calls;
+    state.cw_statistics_.scalar_device_to_host_bytes += sizeof(double);
+    return result;
+  };
+  const auto dot = [&](const void *left, const void *right) {
+    return reduce(left, right, 1.0, 0);
+  };
+  const auto norm = [&](const void *values) {
+    const double maximum = reduce(values, NULL, 1.0, 1);
+    if (maximum == 0.0) return 0.0;
+    const double sum = reduce(values, NULL, 1.0 / maximum, 2);
+    const double result = maximum * std::sqrt(sum);
+    if (!std::isfinite(result))
+      throw std::runtime_error("NVIDIA solve_cw norm is nonfinite");
+    return result;
+  };
+
+  /* Match the legacy entry sequence: one source-suppressed timestep produces
+     the initial guess before RHS construction. */
+  advance(*cw->timestep_, state, 1);
+  pack(x);
+  for (const nvidia::cw_zero_launch &zero : cw->zeroes_) {
+    nvidia::launch_cw_zero(zero, *state.transfer_);
+    ++workspace.kernel_launches_;
+  }
+  for (const NvidiaCwExecutable::Stage &stage : cw->rhs_stages_) {
+    upload_source_scalars(stage.source_time_offset);
+    for (size_t i = stage.source_first; i < stage.source_first + stage.source_count; ++i) {
+      nvidia::launch_cw_source_batch(cw->rhs_sources_[i],
+                                     cw->timestep_->source_scalars_.opaque_handle(),
+                                     *state.transfer_);
+      ++workspace.kernel_launches_;
+    }
+    execute_reconciliation(stage.boundary_operation, false);
+    execute_reconciliation(stage.constitutive_operation, false);
+  }
+  pack(b);
+  vector_op(b, b, NULL, -1.0 / f_.dt,
+            nvidia::cw_vector_operation::scale_field_coefficient);
+  double bnrm = norm(b);
+  if (bnrm == 0.0) throw std::runtime_error("zero current amplitudes in NVIDIA solve_cw");
+
+  apply_operator(x, workspace.r_[0]);
+  vector_op(workspace.r_[0], b, workspace.r_[0], 0.0,
+            nvidia::cw_vector_operation::subtract_field);
+  vector_op(rtilde, workspace.r_[0], NULL, 0.0, nvidia::cw_vector_operation::copy);
+  const double rtilde_norm = norm(rtilde);
+  if (rtilde_norm != 0.0)
+    vector_op(rtilde, rtilde, NULL, 1.0 / rtilde_norm,
+              nvidia::cw_vector_operation::scale_f64_coefficient);
+  nvidia::fill_byte_async(workspace.vectors_,
+                          checked_product(checked_add(Ls, size_t(1), "indexing solve_cw u0"),
+                                          vector_bytes,
+                                          "zeroing solve_cw u0"),
+                          0, vector_bytes, *state.transfer_);
+
+  double rho = 1.0, alpha = 0.0, omega = 1.0;
+  double residual = rtilde_norm;
+  int iterations = 0;
+  CwSolveStatus status = CwSolveStatus::converged;
+  const double break_tolerance = 1e-30;
+  while ((residual = norm(workspace.r_[0])) > request.tolerance * bnrm) {
+    ++iterations;
+    rho = -omega * rho;
+    bool breakdown = false;
+    for (int j = 0; j < request.L; ++j) {
+      if (std::fabs(rho) < break_tolerance) {
+        breakdown = true;
+        break;
+      }
+      const double rho1 = dot(workspace.r_[j], rtilde);
+      const double beta = alpha * rho1 / rho;
+      if (!std::isfinite(beta)) throw std::runtime_error("NVIDIA solve_cw beta is nonfinite");
+      rho = rho1;
+      for (int i = 0; i <= j; ++i)
+        vector_op(workspace.u_[i], workspace.r_[i], workspace.u_[i], -beta,
+                  nvidia::cw_vector_operation::linear_f64_coefficient);
+      apply_operator(workspace.u_[j], workspace.u_[j + 1]);
+      const double denominator = dot(workspace.u_[j + 1], rtilde);
+      alpha = rho / denominator;
+      if (!std::isfinite(alpha)) throw std::runtime_error("NVIDIA solve_cw alpha is nonfinite");
+      for (int i = 0; i <= j; ++i)
+        vector_op(workspace.r_[i], workspace.r_[i], workspace.u_[i + 1], -alpha,
+                  nvidia::cw_vector_operation::linear_f64_coefficient);
+      apply_operator(workspace.r_[j], workspace.r_[j + 1]);
+      vector_op(x, x, workspace.u_[0], alpha,
+                nvidia::cw_vector_operation::linear_f64_coefficient);
+    }
+    if (breakdown) {
+      status = CwSolveStatus::breakdown;
+      break;
+    }
+    for (int j = 1; j <= request.L; ++j) {
+      for (int i = 1; i < j; ++i) {
+        const size_t ij = size_t(j - 1) * size_t(request.L) + size_t(i - 1);
+        workspace.tau_[ij] = dot(workspace.r_[j], workspace.r_[i]) / workspace.sigma_[i];
+        if (!std::isfinite(workspace.tau_[ij]))
+          throw std::runtime_error("NVIDIA solve_cw tau is nonfinite");
+        vector_op(workspace.r_[j], workspace.r_[j], workspace.r_[i], -workspace.tau_[ij],
+                  nvidia::cw_vector_operation::linear_f64_coefficient);
+      }
+      if (breakdown) break;
+      workspace.sigma_[j] = dot(workspace.r_[j], workspace.r_[j]);
+      workspace.gamma_p_[j] = dot(workspace.r_[0], workspace.r_[j]) / workspace.sigma_[j];
+      if (!std::isfinite(workspace.gamma_p_[j]))
+        throw std::runtime_error("NVIDIA solve_cw gamma-prime is nonfinite");
+    }
+    if (breakdown) {
+      status = CwSolveStatus::breakdown;
+      break;
+    }
+    omega = workspace.gamma_[request.L] = workspace.gamma_p_[request.L];
+    for (int j = request.L - 1; j >= 1; --j) {
+      workspace.gamma_[j] = workspace.gamma_p_[j];
+      for (int i = j + 1; i <= request.L; ++i)
+        workspace.gamma_[j] -=
+            workspace.tau_[size_t(i - 1) * size_t(request.L) + size_t(j - 1)] *
+            workspace.gamma_[i];
+    }
+    for (int j = 1; j < request.L; ++j) {
+      workspace.gamma_pp_[j] = workspace.gamma_[j + 1];
+      for (int i = j + 1; i < request.L; ++i)
+        workspace.gamma_pp_[j] +=
+            workspace.tau_[size_t(i - 1) * size_t(request.L) + size_t(j - 1)] *
+            workspace.gamma_[i + 1];
+    }
+    vector_op(x, x, workspace.r_[0], workspace.gamma_[1],
+              nvidia::cw_vector_operation::linear_f64_coefficient);
+    vector_op(workspace.r_[0], workspace.r_[0], workspace.r_[request.L],
+              -workspace.gamma_p_[request.L],
+              nvidia::cw_vector_operation::linear_f64_coefficient);
+    vector_op(workspace.u_[0], workspace.u_[0], workspace.u_[request.L],
+              -workspace.gamma_[request.L],
+              nvidia::cw_vector_operation::linear_f64_coefficient);
+    for (int j = 1; j < request.L; ++j) {
+      vector_op(x, x, workspace.r_[j], workspace.gamma_pp_[j],
+                nvidia::cw_vector_operation::linear_f64_coefficient);
+      vector_op(workspace.r_[0], workspace.r_[0], workspace.r_[j],
+                -workspace.gamma_p_[j], nvidia::cw_vector_operation::linear_f64_coefficient);
+      vector_op(workspace.u_[0], workspace.u_[0], workspace.u_[j], -workspace.gamma_[j],
+                nvidia::cw_vector_operation::linear_f64_coefficient);
+    }
+    if (iterations == request.maxiters) {
+      status = CwSolveStatus::not_converged;
+      break;
+    }
+  }
+
+  const double recursive_relative_residual = residual / bnrm;
+  const int verification_t = f_.t;
+  state.cw_skip_source_evaluation_ = true;
+  try {
+    apply_operator(x, workspace.r_[0]);
+  }
+  catch (...) {
+    state.cw_skip_source_evaluation_ = false;
+    f_.t = verification_t;
+    throw;
+  }
+  state.cw_skip_source_evaluation_ = false;
+  f_.t = verification_t;
+  vector_op(workspace.r_[0], b, workspace.r_[0], 0.0,
+            nvidia::cw_vector_operation::subtract_field);
+  const double true_relative_residual = norm(workspace.r_[0]) / bnrm;
+  const double reduction_error_bound =
+      64.0 * (cw->precision_ == nvidia::scalar_precision::f32
+                  ? double(std::numeric_limits<float>::epsilon())
+                  : std::numeric_limits<double>::epsilon()) *
+      std::sqrt(double(n));
+  if (status == CwSolveStatus::converged &&
+      true_relative_residual > std::max(5.0 * request.tolerance, reduction_error_bound))
+    status = CwSolveStatus::not_converged;
+  unpack(x);
+  for (int i = 0; i < 3; ++i)
+    execute_reconciliation(cw->unpack_operations_[i],
+                           i == 1 && cw->unpack_skip_w_components_);
+  advance(*cw->timestep_, state, 1);
+  session.restore_before_final_dft();
+  size_t final_dft_kernel_launches = 0;
+  for (const nvidia::dft_launch &dft : cw->final_dfts_) {
+    if ((f_.t % dft.decimation_factor) != 0) continue;
+    const double sample_time = dft.magnetic ? f_.time() - 0.5 * f_.dt : f_.time();
+    nvidia::launch_dft(dft, sample_time, *state.transfer_);
+    ++workspace.kernel_launches_;
+    ++final_dft_kernel_launches;
+  }
+  state.transfer_->synchronize();
+  state.device_authoritative_ = true;
+
+  CwSolveResult result;
+  result.status = status;
+  result.iterations = iterations;
+  result.operator_applications = workspace.operator_applications_;
+  result.recursive_relative_residual = recursive_relative_residual;
+  result.true_relative_residual = true_relative_residual;
+  state.cw_statistics_.result = result;
+  state.cw_statistics_.reduction_count = workspace.reduction_count_;
+  state.cw_statistics_.final_dft_kernel_launches = final_dft_kernel_launches;
+  state.cw_statistics_.kernel_launches = workspace.kernel_launches_;
+  state.cw_statistics_.workspace_capacity_bytes = workspace.shape_.vector_bytes +
+                                                  workspace.shape_.reduction_partial_bytes +
+                                                  2 * sizeof(double);
+  state.cw_statistics_.workspace_allocations = state.cw_workspace_allocations_;
+  state.cw_statistics_.valid = true;
+  return result;
 }
 
 void NvidiaBackend::preflight_magnetic_transition(Executable &raw_executable,
@@ -3603,9 +4444,16 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     };
     for (int step = 0; step < num_steps; ++step) {
       bool segment_guard = false;
-      f_.step_source_times[0] = f_.time();
-      f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
-      f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
+      if (executable.program_ == StepProgram::solve_cw) {
+        f_.step_source_times[0] = cw_source_time(f_.t, f_.dt, 0.0);
+        f_.step_source_times[1] = cw_source_time(f_.t, f_.dt, 0.5);
+        f_.step_source_times[2] = cw_source_time(f_.t, f_.dt, 1.0);
+      }
+      else {
+        f_.step_source_times[0] = f_.time();
+        f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
+        f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
+      }
       for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
         const NvidiaCompiledOperation &op = executable.operations_[oi];
         if (op.guard.kind == GuardKind::segment_boundary && !segment_guard) continue;
@@ -3690,6 +4538,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                   executable.halo_scratch_.opaque_handle(), *state.transfer_);
             break;
           case OpKind::evaluate_source_scalars: {
+            if (state.cw_skip_source_evaluation_) break;
             evaluate_supported_source_scalars(f_, op.source_time_offset);
             const SourcePlan &source_plan = f_.descriptors->sources;
             if (source_plan.scalars.size() != executable.source_scalar_count_ ||
@@ -3846,8 +4695,9 @@ void NvidiaBackend::write(ArrayRef ref, const void *host_buffer, size_t bytes) {
 
 void NvidiaBackend::reduce_dft(const DftReductionRequest &request,
                                std::complex<double> *local_result, size_t result_count) {
-  if (!active_state_) throw std::logic_error("NVIDIA backend has no active state");
-  NvidiaBackendState &state = *active_state_;
+  NvidiaBackendState *current = current_state();
+  if (!current) throw std::logic_error("NVIDIA backend has no active state");
+  NvidiaBackendState &state = *current;
   if (!state.initialized_) throw std::logic_error("NVIDIA backend storage is not initialized");
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
@@ -4049,6 +4899,11 @@ NvidiaExecutable &NvidiaBackend::checked_executable(Executable &raw_executable,
   if (!executable || executable->owner_ != this || executable->state_token_ != state.state_token_)
     throw std::invalid_argument("NVIDIA backend received an executable of the wrong type");
   return *executable;
+}
+
+NvidiaCwStatistics NvidiaBackend::cw_statistics_for_testing() const {
+  NvidiaBackendState *state = current_state();
+  return state ? state->cw_statistics_ : NvidiaCwStatistics();
 }
 
 ExecutionBackend *make_nvidia_backend(fields &f, const execution_options &options,
