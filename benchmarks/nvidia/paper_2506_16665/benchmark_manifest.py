@@ -20,8 +20,8 @@ DEFAULT_REFERENCE = HERE / "paper_reference.json"
 DEFAULT_CASES = HERE / "runner_cases.json"
 DEFAULT_MANIFEST_SCHEMA = HERE / "benchmark_manifest.schema.json"
 DEFAULT_RESULT_SCHEMA = HERE / "benchmark_result.schema.json"
-GENERATOR_VERSION = 2
-MANIFEST_SCHEMA_VERSION = 2
+GENERATOR_VERSION = 3
+MANIFEST_SCHEMA_VERSION = 3
 RESULT_SCHEMA_VERSION = 1
 BACKENDS = {"auto", "cpu", "nvidia"}
 PRECISIONS = {"native", "f32", "mixed"}
@@ -32,6 +32,12 @@ SPECTRAL_ENVELOPE_POLICY = {
     "kind": "gaussian_frequency",
     "bandwidth_definition": "full_centered_wavelength_interval",
     "frequency_conversion": "reciprocal_endpoint_span",
+}
+PADDING_INTERPRETATION = "total_added_span_split_equally_between_both_sides"
+PERFORMANCE_ADAPTATION_MATERIALS = {
+    "Si": {"model": "nondispersive", "refractive_index": 3.48, "epsilon": 12.1104},
+    "SiO2": {"model": "nondispersive", "epsilon": 2.09},
+    "Si3N4": {"model": "nondispersive", "refractive_index": 2.0, "epsilon": 4.0},
 }
 
 
@@ -347,6 +353,12 @@ def validate_case_definitions(definitions: Mapping[str, Any]) -> None:
     ):
         raise ValidationError("cell z extent must be positive")
     _finite(cell.get("in_plane_padding_um"), "cell.in_plane_padding_um", positive=True)
+    adaptation_materials = _mapping(
+        definitions.get("performance_adaptation_materials"),
+        "performance_adaptation_materials",
+    )
+    if not _json_equal(adaptation_materials, PERFORMANCE_ADAPTATION_MATERIALS):
+        raise ValidationError("performance adaptation material constants are invalid")
     time_stepping = _mapping(definitions.get("time_stepping"), "time_stepping")
     courant = _finite(
         time_stepping.get("courant_factor"),
@@ -374,8 +386,22 @@ def validate_case_definitions(definitions: Mapping[str, Any]) -> None:
     )
     if dict(spectral_envelope) != SPECTRAL_ENVELOPE_POLICY:
         raise ValidationError("source_defaults.spectral_envelope policy is invalid")
+    if (
+        source_defaults.get("transverse_padding_interpretation")
+        != PADDING_INTERPRETATION
+    ):
+        raise ValidationError("source transverse padding interpretation is invalid")
     monitor_defaults = _mapping(definitions.get("monitor_defaults"), "monitor_defaults")
     _positive_int(monitor_defaults.get("mode_count"), "monitor_defaults.mode_count")
+    if (
+        monitor_defaults.get("transverse_padding_interpretation")
+        != PADDING_INTERPRETATION
+    ):
+        raise ValidationError("monitor transverse padding interpretation is invalid")
+    _positive_int(
+        monitor_defaults.get("dft_decimation_factor"),
+        "monitor_defaults.dft_decimation_factor",
+    )
     decay = _mapping(definitions.get("decay_stop"), "decay_stop")
     _finite(
         decay.get("relative_threshold"), "decay_stop.relative_threshold", positive=True
@@ -561,6 +587,19 @@ def validate_case_definitions(definitions: Mapping[str, Any]) -> None:
             "quality_factor",
         }:
             raise ValidationError("ring must require resonance wavelength, FWHM, and Q")
+        support = case.get("runner_support", {"supported": True, "reason": None})
+        support = _mapping(support, f"case {name}.runner_support")
+        if not isinstance(support.get("supported"), bool):
+            raise ValidationError(
+                f"case {name}.runner_support.supported must be boolean"
+            )
+        reason = support.get("reason")
+        if support["supported"] and reason is not None:
+            raise ValidationError(
+                f"case {name} supported runner must not have a reason"
+            )
+        if not support["supported"] and (not isinstance(reason, str) or not reason):
+            raise ValidationError(f"case {name} unsupported runner requires a reason")
 
 
 def sha256_file(path: pathlib.Path) -> str:
@@ -911,6 +950,48 @@ def _expand_monitors(
     ]
 
 
+def _resolved_monitor_sampling(
+    monitors: Sequence[Mapping[str, Any]],
+    wavelength_min_um: float,
+    wavelength_max_um: float,
+) -> Dict[str, Any]:
+    """Resolve wavelength-domain monitor sampling to an explicit shared grid."""
+    sampled = [monitor for monitor in monitors if monitor.get("kind") == "mode"]
+    if not sampled:
+        raise ValidationError("at least one mode monitor is required")
+    steps_nm = {
+        _finite(
+            _mapping(
+                monitor.get("frequency_sampling"), "monitor frequency_sampling"
+            ).get("step_nm"),
+            "monitor frequency step_nm",
+            positive=True,
+        )
+        for monitor in sampled
+    }
+    step_nm = min(steps_nm)
+    span_nm = (wavelength_max_um - wavelength_min_um) * 1000.0
+    intervals = int(round(span_nm / step_nm))
+    if not math.isclose(intervals * step_nm, span_nm, rel_tol=0.0, abs_tol=1e-9):
+        raise ValidationError(
+            "monitor wavelength step does not exactly divide the band"
+        )
+    wavelengths = [
+        wavelength_min_um + index * step_nm / 1000.0 for index in range(intervals + 1)
+    ]
+    wavelengths[-1] = wavelength_max_um
+    frequencies = [1.0 / wavelength for wavelength in wavelengths]
+    return {
+        "domain": "wavelength",
+        "step_nm": step_nm,
+        "inclusive_endpoints": True,
+        "wavelengths_um": wavelengths,
+        "frequencies_meep": frequencies,
+        "frequency_order": "decreasing_with_increasing_wavelength",
+        "dft_decimation_factor": int(sampled[0]["dft_decimation_factor"]),
+    }
+
+
 def build_manifest(
     *,
     reference: Mapping[str, Any],
@@ -1033,11 +1114,17 @@ def build_manifest(
         "gds_cell_name": runner_case["gds_cell_name"],
         "cladding": device["cladding"],
         "top_cladding": runner_case.get("top_cladding"),
+        "runner_support": dict(
+            runner_case.get("runner_support", {"supported": True, "reason": None})
+        ),
         "paper_input": device["input"],
         "paper_target": device["target"],
         "symmetry": reference["common"]["symmetry"],
     }
     monitor_by_name = {monitor["name"]: monitor for monitor in case["monitors"]}
+    monitor_sampling = _resolved_monitor_sampling(
+        case["monitors"], source_wavelength_min_um, source_wavelength_max_um
+    )
     tolerance = case_definitions["observable_policy"]["tolerances_by_precision"][
         precision
     ]
@@ -1095,6 +1182,7 @@ def build_manifest(
             "source_wavelength_max_um": source_wavelength_max_um,
             "lambda_min_um": resolution["lambda_min_um"],
             "resolution_n_max_wavelength_um": resolution["lambda_min_um"],
+            "monitor_sampling": monitor_sampling,
         },
         "discretization": resolution,
         "materials": {
@@ -1103,6 +1191,11 @@ def build_manifest(
                 dict(reference["materials"]) if material_mode == "paper" else None
             ),
             "validation": proof,
+            "performance_adaptation": (
+                dict(case_definitions["performance_adaptation_materials"])
+                if material_mode == "performance-adaptation"
+                else None
+            ),
             "caveat": reference["common"]["material_mode_caveat"],
         },
         "execution": {
@@ -1336,6 +1429,11 @@ def _validate_run_manifest_for_result(
         or excitation.get("source_wavelength_max_um") != expected_high
     ):
         raise ValidationError(f"{label}.excitation wavelength band is inconsistent")
+    expected_sampling = _resolved_monitor_sampling(
+        _expand_monitors(bundled_cases, runner_case), expected_low, expected_high
+    )
+    if not _json_equal(excitation.get("monitor_sampling"), expected_sampling):
+        raise ValidationError(f"{label}.excitation monitor sampling is inconsistent")
 
     discretization = _mapping(manifest.get("discretization"), f"{label}.discretization")
     expected_discretization = convert_resolution(
@@ -1383,6 +1481,9 @@ def _validate_run_manifest_for_result(
         "gds_cell_name": runner_case["gds_cell_name"],
         "cladding": reference_device["cladding"],
         "top_cladding": runner_case.get("top_cladding"),
+        "runner_support": runner_case.get(
+            "runner_support", {"supported": True, "reason": None}
+        ),
         "paper_input": reference_device["input"],
         "paper_target": reference_device["target"],
         "symmetry": bundled_reference["common"]["symmetry"],
@@ -1404,6 +1505,13 @@ def _validate_run_manifest_for_result(
             raise ValidationError(
                 f"{label}.materials adaptation contains paper-only data"
             )
+        if not _json_equal(
+            materials.get("performance_adaptation"),
+            bundled_cases["performance_adaptation_materials"],
+        ):
+            raise ValidationError(
+                f"{label}.materials performance adaptation is not canonical"
+            )
     elif materials.get("mode") == "paper":
         if not _json_equal(
             materials.get("paper_parameters"), bundled_reference["materials"]
@@ -1417,6 +1525,10 @@ def _validate_run_manifest_for_result(
         proof_path = pathlib.Path(str(validation.get("path")))
         if sha256_file(proof_path) != validation.get("sha256"):
             raise ValidationError(f"{label}.materials validation hash mismatch")
+        if materials.get("performance_adaptation") is not None:
+            raise ValidationError(
+                f"{label}.materials paper mode contains adaptation constants"
+            )
     else:
         raise ValidationError(f"{label}.materials mode is invalid")
 
