@@ -1257,13 +1257,15 @@ private:
 };
 
 void save_dft_hdf5(dft_chunk *dft_chunks, component c, h5file *file, const char *dprefix = 0,
-                   bool single_parallel_file = true);
+                   bool single_parallel_file = true, bool backend_access_prepared = false);
 void load_dft_hdf5(dft_chunk *dft_chunks, component c, h5file *file, const char *dprefix = 0,
-                   bool single_parallel_file = true);
+                   bool single_parallel_file = true,
+                   std::string *deferred_backend_error = NULL);
 void save_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const char *dprefix = 0,
-                   bool single_parallel_file = true);
+                   bool single_parallel_file = true, bool backend_access_prepared = false);
 void load_dft_hdf5(dft_chunk *dft_chunks, const char *name, h5file *file, const char *dprefix = 0,
-                   bool single_parallel_file = true);
+                   bool single_parallel_file = true,
+                   std::string *deferred_backend_error = NULL);
 
 // dft.cpp (normally created with fields::add_dft_flux)
 class dft_flux {
