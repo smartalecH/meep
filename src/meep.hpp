@@ -278,6 +278,8 @@ private:
   int id;            // id for this object and its clones, for comparison purposes
 };
 
+class susceptibility_descriptor_builder;
+
 /* a Lorentzian susceptibility
    \chi(\omega) = sigma * omega_0^2 / (\omega_0^2 - \omega^2 - i\gamma \omega)
   If no_omega_0_denominator is true, then we omit the omega_0^2 factor in the
@@ -314,6 +316,7 @@ public:
   virtual int get_num_params() { return 4; }
 
 protected:
+  friend class susceptibility_descriptor_builder;
   realnum omega_0, gamma;
   bool no_omega_0_denominator;
 };

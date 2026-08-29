@@ -29,6 +29,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdexcept>
 #include <vector>
 
 #include <meep.hpp>
@@ -153,6 +154,27 @@ static void test_polarization_halo_remap() {
     polarization_refs += refs.size();
   }
   CHECK(or_to_all(polarization_refs > 0), "no polarization halo references were remapped");
+
+  size_t polarization_arrays = 0;
+  for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    const StorageKey &key = f.array_catalog->key(id);
+    if (spec.role != array_role::polarization) continue;
+    ++polarization_arrays;
+    CHECK(key.kind == int(array_kind::polarization_internal),
+          "polarization array has the wrong storage kind");
+    CHECK(key.aux == polarization_storage_aux(key.aux / 1024, size_t(key.aux % 1024)),
+          "polarization storage key is not stable");
+  }
+  CHECK(or_to_all(polarization_arrays > 0), "no polarization arrays were catalogued");
+
+  bool rejected_ordinal = false;
+  try {
+    (void)polarization_storage_aux(0, 1024);
+  }
+  catch (const std::overflow_error &) { rejected_ordinal = true; }
+  CHECK(rejected_ordinal, "polarization storage key accepted an overflowing ordinal");
 }
 
 /* ------------------------------------------------------------------ */

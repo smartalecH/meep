@@ -63,6 +63,15 @@ public:
   }
 };
 
+class inherited_lorentzian_susceptibility : public lorentzian_susceptibility {
+public:
+  inherited_lorentzian_susceptibility(realnum w, realnum g)
+      : lorentzian_susceptibility(w, g) {}
+  virtual susceptibility *clone() const {
+    return new inherited_lorentzian_susceptibility(*this);
+  }
+};
+
 class derived_gaussian_source : public gaussian_src_time {
 public:
   derived_gaussian_source() : gaussian_src_time(0.31, 0.08) {}
@@ -370,6 +379,60 @@ static void test_layout_matches_pointers() {
   master_printf("layout: %zu offsets checked against the object's own pointers\n", compared);
 }
 
+static void test_lorentzian_contract() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  lorentzian_susceptibility lorentz(1.25, 0.075);
+  lorentzian_susceptibility drude(0.8, 0.125, true);
+  s.add_susceptibility(one, E_stuff, lorentz);
+  s.add_susceptibility(one, H_stuff, drude);
+  fields f(&s);
+  f.use_bloch(vec(0.07, 0.11));
+  gaussian_src_time g(0.3, 0.1);
+  f.add_point_source(Ez, g, vec(0.11, 0.13));
+  f.advance(2);
+
+  std::vector<PolarizationDescriptor> pols;
+  build_polarization_descriptors(f, pols);
+  size_t lorentz_count = 0, drude_count = 0, state_count = 0;
+  for (const PolarizationDescriptor &d : pols) {
+    if (d.kind != SusceptibilityKind::lorentzian) continue;
+    if (d.ft == E_stuff) {
+      ++lorentz_count;
+      CHECK(d.lorentzian.omega_0 == 1.25 && d.lorentzian.gamma == 0.075 &&
+                !d.lorentzian.drude,
+            "electric Lorentzian parameters are not exact");
+    }
+    if (d.ft == H_stuff) {
+      ++drude_count;
+      CHECK(d.lorentzian.omega_0 == 0.8 && d.lorentzian.gamma == 0.125 &&
+                d.lorentzian.drude,
+            "magnetic Drude parameters are not exact");
+    }
+    bool seen[NUM_FIELD_COMPONENTS][2] = {};
+    for (const LorentzianStateArrays &state : d.lorentzian_states) {
+      ++state_count;
+      CHECK(!seen[int(state.c)][state.cmp], "duplicate Lorentzian component/cmp row");
+      seen[int(state.c)][state.cmp] = true;
+      CHECK(state.elements == size_t(f.chunks[d.chunk]->gv.ntot()),
+            "Lorentzian state has the wrong extent");
+      CHECK(is_valid(state.p) && is_valid(state.p_prev) && state.p != state.p_prev,
+            "Lorentzian state lacks distinct P/P_prev ArrayIds");
+      const ArraySpec &p = f.array_catalog->spec(state.p);
+      const ArraySpec &p_prev = f.array_catalog->spec(state.p_prev);
+      CHECK(p.role == array_role::polarization && p_prev.role == array_role::polarization &&
+                p.element_type == ElementType::realnum_value &&
+                p_prev.element_type == ElementType::realnum_value,
+            "Lorentzian state storage metadata is wrong");
+      const uint64_t bit = uint64_t(1) << (2 * int(state.c) + state.cmp);
+      CHECK(d.required_w & bit, "Lorentzian required-W mask collapsed a component/cmp row");
+    }
+  }
+  CHECK(or_to_all(lorentz_count > 0 && drude_count > 0),
+        "Lorentzian/Drude descriptors were not both emitted");
+  CHECK(or_to_all(state_count > 0), "Lorentzian descriptors contained no bound state arrays");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -383,7 +446,10 @@ int main(int argc, char **argv) {
                      SusceptibilityKind::noisy_lorentzian, true);
   test_polarizations("third-party opaque", new opaque_susceptibility(1.1, 1e-5),
                      SusceptibilityKind::host_custom, false);
+  test_polarizations("derived Lorentzian", new inherited_lorentzian_susceptibility(1.1, 1e-5),
+                     SusceptibilityKind::host_custom, true);
   test_layout_matches_pointers();
+  test_lorentzian_contract();
 
   if (failures) {
     master_printf("descriptors: %d FAILURE(S)\n", failures);
