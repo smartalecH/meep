@@ -2682,10 +2682,43 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       bfast_updates.push_back(compile_bfast(update, state, f_));
     std::vector<unsigned int> bfast_references(plan.bfast_updates.size(), 0);
 
+    size_t expected_material_refreshes = 0;
+    if (f_.phasein_time > 0)
+      for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+        if (!f_.chunks[chunk] || !f_.chunks[chunk]->is_mine()) continue;
+        const structure_chunk &current = *f_.chunks[chunk]->s;
+        for (uint32_t family_value = uint32_t(MaterialRefreshFamily::chi1inv);
+             family_value <= uint32_t(MaterialRefreshFamily::condinv); ++family_value) {
+          const MaterialRefreshFamily family = MaterialRefreshFamily(family_value);
+          const array_kind kind = family == MaterialRefreshFamily::chi1inv
+                                      ? array_kind::chi1inv
+                                      : family == MaterialRefreshFamily::conductivity
+                                            ? array_kind::conductivity
+                                            : array_kind::condinv;
+          FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d) {
+            if (family == MaterialRefreshFamily::condinv &&
+                d != int(component_direction(c)))
+              continue;
+            const realnum *row = family == MaterialRefreshFamily::chi1inv
+                                     ? current.chi1inv[c][d]
+                                     : family == MaterialRefreshFamily::conductivity
+                                           ? current.conductivity[c][d]
+                                           : current.condinv[c][d];
+            if (!row) continue;
+            ++expected_material_refreshes;
+            const ArrayId id = f_.array_catalog->find(
+                StorageKey{chunk, int(kind), int(c), -1, d});
+            if (!is_valid(id) || f_.array_catalog->resolve<realnum>(id) != row)
+              throw std::invalid_argument(
+                  "NVIDIA material phase current storage is absent from the device catalog");
+          }
+        }
+      }
     const StepPlan canonical = build_step_plan(f_, plan.program);
     if (plan.material_phase_target_signature != compute_material_phase_target_signature(f_))
       throw std::invalid_argument("NVIDIA material phase target fingerprint is stale");
-    if (canonical.material_phase_target_signature != plan.material_phase_target_signature ||
+    if (plan.material_refresh_arrays.size() != expected_material_refreshes ||
+        canonical.material_phase_target_signature != plan.material_phase_target_signature ||
         canonical.material_refresh_arrays.size() != plan.material_refresh_arrays.size())
       throw std::invalid_argument("NVIDIA material refresh descriptors are non-canonical");
     for (size_t i = 0; i < plan.material_refresh_arrays.size(); ++i) {
@@ -3515,6 +3548,29 @@ void NvidiaBackend::restore_magnetic_fields(Executable &raw_executable,
   state.device_authoritative_ = true;
 }
 
+void nvidia::validate_material_phase_state(const fields &f,
+                                           uint64_t expected_target_signature) {
+  const bool local_active = f.phasein_time > 0;
+  const bool every_active = and_to_all(local_active);
+  const bool any_active = or_to_all(local_active);
+  const bool local_target_matches =
+      !local_active || expected_target_signature == compute_material_phase_target_signature(f);
+  const bool every_target_matches = and_to_all(local_target_matches);
+  bool local_storage_detached = true;
+  if (local_active)
+    for (int i = 0; i < f.num_chunks; ++i)
+      if (f.chunks[i] && f.chunks[i]->is_mine() &&
+          (!f.chunks[i]->s || f.chunks[i]->s->refcount != 1)) {
+        local_storage_detached = false;
+        break;
+      }
+  const bool every_storage_detached = and_to_all(local_storage_detached);
+  if (any_active != every_active || !every_target_matches || !every_storage_detached)
+    throw std::logic_error(
+        "NVIDIA material phase state, target, or current storage changed after compilation on "
+        "an MPI rank");
+}
+
 void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state, int num_steps) {
   NvidiaBackendState &state = checked_state(raw_state);
   NvidiaExecutable &executable = checked_executable(raw_executable, state);
@@ -3524,27 +3580,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     throw std::logic_error("NVIDIA executable was compiled for a different storage layout");
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
-  const bool material_phase_active = f_.phasein_time > 0;
-  const bool every_rank_material_phase_active = and_to_all(material_phase_active);
-  const bool any_rank_material_phase_active = or_to_all(material_phase_active);
-  const bool local_material_target_matches =
-      !material_phase_active ||
-      executable.material_target_signature_ == compute_material_phase_target_signature(f_);
-  const bool every_material_target_matches = and_to_all(local_material_target_matches);
-  bool local_material_storage_detached = true;
-  if (material_phase_active)
-    for (int i = 0; i < f_.num_chunks; ++i)
-      if (f_.chunks[i] && f_.chunks[i]->is_mine() &&
-          (!f_.chunks[i]->s || f_.chunks[i]->s->refcount != 1)) {
-        local_material_storage_detached = false;
-        break;
-      }
-  const bool every_material_storage_detached = and_to_all(local_material_storage_detached);
-  if (any_rank_material_phase_active != every_rank_material_phase_active ||
-      !every_material_target_matches || !every_material_storage_detached)
-    throw std::logic_error(
-        "NVIDIA material phase state, target, or current storage changed after compilation on "
-        "an MPI rank");
+  nvidia::validate_material_phase_state(f_, executable.material_target_signature_);
 
   const FiniteCheckMode finite_mode = finite_check_mode();
   try {
