@@ -94,7 +94,7 @@ public:
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
   virtual void advance(Executable &, BackendState &, int num_steps) = 0;
 
-  virtual void read(ArrayRef, void *host_buffer, size_t bytes) = 0;  // converts from storage
+  virtual void read(ArrayRef, void *host_buffer, size_t bytes) = 0;        // converts from storage
   virtual void write(ArrayRef, const void *host_buffer, size_t bytes) = 0; // converts to storage
   /* Legacy magnetic synchronization mutates several coupled field families
      through host loops. Resident backends must opt into a complete lowering;
@@ -151,6 +151,11 @@ bool backend_write_host_range(fields &f, const void *host_address, size_t elemen
 /* Every participating rank must call this at the boundary following a batch
    of backend reads and before entering the next MPI/HDF5 collective. */
 void backend_reconcile_host_access(const std::string &local_error, const char *site);
+
+/* Preserve resident-authoritative values and retire the old backend objects
+   before a host-side field-layout mutation can delete or replace their
+   catalogued storage. Every rank must enter this boundary together. */
+void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const char *site);
 
 /* Refresh the exact contiguous field envelopes touched by a legacy
    loop_in_chunks consumer, then reconcile any rank-local read failure before
