@@ -220,6 +220,8 @@ public:
     op.cylindrical_origin_action_count = 0;
     op.polarization_subtraction_index = 0;
     op.polarization_subtraction_count = 0;
+    op.magnetic_state_index = 0;
+    op.magnetic_state_count = 0;
     op.guard = g;
     op.ft = ft;
     op.source_time_offset = src_offset;
@@ -229,6 +231,46 @@ public:
 
   void add_db(field_type ft);
   void add_eh(field_type ft, Guard guard = guard_always());
+
+  uint32_t operation_count() const { return uint32_t(plan_.operations.size()); }
+
+  Operation &add_magnetic_marker(OpKind kind, AccessMode mode) {
+    Operation &op = add(kind, field_type(NUM_FIELD_TYPES), guard_variant(0));
+    if (plan_.magnetic_state_arrays.empty()) build_magnetic_state_arrays();
+    op.magnetic_state_index = 0;
+    op.magnetic_state_count = uint32_t(plan_.magnetic_state_arrays.size());
+    for (const MagneticStateArray &entry : plan_.magnetic_state_arrays)
+      add_access(f_, op, entry.live,
+                 mode == AccessMode::write || entry.average ? mode : AccessMode::read);
+    if (kind == OpKind::synchronize_magnetic_fields) {
+      const uint32_t schedule[] = {
+          plan_.magnetic_half_step.evaluate_b_sources, plan_.magnetic_half_step.update_b,
+          plan_.magnetic_half_step.apply_b_sources,    plan_.magnetic_half_step.transfer_b,
+          plan_.magnetic_half_step.evaluate_h_sources, plan_.magnetic_half_step.update_h,
+          plan_.magnetic_half_step.transfer_h};
+      const size_t marker = plan_.operations.size() - 1;
+      for (size_t i = 0; i < sizeof(schedule) / sizeof(schedule[0]); ++i) {
+        if (schedule[i] == UINT32_MAX) continue;
+        if (schedule[i] >= marker) meep::abort("invalid magnetic half-step operation index");
+        const Operation &referenced = plan_.operations[schedule[i]];
+        for (const BufferAccess &access : referenced.accesses)
+          add_access(f_, op, access.array.id, access.mode);
+      }
+    }
+    return op;
+  }
+
+  void set_magnetic_half_step(uint32_t evaluate_b_sources, uint32_t update_b,
+                              uint32_t apply_b_sources, uint32_t transfer_b,
+                              uint32_t evaluate_h_sources, uint32_t update_h, uint32_t transfer_h) {
+    plan_.magnetic_half_step.evaluate_b_sources = evaluate_b_sources;
+    plan_.magnetic_half_step.update_b = update_b;
+    plan_.magnetic_half_step.apply_b_sources = apply_b_sources;
+    plan_.magnetic_half_step.transfer_b = transfer_b;
+    plan_.magnetic_half_step.evaluate_h_sources = evaluate_h_sources;
+    plan_.magnetic_half_step.update_h = update_h;
+    plan_.magnetic_half_step.transfer_h = transfer_h;
+  }
 
   void add_finite_value_check() {
     Operation &op = add(OpKind::finite_value_check);
@@ -305,6 +347,8 @@ public:
              (sig >> 2);
       sig ^= uint64_t(op.polarization_subtraction_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
              (sig >> 2);
+      mix(sig, uint64_t(op.magnetic_state_index));
+      mix(sig, uint64_t(op.magnetic_state_count));
       uint64_t source_bits = 0;
       static_assert(sizeof(source_bits) == sizeof(op.source_time_offset), "double is not 64-bit");
       memcpy(&source_bits, &op.source_time_offset, sizeof(source_bits));
@@ -340,6 +384,9 @@ public:
       hash_polarization(sig, d);
     for (const PolarizationSubtraction &d : plan.polarization_subtractions)
       hash_polarization_subtraction(sig, d);
+    for (const MagneticStateArray &d : plan.magnetic_state_arrays)
+      hash_magnetic_state(sig, d);
+    hash_magnetic_half_step(sig, plan.magnetic_half_step);
     return sig;
   }
 
@@ -530,6 +577,55 @@ private:
     hash_id(sig, d.target);
     hash_id(sig, d.p);
     mix(sig, uint64_t(d.elements));
+  }
+
+  static void hash_magnetic_state(uint64_t &sig, const MagneticStateArray &d) {
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.c));
+    mix(sig, uint64_t(d.cmp));
+    mix(sig, uint64_t(d.family));
+    hash_id(sig, d.live);
+    mix(sig, uint64_t(d.elements));
+    mix(sig, uint64_t(d.average));
+  }
+
+  static void hash_magnetic_half_step(uint64_t &sig, const MagneticHalfStep &d) {
+    mix(sig, uint64_t(d.evaluate_b_sources));
+    mix(sig, uint64_t(d.update_b));
+    mix(sig, uint64_t(d.apply_b_sources));
+    mix(sig, uint64_t(d.transfer_b));
+    mix(sig, uint64_t(d.evaluate_h_sources));
+    mix(sig, uint64_t(d.update_h));
+    mix(sig, uint64_t(d.transfer_h));
+  }
+
+  void build_magnetic_state_arrays() {
+    const array_kind kinds[] = {array_kind::f, array_kind::f_u, array_kind::f_w, array_kind::f_cond,
+                                array_kind::f_bfast};
+    const MagneticStateFamily families[] = {
+        MagneticStateFamily::primary, MagneticStateFamily::u, MagneticStateFamily::w,
+        MagneticStateFamily::conductivity, MagneticStateFamily::bfast};
+    for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+      if (!f_.chunks[chunk]->is_mine()) continue;
+      const fields_chunk &fc = *f_.chunks[chunk];
+      const int components = fc.is_real ? 1 : 2;
+      for (int family_type = 0; family_type < 2; ++family_type) {
+        const field_type ft = family_type == 0 ? B_stuff : H_stuff;
+        FOR_FT_COMPONENTS(ft, c) for (int cmp = 0; cmp < components; ++cmp) {
+          const ArrayId primary = find_array(f_, chunk, array_kind::f, int(c), cmp, 0);
+          if (!is_valid(primary)) continue;
+          if (ft == H_stuff && is_valid(f_.array_catalog->spec(primary).alias_of)) continue;
+          for (size_t family = 0; family < sizeof(kinds) / sizeof(kinds[0]); ++family) {
+            const ArrayId live = find_array(f_, chunk, kinds[family], int(c), cmp, 0);
+            if (!is_valid(live)) continue;
+            const ArraySpec &spec = f_.array_catalog->spec(live);
+            plan_.magnetic_state_arrays.push_back(
+                MagneticStateArray{chunk, c, cmp, families[family], live, spec.elements,
+                                   families[family] == MagneticStateFamily::primary});
+          }
+        }
+      }
+    }
   }
 
   fields &f_;
@@ -1133,7 +1229,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
 
   /* Magnetic re-synchronization is a graph_variant: the whole program differs
      when synchronized fields are active. */
-  p.add(OpKind::restore_magnetic_fields, field_type(NUM_FIELD_TYPES), guard_variant(0));
+  p.add_magnetic_marker(OpKind::restore_magnetic_fields, AccessMode::write);
 
   /* phase_material's conditional E/H reconciliation is a segment_boundary: the
      condition is an or_to_all over all chunks, so the host has to evaluate it
@@ -1150,16 +1246,29 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
 
   p.add(OpKind::update_material_coefficients);
 
-  p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.0);
+  uint32_t magnetic_evaluate_b = UINT32_MAX;
+  if (has_sources) {
+    magnetic_evaluate_b = p.operation_count();
+    p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_static(true), 0.0);
+  }
+  const uint32_t magnetic_update_b = p.operation_count();
   p.add_db(B_stuff);
+  const uint32_t magnetic_apply_b = p.operation_count();
   p.add(OpKind::apply_sources, B_stuff);
+  const uint32_t magnetic_transfer_b = p.operation_count();
   p.add_boundaries(B_stuff);
 
-  p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
+  uint32_t magnetic_evaluate_h = UINT32_MAX;
+  if (has_sources) {
+    magnetic_evaluate_h = p.operation_count();
+    p.add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard_static(true), 0.5);
+  }
+  const uint32_t magnetic_update_h = p.operation_count();
   p.add_eh(H_stuff);
   p.add_boundaries(WH_stuff);
   p.add(OpKind::update_polarization, H_stuff);
   p.add_boundaries(PH_stuff);
+  const uint32_t magnetic_transfer_h = p.operation_count();
   p.add_boundaries(H_stuff);
 
   p.add_if(has_fluxes, OpKind::update_flux_half);
@@ -1191,7 +1300,10 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   /* The decimation predicate is a device_predicate: the node stays in the
      graph and the kernel returns early when the step is not due. */
   if (has_dfts && !cw) p.add(OpKind::update_dft, field_type(NUM_FIELD_TYPES), guard_device(0));
-  p.add(OpKind::synchronize_magnetic_fields, field_type(NUM_FIELD_TYPES), guard_variant(0));
+  p.set_magnetic_half_step(magnetic_evaluate_b, magnetic_update_b, magnetic_apply_b,
+                           magnetic_transfer_b, magnetic_evaluate_h, magnetic_update_h,
+                           magnetic_transfer_h);
+  p.add_magnetic_marker(OpKind::synchronize_magnetic_fields, AccessMode::read_write);
   p.add_finite_value_check();
 
   return p.finish();

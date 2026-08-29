@@ -114,6 +114,8 @@ struct Operation {
   uint32_t cylindrical_origin_action_count;
   uint32_t polarization_subtraction_index;
   uint32_t polarization_subtraction_count;
+  uint32_t magnetic_state_index;
+  uint32_t magnetic_state_count;
   Guard guard;
   /* CPU execution keeps using the coarse field_type entry point. Device
      executors consume the half-open descriptor span. For finite_value_check,
@@ -372,6 +374,44 @@ struct PolarizationSubtraction {
   size_t elements;
 };
 
+/* A resident magnetic snapshot is backend-private storage.  The portable plan
+   names only the live array and its semantic identity; it deliberately does
+   not expose the legacy lazy host *_backup pointers. */
+enum class MagneticStateFamily : uint32_t {
+  primary = 0,
+  u = 1,
+  w = 2,
+  conductivity = 3,
+  bfast = 4
+};
+
+struct MagneticStateArray {
+  int chunk;
+  component c;
+  int cmp;
+  MagneticStateFamily family;
+  ArrayId live;
+  size_t elements;
+  bool average;
+};
+
+/* Exact operation indices for the restricted B/H half-step used by magnetic
+   synchronization.  UINT32_MAX denotes an omitted source-evaluation node. */
+struct MagneticHalfStep {
+  uint32_t evaluate_b_sources;
+  uint32_t update_b;
+  uint32_t apply_b_sources;
+  uint32_t transfer_b;
+  uint32_t evaluate_h_sources;
+  uint32_t update_h;
+  uint32_t transfer_h;
+
+  MagneticHalfStep()
+      : evaluate_b_sources(UINT32_MAX), update_b(UINT32_MAX), apply_b_sources(UINT32_MAX),
+        transfer_b(UINT32_MAX), evaluate_h_sources(UINT32_MAX), update_h(UINT32_MAX),
+        transfer_h(UINT32_MAX) {}
+};
+
 /* Which timestep program a plan describes. solve_cw is a genuinely different
    program, not a variant: step_source skips non-integrated sources, update_eh
    runs with skip_w_components, and update_dfts is disabled. If step() begins
@@ -400,6 +440,8 @@ struct StepPlan {
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
+  std::vector<MagneticStateArray> magnetic_state_arrays;
+  MagneticHalfStep magnetic_half_step;
   uint64_t signature;
 
   StepPlan()
@@ -424,6 +466,8 @@ struct StepPlan {
     eh_updates.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
+    magnetic_state_arrays.clear();
+    magnetic_half_step = MagneticHalfStep();
     signature = 0;
   }
 };
