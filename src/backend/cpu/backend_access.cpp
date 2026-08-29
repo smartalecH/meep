@@ -49,8 +49,7 @@ void refresh_field_chunk(fields_chunk *fc, int, component cgrid, ivec is, ivec i
     ptrdiff_t minimum = std::numeric_limits<ptrdiff_t>::max();
     ptrdiff_t maximum = std::numeric_limits<ptrdiff_t>::min();
     LOOP_OVER_IVECS(fc->gv, is, ie, idx) {
-      const ptrdiff_t candidates[4] = {idx, idx + offset1, idx + offset2,
-                                       idx + offset1 + offset2};
+      const ptrdiff_t candidates[4] = {idx, idx + offset1, idx + offset2, idx + offset1 + offset2};
       for (int k = 0; k < 4; ++k) {
         minimum = std::min(minimum, candidates[k]);
         maximum = std::max(maximum, candidates[k]);
@@ -174,8 +173,29 @@ bool backend_write_host_range(fields &f, const void *host_address, size_t elemen
 void backend_reconcile_host_access(const std::string &local_error, const char *site) {
   if (!or_to_all(!local_error.empty())) return;
   if (local_error.empty())
-    throw std::runtime_error(std::string(site) + ": backend host access failed on another MPI rank");
+    throw std::runtime_error(std::string(site) +
+                             ": backend host access failed on another MPI rank");
   throw std::runtime_error(std::string(site) + ": " + local_error);
+}
+
+void backend_prepare_field_layout_change(fields &f, DirtyMask reasons, const char *site) {
+  std::string local_error;
+  if (f.backend_state) try {
+      f.backend->prepare_state_rebuild(*f.backend_state, reasons);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown backend field-layout preparation failure";
+    }
+  backend_reconcile_host_access(local_error, site);
+  if (f.backend_state) {
+    delete f.executable;
+    f.executable = NULL;
+    delete f.backend_state;
+    f.backend_state = NULL;
+  }
 }
 
 void backend_refresh_host_fields(fields &owner, int count, const component *components,
@@ -275,12 +295,10 @@ void backend_require_magnetic_synchronization(const fields &f, const char *site)
 bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
                             std::complex<double> *local_result, size_t result_count,
                             std::string &local_error, const char *site) {
-  if (!backend_host_refresh_required(owner) ||
-      !owner.backend->supports_compact_dft_reductions())
+  if (!backend_host_refresh_required(owner) || !owner.backend->supports_compact_dft_reductions())
     return false;
 
-  if (local_error.empty())
-    try {
+  if (local_error.empty()) try {
       if (!local_result && result_count)
         throw std::invalid_argument("compact DFT reduction has no result buffer");
       if (request.result_count != result_count)
@@ -301,25 +319,8 @@ bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
 }
 
 void backend_prepare_checkpoint_load(fields &f) {
-  std::string local_error;
-  if (f.backend_state)
-    try {
-      f.backend->prepare_state_rebuild(
-          *f.backend_state, DirtyMask(dirty_storage | dirty_initialization | dirty_executable));
-    }
-    catch (const std::exception &e) {
-      local_error = e.what();
-    }
-    catch (...) {
-      local_error = "unknown backend checkpoint-preparation failure";
-    }
-  backend_reconcile_host_access(local_error, "fields::load");
-  if (f.backend_state) {
-    delete f.executable;
-    f.executable = NULL;
-    delete f.backend_state;
-    f.backend_state = NULL;
-  }
+  backend_prepare_field_layout_change(
+      f, DirtyMask(dirty_storage | dirty_initialization | dirty_executable), "fields::load");
   /* A load can create or remove lazily allocated arrays. Always rebuild the
      catalog before the next resident execution rather than trying to infer
      whether this particular checkpoint happened to retain its old shape. */
@@ -355,8 +356,8 @@ void fields::select_backend(const execution_options &opts) {
      replacement has been selected, and do not leak the replacement if the old
      backend refuses or fails migration. */
   try {
-    release_backend_state_for_rebuild(
-        *this, DirtyMask(dirty_mask | dirty_storage | dirty_executable));
+    release_backend_state_for_rebuild(*this,
+                                      DirtyMask(dirty_mask | dirty_storage | dirty_executable));
   }
   catch (...) {
     delete b;
@@ -385,16 +386,15 @@ void fields::init_backend() {
     return;
   }
 
-  bool coordinates_match = beta_coordinate_state_matches(*this, step_plans[0]);
-  if (step_plans[1]) coordinates_match &= beta_coordinate_state_matches(*this, step_plans[1]);
+  bool coordinates_match = coordinate_state_matches(*this, step_plans[0]);
+  if (step_plans[1]) coordinates_match &= coordinate_state_matches(*this, step_plans[1]);
   if (!and_to_all(coordinates_match))
-    meep::abort("meep: fields::beta changed after construction; recreate fields so the "
-                "per-chunk coordinate state and resident executable agree");
+    meep::abort("meep: fields coordinate state changed without invalidation; recreate fields so "
+                "the per-chunk coordinate state and resident executable agree");
   /* A value-only material update can change classification without changing
      the existing storage layout. Reconcile the host representation first; any
      promotion it discovers will set dirty_storage for the rebuild below. */
-  if (backend_state && is_dirty(*this, dirty_classification) &&
-      !is_dirty(*this, dirty_storage))
+  if (backend_state && is_dirty(*this, dirty_classification) && !is_dirty(*this, dirty_storage))
     classify_and_finalize();
 
   const bool rebuild_state = !backend_state || is_dirty(*this, dirty_storage);
