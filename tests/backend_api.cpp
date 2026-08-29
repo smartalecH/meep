@@ -69,12 +69,18 @@ struct lifetime_counts {
   int writes;
   int rebuilds;
   size_t arrays_at_create;
+  size_t polarization_arrays_at_create;
+  size_t polarization_updates_at_compile;
+  size_t polarization_subtractions_at_compile;
+  bool polarization_zero_at_create;
   bool connections_current_at_create;
 
   lifetime_counts()
       : states_created(0), states_destroyed(0), executables_created(0),
         executables_destroyed(0), initialized(0), classified(0), finalized(0), advanced(0),
         reads(0), writes(0), rebuilds(0), arrays_at_create(0),
+        polarization_arrays_at_create(0), polarization_updates_at_compile(0),
+        polarization_subtractions_at_compile(0), polarization_zero_at_create(true),
         connections_current_at_create(false) {}
 };
 
@@ -99,6 +105,14 @@ public:
   BackendState *create_state(const StoragePlan &plan) override {
     counts.arrays_at_create = plan.arrays.size();
     counts.connections_current_at_create = connections_are_current(f);
+    for (size_t i = 0; i < plan.arrays.size(); ++i) {
+      const ArraySpec &spec = plan.arrays[i];
+      if (spec.role != array_role::polarization || is_valid(spec.alias_of)) continue;
+      ++counts.polarization_arrays_at_create;
+      const realnum *values = f.array_catalog->resolve<realnum>(spec.id);
+      for (size_t j = 0; j < spec.elements; ++j)
+        if (values[j] != realnum(0)) counts.polarization_zero_at_create = false;
+    }
     return new tracking_state(counts);
   }
   void initialize(const InitializationPlan &, BackendState &) override { ++counts.initialized; }
@@ -107,7 +121,9 @@ public:
     return classify(f, plan);
   }
   void finalize_storage(const StoragePlan &, BackendState &) override { ++counts.finalized; }
-  Executable *compile(const StepPlan &, BackendState &) override {
+  Executable *compile(const StepPlan &plan, BackendState &) override {
+    counts.polarization_updates_at_compile = plan.polarization_updates.size();
+    counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
     return new tracking_executable(counts);
   }
   void advance(Executable &, BackendState &, int) override { ++counts.advanced; }
@@ -806,6 +822,61 @@ static void test_backend_lifecycle_epoch() {
   delete s;
 }
 
+static void test_resident_polarization_preparation() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  lorentzian_susceptibility susceptibility(1.1, 0.05);
+
+  structure resident_structure(gv, eps_slab, pml(0.5), identity(), 2);
+  resident_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
+  fields resident(&resident_structure);
+  resident.require_component(Ez);
+  bool initially_null = true;
+  for (int i = 0; i < resident.num_chunks; ++i)
+    if (resident.chunks[i]->is_mine())
+      for (polarization_state *p = resident.chunks[i]->pol[E_stuff]; p; p = p->next)
+        initially_null = initially_null && !p->data;
+  CHECK(and_to_all(initially_null), "polarization state was allocated before preparation");
+
+  lifetime_counts counts;
+  resident.backend = new tracking_backend(resident, counts);
+  resident.advance(1);
+  CHECK(or_to_all(counts.polarization_arrays_at_create > 0),
+        "resident state was created without P/P_prev arrays");
+  CHECK(or_to_all(counts.polarization_updates_at_compile > 0 &&
+                      counts.polarization_subtractions_at_compile > 0),
+        "resident executable was compiled without polarization spans");
+  CHECK(counts.polarization_zero_at_create,
+        "resident polarization arrays were not zero-initialized before state creation");
+  CHECK(counts.connections_current_at_create,
+        "resident state was created before PE/PH topology was finalized");
+  CHECK(resident.t == 0, "tracking backend unexpectedly advanced host time");
+  const size_t arrays_after_first = counts.polarization_arrays_at_create;
+  BackendState *state_after_first = resident.backend_state;
+  resident.advance(1);
+  CHECK(resident.backend_state == state_after_first && counts.states_created == 1,
+        "second resident preparation rebuilt already-realized polarization state");
+  CHECK(counts.polarization_arrays_at_create == arrays_after_first,
+        "second resident preparation changed the polarization catalog");
+
+  structure cpu_structure(gv, eps_slab, pml(0.5), identity(), 2);
+  cpu_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
+  fields cpu(&cpu_structure);
+  cpu.require_component(Ez);
+  bool cpu_null = true;
+  for (int i = 0; i < cpu.num_chunks; ++i)
+    if (cpu.chunks[i]->is_mine())
+      for (polarization_state *p = cpu.chunks[i]->pol[E_stuff]; p; p = p->next)
+        cpu_null = cpu_null && !p->data;
+  CHECK(or_to_all(cpu_null), "CPU polarization state is no longer lazy before update_pols");
+  cpu.advance(1);
+  bool cpu_allocated = false;
+  for (int i = 0; i < cpu.num_chunks; ++i)
+    if (cpu.chunks[i]->is_mine())
+      for (polarization_state *p = cpu.chunks[i]->pol[E_stuff]; p; p = p->next)
+        cpu_allocated = cpu_allocated || p->data;
+  CHECK(or_to_all(cpu_allocated), "CPU update_pols did not lazily allocate polarization state");
+}
+
 static void test_classification_change_recompiles() {
   structure *s;
   fields *f;
@@ -1391,6 +1462,7 @@ int main(int argc, char **argv) {
   test_dft_access_boundaries();
   test_detached_dft_access();
   test_backend_lifecycle_epoch();
+  test_resident_polarization_preparation();
   test_classification_change_recompiles();
   test_initialization_plan();
   test_authority_safe_state_rebuild();
