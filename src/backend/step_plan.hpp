@@ -831,6 +831,122 @@ inline bool operator!=(const MultilevelTransitionUpdate &a,
   return !(a == b);
 }
 
+/* solve_cw constructs its RHS by applying every matching source, including
+   integrated sources, directly to primary D/B with primary -= current*dt.
+   This is intentionally distinct from the ordinary integrated-source path,
+   which subtracts dipoles through f_minus_p. */
+enum class CwRhsSourceMode : uint32_t {
+  primary_subtract_current_dt_including_integrated = 0
+};
+
+struct CwRhsSourceDescriptor {
+  uint32_t source_descriptor_index;
+  uint32_t source_ordinal;
+  CwRhsSourceMode mode;
+};
+
+/* A reference into the sole canonical solve_cw StepPlan. Descriptor spans are
+   repeated only as checked lookup metadata; the operation schedule and the
+   descriptors themselves remain owned by StepPlan. */
+struct CwStepOperationRef {
+  uint32_t operation_index;
+  OpKind kind;
+  field_type ft;
+  uint32_t descriptor_index;
+  uint32_t descriptor_count;
+  uint32_t polarization_subtraction_index;
+  uint32_t polarization_subtraction_count;
+
+  CwStepOperationRef()
+      : operation_index(UINT32_MAX), kind(OpKind::num_kinds),
+        ft(field_type(NUM_FIELD_TYPES)), descriptor_index(0), descriptor_count(0),
+        polarization_subtraction_index(0), polarization_subtraction_count(0) {}
+};
+
+struct CwRhsStage {
+  field_type ft;
+  double source_time_offset;
+  uint32_t source_time_index;
+  uint32_t source_time_count;
+  uint32_t source_index;
+  uint32_t source_count;
+  CwStepOperationRef boundary;
+  CwStepOperationRef constitutive;
+  std::vector<BufferAccess> accesses;
+};
+
+struct CwUnpackDescriptorRefs {
+  CwStepOperationRef first_boundary;
+  CwStepOperationRef constitutive;
+  CwStepOperationRef second_boundary;
+  bool skip_w_components;
+  bool invalidate_field_values;
+
+  CwUnpackDescriptorRefs() : skip_w_components(false), invalidate_field_values(false) {}
+};
+
+struct CwDftDescriptorRef {
+  uint32_t descriptor_index;
+  int chunk;
+  component c;
+  int decimation_factor;
+  uint32_t due_scalar_slot;
+};
+
+/* Source/monitor-dependent extension of CwStateLayout. Source and DFT indices
+   refer to the DescriptorSet owned by the same prepared fields object (and,
+   later, its compiled ordinary executable); the fingerprints bind that owner.
+   The plan does not copy payload tables or duplicate the solve_cw schedule. */
+struct CwPlan {
+  uint64_t state_layout_signature;
+  uint64_t step_plan_signature;
+  std::vector<CwRhsStage> rhs_stages;
+  std::vector<CwRhsSourceDescriptor> rhs_sources;
+  CwUnpackDescriptorRefs unpack;
+  std::vector<CwDftDescriptorRef> final_dfts;
+  std::vector<BufferAccess> rhs_accesses;
+  std::vector<BufferAccess> unpack_accesses;
+  std::vector<BufferAccess> final_dft_accesses;
+  uint32_t source_time_count;
+  uint32_t rhs_source_count;
+  uint32_t final_dft_count;
+  uint64_t source_fingerprint;
+  uint64_t monitor_fingerprint;
+  uint64_t signature;
+
+  CwPlan()
+      : state_layout_signature(0), step_plan_signature(0), source_time_count(0),
+        rhs_source_count(0), final_dft_count(0), source_fingerprint(0), monitor_fingerprint(0),
+        signature(0) {}
+  void clear();
+};
+
+bool operator==(const CwRhsSourceDescriptor &a, const CwRhsSourceDescriptor &b);
+inline bool operator!=(const CwRhsSourceDescriptor &a, const CwRhsSourceDescriptor &b) {
+  return !(a == b);
+}
+bool operator==(const CwStepOperationRef &a, const CwStepOperationRef &b);
+inline bool operator!=(const CwStepOperationRef &a, const CwStepOperationRef &b) {
+  return !(a == b);
+}
+bool operator==(const CwRhsStage &a, const CwRhsStage &b);
+inline bool operator!=(const CwRhsStage &a, const CwRhsStage &b) { return !(a == b); }
+bool operator==(const CwUnpackDescriptorRefs &a, const CwUnpackDescriptorRefs &b);
+inline bool operator!=(const CwUnpackDescriptorRefs &a, const CwUnpackDescriptorRefs &b) {
+  return !(a == b);
+}
+bool operator==(const CwDftDescriptorRef &a, const CwDftDescriptorRef &b);
+inline bool operator!=(const CwDftDescriptorRef &a, const CwDftDescriptorRef &b) {
+  return !(a == b);
+}
+bool operator==(const CwPlan &a, const CwPlan &b);
+inline bool operator!=(const CwPlan &a, const CwPlan &b) { return !(a == b); }
+
+CwPlan build_cw_plan(fields &f, const StepPlan &step_plan);
+uint64_t compute_cw_plan_signature(const CwPlan &plan);
+bool validate_cw_plan(fields &f, const StepPlan &step_plan, const CwPlan &plan,
+                      std::string *error = NULL);
+
 /* A direct transcription of the order in src/step.cpp. It omits empty work and
    NEVER reorders what remains. It is not a scheduler that infers Maxwell's
    equations from array dependencies: if a reviewer cannot line this up against

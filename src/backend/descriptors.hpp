@@ -55,6 +55,9 @@ struct SourceDescriptor {
   std::vector<std::complex<double> > complex_amplitudes;
   ArrayId condinv; // invalid when the destination has no conductivity
   uint32_t source_time_id;
+  /* Stable position in fields_chunk::get_sources(ft), before the ordinary /
+     integrated grouping used by the timestep operations. */
+  uint32_t source_ordinal;
   bool integrated;
   field_type ft;
 };
@@ -207,6 +210,10 @@ void populate_source_scalars(fields &f, SourcePlan &out);
    are deliberately excluded so ordinary timesteps do not invalidate code. */
 uint64_t source_plan_signature(const SourcePlan &plan);
 void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
+/* Structural identity of the complete final-monitor recipes. Runtime due
+   values are deliberately excluded; decimation_factor and due_scalar_slot
+   are descriptor metadata and are included. */
+uint64_t dft_plan_signature(const std::vector<DftDescriptor> &plan);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
 
 } // namespace meep
