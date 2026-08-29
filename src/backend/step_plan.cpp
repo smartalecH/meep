@@ -1007,6 +1007,13 @@ uint64_t compute_step_plan_signature(const StepPlan &plan) {
   return StepPlanBuilder::signature_for(plan);
 }
 
+bool beta_coordinate_state_matches(const fields &f, const StepPlan *prepared) {
+  if (prepared && prepared->beta != f.beta) return false;
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->beta != f.beta) return false;
+  return true;
+}
+
 /* Transcribed from fields::step_once. Read the two side by side.
  *
  * step_boundaries() begins with zero_metal for every owned chunk and then does
