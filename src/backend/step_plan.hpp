@@ -106,6 +106,8 @@ struct Operation {
   OpKind kind;
   uint32_t descriptor_index;
   uint32_t descriptor_count;
+  uint32_t beta_descriptor_index;
+  uint32_t beta_descriptor_count;
   uint32_t polarization_subtraction_index;
   uint32_t polarization_subtraction_count;
   Guard guard;
@@ -165,6 +167,27 @@ struct CurlUpdate {
   PmlProfile pml_u;
   double dtdx;
   double dt;
+};
+
+enum BetaVariant : uint32_t {
+  beta_has_pml = 1u << 0,
+  beta_has_pml_aux = 1u << 1,
+  beta_has_conductivity = 1u << 2
+};
+
+/* The 2-D special-kz correction applied after every ordinary curl span.
+   betadt is formed in host realnum arithmetic and widened only for storage, so
+   native-single lowering can reproduce the CPU coefficient bit for bit. */
+struct BetaUpdate {
+  UpdateRegion region;
+  ArrayId target;
+  ArrayId source;
+  ArrayId target_u;
+  ArrayId condinv;
+  ArrayId target_cond;
+  PmlProfile pml;
+  PmlProfile pml_u;
+  double betadt;
 };
 
 enum ConstitutiveVariant : uint32_t {
@@ -255,17 +278,21 @@ enum class StepProgram { ordinary, solve_cw };
 
 struct StepPlan {
   StepProgram program;
+  double beta;
   std::vector<Operation> operations;
   std::vector<CurlUpdate> db_updates;
+  std::vector<BetaUpdate> beta_updates;
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
   uint64_t signature;
 
-  StepPlan() : program(StepProgram::ordinary), signature(0) {}
+  StepPlan() : program(StepProgram::ordinary), beta(0), signature(0) {}
   void clear() {
+    beta = 0;
     operations.clear();
     db_updates.clear();
+    beta_updates.clear();
     eh_updates.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
