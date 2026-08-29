@@ -67,6 +67,11 @@ public:
 
   Executable *compile(const StepPlan &plan, BackendState &state) override;
   void advance(Executable &executable, BackendState &state, int num_steps) override;
+  bool supports_magnetic_synchronization() const override { return true; }
+  void preflight_magnetic_transition(Executable &executable, BackendState &state,
+                                     bool synchronize) override;
+  void synchronize_magnetic_fields(Executable &executable, BackendState &state) override;
+  void restore_magnetic_fields(Executable &executable, BackendState &state) override;
 
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override;
   void write(ArrayRef ref, const void *host_buffer, size_t bytes) override;
@@ -86,6 +91,7 @@ private:
   NvidiaBackendState *current_state() const;
   NvidiaExecutable &checked_executable(Executable &executable,
                                        const NvidiaBackendState &state) const;
+  void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
 
   fields &f_;
   execution_options options_;
