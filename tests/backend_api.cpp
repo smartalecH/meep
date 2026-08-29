@@ -74,6 +74,7 @@ struct lifetime_counts {
   size_t polarization_updates_at_compile;
   size_t polarization_subtractions_at_compile;
   size_t beta_updates_at_compile;
+  size_t bfast_updates_at_compile;
   bool gyrotropic_update_at_compile;
   bool polarization_zero_at_create;
   bool connections_current_at_create;
@@ -84,6 +85,7 @@ struct lifetime_counts {
         reads(0), writes(0), rebuilds(0), arrays_at_create(0),
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
+        bfast_updates_at_compile(0),
         gyrotropic_update_at_compile(false),
         polarization_zero_at_create(true), connections_current_at_create(false) {}
 };
@@ -129,6 +131,7 @@ public:
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
     counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
     counts.beta_updates_at_compile = plan.beta_updates.size();
+    counts.bfast_updates_at_compile = plan.bfast_updates.size();
     for (const PolarizationUpdate &update : plan.polarization_updates)
       if (update.kind == PolarizationUpdateKind::gyrotropic)
         counts.gyrotropic_update_at_compile = true;
@@ -925,24 +928,65 @@ static void test_resident_beta_fingerprint() {
     owns_chunk = owns_chunk || f.chunks[i]->is_mine();
   CHECK(and_to_all(!owns_chunk || counts.beta_updates_at_compile > 0),
         "resident executable was compiled without beta updates");
-  CHECK(beta_coordinate_state_matches(f, f.step_plans[0]),
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
         "fresh resident beta fingerprint does not match");
 
   const double original = f.beta;
   f.beta = -original;
-  CHECK(!beta_coordinate_state_matches(f, f.step_plans[0]),
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
         "outer beta mutation was not rejected by the resident fingerprint");
   f.beta = original;
 
   CHECK(f.num_chunks > 0, "beta fingerprint test has no chunks");
   if (f.num_chunks > 0) {
     f.chunks[0]->beta = -original;
-    CHECK(!beta_coordinate_state_matches(f, f.step_plans[0]),
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
           "per-chunk beta mutation was not rejected by the resident fingerprint");
     f.chunks[0]->beta = original;
   }
-  CHECK(beta_coordinate_state_matches(f, f.step_plans[0]),
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
         "restored beta fingerprint does not match");
+}
+
+static void test_resident_bfast_fingerprint() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields f(&s, 0, 0, true, 0, 0, scaled_k);
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.1, 0.1));
+  f.require_component(Ez);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+
+  bool owns_chunk = false;
+  for (int i = 0; i < f.num_chunks; ++i)
+    owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+  CHECK(and_to_all(!owns_chunk || counts.bfast_updates_at_compile > 0),
+        "resident executable was compiled without BFAST updates");
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
+        "fresh resident BFAST fingerprint does not match");
+
+  f.bfast_scaled_k[0] = -scaled_k[0];
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+        "outer BFAST mutation was not rejected by the resident fingerprint");
+  f.bfast_scaled_k = scaled_k;
+
+  CHECK(f.num_chunks > 0, "BFAST fingerprint test has no chunks");
+  if (f.num_chunks > 0) {
+    f.chunks[0]->bfast_scaled_k[1] = -scaled_k[1];
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+          "per-chunk BFAST mutation was not rejected by the resident fingerprint");
+    f.chunks[0]->bfast_scaled_k = scaled_k;
+  }
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
+        "restored BFAST fingerprint does not match");
+
+  f.bfast_scaled_k.resize(2);
+  for (int i = 0; i < f.num_chunks; ++i) f.chunks[i]->bfast_scaled_k.resize(2);
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+        "malformed matching BFAST vectors were not rejected before plan rebuild");
 }
 
 static void test_classification_change_recompiles() {
@@ -1529,6 +1573,12 @@ int main(int argc, char **argv) {
     master_printf("backend_api: beta checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_BFAST_ONLY")) {
+    test_resident_bfast_fingerprint();
+    if (failures) return 1;
+    master_printf("backend_api: BFAST checks passed\n");
+    return 0;
+  }
 
   test_selection();
   test_construction_equivalence();
@@ -1539,6 +1589,7 @@ int main(int argc, char **argv) {
   test_backend_lifecycle_epoch();
   test_resident_polarization_preparation();
   test_resident_beta_fingerprint();
+  test_resident_bfast_fingerprint();
   test_classification_change_recompiles();
   test_initialization_plan();
   test_authority_safe_state_rebuild();

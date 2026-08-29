@@ -1071,10 +1071,19 @@ uint64_t compute_step_plan_signature(const StepPlan &plan) {
   return StepPlanBuilder::signature_for(plan);
 }
 
-bool beta_coordinate_state_matches(const fields &f, const StepPlan *prepared) {
-  if (prepared && prepared->beta != f.beta) return false;
+bool coordinate_state_matches(const fields &f, const StepPlan *prepared) {
+  const auto same_k = [](const std::vector<double> &a, const std::vector<double> &b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin());
+  };
+  if (f.bfast_scaled_k.size() != 3) return false;
+  if (prepared &&
+      (prepared->beta != f.beta || !same_k(prepared->bfast_scaled_k, f.bfast_scaled_k)))
+    return false;
   for (int i = 0; i < f.num_chunks; ++i)
-    if (f.chunks[i]->beta != f.beta) return false;
+    if (!f.chunks[i] || f.chunks[i]->bfast_scaled_k.size() != 3 ||
+        f.chunks[i]->beta != f.beta ||
+        !same_k(f.chunks[i]->bfast_scaled_k, f.bfast_scaled_k))
+      return false;
   return true;
 }
 
