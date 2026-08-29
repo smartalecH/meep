@@ -74,18 +74,24 @@ struct lifetime_counts {
   size_t polarization_updates_at_compile;
   size_t polarization_subtractions_at_compile;
   size_t beta_updates_at_compile;
+  size_t bfast_updates_at_compile;
+  size_t cylindrical_m_updates_at_compile;
+  size_t cylindrical_origin_actions_at_compile;
   bool gyrotropic_update_at_compile;
   bool polarization_zero_at_create;
   bool connections_current_at_create;
+  bool rebuild_saw_live_imaginary;
+  bool fail_rebuild;
 
   lifetime_counts()
-      : states_created(0), states_destroyed(0), executables_created(0),
-        executables_destroyed(0), initialized(0), classified(0), finalized(0), advanced(0),
-        reads(0), writes(0), rebuilds(0), arrays_at_create(0),
-        polarization_arrays_at_create(0), polarization_updates_at_compile(0),
+      : states_created(0), states_destroyed(0), executables_created(0), executables_destroyed(0),
+        initialized(0), classified(0), finalized(0), advanced(0), reads(0), writes(0), rebuilds(0),
+        arrays_at_create(0), polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
-        gyrotropic_update_at_compile(false),
-        polarization_zero_at_create(true), connections_current_at_create(false) {}
+        bfast_updates_at_compile(0), cylindrical_m_updates_at_compile(0),
+        cylindrical_origin_actions_at_compile(0), gyrotropic_update_at_compile(false),
+        polarization_zero_at_create(true), connections_current_at_create(false),
+        rebuild_saw_live_imaginary(false), fail_rebuild(false) {}
 };
 
 struct tracking_state : BackendState {
@@ -129,6 +135,9 @@ public:
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
     counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
     counts.beta_updates_at_compile = plan.beta_updates.size();
+    counts.bfast_updates_at_compile = plan.bfast_updates.size();
+    counts.cylindrical_m_updates_at_compile = plan.cylindrical_m_updates.size();
+    counts.cylindrical_origin_actions_at_compile = plan.cylindrical_origin_actions.size();
     for (const PolarizationUpdate &update : plan.polarization_updates)
       if (update.kind == PolarizationUpdateKind::gyrotropic)
         counts.gyrotropic_update_at_compile = true;
@@ -143,7 +152,19 @@ public:
     return c;
   }
   bool requires_full_storage_preparation() const override { return true; }
-  void prepare_state_rebuild(BackendState &, DirtyMask) override { ++counts.rebuilds; }
+  void prepare_state_rebuild(BackendState &, DirtyMask) override {
+    ++counts.rebuilds;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk] || !f.chunks[chunk]->is_mine()) continue;
+      FOR_COMPONENTS(c) {
+        if (!f.chunks[chunk]->f[c][1]) continue;
+        const ArrayId id = f.array_catalog->find({chunk, int(array_kind::f), int(c), 1, 0});
+        if (is_valid(id) && f.array_catalog->resolve<realnum>(id) == f.chunks[chunk]->f[c][1])
+          counts.rebuild_saw_live_imaginary = true;
+      }
+    }
+    if (counts.fail_rebuild) throw std::runtime_error("injected layout migration failure");
+  }
   bool accepts(const execution_options &, std::string &) const override { return true; }
 
 private:
@@ -352,8 +373,7 @@ public:
           throw std::invalid_argument("compact region has a zero count");
         const size_t extent = term.region.counts[axis] - 1;
         if (term.region.strides[axis] &&
-            extent > (std::numeric_limits<size_t>::max() - maximum) /
-                         term.region.strides[axis])
+            extent > (std::numeric_limits<size_t>::max() - maximum) / term.region.strides[axis])
           throw std::overflow_error("compact region overflows");
         maximum += extent * term.region.strides[axis];
       }
@@ -430,8 +450,7 @@ static void test_sharded_dft_checkpoint_ordering() {
   if (count_processors() > 1)
     CHECK(min_to_all(owned_chunks) < max_to_all(owned_chunks),
           "custom checkpoint partition did not produce uneven ownership");
-  const int dft_failure_rank =
-      min_to_all(monitor.chunks ? my_rank() : count_processors());
+  const int dft_failure_rank = min_to_all(monitor.chunks ? my_rank() : count_processors());
   CHECK(dft_failure_rank < count_processors(), "custom checkpoint monitor has no DFT owner");
 
   char filename[160];
@@ -440,12 +459,16 @@ static void test_sharded_dft_checkpoint_ordering() {
 
   accesses.fail_dft_read_rank = dft_failure_rank;
   bool dump_failure = false;
-  try { f->dump(filename, false); }
-  catch (const std::runtime_error &) { dump_failure = true; }
+  try {
+    f->dump(filename, false);
+  }
+  catch (const std::runtime_error &) {
+    dump_failure = true;
+  }
   const int dump_failures = sum_to_all(int(dump_failure));
   CHECK(dump_failures == count_processors(),
-        "sharded DFT dump failure was not reconciled at its outer boundary (%d/%d)",
-        dump_failures, count_processors());
+        "sharded DFT dump failure was not reconciled at its outer boundary (%d/%d)", dump_failures,
+        count_processors());
   accesses.fail_dft_read_rank = -1;
   std::remove(filename);
   all_wait();
@@ -467,11 +490,13 @@ static void test_sharded_dft_checkpoint_ordering() {
       }
     backend_reconcile_host_access(local_error, "backend_api sharded DFT load");
   }
-  catch (const std::runtime_error &) { load_failure = true; }
+  catch (const std::runtime_error &) {
+    load_failure = true;
+  }
   const int load_failures = sum_to_all(int(load_failure));
   CHECK(load_failures == count_processors(),
-        "sharded DFT load failure was not reconciled at its outer boundary (%d/%d)",
-        load_failures, count_processors());
+        "sharded DFT load failure was not reconciled at its outer boundary (%d/%d)", load_failures,
+        count_processors());
   accesses.fail_dft_write_rank = -1;
 
   {
@@ -492,8 +517,7 @@ static void test_sharded_dft_checkpoint_ordering() {
   CHECK(f->t == restored_time + 1, "execution did not continue after sharded DFT restore");
   int rank = 0;
   size_t dims[3] = {0, 0, 0};
-  std::unique_ptr<std::complex<realnum>[]> restored(
-      f->get_dft_array(monitor, Ez, 0, &rank, dims));
+  std::unique_ptr<std::complex<realnum>[]> restored(f->get_dft_array(monitor, Ez, 0, &rank, dims));
   CHECK(restored.get() != NULL, "restored sharded DFT state could not be queried");
 
   std::remove(filename);
@@ -613,8 +637,8 @@ static void test_read_write_roundtrip() {
   size_t iz[4] = {1, 2, 3, 4};
   void *arrays[] = {r, cr, d, cd, i32, iz};
   const ElementType types[] = {ElementType::realnum_value, ElementType::complex_realnum,
-                               ElementType::float64, ElementType::complex_float64,
-                               ElementType::int32, ElementType::index};
+                               ElementType::float64,       ElementType::complex_float64,
+                               ElementType::int32,         ElementType::index};
   for (size_t k = 0; k < sizeof(types) / sizeof(types[0]); ++k) {
     const StorageKey key{-1, int(array_kind::num_kinds), -1, -1, int(k)};
     const ArrayId id =
@@ -622,7 +646,8 @@ static void test_read_write_roundtrip() {
     const size_t element_size = host_element_bytes(types[k]);
     std::vector<unsigned char> got(2 * element_size, 0);
     cpu.read(ArrayRef{id, 1, 2}, got.data(), got.size());
-    CHECK(memcmp(got.data(), static_cast<unsigned char *>(arrays[k]) + element_size, got.size()) == 0,
+    CHECK(memcmp(got.data(), static_cast<unsigned char *>(arrays[k]) + element_size, got.size()) ==
+              0,
           "typed access failed for ElementType %zu", k);
     std::vector<unsigned char> replacement(got.size(), 0x5a);
     cpu.write(ArrayRef{id, 1, 2}, replacement.data(), replacement.size());
@@ -636,7 +661,9 @@ static void test_read_write_roundtrip() {
     realnum one = 0;
     cpu.read(ArrayRef{invalid_array(), 0, 1}, &one, sizeof(one));
   }
-  catch (const std::out_of_range &) { rejected = true; }
+  catch (const std::out_of_range &) {
+    rejected = true;
+  }
   CHECK(rejected, "an invalid ArrayId was not rejected");
 
   rejected = false;
@@ -645,7 +672,9 @@ static void test_read_write_roundtrip() {
     cpu.read(ArrayRef{ArrayId{0}, f->array_catalog->spec(ArrayId{0}).elements, 1}, &one,
              sizeof(one));
   }
-  catch (const std::out_of_range &) { rejected = true; }
+  catch (const std::out_of_range &) {
+    rejected = true;
+  }
   CHECK(rejected, "an out-of-bounds ArrayRef was not rejected");
 
   rejected = false;
@@ -653,7 +682,9 @@ static void test_read_write_roundtrip() {
     realnum one = 0;
     cpu.read(ArrayRef{ArrayId{0}, 0, 1}, &one, sizeof(one) + 1);
   }
-  catch (const std::invalid_argument &) { rejected = true; }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
   CHECK(rejected, "a mismatched host byte count was not rejected");
   delete f;
   delete s;
@@ -697,23 +728,32 @@ static void test_precision_policy() {
   CHECK(plan.arrays[0].storage == Precision::f32 && plan.arrays[1].storage == Precision::f32,
         "mixed policy did not apply to field/alias storage");
   CHECK(plan.arrays[2].storage == Precision::f32, "mixed policy did not apply to material storage");
-  CHECK(plan.arrays[3].storage == Precision::f64, "mixed policy did not preserve monitor precision");
+  CHECK(plan.arrays[3].storage == Precision::f64,
+        "mixed policy did not preserve monitor precision");
   CHECK(plan.arrays[4].storage == Precision::f64, "fixed float64 storage was narrowed");
-  CHECK(plan.provisional_peak_bytes() == 132,
-        "precision-aware peak bytes are %zu, expected 132", plan.provisional_peak_bytes());
-  CHECK(plan.steady_state_bytes() == 112,
-        "precision-aware steady bytes are %zu, expected 112", plan.steady_state_bytes());
+  CHECK(plan.provisional_peak_bytes() == 132, "precision-aware peak bytes are %zu, expected 132",
+        plan.provisional_peak_bytes());
+  CHECK(plan.steady_state_bytes() == 112, "precision-aware steady bytes are %zu, expected 112",
+        plan.steady_state_bytes());
   CHECK(validate_alias_precisions(plan, why), "valid plan aliases were rejected: %s", why.c_str());
   plan.arrays[1].storage = Precision::f64;
   CHECK(!validate_alias_precisions(plan, why), "mismatched plan alias precision was accepted");
 
-  ArraySpec huge = {ArrayId{0}, array_role::dft, ElementType::complex_float64, Precision::f64,
-                    std::numeric_limits<size_t>::max(), alignof(double), invalid_array(), false};
+  ArraySpec huge = {ArrayId{0},
+                    array_role::dft,
+                    ElementType::complex_float64,
+                    Precision::f64,
+                    std::numeric_limits<size_t>::max(),
+                    alignof(double),
+                    invalid_array(),
+                    false};
   bool overflow_rejected = false;
   try {
     (void)storage_bytes(huge);
   }
-  catch (const std::overflow_error &) { overflow_rejected = true; }
+  catch (const std::overflow_error &) {
+    overflow_rejected = true;
+  }
   CHECK(overflow_rejected, "overflowing storage byte count was accepted");
 }
 
@@ -811,8 +851,7 @@ static void test_backend_lifecycle_epoch() {
         "field-value refresh rebuilt unrelated backend artifacts");
 
   f->initialize_field(Ez, initial_ez);
-  CHECK(is_dirty(*f, dirty_initialization),
-        "initialize_field did not invalidate resident values");
+  CHECK(is_dirty(*f, dirty_initialization), "initialize_field did not invalidate resident values");
   f->advance(1);
   CHECK(f->backend_state == first_state && counts.states_created == 1 && counts.initialized == 4,
         "initialize_field refresh did not preserve and reinitialize resident state");
@@ -833,8 +872,7 @@ static void test_backend_lifecycle_epoch() {
 static void test_resident_polarization_preparation() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
-  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07,
-                                 GYROTROPIC_SATURATED);
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07, GYROTROPIC_SATURATED);
 
   structure resident_structure(gv, eps_slab, pml(0.5), identity(), 2);
   resident_structure.add_susceptibility(eps_slab, E_stuff, susceptibility);
@@ -878,9 +916,10 @@ static void test_resident_polarization_preparation() {
   counts.gyrotropic_update_at_compile = false;
   resident.require_component(Ex);
   resident.advance(1);
-  CHECK(counts.states_created == 2 && counts.states_destroyed == 1,
+  CHECK(and_to_all(!owns_chunk || (counts.states_created == 2 && counts.states_destroyed == 1)),
         "post-allocation field growth did not replace resident state");
-  CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
+  CHECK(and_to_all(!owns_chunk ||
+                   (counts.executables_created == 2 && counts.executables_destroyed == 1)),
         "post-allocation field growth did not replace the resident executable");
   CHECK(and_to_all(!owns_chunk || counts.gyrotropic_update_at_compile),
         "rebuilt resident executable lost its gyrotropic update");
@@ -925,24 +964,218 @@ static void test_resident_beta_fingerprint() {
     owns_chunk = owns_chunk || f.chunks[i]->is_mine();
   CHECK(and_to_all(!owns_chunk || counts.beta_updates_at_compile > 0),
         "resident executable was compiled without beta updates");
-  CHECK(beta_coordinate_state_matches(f, f.step_plans[0]),
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
         "fresh resident beta fingerprint does not match");
 
   const double original = f.beta;
   f.beta = -original;
-  CHECK(!beta_coordinate_state_matches(f, f.step_plans[0]),
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
         "outer beta mutation was not rejected by the resident fingerprint");
   f.beta = original;
 
   CHECK(f.num_chunks > 0, "beta fingerprint test has no chunks");
   if (f.num_chunks > 0) {
     f.chunks[0]->beta = -original;
-    CHECK(!beta_coordinate_state_matches(f, f.step_plans[0]),
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
           "per-chunk beta mutation was not rejected by the resident fingerprint");
     f.chunks[0]->beta = original;
   }
-  CHECK(beta_coordinate_state_matches(f, f.step_plans[0]),
-        "restored beta fingerprint does not match");
+  CHECK(coordinate_state_matches(f, f.step_plans[0]), "restored beta fingerprint does not match");
+}
+
+static void test_resident_bfast_fingerprint() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  const std::vector<double> scaled_k{0.17, -0.11, 0.07};
+  fields f(&s, 0, 0, true, 0, 0, scaled_k);
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.1, 0.1));
+  f.require_component(Ez);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+
+  bool owns_chunk = false;
+  for (int i = 0; i < f.num_chunks; ++i)
+    owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+  CHECK(and_to_all(!owns_chunk || counts.bfast_updates_at_compile > 0),
+        "resident executable was compiled without BFAST updates");
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
+        "fresh resident BFAST fingerprint does not match");
+
+  f.bfast_scaled_k[0] = -scaled_k[0];
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+        "outer BFAST mutation was not rejected by the resident fingerprint");
+  f.bfast_scaled_k = scaled_k;
+
+  CHECK(f.num_chunks > 0, "BFAST fingerprint test has no chunks");
+  if (f.num_chunks > 0) {
+    f.chunks[0]->bfast_scaled_k[1] = -scaled_k[1];
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+          "per-chunk BFAST mutation was not rejected by the resident fingerprint");
+    f.chunks[0]->bfast_scaled_k = scaled_k;
+  }
+  CHECK(coordinate_state_matches(f, f.step_plans[0]), "restored BFAST fingerprint does not match");
+
+  f.bfast_scaled_k.resize(2);
+  for (int i = 0; i < f.num_chunks; ++i)
+    f.chunks[i]->bfast_scaled_k.resize(2);
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+        "malformed matching BFAST vectors were not rejected before plan rebuild");
+}
+
+static void test_resident_cylindrical_fingerprint() {
+  grid_volume gv = volcyl(3.0, 4.0, 8.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  fields f(&s, +1.0, 0, true, 64, 64, std::vector<double>{0, 0, 0});
+  const component components[] = {Er, Ep, Ez, Hr, Hp, Hz};
+  for (component c : components)
+    f.require_component(c);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+
+  bool owns_chunk = false, owns_origin_chunk = false;
+  for (int i = 0; i < f.num_chunks; ++i) {
+    owns_chunk = owns_chunk || f.chunks[i]->is_mine();
+    owns_origin_chunk =
+        owns_origin_chunk || (f.chunks[i]->is_mine() && f.chunks[i]->gv.origin_r() == 0.0);
+  }
+  CHECK(and_to_all(!owns_chunk || counts.cylindrical_m_updates_at_compile > 0),
+        "resident executable was compiled without cylindrical m/r updates");
+  CHECK(and_to_all(!owns_origin_chunk || counts.cylindrical_origin_actions_at_compile > 0),
+        "resident executable was compiled without cylindrical origin actions");
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
+        "fresh resident cylindrical fingerprint does not match");
+
+  const size_t arrays_after_first = counts.arrays_at_create;
+  BackendState *state_after_first = f.backend_state;
+  f.change_m(-1.0);
+  f.advance(1);
+  CHECK(f.backend_state == state_after_first && counts.states_created == 1 &&
+            counts.states_destroyed == 0 && counts.arrays_at_create == arrays_after_first,
+        "sign-only cylindrical m change unnecessarily rebuilt resident storage");
+  CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
+        "sign-only cylindrical m change did not replace the resident executable");
+  CHECK(f.step_plans[0] && f.step_plans[0]->cylindrical_m == -1.0 &&
+            coordinate_state_matches(f, f.step_plans[0]),
+        "sign-only cylindrical m change did not publish a matching plan");
+
+  f.change_m(0.0);
+  CHECK(f.backend_state == NULL && f.executable == NULL && counts.rebuilds == 1 &&
+            (!owns_chunk || counts.rebuild_saw_live_imaginary),
+        "complex-to-real cylindrical transition did not migrate and retire live storage first");
+  f.advance(1);
+  CHECK(counts.states_created == 2 && counts.states_destroyed == 1 &&
+            counts.arrays_at_create <= arrays_after_first,
+        "cylindrical m-to-zero field-layout change did not rebuild resident storage");
+  CHECK(counts.executables_created == 3 && counts.executables_destroyed == 2,
+        "cylindrical m-to-zero change did not replace the resident executable");
+  CHECK(counts.cylindrical_m_updates_at_compile == 0,
+        "zero cylindrical m retained m/r descriptors after recompilation");
+  CHECK(and_to_all(!owns_origin_chunk || counts.cylindrical_origin_actions_at_compile > 0),
+        "zero cylindrical m lost its origin actions after recompilation");
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
+        "recompiled zero-m cylindrical fingerprint does not match");
+
+  f.m = +0.5;
+  CHECK(and_to_all(!coordinate_state_matches(f, f.step_plans[0])),
+        "direct outer cylindrical m mutation was not rejected");
+  if (count_processors() == 1) {
+    bool rejected = false;
+    try {
+      f.init_backend();
+    }
+    catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    CHECK(rejected, "direct outer cylindrical m mutation was not rejected before preparation");
+    CHECK(counts.states_created == 2 && counts.states_destroyed == 1 &&
+              counts.executables_created == 3,
+          "rejected cylindrical mismatch changed resident state or executable counts");
+  }
+  f.m = 0.0;
+
+  CHECK(f.num_chunks > 0, "cylindrical fingerprint test has no chunks");
+  if (f.num_chunks > 0) {
+    f.chunks[0]->m = +0.5;
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+          "per-chunk cylindrical m mutation was not rejected");
+    f.chunks[0]->m = 0.0;
+
+    f.chunks[0]->zero_fields_near_cylorigin = !f.chunks[0]->zero_fields_near_cylorigin;
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+          "per-chunk cylindrical origin-policy mutation was not rejected");
+    f.chunks[0]->zero_fields_near_cylorigin = !f.chunks[0]->zero_fields_near_cylorigin;
+  }
+
+  const double plan_m = f.step_plans[0]->cylindrical_m;
+  f.step_plans[0]->cylindrical_m = +0.5;
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+        "prepared-plan cylindrical m mutation was not rejected");
+  f.step_plans[0]->cylindrical_m = plan_m;
+
+  CHECK(!f.step_plans[0]->cylindrical_origin_r.empty() &&
+            !f.step_plans[0]->cylindrical_zero_near_origin.empty(),
+        "prepared cylindrical plan lacks per-chunk origin fingerprints");
+  if (!f.step_plans[0]->cylindrical_origin_r.empty()) {
+    f.step_plans[0]->cylindrical_origin_r[0] += 1.0;
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+          "prepared-plan cylindrical origin mutation was not rejected");
+    f.step_plans[0]->cylindrical_origin_r[0] -= 1.0;
+  }
+  if (!f.step_plans[0]->cylindrical_zero_near_origin.empty()) {
+    f.step_plans[0]->cylindrical_zero_near_origin[0] ^= 1;
+    CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+          "prepared-plan cylindrical origin-policy mutation was not rejected");
+    f.step_plans[0]->cylindrical_zero_near_origin[0] ^= 1;
+  }
+  CHECK(coordinate_state_matches(f, f.step_plans[0]),
+        "restored cylindrical fingerprint does not match");
+
+  f.step_plans[0]->cylindrical_origin_r.pop_back();
+  CHECK(!coordinate_state_matches(f, f.step_plans[0]),
+        "malformed cylindrical origin vector was not rejected");
+
+  structure refused_structure(gv, eps_slab, pml(0.5), identity(), 2);
+  fields refused(&refused_structure, +1.0, 0, true, 64, 64, std::vector<double>{0, 0, 0});
+  for (component c : components)
+    refused.require_component(c);
+  lifetime_counts refused_counts;
+  refused.backend = new tracking_backend(refused, refused_counts);
+  refused.advance(1);
+  bool refused_owns_chunk = false;
+  int refused_owned_chunk = -1;
+  for (int i = 0; i < refused.num_chunks; ++i)
+    if (refused.chunks[i]->is_mine()) {
+      refused_owns_chunk = true;
+      if (refused_owned_chunk < 0) refused_owned_chunk = i;
+    }
+  BackendState *refused_state = refused.backend_state;
+  Executable *refused_executable = refused.executable;
+  realnum *const refused_imaginary =
+      refused_owned_chunk < 0 ? NULL : refused.chunks[refused_owned_chunk]->f[Er][1];
+  refused_counts.fail_rebuild = true;
+  bool rejected = false;
+  try {
+    refused.change_m(0.0);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  CHECK(and_to_all(rejected), "failed complex-to-real migration was not rejected collectively");
+  CHECK(refused_counts.rebuilds == 1 &&
+            (!refused_owns_chunk || refused_counts.rebuild_saw_live_imaginary),
+        "failed migration did not observe the old imaginary catalog and pointers");
+  CHECK(refused.backend_state == refused_state && refused.executable == refused_executable &&
+            refused.m == +1.0 && !refused.is_real &&
+            (refused_owned_chunk < 0 ||
+             refused.chunks[refused_owned_chunk]->f[Er][1] == refused_imaginary),
+        "failed complex-to-real migration partially mutated live resident state");
+  for (int i = 0; i < refused.num_chunks; ++i)
+    CHECK(refused.chunks[i]->m == +1.0,
+          "failed complex-to-real migration partially changed chunk %d m", i);
+  refused_counts.fail_rebuild = false;
 }
 
 static void test_classification_change_recompiles() {
@@ -955,8 +1188,7 @@ static void test_classification_change_recompiles() {
 
   CHECK(f->prepared_classification_hash != 0, "classification did not publish a hash");
   ++f->prepared_classification_hash;
-  invalidate(*f, MutationKind::material_values,
-             "backend_api:changed_classification_hash");
+  invalidate(*f, MutationKind::material_values, "backend_api:changed_classification_hash");
   f->advance(1);
   CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
         "a changed classification hash did not recompile the executable");
@@ -1029,10 +1261,8 @@ static void test_authority_safe_state_rebuild() {
           trace.events[0].c_str());
     CHECK(trace.events[1] == "destroy-executable", "second rebuild event is %s",
           trace.events[1].c_str());
-    CHECK(trace.events[2] == "destroy-state", "third rebuild event is %s",
-          trace.events[2].c_str());
-    CHECK(trace.events[3] == "create-state", "fourth rebuild event is %s",
-          trace.events[3].c_str());
+    CHECK(trace.events[2] == "destroy-state", "third rebuild event is %s", trace.events[2].c_str());
+    CHECK(trace.events[3] == "create-state", "fourth rebuild event is %s", trace.events[3].c_str());
   }
   CHECK((trace.reasons & dirty_storage) != 0, "rebuild hook did not receive dirty_storage");
 
@@ -1049,8 +1279,12 @@ static void test_authority_safe_state_rebuild() {
   clear_dirty(*f, DirtyMask(f->dirty_mask));
   invalidate(*f, MutationKind::field_layout);
   bool rejected = false;
-  try { f->init_backend(); }
-  catch (const std::logic_error &) { rejected = true; }
+  try {
+    f->init_backend();
+  }
+  catch (const std::logic_error &) {
+    rejected = true;
+  }
   CHECK(rejected, "backend rebuild refusal did not propagate");
   CHECK(f->backend_state == live_state, "a refused rebuild destroyed the live state");
   CHECK(f->executable == NULL, "refused rebuild unexpectedly created an executable");
@@ -1126,8 +1360,12 @@ static void test_backend_safe_host_access() {
 
   accesses.fail_read_rank = 0;
   bool integration_failure = false;
-  try { (void)f->max_abs(Ez, access_region); }
-  catch (const std::runtime_error &) { integration_failure = true; }
+  try {
+    (void)f->max_abs(Ez, access_region);
+  }
+  catch (const std::runtime_error &) {
+    integration_failure = true;
+  }
   CHECK(sum_to_all(int(integration_failure)) == count_processors(),
         "integration read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
@@ -1144,7 +1382,9 @@ static void test_backend_safe_host_access() {
   try {
     (void)f->integrate2(*f2, 1, components, 1, components, multiply_fields, NULL, access_region);
   }
-  catch (const std::runtime_error &) { integration2_failure = true; }
+  catch (const std::runtime_error &) {
+    integration2_failure = true;
+  }
   CHECK(sum_to_all(int(integration2_failure)) == count_processors(),
         "second integration read failure was not reconciled on every rank");
   accesses2.fail_read_rank = -1;
@@ -1165,8 +1405,12 @@ static void test_backend_safe_host_access() {
   accesses.fail_read_rank = 0;
   bool hdf5_failure = false;
   field_file = new h5file("backend-api-field-failure.h5", h5file::WRITE, true);
-  try { f->output_hdf5(Ez, access_region, field_file); }
-  catch (const std::runtime_error &) { hdf5_failure = true; }
+  try {
+    f->output_hdf5(Ez, access_region, field_file);
+  }
+  catch (const std::runtime_error &) {
+    hdf5_failure = true;
+  }
   CHECK(sum_to_all(int(hdf5_failure)) == count_processors(),
         "ordinary HDF5 read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
@@ -1202,10 +1446,11 @@ static void test_backend_safe_host_access() {
   accesses.fail_read_rank = 0;
   bool dft_array_failure = false;
   try {
-    std::unique_ptr<std::complex<realnum>[]> failed(
-        f->get_dft_array(monitor, Ez, 0, &rank, dims));
+    std::unique_ptr<std::complex<realnum>[]> failed(f->get_dft_array(monitor, Ez, 0, &rank, dims));
   }
-  catch (const std::runtime_error &) { dft_array_failure = true; }
+  catch (const std::runtime_error &) {
+    dft_array_failure = true;
+  }
   CHECK(sum_to_all(int(dft_array_failure)) == count_processors(),
         "DFT array read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
@@ -1221,8 +1466,12 @@ static void test_backend_safe_host_access() {
 
   accesses.fail_write_rank = 0;
   bool dft_write_failure = false;
-  try { backend_publish_dft_chain(monitor.chunks, "backend_api injected DFT write"); }
-  catch (const std::runtime_error &) { dft_write_failure = true; }
+  try {
+    backend_publish_dft_chain(monitor.chunks, "backend_api injected DFT write");
+  }
+  catch (const std::runtime_error &) {
+    dft_write_failure = true;
+  }
   CHECK(sum_to_all(int(dft_write_failure)) == count_processors(),
         "rank-asymmetric DFT write failure was not reconciled on every rank");
   accesses.fail_write_rank = -1;
@@ -1242,8 +1491,12 @@ static void test_backend_safe_host_access() {
 
   accesses.fail_read_rank = 0;
   bool ldos_failure = false;
-  try { ldos.update(*f); }
-  catch (const std::runtime_error &) { ldos_failure = true; }
+  try {
+    ldos.update(*f);
+  }
+  catch (const std::runtime_error &) {
+    ldos_failure = true;
+  }
   CHECK(sum_to_all(int(ldos_failure)) == count_processors(),
         "rank-asymmetric LDOS read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
@@ -1251,27 +1504,43 @@ static void test_backend_safe_host_access() {
 
   BackendState *state_before_magnetic_rejection = f->backend_state;
   bool direct_magnetic_failure = false;
-  try { f->synchronize_magnetic_fields(); }
-  catch (const std::runtime_error &) { direct_magnetic_failure = true; }
+  try {
+    f->synchronize_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    direct_magnetic_failure = true;
+  }
   CHECK(sum_to_all(int(direct_magnetic_failure)) == count_processors(),
         "resident magnetic synchronization was not rejected on every rank");
   CHECK(f->backend_state == state_before_magnetic_rejection,
         "magnetic rejection replaced resident state");
   bool repeated_magnetic_failure = false;
-  try { f->synchronize_magnetic_fields(); }
-  catch (const std::runtime_error &) { repeated_magnetic_failure = true; }
+  try {
+    f->synchronize_magnetic_fields();
+  }
+  catch (const std::runtime_error &) {
+    repeated_magnetic_failure = true;
+  }
   CHECK(sum_to_all(int(repeated_magnetic_failure)) == count_processors(),
         "magnetic rejection changed nesting state before returning");
 
   bool energy_magnetic_failure = false;
-  try { (void)f->field_energy_in_box(f->v); }
-  catch (const std::runtime_error &) { energy_magnetic_failure = true; }
+  try {
+    (void)f->field_energy_in_box(f->v);
+  }
+  catch (const std::runtime_error &) {
+    energy_magnetic_failure = true;
+  }
   CHECK(sum_to_all(int(energy_magnetic_failure)) == count_processors(),
         "field_energy_in_box did not reject unsupported magnetic synchronization");
 
   bool flux_magnetic_failure = false;
-  try { (void)f->flux_in_box(X, f->v); }
-  catch (const std::runtime_error &) { flux_magnetic_failure = true; }
+  try {
+    (void)f->flux_in_box(X, f->v);
+  }
+  catch (const std::runtime_error &) {
+    flux_magnetic_failure = true;
+  }
   CHECK(sum_to_all(int(flux_magnetic_failure)) == count_processors(),
         "flux_in_box did not reject unsupported magnetic synchronization");
   const int time_before_magnetic_recovery = f->t;
@@ -1279,8 +1548,8 @@ static void test_backend_safe_host_access() {
   CHECK(f->t == time_before_magnetic_recovery + 1,
         "execution did not continue after magnetic-sync rejection");
 
-  dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where,
-                NO_DIRECTION, true);
+  dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where, NO_DIRECTION,
+                true);
   flux.monitor_lifetime = monitor.monitor_lifetime;
   dft_energy energy(monitor.chunks, monitor.chunks, monitor.chunks, monitor.chunks, frequencies, 2,
                     monitor.where);
@@ -1297,7 +1566,8 @@ static void test_backend_safe_host_access() {
 
   accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
   if (am_master()) {
-    std::vector<std::complex<double> > local_farfield(6 * (sizeof(frequencies) / sizeof(*frequencies)));
+    std::vector<std::complex<double> > local_farfield(6 *
+                                                      (sizeof(frequencies) / sizeof(*frequencies)));
     near2far.farfield_lowlevel(local_farfield.data(), vec(2.0, 2.0));
   }
   all_wait();
@@ -1306,38 +1576,62 @@ static void test_backend_safe_host_access() {
 
   accesses.fail_read_rank = 0;
   bool dft_norm_failure = false;
-  try { (void)f->dft_norm(); }
-  catch (const std::runtime_error &) { dft_norm_failure = true; }
+  try {
+    (void)f->dft_norm();
+  }
+  catch (const std::runtime_error &) {
+    dft_norm_failure = true;
+  }
   CHECK(sum_to_all(int(dft_norm_failure)) == count_processors(),
         "DFT norm read failure was not reconciled on every rank");
 
   bool flux_failure = false;
-  try { delete[] flux.flux(); }
-  catch (const std::runtime_error &) { flux_failure = true; }
+  try {
+    delete[] flux.flux();
+  }
+  catch (const std::runtime_error &) {
+    flux_failure = true;
+  }
   CHECK(sum_to_all(int(flux_failure)) == count_processors(),
         "flux read failure was not reconciled on every rank");
 
   bool electric_failure = false;
-  try { delete[] energy.electric(); }
-  catch (const std::runtime_error &) { electric_failure = true; }
+  try {
+    delete[] energy.electric();
+  }
+  catch (const std::runtime_error &) {
+    electric_failure = true;
+  }
   CHECK(sum_to_all(int(electric_failure)) == count_processors(),
         "electric-energy read failure was not reconciled on every rank");
 
   bool magnetic_failure = false;
-  try { delete[] energy.magnetic(); }
-  catch (const std::runtime_error &) { magnetic_failure = true; }
+  try {
+    delete[] energy.magnetic();
+  }
+  catch (const std::runtime_error &) {
+    magnetic_failure = true;
+  }
   CHECK(sum_to_all(int(magnetic_failure)) == count_processors(),
         "magnetic-energy read failure was not reconciled on every rank");
 
   bool force_failure = false;
-  try { delete[] force.force(); }
-  catch (const std::runtime_error &) { force_failure = true; }
+  try {
+    delete[] force.force();
+  }
+  catch (const std::runtime_error &) {
+    force_failure = true;
+  }
   CHECK(sum_to_all(int(force_failure)) == count_processors(),
         "force read failure was not reconciled on every rank");
 
   bool farfield_failure = false;
-  try { delete[] near2far.farfield(vec(2.0, 2.0)); }
-  catch (const std::runtime_error &) { farfield_failure = true; }
+  try {
+    delete[] near2far.farfield(vec(2.0, 2.0));
+  }
+  catch (const std::runtime_error &) {
+    farfield_failure = true;
+  }
   CHECK(sum_to_all(int(farfield_failure)) == count_processors(),
         "far-field read failure was not reconciled on every rank");
   accesses.fail_read_rank = -1;
@@ -1382,11 +1676,11 @@ static void test_compact_dft_reduction_boundary() {
   f->require_component(Ez);
   component component_ez = Ez;
   const double frequencies[2] = {0.2, 0.3};
-  dft_fields monitor = f->add_dft_fields(&component_ez, 1,
-                                         volume(vec(0.4, 0.4), vec(1.2, 1.2)), frequencies, 2,
-                                         /*use_centered_grid=*/true,
-                                         /*decimation_factor=*/1,
-                                         /*persist=*/true);
+  dft_fields monitor =
+      f->add_dft_fields(&component_ez, 1, volume(vec(0.4, 0.4), vec(1.2, 1.2)), frequencies, 2,
+                        /*use_centered_grid=*/true,
+                        /*decimation_factor=*/1,
+                        /*persist=*/true);
 
   rebuild_trace rebuilds;
   access_trace accesses;
@@ -1394,8 +1688,8 @@ static void test_compact_dft_reduction_boundary() {
   f->backend = new compact_access_backend(*f, rebuilds, accesses, compact);
   f->advance(1);
 
-  dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where,
-                NO_DIRECTION, true);
+  dft_flux flux(Ez, Ez, monitor.chunks, monitor.chunks, frequencies, 2, monitor.where, NO_DIRECTION,
+                true);
   flux.monitor_lifetime = monitor.monitor_lifetime;
   dft_energy energy(monitor.chunks, monitor.chunks, monitor.chunks, monitor.chunks, frequencies, 2,
                     monitor.where);
@@ -1457,59 +1751,91 @@ static void test_compact_dft_reduction_boundary() {
     std::complex<double> result;
     bool rejected = false;
     malformed.terms[0].left = invalid_array();
-    try { f->backend->reduce_dft(malformed, &result, 1); }
-    catch (const std::exception &) { rejected = true; }
+    try {
+      f->backend->reduce_dft(malformed, &result, 1);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
     CHECK(rejected, "compact mock accepted an invalid array id");
 
     malformed = compact.requests[0];
     malformed.terms[0].region.counts[0] = 3;
     malformed.terms[0].region.strides[0] = std::numeric_limits<size_t>::max();
     rejected = false;
-    try { f->backend->reduce_dft(malformed, &result, 1); }
-    catch (const std::exception &) { rejected = true; }
+    try {
+      f->backend->reduce_dft(malformed, &result, 1);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
     CHECK(rejected, "compact mock accepted an overflowing region");
 
     malformed = compact.requests[0];
     malformed.terms[0].right = malformed.terms[0].left;
     rejected = false;
-    try { f->backend->reduce_dft(malformed, &result, 1); }
-    catch (const std::exception &) { rejected = true; }
+    try {
+      f->backend->reduce_dft(malformed, &result, 1);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
     CHECK(rejected, "compact mock accepted a norm request with a right operand");
   }
 
   compact.fail_rank = 0;
   compact.fail_call = int(compact.calls);
   bool failed = false;
-  try { delete[] flux.flux(); }
-  catch (const std::runtime_error &) { failed = true; }
+  try {
+    delete[] flux.flux();
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
   CHECK(sum_to_all(int(failed)) == count_processors(),
         "rank-asymmetric compact flux failure was not reconciled");
 
   compact.fail_call = int(compact.calls);
   failed = false;
-  try { delete[] energy.electric(); }
-  catch (const std::runtime_error &) { failed = true; }
+  try {
+    delete[] energy.electric();
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
   CHECK(sum_to_all(int(failed)) == count_processors(),
         "rank-asymmetric compact electric-energy failure was not reconciled");
 
   compact.fail_call = int(compact.calls);
   failed = false;
-  try { delete[] energy.magnetic(); }
-  catch (const std::runtime_error &) { failed = true; }
+  try {
+    delete[] energy.magnetic();
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
   CHECK(sum_to_all(int(failed)) == count_processors(),
         "rank-asymmetric compact magnetic-energy failure was not reconciled");
 
   compact.fail_call = int(compact.calls);
   failed = false;
-  try { delete[] force.force(); }
-  catch (const std::runtime_error &) { failed = true; }
+  try {
+    delete[] force.force();
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
   CHECK(sum_to_all(int(failed)) == count_processors(),
         "rank-asymmetric compact force failure was not reconciled");
 
   compact.fail_call = int(compact.calls + 1);
   failed = false;
-  try { delete[] energy.total(); }
-  catch (const std::runtime_error &) { failed = true; }
+  try {
+    delete[] energy.total();
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
   CHECK(sum_to_all(int(failed)) == count_processors(),
         "rank-asymmetric compact total-energy second-call failure was not reconciled");
   all_wait();
@@ -1529,6 +1855,18 @@ int main(int argc, char **argv) {
     master_printf("backend_api: beta checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_BFAST_ONLY")) {
+    test_resident_bfast_fingerprint();
+    if (failures) return 1;
+    master_printf("backend_api: BFAST checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_CYLINDRICAL_ONLY")) {
+    test_resident_cylindrical_fingerprint();
+    if (failures) return 1;
+    master_printf("backend_api: cylindrical checks passed\n");
+    return 0;
+  }
 
   test_selection();
   test_construction_equivalence();
@@ -1539,6 +1877,8 @@ int main(int argc, char **argv) {
   test_backend_lifecycle_epoch();
   test_resident_polarization_preparation();
   test_resident_beta_fingerprint();
+  test_resident_bfast_fingerprint();
+  test_resident_cylindrical_fingerprint();
   test_classification_change_recompiles();
   test_initialization_plan();
   test_authority_safe_state_rebuild();
