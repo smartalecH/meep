@@ -364,10 +364,15 @@ private:
     hash_pml(sig, d.pml);
   }
   static void hash_polarization(uint64_t &sig, const PolarizationUpdate &d) {
+    mix(sig, uint64_t(d.kind));
     hash_region(sig, d.region);
     mix(sig, uint64_t(d.state_index));
     hash_id(sig, d.p);
     hash_id(sig, d.p_prev);
+    hash_id(sig, d.p_cross1);
+    hash_id(sig, d.p_prev_cross1);
+    hash_id(sig, d.p_cross2);
+    hash_id(sig, d.p_prev_cross2);
     hash_id(sig, d.primary_w);
     hash_id(sig, d.cross_w1);
     hash_id(sig, d.cross_w2);
@@ -379,6 +384,10 @@ private:
     mix(sig, uint64_t(d.cross_stride2));
     mix_double(sig, d.omega_0);
     mix_double(sig, d.gamma);
+    mix_double(sig, d.alpha);
+    for (int i = 0; i < 3; ++i)
+      for (int j = 0; j < 3; ++j) mix_double(sig, d.gyro_tensor[i][j]);
+    mix(sig, uint64_t(d.gyro_model));
     mix_double(sig, d.dt);
   }
   static void hash_polarization_subtraction(uint64_t &sig,
