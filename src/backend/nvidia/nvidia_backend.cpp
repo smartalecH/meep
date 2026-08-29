@@ -16,7 +16,6 @@
 #include <complex>
 #include <limits>
 #include <memory>
-#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
@@ -609,6 +608,8 @@ nvidia::source_batch_launch compile_source_batch(const SourceDescriptor &source,
   result.scalar_slot = time.scalar_slot;
   result.dt = f.dt;
   result.integrated = source.integrated;
+  result.sequential =
+      nvidia::source_indices_require_sequential(source.indices.data(), source.indices.size());
   const std::pair<std::vector<ptrdiff_t>::const_iterator,
                   std::vector<ptrdiff_t>::const_iterator> bounds =
       std::minmax_element(source.indices.begin(), source.indices.end());
@@ -623,14 +624,12 @@ nvidia::source_batch_launch compile_source_batch(const SourceDescriptor &source,
     throw std::invalid_argument("real NVIDIA fields have an imaginary source target");
   if (!f.is_real && !result.target_imag)
     throw std::invalid_argument("complex NVIDIA fields have no imaginary source target");
-  std::set<ptrdiff_t> unique_indices;
   for (size_t point = 0; point < source.indices.size(); ++point) {
     nvidia::source_point packed = {};
     packed.index = source.indices[point];
     packed.amplitude_real = source.complex_amplitudes[point].real();
     packed.amplitude_imag = source.complex_amplitudes[point].imag();
     points.push_back(packed);
-    if (!unique_indices.insert(packed.index).second) result.sequential = true;
   }
   return result;
 }
