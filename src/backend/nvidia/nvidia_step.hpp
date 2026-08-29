@@ -53,6 +53,19 @@ struct curl_launch {
   scalar_precision precision;
 };
 
+struct beta_launch {
+  flat_region region;
+  void *target;
+  const void *source;
+  void *target_u;
+  const void *conductivity_inverse;
+  void *target_conductivity;
+  pml_profile_launch pml;
+  pml_profile_launch pml_u;
+  double betadt;
+  scalar_precision precision;
+};
+
 struct constitutive_launch {
   flat_region region;
   void *target;
@@ -114,6 +127,7 @@ struct finite_check_launch {
 /* All launches are asynchronous on `stream`. Invalid geometry or a CUDA launch
    failure throws before returning. */
 void launch_curl(const curl_launch &update, const stream &stream);
+void launch_beta(const beta_launch &update, const stream &stream);
 void launch_constitutive(const constitutive_launch &update, const stream &stream);
 void launch_zero(const zero_launch &update, const stream &stream);
 void launch_halo_gather(const halo_launch &launch, const void *device_entries, void *device_buffer,

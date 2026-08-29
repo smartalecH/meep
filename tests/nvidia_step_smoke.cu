@@ -19,6 +19,7 @@
 
 using meep::nvidia::constitutive_launch;
 using meep::nvidia::array_copy_launch;
+using meep::nvidia::beta_launch;
 using meep::nvidia::copy_device_to_host_async;
 using meep::nvidia::copy_host_to_device_async;
 using meep::nvidia::curl_launch;
@@ -34,6 +35,7 @@ using meep::nvidia::halo_launch;
 using meep::nvidia::halo_scatter_entry;
 using meep::nvidia::launch_constitutive;
 using meep::nvidia::launch_array_copy;
+using meep::nvidia::launch_beta;
 using meep::nvidia::launch_curl;
 using meep::nvidia::launch_finite_check;
 using meep::nvidia::launch_halo_gather;
@@ -57,6 +59,146 @@ static T nonlinear_reference(T dsqr, T di, T chi1inv, T chi2, T chi3) {
   const T c2 = di * chi2 * (chi1inv * chi1inv);
   const T c3 = dsqr * chi3 * (chi1inv * chi1inv * chi1inv);
   return (T(1) + c2 + T(2) * c3) / (T(1) + T(2) * c2 + T(3) * c3);
+}
+
+template <typename T>
+static void check_beta_variants(int device, stream &execution, scalar_precision precision) {
+  const size_t elements = 257;
+  const size_t bytes = elements * sizeof(T);
+  std::vector<T> initial(elements), source(elements), initial_u(elements), initial_cond(elements),
+      condinv(elements), inverse(elements), inverse_u(elements), observed(elements),
+      observed_u(elements), observed_cond(elements);
+  for (size_t i = 0; i < elements; ++i) {
+    initial[i] = T(0.2 + 0.001 * double(i));
+    source[i] = T(std::sin(0.031 * double(i + 1)));
+    initial_u[i] = T(-0.1 + 0.0007 * double(i));
+    initial_cond[i] = T(0.05 - 0.0002 * double(i));
+    condinv[i] = T(1.0 / (1.0 + 0.0003 * double(i + 1)));
+    inverse[i] = T(1.0 / (1.0 + 0.0004 * double(i + 1)));
+    inverse_u[i] = T(1.0 / (1.0 + 0.0005 * double(i + 1)));
+  }
+
+  device_buffer d_target(bytes, device), d_source(bytes, device), d_u(bytes, device),
+      d_cond(bytes, device), d_condinv(bytes, device), d_inverse(bytes, device),
+      d_inverse_u(bytes, device);
+  copy_host_to_device_async(d_source, 0, source.data(), bytes, execution);
+  copy_host_to_device_async(d_condinv, 0, condinv.data(), bytes, execution);
+  copy_host_to_device_async(d_inverse, 0, inverse.data(), bytes, execution);
+  copy_host_to_device_async(d_inverse_u, 0, inverse_u.data(), bytes, execution);
+
+  for (unsigned int variant = 0; variant < 8; ++variant)
+    for (int sign = -1; sign <= 1; sign += 2) {
+      const bool main_pml = (variant & 1) != 0;
+      const bool auxiliary_pml = (variant & 2) != 0;
+      const bool conductive = (variant & 4) != 0;
+      copy_host_to_device_async(d_target, 0, initial.data(), bytes, execution);
+      copy_host_to_device_async(d_u, 0, initial_u.data(), bytes, execution);
+      copy_host_to_device_async(d_cond, 0, initial_cond.data(), bytes, execution);
+
+      beta_launch beta = {};
+      beta.region.base = 0;
+      beta.region.counts[0] = 1;
+      beta.region.counts[1] = 1;
+      beta.region.counts[2] = elements;
+      beta.region.strides[2] = 1;
+      beta.target = d_target.opaque_handle();
+      beta.source = d_source.opaque_handle();
+      beta.betadt = sign * 0.0375;
+      beta.precision = precision;
+      if (main_pml) {
+        beta.pml.inverse = d_inverse.opaque_handle();
+        beta.pml.strides[2] = 1;
+      }
+      if (auxiliary_pml) {
+        beta.target_u = d_u.opaque_handle();
+        beta.pml_u.inverse = d_inverse_u.opaque_handle();
+        beta.pml_u.strides[2] = 1;
+      }
+      if (conductive) beta.conductivity_inverse = d_condinv.opaque_handle();
+      if (main_pml && conductive) beta.target_conductivity = d_cond.opaque_handle();
+      launch_beta(beta, execution);
+
+      copy_device_to_host_async(observed.data(), d_target, 0, bytes, execution);
+      copy_device_to_host_async(observed_u.data(), d_u, 0, bytes, execution);
+      copy_device_to_host_async(observed_cond.data(), d_cond, 0, bytes, execution);
+      execution.synchronize();
+
+      std::vector<T> expected = initial;
+      std::vector<T> expected_u = initial_u;
+      std::vector<T> expected_cond = initial_cond;
+      for (size_t i = 0; i < elements; ++i) {
+        T delta = T(beta.betadt) * source[i];
+        if (conductive) delta *= condinv[i];
+        if (main_pml) {
+          if (conductive) expected_cond[i] += delta;
+          delta *= inverse[i];
+        }
+        if (auxiliary_pml) {
+          expected_u[i] += delta;
+          delta *= inverse_u[i];
+        }
+        expected[i] += delta;
+      }
+      const double tolerance = 16.0 * std::numeric_limits<T>::epsilon();
+      for (size_t i = 0; i < elements; ++i) {
+        require(std::fabs(double(observed[i] - expected[i])) <=
+                    tolerance * (1.0 + std::fabs(double(expected[i]))),
+                "beta target differs from host recurrence");
+        require(std::fabs(double(observed_u[i] - expected_u[i])) <=
+                    tolerance * (1.0 + std::fabs(double(expected_u[i]))),
+                "beta auxiliary target differs");
+        require(std::fabs(double(observed_cond[i] - expected_cond[i])) <=
+                    tolerance * (1.0 + std::fabs(double(expected_cond[i]))),
+                "beta conductivity target differs");
+      }
+    }
+
+  beta_launch malformed = {};
+  malformed.region.counts[0] = malformed.region.counts[1] = malformed.region.counts[2] = 1;
+  malformed.target = d_target.opaque_handle();
+  malformed.source = d_source.opaque_handle();
+  malformed.precision = precision;
+  bool rejected = false;
+  try {
+    beta_launch missing = malformed;
+    missing.source = NULL;
+    launch_beta(missing, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "beta launch accepted a missing source");
+  rejected = false;
+  try {
+    beta_launch aliased = malformed;
+    aliased.source = aliased.target;
+    launch_beta(aliased, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "beta launch accepted aliased target/source state");
+  rejected = false;
+  try {
+    beta_launch empty = malformed;
+    empty.region.counts[1] = 0;
+    launch_beta(empty, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "beta launch accepted an empty region");
+  rejected = false;
+  try {
+    beta_launch overflow = malformed;
+    overflow.region.counts[0] = std::numeric_limits<size_t>::max();
+    overflow.region.counts[1] = 2;
+    launch_beta(overflow, execution);
+  }
+  catch (const std::overflow_error &) { rejected = true; }
+  require(rejected, "beta launch accepted an overflowing region");
+  rejected = false;
+  try {
+    beta_launch invalid_precision = malformed;
+    invalid_precision.precision = static_cast<scalar_precision>(99);
+    launch_beta(invalid_precision, execution);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  require(rejected, "beta launch accepted an invalid precision");
 }
 
 template <typename T> static void check_device(int device) {
@@ -105,6 +247,8 @@ template <typename T> static void check_device(int device) {
   region.strides[2] = 1;
   const scalar_precision precision =
       sizeof(T) == sizeof(float) ? scalar_precision::f32 : scalar_precision::f64;
+  check_beta_variants<T>(device, execution, precision);
+  if (std::getenv("MEEP_NVIDIA_STEP_BETA_ONLY")) return;
 
   curl_launch curl = {};
   curl.region = region;

@@ -398,6 +398,8 @@ struct NvidiaCompiledOperation {
   OpKind kind;
   size_t first;
   size_t count;
+  size_t beta_first;
+  size_t beta_count;
   size_t halo_first;
   size_t halo_count;
   size_t source_first;
@@ -428,6 +430,7 @@ public:
                    uint64_t state_token,
                    const std::vector<NvidiaCompiledOperation> &operations,
                    const std::vector<nvidia::curl_launch> &curl_updates,
+                   const std::vector<nvidia::beta_launch> &beta_updates,
                    const std::vector<nvidia::constitutive_launch> &constitutive_updates,
                    const std::vector<nvidia::zero_launch> &zero_updates,
                    const std::vector<NvidiaCompiledHalo> &halo_plans,
@@ -447,7 +450,7 @@ public:
                    NvidiaBackendState &state)
       : owner_(owner), state_token_(state_token), signature_(signature),
         storage_fingerprint_(storage_fingerprint),
-        operations_(operations), curl_updates_(curl_updates),
+        operations_(operations), curl_updates_(curl_updates), beta_updates_(beta_updates),
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
@@ -522,6 +525,7 @@ public:
   uint64_t storage_fingerprint_;
   std::vector<NvidiaCompiledOperation> operations_;
   std::vector<nvidia::curl_launch> curl_updates_;
+  std::vector<nvidia::beta_launch> beta_updates_;
   std::vector<nvidia::constitutive_launch> constitutive_updates_;
   std::vector<nvidia::zero_launch> zero_updates_;
   std::vector<NvidiaCompiledHalo> halo_plans_;
@@ -1310,6 +1314,74 @@ nvidia::curl_launch compile_curl(const CurlUpdate &source, NvidiaBackendState &s
   return result;
 }
 
+nvidia::beta_launch compile_beta(const BetaUpdate &source, NvidiaBackendState &state) {
+  const uint32_t supported_variants =
+      beta_has_pml | beta_has_pml_aux | beta_has_conductivity;
+  if (source.region.variant_key & ~supported_variants)
+    throw std::invalid_argument("beta descriptor has an unsupported variant bit");
+
+  const bool have_pml = (source.region.variant_key & beta_has_pml) != 0;
+  const bool have_pml_u = (source.region.variant_key & beta_has_pml_aux) != 0;
+  const bool have_conductivity =
+      (source.region.variant_key & beta_has_conductivity) != 0;
+  const bool complete_pml = is_valid(source.pml.sig) && is_valid(source.pml.kap) &&
+                            is_valid(source.pml.siginv);
+  const bool complete_pml_u = is_valid(source.pml_u.sig) && is_valid(source.pml_u.kap) &&
+                              is_valid(source.pml_u.siginv);
+  if (have_pml != complete_pml || have_pml_u != complete_pml_u ||
+      have_pml_u != is_valid(source.target_u) ||
+      have_conductivity != is_valid(source.condinv) ||
+      (have_pml && have_conductivity) != is_valid(source.target_cond))
+    throw std::invalid_argument("beta descriptor variant bits and auxiliary arrays disagree");
+  if ((!have_pml && (is_valid(source.pml.sig) || is_valid(source.pml.kap) ||
+                     is_valid(source.pml.siginv))) ||
+      (!have_pml_u && (is_valid(source.pml_u.sig) || is_valid(source.pml_u.kap) ||
+                       is_valid(source.pml_u.siginv))))
+    throw std::invalid_argument("beta descriptor has a partial disabled PML profile");
+  if (!std::isfinite(source.betadt))
+    throw std::invalid_argument("beta descriptor coefficient is non-finite");
+  if (source.target == source.source || source.target == source.target_u ||
+      source.target == source.target_cond ||
+      (is_valid(source.target_u) && source.target_u == source.target_cond) ||
+      (is_valid(source.target_u) && source.target_u == source.source) ||
+      (is_valid(source.target_cond) && source.target_cond == source.source))
+    throw std::invalid_argument("beta descriptor aliases mutable and input state");
+
+  nvidia::beta_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.target, "beta target");
+  result.target = device_address(state, source.target, "beta target");
+  result.source = optional_device_address(state, source.source, result.precision, "beta source");
+  if (!result.source) throw std::invalid_argument("beta descriptor has no source field");
+  result.target_u = optional_mutable_device_address(state, source.target_u, result.precision,
+                                                     "beta auxiliary target");
+  result.conductivity_inverse = optional_device_address(
+      state, source.condinv, result.precision, "beta conductivity inverse");
+  result.target_conductivity = optional_mutable_device_address(
+      state, source.target_cond, result.precision, "beta conductivity target");
+  result.pml =
+      compile_pml_profile(source.pml, result.region, result.precision, state, "beta main PML");
+  result.pml_u = compile_pml_profile(source.pml_u, result.region, result.precision, state,
+                                     "beta auxiliary PML");
+  result.betadt = source.betadt;
+
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.target, ptrdiff_t(result.region.base), region_max,
+                       "beta target");
+  validate_index_range(state.plan_, source.source, ptrdiff_t(result.region.base), region_max,
+                       "beta source");
+  if (is_valid(source.target_u))
+    validate_index_range(state.plan_, source.target_u, ptrdiff_t(result.region.base), region_max,
+                         "beta auxiliary target");
+  if (is_valid(source.condinv))
+    validate_index_range(state.plan_, source.condinv, ptrdiff_t(result.region.base), region_max,
+                         "beta conductivity inverse");
+  if (is_valid(source.target_cond))
+    validate_index_range(state.plan_, source.target_cond, ptrdiff_t(result.region.base), region_max,
+                         "beta conductivity target");
+  return result;
+}
+
 nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &source,
                                                  NvidiaBackendState &state) {
   const uint32_t supported_variants = constitutive_has_pml | constitutive_one_offdiagonal |
@@ -1770,8 +1842,14 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument("NVIDIA PR2 does not support solve_cw");
     if (count_processors() != 1)
       throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
-    if (f_.gv.dim == Dcyl || f_.m != 0.0 || f_.beta != 0.0)
-      throw std::invalid_argument("NVIDIA PR2 supports Cartesian fields with m=beta=0 only");
+    if (f_.gv.dim == Dcyl || f_.m != 0.0)
+      throw std::invalid_argument("NVIDIA does not yet support cylindrical coordinates");
+    if (f_.beta != 0.0 && f_.gv.dim != D2)
+      throw std::invalid_argument("NVIDIA nonzero beta requires a 2-D Cartesian grid");
+    if (plan.beta != f_.beta)
+      throw std::invalid_argument("NVIDIA beta coordinate fingerprint is stale");
+    if (f_.beta != 0.0 && plan.beta_updates.empty())
+      throw std::invalid_argument("NVIDIA nonzero-beta plan has no beta descriptors");
     if (f_.is_phasing())
       throw std::invalid_argument("NVIDIA PR2 does not support material phasing");
     if (f_.fluxes)
@@ -1828,6 +1906,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
 
     std::vector<NvidiaCompiledOperation> operations;
     std::vector<nvidia::curl_launch> curl_updates;
+    std::vector<nvidia::beta_launch> beta_updates;
     std::vector<nvidia::constitutive_launch> constitutive_updates;
     std::vector<nvidia::zero_launch> zero_updates;
     std::vector<NvidiaCompiledHalo> halo_plans;
@@ -1866,6 +1945,16 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
             curl_updates.push_back(compile_curl(plan.db_updates[i], state));
           compiled.count = curl_updates.size() - compiled.first;
           if (!compiled.count) set_reason(local_error, oi, "curl descriptor span is empty");
+          if (size_t(op.beta_descriptor_index) + op.beta_descriptor_count >
+              plan.beta_updates.size()) {
+            set_reason(local_error, oi, "beta descriptor span is out of range");
+            break;
+          }
+          compiled.beta_first = beta_updates.size();
+          for (size_t i = op.beta_descriptor_index;
+               i < size_t(op.beta_descriptor_index) + op.beta_descriptor_count; ++i)
+            beta_updates.push_back(compile_beta(plan.beta_updates[i], state));
+          compiled.beta_count = beta_updates.size() - compiled.beta_first;
           break;
         }
         case OpKind::update_eh: {
@@ -2099,6 +2188,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     if (local_error.empty())
       executable.reset(new NvidiaExecutable(
           this, plan.signature, state.fingerprint_, state.state_token_, operations, curl_updates,
+          beta_updates,
           constitutive_updates, zero_updates, halo_plans, halo_gathers, halo_scatters,
           halo_scratch_bytes, finite_checks, source_batches, source_points, source_copies,
           polarization_updates,
@@ -2144,6 +2234,8 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
           case OpKind::update_db:
             for (size_t i = op.first; i < op.first + op.count; ++i)
               nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
+            for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i)
+              nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
             break;
           case OpKind::update_eh:
             for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i)
