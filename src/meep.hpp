@@ -1852,6 +1852,7 @@ class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
 enum class HostCustomFallbackUse; // src/backend/backend.hpp -- backend-private
 class PreparedBackendEpoch;      // src/backend/backend_access.cpp -- backend-private
 struct BackendEpochSnapshot;     // tests/backend_api.cpp -- lifecycle invariant probe
+class NvidiaBackend;             // src/backend/nvidia/nvidia_backend.hpp -- backend-private
 struct BackendState;
 struct Executable;
 struct InitializationPlan;
@@ -2484,6 +2485,7 @@ public:
 private:
   friend void backend_classify_and_finalize(fields &);
   friend struct StepPlanTestAccess;
+  friend class NvidiaBackend;
   friend void backend_prepare_field_layout_change(fields &, uint32_t, const char *);
   friend void backend_preflight_field_layout_change(fields &, uint32_t, const char *);
   friend void backend_commit_field_layout_change(fields &);
