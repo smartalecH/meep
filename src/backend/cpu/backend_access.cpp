@@ -21,6 +21,7 @@
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
+#include "backend/prepare.hpp"
 #include "backend/step_plan.hpp"
 
 namespace meep {
@@ -499,6 +500,26 @@ void fields::init_backend() {
     clear_dirty(*this, dirty_initialization);
     return;
   }
+
+  /* A phase may have been configured while the CPU backend was still lazy and
+     only then moved to a resident backend.  Before that backend freezes its
+     catalog, detach shared current structure chunks and realize the retained
+     current/target storage union transactionally.  CPU-only execution remains
+     lazy, and no rank publishes replacement pointers until every rank has
+     completed the fallible preparation. */
+  std::unique_ptr<PreparedMaterialPhaseStorage> prepared_material;
+  std::string material_error;
+  if (phasein_time > 0 && !backend_state) try {
+      prepared_material = prepare_material_phase_storage(*this);
+    }
+    catch (const std::exception &e) {
+      material_error = e.what();
+    }
+    catch (...) {
+      material_error = "unknown resident material phase preparation failure";
+    }
+  backend_reconcile_host_access(material_error, "fields::init_backend material phase");
+  if (prepared_material) prepared_material->commit();
 
   bool coordinates_match = coordinate_state_matches(*this, step_plans[0]);
   if (step_plans[1]) coordinates_match &= coordinate_state_matches(*this, step_plans[1]);
