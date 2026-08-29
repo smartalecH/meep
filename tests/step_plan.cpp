@@ -40,6 +40,7 @@
 #include <meep.hpp>
 
 #include "backend/lifecycle.hpp"
+#include "backend/prepare.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/step_plan.hpp"
 #include "meep_internals.hpp"
@@ -603,21 +604,225 @@ static void test_phasing_plan() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   structure s(gv, one, pml(0.5));
   structure s2(gv, eps_slab, pml(0.5));
+  s.set_conductivity(Dz, magnetic_conductivity);
+  s2.set_conductivity(Dz, magnetic_conductivity);
+  for (int i = 0; i < s.num_chunks; ++i) {
+    if (!s.chunks[i]->is_mine()) continue;
+    const size_t n = size_t(s.chunks[i]->gv.ntot());
+    delete[] s.chunks[i]->chi1inv[Ex][Y];
+    s.chunks[i]->chi1inv[Ex][Y] = new realnum[n];
+    std::fill(s.chunks[i]->chi1inv[Ex][Y], s.chunks[i]->chi1inv[Ex][Y] + n, realnum(0));
+    s.chunks[i]->trivial_chi1inv[Ex][Y] = false;
+    delete[] s2.chunks[i]->chi1inv[Ex][Y];
+    s2.chunks[i]->chi1inv[Ex][Y] = new realnum[n];
+    std::fill(s2.chunks[i]->chi1inv[Ex][Y], s2.chunks[i]->chi1inv[Ex][Y] + n,
+              realnum(0.125));
+    s2.chunks[i]->trivial_chi1inv[Ex][Y] = false;
+  }
   fields f(&s);
+  std::unique_ptr<PreparedMaterialPhaseStorage> prepared =
+      prepare_material_phase_storage(f, s2);
+  prepared->commit();
   gaussian_src_time src(0.3, 0.1);
   f.add_point_source(Ez, src, vec(0.11, 0.13));
   f.advance(2);
   f.phase_in_material(&s2, 1.0);
 
   const StepPlan p = build_step_plan(f, StepProgram::ordinary);
-  size_t segments = 0, phase_ops = 0;
-  for (const Operation &op : p.operations) {
+  size_t segments = 0, phase_ops = 0, coefficient_ops = 0;
+  size_t phase_index = p.operations.size(), coefficient_index = p.operations.size();
+  const Operation *phase = NULL, *coefficients = NULL;
+  for (size_t i = 0; i < p.operations.size(); ++i) {
+    const Operation &op = p.operations[i];
     if (op.guard.kind == GuardKind::segment_boundary) ++segments;
-    if (op.kind == OpKind::phase_material) ++phase_ops;
+    if (op.kind == OpKind::phase_material) {
+      ++phase_ops;
+      phase = &op;
+      phase_index = i;
+    }
+    if (op.kind == OpKind::update_material_coefficients) {
+      ++coefficient_ops;
+      coefficients = &op;
+      coefficient_index = i;
+    }
   }
   CHECK(phase_ops == 1, "expected one phase_material op, got %zu", phase_ops);
+  CHECK(coefficient_ops == 1, "expected one material-coefficient op, got %zu", coefficient_ops);
   CHECK(segments == 6, "expected 6 segment-guarded reconciliation ops, got %zu", segments);
+  CHECK(phase_index + 7 == coefficient_index,
+        "material refresh boundaries do not enclose exactly six guarded reconciliation ops");
+  CHECK(p.material_phase_target_signature == compute_material_phase_target_signature(f),
+        "plan did not capture the live target structural fingerprint");
+
+  std::vector<MaterialRefreshArray> expected;
+  for (uint32_t family_value = uint32_t(MaterialRefreshFamily::chi1inv);
+       family_value <= uint32_t(MaterialRefreshFamily::condinv); ++family_value) {
+    const MaterialRefreshFamily family = MaterialRefreshFamily(family_value);
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      if (!f.chunks[chunk]->is_mine()) continue;
+      const structure_chunk &sc = *f.chunks[chunk]->s;
+      FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d) {
+        if (family == MaterialRefreshFamily::condinv && d != int(component_direction(c)))
+          continue;
+        const realnum *row = family == MaterialRefreshFamily::chi1inv
+                                 ? sc.chi1inv[c][d]
+                                 : family == MaterialRefreshFamily::conductivity
+                                       ? sc.conductivity[c][d]
+                                       : sc.condinv[c][d];
+        if (!row) continue;
+        const array_kind kind = family == MaterialRefreshFamily::chi1inv
+                                    ? array_kind::chi1inv
+                                    : family == MaterialRefreshFamily::conductivity
+                                          ? array_kind::conductivity
+                                          : array_kind::condinv;
+        const ArrayId id = f.array_catalog->find(StorageKey{chunk, int(kind), int(c), -1, d});
+        CHECK(is_valid(id), "expected material row is missing from the current catalog");
+        if (!is_valid(id)) continue;
+        expected.push_back(MaterialRefreshArray{chunk, c, direction(d), family, id,
+                                                f.array_catalog->spec(id).elements});
+      }
+    }
+  }
+
+  CHECK(phase && coefficients, "material refresh operations are absent");
+  if (phase && coefficients) {
+    size_t phase_rows = 0;
+    while (phase_rows < expected.size() &&
+           expected[phase_rows].family == MaterialRefreshFamily::chi1inv)
+      ++phase_rows;
+    CHECK(phase->material_refresh_index == 0 && phase->material_refresh_count == phase_rows,
+          "phase refresh span is not the exact chi1inv prefix");
+    CHECK(coefficients->material_refresh_index == phase_rows &&
+              coefficients->material_refresh_count == expected.size() - phase_rows,
+          "coefficient refresh span is not the exact conductivity/condinv suffix");
+    CHECK(phase->accesses.size() == phase_rows,
+          "phase refresh access count does not match its rows");
+    CHECK(coefficients->accesses.size() == expected.size() - phase_rows,
+          "coefficient refresh access count does not match its rows");
+  }
+  CHECK(p.material_refresh_arrays.size() == expected.size(),
+        "material refresh row count is %zu, expected %zu", p.material_refresh_arrays.size(),
+        expected.size());
+  const size_t compared = std::min(p.material_refresh_arrays.size(), expected.size());
+  for (size_t i = 0; i < compared; ++i) {
+    const MaterialRefreshArray &got = p.material_refresh_arrays[i];
+    const MaterialRefreshArray &want = expected[i];
+    CHECK(got.chunk == want.chunk && got.c == want.c && got.d == want.d &&
+              got.family == want.family && got.current == want.current &&
+              got.elements == want.elements,
+          "material refresh row %zu is not canonical", i);
+    const Operation *owner = got.family == MaterialRefreshFamily::chi1inv ? phase : coefficients;
+    const BufferAccess *access = owner ? find_access(*owner, got.current) : NULL;
+    CHECK(access && access->mode == AccessMode::write && access->array.offset == 0 &&
+              access->array.elements == got.elements,
+          "material refresh row %zu lacks its exact device-write access", i);
+    const ArraySpec &spec = f.array_catalog->spec(got.current);
+    CHECK(!is_valid(spec.alias_of), "material refresh row %zu names an alias", i);
+  }
+
+  int controlled_chunk = -1;
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine() && f.chunks[i]->new_s) {
+      controlled_chunk = i;
+      break;
+    }
+  if (controlled_chunk >= 0) {
+    structure_chunk &target = *f.chunks[controlled_chunk]->new_s;
+    component numeric_c = NO_COMPONENT;
+    direction numeric_d = NO_DIRECTION;
+    FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d)
+      if (numeric_c == NO_COMPONENT && target.chi1inv[c][d]) {
+        numeric_c = c;
+        numeric_d = direction(d);
+      }
+    CHECK(numeric_c != NO_COMPONENT, "owned material target has no chi1inv row");
+    if (numeric_c != NO_COMPONENT) {
+      const realnum saved = target.chi1inv[numeric_c][numeric_d][0];
+      target.chi1inv[numeric_c][numeric_d][0] = saved + realnum(0.125);
+      CHECK(compute_material_phase_target_signature(f) == p.material_phase_target_signature,
+            "target numerical values changed the structural fingerprint");
+      target.chi1inv[numeric_c][numeric_d][0] = saved;
+      target.trivial_chi1inv[numeric_c][numeric_d] =
+          !target.trivial_chi1inv[numeric_c][numeric_d];
+      CHECK(compute_material_phase_target_signature(f) != p.material_phase_target_signature,
+            "target triviality did not change the structural fingerprint");
+      target.trivial_chi1inv[numeric_c][numeric_d] =
+          !target.trivial_chi1inv[numeric_c][numeric_d];
+    }
+  }
   f.advance(3);
+}
+
+static void test_material_schema_signature() {
+  StepPlan plan;
+  plan.material_phase_target_signature = 0x123456789abcdef0ull;
+  Operation phase = {};
+  phase.kind = OpKind::phase_material;
+  phase.guard = guard_static(true);
+  phase.material_refresh_index = 0;
+  phase.material_refresh_count = 1;
+  phase.accesses.push_back(BufferAccess{ArrayRef{ArrayId{7}, 0, 257}, AccessMode::write});
+  plan.operations.push_back(phase);
+  Operation coefficients = {};
+  coefficients.kind = OpKind::update_material_coefficients;
+  coefficients.guard = guard_always();
+  coefficients.material_refresh_index = 1;
+  coefficients.material_refresh_count = 2;
+  coefficients.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{9}, 0, 257}, AccessMode::write});
+  coefficients.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{11}, 0, 257}, AccessMode::write});
+  plan.operations.push_back(coefficients);
+  plan.material_refresh_arrays.push_back(
+      MaterialRefreshArray{2, Ez, Z, MaterialRefreshFamily::chi1inv, ArrayId{7}, 257});
+  plan.material_refresh_arrays.push_back(
+      MaterialRefreshArray{2, Dz, Z, MaterialRefreshFamily::conductivity, ArrayId{9}, 257});
+  plan.material_refresh_arrays.push_back(
+      MaterialRefreshArray{2, Dz, Z, MaterialRefreshFamily::condinv, ArrayId{11}, 257});
+  const uint64_t signature = compute_step_plan_signature(plan);
+#define CHECK_MATERIAL_SIGNATURE(mutation, message)                                                \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    mutation;                                                                                      \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
+  } while (0)
+  CHECK_MATERIAL_SIGNATURE(++changed.operations[0].material_refresh_index,
+                           "signature ignored material refresh span start");
+  CHECK_MATERIAL_SIGNATURE(++changed.operations[1].material_refresh_count,
+                           "signature ignored material refresh span count");
+  CHECK_MATERIAL_SIGNATURE(++changed.material_refresh_arrays[0].chunk,
+                           "signature ignored material refresh chunk");
+  CHECK_MATERIAL_SIGNATURE(changed.material_refresh_arrays[0].c = Ex,
+                           "signature ignored material refresh component");
+  CHECK_MATERIAL_SIGNATURE(changed.material_refresh_arrays[0].d = X,
+                           "signature ignored material refresh direction");
+  CHECK_MATERIAL_SIGNATURE(changed.material_refresh_arrays[0].family =
+                               MaterialRefreshFamily::conductivity,
+                           "signature ignored material refresh family");
+  CHECK_MATERIAL_SIGNATURE(++changed.material_refresh_arrays[0].current.value,
+                           "signature ignored material refresh ArrayId");
+  CHECK_MATERIAL_SIGNATURE(++changed.material_refresh_arrays[0].elements,
+                           "signature ignored material refresh extent");
+  CHECK_MATERIAL_SIGNATURE(std::swap(changed.material_refresh_arrays[0],
+                                     changed.material_refresh_arrays[1]),
+                           "signature ignored material refresh row order");
+  CHECK_MATERIAL_SIGNATURE(++changed.operations[0].accesses[0].array.id.value,
+                           "signature ignored material access identity");
+  CHECK_MATERIAL_SIGNATURE(changed.operations[0].accesses[0].mode = AccessMode::read,
+                           "signature ignored material access mode");
+  CHECK_MATERIAL_SIGNATURE(std::swap(changed.operations[1].accesses[0],
+                                     changed.operations[1].accesses[1]),
+                           "signature ignored material access order");
+  CHECK_MATERIAL_SIGNATURE(++changed.material_phase_target_signature,
+                           "signature ignored material target fingerprint");
+#undef CHECK_MATERIAL_SIGNATURE
+
+  plan.clear();
+  CHECK(plan.material_refresh_arrays.empty() && plan.material_phase_target_signature == 0,
+        "StepPlan::clear retained material phase state");
+  for (const Operation &op : plan.operations)
+    CHECK(op.material_refresh_index == 0 && op.material_refresh_count == 0,
+          "StepPlan::clear retained a material operation span");
 }
 
 static void test_polarization_schema_signature() {
@@ -1107,6 +1312,7 @@ int main(int argc, char **argv) {
   test_empty_plan();
   test_solve_cw_plan();
   test_phasing_plan();
+  test_material_schema_signature();
   test_magnetic_schema_signature();
   test_polarization_schema_signature();
   test_beta_schema_signature();

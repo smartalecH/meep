@@ -106,6 +106,8 @@ struct Operation {
   OpKind kind;
   uint32_t descriptor_index;
   uint32_t descriptor_count;
+  uint32_t material_refresh_index;
+  uint32_t material_refresh_count;
   uint32_t beta_descriptor_index;
   uint32_t beta_descriptor_count;
   uint32_t cylindrical_m_descriptor_index;
@@ -395,6 +397,24 @@ struct MagneticStateArray {
   bool average;
 };
 
+/* Material interpolation remains host-authoritative.  These rows identify the
+   stable current arrays that a resident backend refreshes after the host has
+   mixed them; target material arrays deliberately never enter the catalog. */
+enum class MaterialRefreshFamily : uint32_t {
+  chi1inv = 0,
+  conductivity = 1,
+  condinv = 2
+};
+
+struct MaterialRefreshArray {
+  int chunk;
+  component c;
+  direction d;
+  MaterialRefreshFamily family;
+  ArrayId current;
+  size_t elements;
+};
+
 /* Exact operation indices for the restricted B/H half-step used by magnetic
    synchronization.  UINT32_MAX denotes an omitted source-evaluation node. */
 struct MagneticHalfStep {
@@ -441,12 +461,16 @@ struct StepPlan {
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
   std::vector<MagneticStateArray> magnetic_state_arrays;
+  std::vector<MaterialRefreshArray> material_refresh_arrays;
   MagneticHalfStep magnetic_half_step;
+  /* Structural identity of the host-only phase target.  Values are excluded:
+     changing them is the purpose of material phasing. */
+  uint64_t material_phase_target_signature;
   uint64_t signature;
 
   StepPlan()
       : program(StepProgram::ordinary), coordinate_generation(0), beta(0), cylindrical_m(0),
-        signature(0) {}
+        material_phase_target_signature(0), signature(0) {}
   void clear() {
     coordinate_generation = 0;
     beta = 0;
@@ -467,7 +491,9 @@ struct StepPlan {
     polarization_updates.clear();
     polarization_subtractions.clear();
     magnetic_state_arrays.clear();
+    material_refresh_arrays.clear();
     magnetic_half_step = MagneticHalfStep();
+    material_phase_target_signature = 0;
     signature = 0;
   }
 };
@@ -480,6 +506,10 @@ StepPlan build_step_plan(fields &f, StepProgram program);
 
 /* Structural identity used by device executables and tests. */
 uint64_t compute_step_plan_signature(const StepPlan &plan);
+
+/* Recomputed by resident preflight so externally-mutated target topology is
+   rejected before phase_material_mix changes current coefficients. */
+uint64_t compute_material_phase_target_signature(const fields &f);
 
 /* Human-readable operation sequence, for the trace test and for debugging. */
 void format_step_plan(const StepPlan &p, std::vector<std::string> &out);
