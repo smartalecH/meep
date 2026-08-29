@@ -52,8 +52,11 @@ DirtyMask invalidation_closure(MutationKind cause) {
        delta to the changed region. */
     case MutationKind::material_region: return dirty_initialization | dirty_classification;
 
+    /* Phasing can promote a previously absent chi1inv or conductivity row.
+       Resident backends must rebuild the catalog before the first mix rather
+       than letting structure_chunk::mix_with allocate behind frozen ArrayIds. */
     case MutationKind::material_phase:
-      return dirty_initialization | dirty_classification | dirty_executable;
+      return dirty_initialization | dirty_storage | dirty_classification | dirty_executable;
 
     /* A different recipe or susceptibility set changes which arrays exist,
        which polarization internals need halo exchange, and the op list. */

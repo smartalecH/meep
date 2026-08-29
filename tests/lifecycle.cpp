@@ -64,7 +64,7 @@ static void test_closure_table() {
       {MutationKind::material_values, dirty_initialization | dirty_classification},
       {MutationKind::material_region, dirty_initialization | dirty_classification},
       {MutationKind::material_phase,
-       dirty_initialization | dirty_classification | dirty_executable},
+       dirty_initialization | dirty_storage | dirty_classification | dirty_executable},
       {MutationKind::material_definition, dirty_initialization | dirty_storage | dirty_halos |
                                               dirty_classification | dirty_executable},
       {MutationKind::field_layout, dirty_storage | dirty_halos | dirty_executable},
