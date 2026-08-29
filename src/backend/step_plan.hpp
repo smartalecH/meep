@@ -207,11 +207,18 @@ enum PolarizationVariant : uint32_t {
   polarization_drude = 1u << 2
 };
 
+enum class PolarizationUpdateKind : uint32_t { lorentzian = 0, gyrotropic = 1 };
+
 struct PolarizationUpdate {
+  PolarizationUpdateKind kind;
   UpdateRegion region;
   int state_index;
   ArrayId p;
   ArrayId p_prev;
+  ArrayId p_cross1;
+  ArrayId p_prev_cross1;
+  ArrayId p_cross2;
+  ArrayId p_prev_cross2;
   ArrayId primary_w;
   ArrayId cross_w1;
   ArrayId cross_w2;
@@ -223,6 +230,9 @@ struct PolarizationUpdate {
   ptrdiff_t cross_stride2;
   double omega_0;
   double gamma;
+  double alpha;
+  double gyro_tensor[3][3];
+  gyrotropy_model gyro_model;
   double dt;
 };
 
