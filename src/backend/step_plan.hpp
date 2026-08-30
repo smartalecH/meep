@@ -114,6 +114,8 @@ struct Operation {
   uint32_t cylindrical_m_descriptor_count;
   uint32_t cylindrical_origin_action_index;
   uint32_t cylindrical_origin_action_count;
+  uint32_t polarization_group_index;
+  uint32_t polarization_group_count;
   uint32_t polarization_subtraction_index;
   uint32_t polarization_subtraction_count;
   uint32_t magnetic_state_index;
@@ -381,9 +383,85 @@ struct PolarizationSubtraction {
   component c;
   int cmp;
   int state_index;
+  int transition_index;
   ArrayId target;
   ArrayId p;
   size_t elements;
+};
+
+bool operator==(const PolarizationSubtraction &a, const PolarizationSubtraction &b);
+inline bool operator!=(const PolarizationSubtraction &a, const PolarizationSubtraction &b) {
+  return !(a == b);
+}
+
+enum class PolarizationGroupKind : uint32_t { recurrence = 0, multilevel = 1 };
+
+/* One susceptibility in live linked-list order. The CPU still executes one
+   update_polarization(ft) operation; device backends walk these groups so a
+   multilevel population phase cannot be split from its transition phase or
+   cause the CPU entry point to run more than once. */
+struct PolarizationUpdateGroup {
+  PolarizationGroupKind kind;
+  int chunk;
+  field_type ft;
+  int state_index;
+  uint32_t recurrence_index;
+  uint32_t recurrence_count;
+  uint32_t noise_count;
+  uint32_t population_index;
+  uint32_t population_count;
+  uint32_t transition_index;
+  uint32_t transition_count;
+};
+
+struct MultilevelPopulationTerm {
+  int transition_index;
+  component c;
+  int cmp;
+  ArrayId w;
+  ArrayId w_prev;
+  ArrayId p;
+  ArrayId p_prev;
+  ptrdiff_t centered_offsets[2];
+};
+
+struct MultilevelPopulationUpdate {
+  UpdateRegion region;
+  field_type ft;
+  int state_index;
+  uint32_t levels;
+  uint32_t transitions;
+  uint32_t active_component_cmps;
+  ArrayId gamma_inv;
+  ArrayId populations;
+  uint32_t gamma_index;
+  uint32_t gamma_count;
+  uint32_t alpha_index;
+  uint32_t alpha_count;
+  uint32_t term_index;
+  uint32_t term_count;
+  size_t scratch_elements_per_point;
+  double dt;
+};
+
+struct MultilevelTransitionUpdate {
+  UpdateRegion region;
+  field_type ft;
+  int state_index;
+  int transition_index;
+  ArrayId p;
+  ArrayId p_prev;
+  ArrayId w;
+  ArrayId diagonal_sigma;
+  ArrayId populations;
+  ptrdiff_t population_offsets[2];
+  uint32_t population_stride;
+  int positive_level;
+  int negative_level;
+  double omega;
+  double gamma;
+  double sigmat[5];
+  double dt;
 };
 
 /* One legacy time-domain flux monitor owns a private half-step scalar and a
@@ -626,8 +704,13 @@ struct StepPlan {
   std::vector<SlabRef> cylindrical_zero_slabs;
   std::vector<CylindricalOriginAction> cylindrical_origin_actions;
   std::vector<ConstitutiveUpdate> eh_updates;
+  std::vector<PolarizationUpdateGroup> polarization_groups;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
+  std::vector<MultilevelPopulationUpdate> multilevel_population_updates;
+  std::vector<MultilevelPopulationTerm> multilevel_population_terms;
+  std::vector<MultilevelTransitionUpdate> multilevel_transition_updates;
+  std::vector<double> multilevel_coefficients;
   std::vector<LegacyFluxUpdate> legacy_flux_updates;
   std::vector<LegacyFluxTerm> legacy_flux_terms;
   std::vector<MagneticStateArray> magnetic_state_arrays;
@@ -659,8 +742,13 @@ struct StepPlan {
     cylindrical_zero_slabs.clear();
     cylindrical_origin_actions.clear();
     eh_updates.clear();
+    polarization_groups.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
+    multilevel_population_updates.clear();
+    multilevel_population_terms.clear();
+    multilevel_transition_updates.clear();
+    multilevel_coefficients.clear();
     legacy_flux_updates.clear();
     legacy_flux_terms.clear();
     magnetic_state_arrays.clear();
@@ -679,6 +767,32 @@ struct StepPlan {
 void append_polarization_update_group(fields &f, StepPlan &plan, Operation &op,
                                       const std::vector<PolarizationUpdate> &recurrences,
                                       const std::vector<PolarizationUpdate> &noise_additions);
+
+void append_multilevel_update_group(fields &f, StepPlan &plan, Operation &op,
+                                    const MultilevelPopulationUpdate &population,
+                                    const std::vector<MultilevelPopulationTerm> &terms,
+                                    const std::vector<MultilevelTransitionUpdate> &transitions,
+                                    const std::vector<double> &gamma_matrix,
+                                    const std::vector<double> &alpha);
+
+bool operator==(const PolarizationUpdateGroup &a, const PolarizationUpdateGroup &b);
+bool operator==(const MultilevelPopulationTerm &a, const MultilevelPopulationTerm &b);
+bool operator==(const MultilevelPopulationUpdate &a, const MultilevelPopulationUpdate &b);
+bool operator==(const MultilevelTransitionUpdate &a, const MultilevelTransitionUpdate &b);
+inline bool operator!=(const PolarizationUpdateGroup &a, const PolarizationUpdateGroup &b) {
+  return !(a == b);
+}
+inline bool operator!=(const MultilevelPopulationTerm &a, const MultilevelPopulationTerm &b) {
+  return !(a == b);
+}
+inline bool operator!=(const MultilevelPopulationUpdate &a,
+                       const MultilevelPopulationUpdate &b) {
+  return !(a == b);
+}
+inline bool operator!=(const MultilevelTransitionUpdate &a,
+                       const MultilevelTransitionUpdate &b) {
+  return !(a == b);
+}
 
 /* A direct transcription of the order in src/step.cpp. It omits empty work and
    NEVER reorders what remains. It is not a scheduler that infers Maxwell's
