@@ -53,6 +53,7 @@ struct device_properties {
 
 std::vector<device_properties> enumerate_devices();
 device_properties properties_for_device(int device);
+size_t free_memory_for_device(int device);
 int runtime_version();
 int driver_version();
 bool devices_can_access_peer(int source, int destination);
@@ -238,7 +239,9 @@ enum class failure_point {
   cw_breakdown,
   noisy_seed_copy,
   noisy_seed_sync,
-  noisy_add
+  noisy_add,
+  multilevel_population,
+  multilevel_transition
 };
 void fail_next(failure_point point);
 void clear_failure();

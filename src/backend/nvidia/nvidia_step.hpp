@@ -83,6 +83,9 @@ struct constitutive_launch {
   ptrdiff_t cross1_stride;
   ptrdiff_t cross2_stride;
   void *target_w;
+  void *previous_w;
+  const void *previous_w_source;
+  size_t previous_w_elements;
   pml_profile_launch pml;
   scalar_precision precision;
 };

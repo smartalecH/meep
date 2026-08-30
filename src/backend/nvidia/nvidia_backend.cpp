@@ -36,6 +36,7 @@
 #include "backend/nvidia/nvidia_dft.hpp"
 #include "backend/nvidia/nvidia_flux.hpp"
 #include "backend/nvidia/nvidia_magnetic.hpp"
+#include "backend/nvidia/nvidia_multilevel.hpp"
 #include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
@@ -597,6 +598,11 @@ struct NvidiaCompiledOperation {
   double source_time_offset;
 };
 
+struct NvidiaCompiledPolarizationAction {
+  enum class Kind { ordinary, multilevel_population, multilevel_transition } kind;
+  size_t index;
+};
+
 struct NvidiaCompiledCylindricalOriginAction {
   CylindricalOriginActionKind kind;
   size_t index;
@@ -660,6 +666,16 @@ public:
                    const std::vector<nvidia::array_copy_launch> &source_copies,
                    const std::vector<nvidia::compiled_polarization_update>
                        &polarization_updates,
+                   const std::vector<NvidiaCompiledPolarizationAction>
+                       &polarization_actions,
+                   const std::vector<nvidia::multilevel_population_launch>
+                       &multilevel_population_updates,
+                   const std::vector<nvidia::multilevel_population_term_launch>
+                       &multilevel_population_terms,
+                   const std::vector<nvidia::multilevel_transition_launch>
+                       &multilevel_transition_updates,
+                   const std::vector<unsigned char> &multilevel_coefficients,
+                   size_t multilevel_scratch_bytes,
                    const std::vector<nvidia::polarization_subtract_launch>
                        &polarization_subtractions,
                    const std::vector<nvidia::dft_launch> &dft_updates,
@@ -685,7 +701,9 @@ public:
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
-        has_noisy_updates_(false),
+        polarization_actions_(polarization_actions),
+        multilevel_population_updates_(multilevel_population_updates),
+        multilevel_transition_updates_(multilevel_transition_updates), has_noisy_updates_(false),
         polarization_subtractions_(polarization_subtractions), dft_updates_(dft_updates),
         legacy_flux_updates_(legacy_flux_updates), legacy_flux_terms_(legacy_flux_terms),
         legacy_flux_global_(legacy_flux_updates.size(), 0.0),
@@ -700,6 +718,42 @@ public:
                                nvidia::compiled_polarization_update::kind_type::noisy_add;
     try {
       nvidia::device_scope scope(state.device_);
+      size_t executable_device_bytes = 0;
+      const auto budget = [&](size_t bytes, const char *what) {
+        executable_device_bytes = checked_add(executable_device_bytes, bytes, what);
+      };
+      budget(checked_product(halo_gathers.size(), sizeof(halo_gathers[0]),
+                             "budgeting NVIDIA halo gather descriptors"),
+             "budgeting NVIDIA executable storage");
+      budget(checked_product(halo_scatters.size(), sizeof(halo_scatters[0]),
+                             "budgeting NVIDIA halo scatter descriptors"),
+             "budgeting NVIDIA executable storage");
+      budget(halo_scratch_bytes, "budgeting NVIDIA executable storage");
+      if (!finite_checks_.empty()) budget(sizeof(uint64_t), "budgeting NVIDIA executable storage");
+      budget(checked_product(source_scalar_count_, sizeof(nvidia::source_scalar),
+                             "budgeting NVIDIA source scalars"),
+             "budgeting NVIDIA executable storage");
+      budget(checked_product(source_points.size(), sizeof(source_points[0]),
+                             "budgeting NVIDIA source points"),
+             "budgeting NVIDIA executable storage");
+      budget(checked_product(dft_omega.size(), sizeof(double),
+                             "budgeting NVIDIA DFT frequencies"),
+             "budgeting NVIDIA executable storage");
+      budget(checked_product(legacy_flux_updates_.size(), 2 * sizeof(double),
+                             "budgeting NVIDIA legacy flux scalars"),
+             "budgeting NVIDIA executable storage");
+      budget(checked_product(legacy_flux_partial_count, sizeof(double),
+                             "budgeting NVIDIA legacy flux partials"),
+             "budgeting NVIDIA executable storage");
+      budget(multilevel_coefficients.size(), "budgeting NVIDIA executable storage");
+      budget(checked_product(multilevel_population_terms.size(),
+                             sizeof(multilevel_population_terms[0]),
+                             "budgeting NVIDIA multilevel term descriptors"),
+             "budgeting NVIDIA executable storage");
+      budget(multilevel_scratch_bytes, "budgeting NVIDIA executable storage");
+      const size_t free_device_bytes = nvidia::free_memory_for_device(state.device_);
+      if (executable_device_bytes > free_device_bytes)
+        throw std::runtime_error("NVIDIA executable memory budget exceeds available device memory");
       if (!halo_gathers.empty()) {
         halo_gathers_.allocate(checked_product(halo_gathers.size(), sizeof(halo_gathers[0]),
                                                "allocating NVIDIA halo gather descriptors"),
@@ -728,6 +782,38 @@ public:
                                                  sizeof(nvidia::source_scalar),
                                                  "allocating NVIDIA source-scalar staging"));
       }
+      if (!multilevel_coefficients.empty()) {
+        multilevel_coefficients_.allocate(multilevel_coefficients.size(), state.device_);
+        nvidia::copy_host_to_device_async(multilevel_coefficients_, 0,
+                                          multilevel_coefficients.data(),
+                                          multilevel_coefficients.size(), *state.transfer_);
+      }
+      if (!multilevel_population_terms.empty()) {
+        multilevel_population_terms_.allocate(
+            checked_product(multilevel_population_terms.size(),
+                            sizeof(multilevel_population_terms[0]),
+                            "allocating NVIDIA multilevel term descriptors"),
+            state.device_);
+        nvidia::copy_host_to_device_async(multilevel_population_terms_, 0,
+                                          multilevel_population_terms.data(),
+                                          multilevel_population_terms_.size(), *state.transfer_);
+      }
+      if (multilevel_scratch_bytes)
+        multilevel_scratch_.allocate(multilevel_scratch_bytes, state.device_);
+      unsigned char *coefficient_base = static_cast<unsigned char *>(
+          multilevel_coefficients_.opaque_handle());
+      const nvidia::multilevel_population_term_launch *term_base =
+          static_cast<const nvidia::multilevel_population_term_launch *>(
+              multilevel_population_terms_.opaque_handle());
+      for (nvidia::multilevel_population_launch &update : multilevel_population_updates_) {
+        update.gamma_matrix = coefficient_base + update.gamma_byte_offset;
+        update.alpha = coefficient_base + update.alpha_byte_offset;
+        update.transition_gperpdt = coefficient_base + update.transition_byte_offset;
+        update.terms = update.term_count ? term_base + update.term_index : NULL;
+        update.scratch = multilevel_scratch_.opaque_handle();
+      }
+      for (nvidia::multilevel_transition_launch &update : multilevel_transition_updates_)
+        update.coefficients = coefficient_base + update.coefficient_byte_offset;
       if (material_staging_bytes) material_staging_.allocate(material_staging_bytes);
       if (!source_points.empty()) {
         source_points_.allocate(checked_product(source_points.size(), sizeof(source_points[0]),
@@ -765,7 +851,8 @@ public:
                             "allocating NVIDIA legacy flux reduction scratch"),
             state.device_);
       if (!halo_gathers.empty() || !halo_scatters.empty() || !source_points.empty() ||
-          !dft_omega.empty() || !legacy_flux_updates_.empty())
+          !dft_omega.empty() || !legacy_flux_updates_.empty() ||
+          !multilevel_coefficients.empty() || !multilevel_population_terms.empty())
         state.transfer_->synchronize();
     }
     catch (...) {
@@ -796,6 +883,9 @@ public:
   std::vector<nvidia::source_batch_launch> source_batches_;
   std::vector<nvidia::array_copy_launch> source_copies_;
   std::vector<nvidia::compiled_polarization_update> polarization_updates_;
+  std::vector<NvidiaCompiledPolarizationAction> polarization_actions_;
+  std::vector<nvidia::multilevel_population_launch> multilevel_population_updates_;
+  std::vector<nvidia::multilevel_transition_launch> multilevel_transition_updates_;
   bool has_noisy_updates_;
   std::vector<nvidia::polarization_subtract_launch> polarization_subtractions_;
   std::vector<nvidia::dft_launch> dft_updates_;
@@ -819,6 +909,9 @@ public:
   nvidia::pinned_buffer material_staging_;
   nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
+  nvidia::device_buffer multilevel_coefficients_;
+  nvidia::device_buffer multilevel_population_terms_;
+  nvidia::device_buffer multilevel_scratch_;
   nvidia::device_buffer legacy_flux_half_;
   nvidia::device_buffer legacy_flux_current_;
   nvidia::device_buffer legacy_flux_partials_;
@@ -1564,6 +1657,8 @@ bool same_polarization_operation(const Operation &a, const Operation &b) {
       a.cylindrical_m_descriptor_count != b.cylindrical_m_descriptor_count ||
       a.cylindrical_origin_action_index != b.cylindrical_origin_action_index ||
       a.cylindrical_origin_action_count != b.cylindrical_origin_action_count ||
+      a.polarization_group_index != b.polarization_group_index ||
+      a.polarization_group_count != b.polarization_group_count ||
       a.polarization_subtraction_index != b.polarization_subtraction_index ||
       a.polarization_subtraction_count != b.polarization_subtraction_count ||
       a.magnetic_state_index != b.magnetic_state_index ||
@@ -1578,6 +1673,45 @@ bool same_polarization_operation(const Operation &a, const Operation &b) {
     return false;
   for (size_t i = 0; i < a.accesses.size(); ++i)
     if (!same_polarization_access(a.accesses[i], b.accesses[i])) return false;
+  return true;
+}
+
+bool same_multilevel_descriptor(const PolarizationDescriptor &a,
+                                const PolarizationDescriptor &b) {
+  if (a.kind != SusceptibilityKind::multilevel || b.kind != SusceptibilityKind::multilevel ||
+      a.chunk != b.chunk || a.ft != b.ft || a.state_index != b.state_index ||
+      a.has_internal_state != b.has_internal_state ||
+      a.multilevel.levels != b.multilevel.levels ||
+      a.multilevel.transitions != b.multilevel.transitions ||
+      a.multilevel.gamma_matrix != b.multilevel.gamma_matrix ||
+      a.multilevel.initial_populations != b.multilevel.initial_populations ||
+      a.multilevel.alpha != b.multilevel.alpha || a.multilevel.omega != b.multilevel.omega ||
+      a.multilevel.transition_gamma != b.multilevel.transition_gamma ||
+      a.multilevel.sigmat != b.multilevel.sigmat ||
+      a.multilevel_gamma_inv != b.multilevel_gamma_inv ||
+      a.multilevel_populations != b.multilevel_populations ||
+      a.multilevel_population_points != b.multilevel_population_points ||
+      a.per_thread_scratch_elements != b.per_thread_scratch_elements ||
+      a.required_w != b.required_w || a.required_w_prev != b.required_w_prev ||
+      a.needs_halo != b.needs_halo ||
+      a.multilevel_states.size() != b.multilevel_states.size() ||
+      a.internal_arrays.size() != b.internal_arrays.size())
+    return false;
+  for (size_t i = 0; i < a.multilevel_states.size(); ++i) {
+    const MultilevelStateArrays &x = a.multilevel_states[i];
+    const MultilevelStateArrays &y = b.multilevel_states[i];
+    if (x.transition_index != y.transition_index || x.c != y.c || x.cmp != y.cmp ||
+        x.p != y.p || x.p_prev != y.p_prev || x.elements != y.elements)
+      return false;
+  }
+  for (size_t i = 0; i < a.internal_arrays.size(); ++i) {
+    const InternalArrayLayout &x = a.internal_arrays[i];
+    const InternalArrayLayout &y = b.internal_arrays[i];
+    if (((x.name || y.name) && (!x.name || !y.name || strcmp(x.name, y.name))) ||
+        x.element_type != y.element_type || x.offset_elements != y.offset_elements ||
+        x.elements != y.elements || x.c != y.c || x.cmp != y.cmp)
+      return false;
+  }
   return true;
 }
 
@@ -1634,7 +1768,8 @@ nvidia::compiled_polarization_update compile_polarization_update(
           p_key.chunk != source.region.chunk ||
           p_key.kind != int(array_kind::polarization_internal) ||
           p_key.component_ != int(source.region.c) || p_key.cmp != source.region.cmp ||
-          p_key.aux < 0 || p_key.aux / 1024 != source.state_index)
+          polarization_storage_field_type(p_key.aux) != source.ft ||
+          polarization_storage_state_index(p_key.aux) != source.state_index)
         throw std::invalid_argument("noisy polarization P has the wrong storage identity");
       if (sigma_spec.id != source.diagonal_sigma || sigma_spec.role != array_role::material ||
           sigma_spec.element_type != ElementType::realnum_value ||
@@ -1642,7 +1777,7 @@ nvidia::compiled_polarization_update compile_polarization_update(
           sigma_key.kind != int(array_kind::sigma) ||
           sigma_key.component_ != int(source.region.c) ||
           sigma_key.cmp != int(component_direction(source.region.c)) ||
-          sigma_key.aux != sigma_aux)
+          sigma_key.aux != uint64_t(sigma_aux))
         throw std::invalid_argument("noisy polarization sigma has the wrong storage identity");
       nvidia::noisy_add_launch launch = {};
       launch.region = flat_region_for(source.region);
@@ -1679,8 +1814,356 @@ nvidia::compiled_polarization_update compile_polarization_update(
   return result;
 }
 
+size_t append_multilevel_coefficients(std::vector<unsigned char> &storage,
+                                      nvidia::scalar_precision precision,
+                                      const std::vector<double> &values) {
+  const size_t bytes = precision == nvidia::scalar_precision::f32 ? sizeof(float)
+                                                                  : sizeof(double);
+  const size_t padding = (bytes - storage.size() % bytes) % bytes;
+  const size_t offset = checked_add(storage.size(), padding,
+                                    "aligning NVIDIA multilevel coefficients");
+  const size_t payload = checked_product(values.size(), bytes,
+                                         "sizing NVIDIA multilevel coefficients");
+  storage.resize(checked_add(offset, payload, "packing NVIDIA multilevel coefficients"), 0);
+  if (precision == nvidia::scalar_precision::f32) {
+    for (size_t i = 0; i < values.size(); ++i) {
+      const float value = float(values[i]);
+      memcpy(storage.data() + offset + i * sizeof(value), &value, sizeof(value));
+    }
+  }
+  else {
+    for (size_t i = 0; i < values.size(); ++i)
+      memcpy(storage.data() + offset + i * sizeof(values[i]), &values[i],
+             sizeof(values[i]));
+  }
+  return offset;
+}
+
+size_t multilevel_region_points(const nvidia::flat_region &region) {
+  size_t points = 1;
+  for (int axis = 0; axis < 3; ++axis)
+    points = checked_product(points, region.counts[axis],
+                             "sizing NVIDIA multilevel region");
+  return points;
+}
+
+ptrdiff_t checked_index_product(ptrdiff_t value, uint32_t multiplier, const char *what) {
+  const __int128 product = __int128(value) * multiplier;
+  if (product < std::numeric_limits<ptrdiff_t>::min() ||
+      product > std::numeric_limits<ptrdiff_t>::max())
+    throw std::overflow_error(std::string(what) + " index overflow");
+  return ptrdiff_t(product);
+}
+
+void validate_multilevel_storage_identity(const StoragePlan &plan, ArrayId id,
+                                          array_role role, int chunk, field_type ft,
+                                          int state_index, component c, int cmp,
+                                          uint32_t layout_ordinal,
+                                          nvidia::scalar_precision precision,
+                                          const char *what) {
+  if (!is_valid(id) || id.value >= plan.arrays.size() || id.value >= plan.keys.size())
+    throw std::out_of_range(std::string(what) + " ArrayId is out of range");
+  const ArraySpec &spec = plan.arrays[id.value];
+  const StorageKey &key = plan.keys[id.value];
+  if (spec.id != id || spec.role != role || spec.element_type != ElementType::realnum_value ||
+      is_valid(spec.alias_of) || key.chunk != chunk ||
+      key.kind != int(array_kind::polarization_internal) || key.component_ != int(c) ||
+      key.cmp != cmp || polarization_storage_field_type(key.aux) != ft ||
+      polarization_storage_state_index(key.aux) != state_index ||
+      polarization_storage_layout_ordinal(key.aux) != layout_ordinal ||
+      scalar_precision_for(plan, id, what) != precision)
+    throw std::invalid_argument(std::string(what) + " has a noncanonical storage identity");
+}
+
+nvidia::multilevel_population_launch compile_multilevel_population(
+    const MultilevelPopulationUpdate &source, uint32_t transition_index, const StepPlan &plan,
+    NvidiaBackendState &state,
+    std::vector<nvidia::multilevel_population_term_launch> &compiled_terms,
+    std::vector<unsigned char> &coefficient_storage, size_t &scratch_bytes) {
+  if (source.region.c != Centered || source.region.cmp != -1 || source.region.variant_key ||
+      source.region.chunk < 0 || source.state_index < 0 ||
+      (source.ft != E_stuff && source.ft != H_stuff) || !source.levels || !source.transitions ||
+      source.scratch_elements_per_point != source.levels || !std::isfinite(source.dt) ||
+      source.dt <= 0.0 ||
+      size_t(source.levels) > std::numeric_limits<size_t>::max() / source.levels ||
+      size_t(source.levels) > std::numeric_limits<size_t>::max() / source.transitions ||
+      source.gamma_count != size_t(source.levels) * source.levels ||
+      source.alpha_count != size_t(source.levels) * source.transitions ||
+      size_t(source.gamma_index) + source.gamma_count > plan.multilevel_coefficients.size() ||
+      size_t(source.alpha_index) + source.alpha_count > plan.multilevel_coefficients.size() ||
+      size_t(source.term_index) + source.term_count > plan.multilevel_population_terms.size())
+    throw std::invalid_argument("NVIDIA multilevel population descriptor is noncanonical");
+
+  nvidia::multilevel_population_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.populations,
+                                          "multilevel populations");
+  require_same_precision(state.plan_, source.gamma_inv, result.precision,
+                         "multilevel GammaInv");
+  validate_multilevel_storage_identity(state.plan_, source.gamma_inv,
+                                       array_role::polarization, source.region.chunk, source.ft,
+                                       source.state_index, Centered, -1, 0, result.precision,
+                                       "multilevel GammaInv");
+  const size_t population_ordinal =
+      checked_add(1, checked_product(checked_product(2, size_t(source.active_component_cmps),
+                                                    "computing NVIDIA multilevel population ordinal"),
+                                     size_t(source.transitions),
+                                     "computing NVIDIA multilevel population ordinal"),
+                  "computing NVIDIA multilevel population ordinal");
+  if (population_ordinal > UINT32_MAX)
+    throw std::overflow_error("NVIDIA multilevel population ordinal overflows");
+  validate_multilevel_storage_identity(state.plan_, source.populations,
+                                       array_role::polarization, source.region.chunk, source.ft,
+                                       source.state_index, Centered, -1,
+                                       uint32_t(population_ordinal), result.precision,
+                                       "multilevel populations");
+  const ArraySpec &gamma_spec = state.plan_.arrays[source.gamma_inv.value];
+  const ArraySpec &population_spec = state.plan_.arrays[source.populations.value];
+  if (gamma_spec.elements != size_t(source.levels) * source.levels)
+    throw std::invalid_argument("NVIDIA multilevel GammaInv extent is noncanonical");
+  const ptrdiff_t region_min = ptrdiff_t(result.region.base);
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  const ptrdiff_t population_min = checked_index_product(region_min, source.levels,
+                                                         "multilevel population");
+  const ptrdiff_t population_max = checked_shift(
+      checked_index_product(region_max, source.levels, "multilevel population"),
+      ptrdiff_t(source.levels - 1), "multilevel population");
+  validate_index_range(state.plan_, source.populations, population_min, population_max,
+                       "multilevel populations");
+  if (population_spec.elements < size_t(population_max) + 1)
+    throw std::out_of_range("NVIDIA multilevel population extent is too small");
+  result.populations = device_address(state, source.populations, "multilevel populations");
+  result.gamma_inv = device_address(state, source.gamma_inv, "multilevel GammaInv");
+  result.levels = source.levels;
+  result.transitions = source.transitions;
+  if (compiled_terms.size() > UINT32_MAX ||
+      size_t(source.term_count) > size_t(UINT32_MAX) - compiled_terms.size())
+    throw std::overflow_error("NVIDIA multilevel population term span overflows");
+  result.term_index = uint32_t(compiled_terms.size());
+  result.term_count = source.term_count;
+
+  std::vector<double> gamma(source.gamma_count);
+  const realnum dt2 = realnum(source.dt) / 2;
+  for (uint32_t l1 = 0; l1 < source.levels; ++l1)
+    for (uint32_t l2 = 0; l2 < source.levels; ++l2) {
+      const realnum value =
+          (l1 == l2 ? realnum(1) : realnum(0)) -
+          realnum(plan.multilevel_coefficients[source.gamma_index + l1 * source.levels + l2]) *
+              dt2;
+      if (!std::isfinite(double(value)))
+        throw std::invalid_argument("NVIDIA multilevel Gamma coefficient is nonfinite");
+      gamma[l1 * source.levels + l2] = double(value);
+    }
+  std::vector<double> alpha(source.alpha_count);
+  for (uint32_t i = 0; i < source.alpha_count; ++i) {
+    const realnum value = realnum(plan.multilevel_coefficients[source.alpha_index + i]);
+    if (!std::isfinite(double(value)))
+      throw std::invalid_argument("NVIDIA multilevel alpha coefficient is nonfinite");
+    alpha[i] = double(value);
+  }
+  std::vector<double> gperpdt(source.transitions, 0.0);
+  std::vector<bool> have_transition(source.transitions, false);
+  for (uint32_t i = 0; i < source.term_count; ++i) {
+    const MultilevelPopulationTerm &term = plan.multilevel_population_terms[source.term_index + i];
+    if (term.transition_index < 0 || uint32_t(term.transition_index) >= source.transitions)
+      throw std::invalid_argument("NVIDIA multilevel population term has invalid transition");
+    if (size_t(transition_index) + i >= plan.multilevel_transition_updates.size())
+      throw std::out_of_range("NVIDIA multilevel transition span is out of range");
+    const MultilevelTransitionUpdate &transition =
+        plan.multilevel_transition_updates[transition_index + i];
+    if (transition.transition_index != term.transition_index)
+      throw std::invalid_argument("NVIDIA multilevel term/action ordering differs");
+    const uint32_t t = uint32_t(term.transition_index);
+    const realnum value = realnum(transition.gamma) * pi * realnum(source.dt);
+    if (!std::isfinite(double(value)))
+      throw std::invalid_argument("NVIDIA multilevel transition damping is nonfinite");
+    if (have_transition[t] && gperpdt[t] != double(value))
+      throw std::invalid_argument("NVIDIA multilevel transition damping differs by row");
+    have_transition[t] = true;
+    gperpdt[t] = double(value);
+
+    nvidia::multilevel_population_term_launch compiled = {};
+    compiled.transition_index = t;
+    compiled.centered_offsets[0] = term.centered_offsets[0];
+    compiled.centered_offsets[1] = term.centered_offsets[1];
+    const ArrayId ids[] = {term.w, term.w_prev, term.p, term.p_prev};
+    const char *names[] = {"multilevel W", "multilevel W_prev", "multilevel P",
+                           "multilevel P_prev"};
+    for (size_t operand = 0; operand < 4; ++operand) {
+      require_same_precision(state.plan_, ids[operand], result.precision, names[operand]);
+      const ptrdiff_t combined = checked_shift(term.centered_offsets[0],
+                                               term.centered_offsets[1], names[operand]);
+      validate_shifted_index_range(state.plan_, ids[operand], region_min, region_max, 0,
+                                   term.centered_offsets[0], term.centered_offsets[1], combined,
+                                   names[operand]);
+    }
+    if (!source.active_component_cmps ||
+        size_t(source.term_count) !=
+            size_t(source.active_component_cmps) * size_t(source.transitions))
+      throw std::invalid_argument("NVIDIA multilevel population row count is noncanonical");
+    const uint32_t row = i % source.active_component_cmps;
+    const size_t expected_ordinal =
+        1 + 2 * (size_t(row) * source.transitions + uint32_t(term.transition_index));
+    if (expected_ordinal >= UINT32_MAX)
+      throw std::overflow_error("NVIDIA multilevel transition ordinal overflows");
+    const uint32_t expected_p_ordinal = uint32_t(expected_ordinal);
+    validate_multilevel_storage_identity(state.plan_, term.p, array_role::polarization,
+                                         source.region.chunk, source.ft, source.state_index,
+                                         term.c, term.cmp, expected_p_ordinal, result.precision,
+                                         names[2]);
+    validate_multilevel_storage_identity(state.plan_, term.p_prev, array_role::polarization,
+                                         source.region.chunk, source.ft, source.state_index,
+                                         term.c, term.cmp, expected_p_ordinal + 1,
+                                         result.precision, names[3]);
+    for (size_t operand = 0; operand < 2; ++operand) {
+      const ArraySpec &spec = state.plan_.arrays[ids[operand].value];
+      const StorageKey &key = state.plan_.keys[ids[operand].value];
+      const array_kind expected = operand == 0 ? array_kind::f_w : array_kind::f_w_prev;
+      const bool primary_fallback = operand == 0 && key.kind == int(array_kind::f);
+      if (spec.role != array_role::field || is_valid(spec.alias_of) ||
+          key.chunk != source.region.chunk ||
+          (!primary_fallback && key.kind != int(expected)) || key.component_ != int(term.c) ||
+          key.cmp != term.cmp || key.aux != 0)
+        throw std::invalid_argument(std::string(names[operand]) +
+                                    " has a noncanonical storage identity");
+    }
+    compiled.w = device_address(state, term.w, names[0]);
+    compiled.w_prev = device_address(state, term.w_prev, names[1]);
+    compiled.p = device_address(state, term.p, names[2]);
+    compiled.p_prev = device_address(state, term.p_prev, names[3]);
+    compiled_terms.push_back(compiled);
+  }
+  result.gamma_byte_offset = append_multilevel_coefficients(coefficient_storage,
+                                                            result.precision, gamma);
+  result.alpha_byte_offset = append_multilevel_coefficients(coefficient_storage,
+                                                            result.precision, alpha);
+  result.transition_byte_offset = append_multilevel_coefficients(
+      coefficient_storage, result.precision, gperpdt);
+  const size_t scratch_elements = checked_product(multilevel_region_points(result.region),
+                                                  source.levels,
+                                                  "sizing NVIDIA multilevel scratch");
+  const size_t bytes = result.precision == nvidia::scalar_precision::f32 ? sizeof(float)
+                                                                         : sizeof(double);
+  scratch_bytes = std::max(scratch_bytes,
+                           checked_product(scratch_elements, bytes,
+                                           "sizing NVIDIA multilevel scratch"));
+  return result;
+}
+
+nvidia::multilevel_transition_launch compile_multilevel_transition(
+    const MultilevelTransitionUpdate &source, uint32_t expected_p_ordinal,
+    uint32_t expected_population_ordinal, NvidiaBackendState &state,
+    std::vector<unsigned char> &coefficient_storage) {
+  if (source.region.variant_key || source.region.chunk < 0 || source.state_index < 0 ||
+      source.transition_index < 0 || (source.ft != E_stuff && source.ft != H_stuff) ||
+      source.region.c == Centered || source.region.cmp < 0 || source.region.cmp > 1 ||
+      source.population_stride == 0 || source.positive_level < 0 || source.negative_level < 0 ||
+      uint32_t(source.positive_level) >= source.population_stride ||
+      uint32_t(source.negative_level) >= source.population_stride ||
+      source.positive_level == source.negative_level || !std::isfinite(source.omega) ||
+      !std::isfinite(source.gamma) || !std::isfinite(source.dt) || source.dt <= 0.0)
+    throw std::invalid_argument("NVIDIA multilevel transition descriptor is noncanonical");
+  for (double value : source.sigmat)
+    if (!std::isfinite(value))
+      throw std::invalid_argument("NVIDIA multilevel transition coefficient is nonfinite");
+
+  nvidia::multilevel_transition_launch result = {};
+  result.region = flat_region_for(source.region);
+  result.precision = scalar_precision_for(state.plan_, source.p, "multilevel P");
+  const ArrayId ids[] = {source.p_prev, source.w, source.diagonal_sigma, source.populations};
+  const char *names[] = {"multilevel P_prev", "multilevel W", "multilevel sigma",
+                         "multilevel populations"};
+  for (size_t i = 0; i < 4; ++i)
+    require_same_precision(state.plan_, ids[i], result.precision, names[i]);
+  result.p = device_address(state, source.p, "multilevel P");
+  result.p_prev = device_address(state, source.p_prev, names[0]);
+  result.w = device_address(state, source.w, names[1]);
+  result.diagonal_sigma = device_address(state, source.diagonal_sigma, names[2]);
+  result.populations = device_address(state, source.populations, names[3]);
+  if (result.p == result.p_prev)
+    throw std::invalid_argument("NVIDIA multilevel P and P_prev alias");
+  validate_multilevel_storage_identity(state.plan_, source.p, array_role::polarization,
+                                       source.region.chunk, source.ft, source.state_index,
+                                       source.region.c, source.region.cmp, expected_p_ordinal,
+                                       result.precision,
+                                       "multilevel P");
+  validate_multilevel_storage_identity(state.plan_, source.p_prev, array_role::polarization,
+                                       source.region.chunk, source.ft, source.state_index,
+                                       source.region.c, source.region.cmp,
+                                       expected_p_ordinal + 1, result.precision,
+                                       "multilevel P_prev");
+  validate_multilevel_storage_identity(state.plan_, source.populations,
+                                       array_role::polarization, source.region.chunk, source.ft,
+                                       source.state_index, Centered, -1,
+                                       expected_population_ordinal, result.precision,
+                                       "multilevel populations");
+  const ArraySpec &w_spec = state.plan_.arrays[source.w.value];
+  const StorageKey &w_key = state.plan_.keys[source.w.value];
+  if (w_spec.role != array_role::field || is_valid(w_spec.alias_of) ||
+      w_key.chunk != source.region.chunk ||
+      (w_key.kind != int(array_kind::f_w) && w_key.kind != int(array_kind::f)) ||
+      w_key.component_ != int(source.region.c) || w_key.cmp != source.region.cmp || w_key.aux != 0)
+    throw std::invalid_argument("NVIDIA multilevel W has a noncanonical storage identity");
+  const ArraySpec &sigma_spec = state.plan_.arrays[source.diagonal_sigma.value];
+  const StorageKey &sigma_key = state.plan_.keys[source.diagonal_sigma.value];
+  if (source.state_index >
+      (std::numeric_limits<int>::max() - int(source.ft)) / NUM_FIELD_TYPES)
+    throw std::overflow_error("NVIDIA multilevel sigma identity overflows");
+  const int sigma_aux = source.state_index * NUM_FIELD_TYPES + int(source.ft);
+  if (sigma_spec.role != array_role::material || is_valid(sigma_spec.alias_of) ||
+      sigma_key.chunk != source.region.chunk || sigma_key.kind != int(array_kind::sigma) ||
+      sigma_key.component_ != int(source.region.c) ||
+      sigma_key.cmp != int(component_direction(source.region.c)) ||
+      sigma_key.aux != uint64_t(sigma_aux))
+    throw std::invalid_argument("NVIDIA multilevel sigma has a noncanonical storage identity");
+  result.population_stride = source.population_stride;
+  result.population_offsets[0] = checked_index_product(
+      source.population_offsets[0], result.population_stride,
+      "scaling NVIDIA multilevel population offset");
+  result.population_offsets[1] = checked_index_product(
+      source.population_offsets[1], result.population_stride,
+      "scaling NVIDIA multilevel population offset");
+  result.positive_level = uint32_t(source.positive_level);
+  result.negative_level = uint32_t(source.negative_level);
+
+  const ptrdiff_t region_min = ptrdiff_t(result.region.base);
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  validate_index_range(state.plan_, source.p, region_min, region_max, "multilevel P");
+  validate_index_range(state.plan_, source.p_prev, region_min, region_max, names[0]);
+  validate_index_range(state.plan_, source.w, region_min, region_max, names[1]);
+  validate_index_range(state.plan_, source.diagonal_sigma, region_min, region_max, names[2]);
+  const ptrdiff_t population_min = checked_index_product(region_min, source.population_stride,
+                                                         "multilevel population");
+  const ptrdiff_t population_max = checked_index_product(region_max, source.population_stride,
+                                                         "multilevel population");
+  const ptrdiff_t combined = checked_shift(result.population_offsets[0],
+                                           result.population_offsets[1],
+                                           "multilevel population");
+  validate_shifted_index_range(state.plan_, source.populations, population_min, population_max,
+                               0, result.population_offsets[0], result.population_offsets[1],
+                               combined, names[3]);
+
+  const realnum dt = realnum(source.dt);
+  const realnum omega2pi = 2 * pi * realnum(source.omega);
+  const realnum g2pi = realnum(source.gamma) * 2 * pi;
+  const realnum gperp = realnum(source.gamma) * pi;
+  const realnum corrected = omega2pi * omega2pi * dt * dt + gperp * gperp * dt * dt;
+  const realnum gamma1inv = 1 / (1 + g2pi * dt / 2);
+  const realnum gamma1 = 1 - g2pi * dt / 2;
+  const realnum dtsqr = dt * dt;
+  const realnum st = realnum(source.sigmat[component_direction(source.region.c)]);
+  const std::vector<double> coefficients = {double(corrected), double(gamma1inv),
+                                            double(gamma1), double(dtsqr), double(st)};
+  for (double value : coefficients)
+    if (!std::isfinite(value))
+      throw std::invalid_argument("NVIDIA multilevel derived coefficient is nonfinite");
+  result.coefficient_byte_offset = append_multilevel_coefficients(
+      coefficient_storage, result.precision, coefficients);
+  return result;
+}
+
 nvidia::polarization_subtract_launch compile_polarization_subtraction(
-    const PolarizationSubtraction &source, NvidiaBackendState &state) {
+    const PolarizationSubtraction &source, const StepPlan &plan, NvidiaBackendState &state) {
   if (!is_valid(source.target) || !is_valid(source.p) || source.target == source.p ||
       !source.elements)
     throw std::invalid_argument("polarization subtraction has invalid operands");
@@ -1688,8 +2171,42 @@ nvidia::polarization_subtract_launch compile_polarization_subtraction(
     throw std::out_of_range("polarization subtraction ArrayId is out of range");
   const ArraySpec &target_spec = state.plan_.arrays[source.target.value];
   const ArraySpec &p_spec = state.plan_.arrays[source.p.value];
-  if (source.elements != target_spec.elements || source.elements != p_spec.elements)
+  const StorageKey &target_key = state.plan_.keys[source.target.value];
+  const StorageKey &p_key = state.plan_.keys[source.p.value];
+  const field_type source_ft = type(source.c);
+  const field_type target_ft = source_ft == E_stuff ? D_stuff : B_stuff;
+  const component target_component = field_type_component(target_ft, source.c);
+  if ((source_ft != E_stuff && source_ft != H_stuff) || source.chunk < 0 ||
+      source.state_index < 0 || source.cmp < 0 || source.cmp > 1 ||
+      source.elements != target_spec.elements || source.elements != p_spec.elements)
     throw std::out_of_range("polarization subtraction is not a full-array operation");
+  if (target_spec.role != array_role::field || is_valid(target_spec.alias_of) ||
+      target_key.chunk != source.chunk || target_key.kind != int(array_kind::f_minus_p) ||
+      target_key.component_ != int(target_component) || target_key.cmp != source.cmp ||
+      target_key.aux != 0 || p_spec.role != array_role::polarization ||
+      is_valid(p_spec.alias_of) || p_key.chunk != source.chunk ||
+      p_key.kind != int(array_kind::polarization_internal) ||
+      p_key.component_ != int(source.c) || p_key.cmp != source.cmp ||
+      polarization_storage_field_type(p_key.aux) != source_ft ||
+      polarization_storage_state_index(p_key.aux) != source.state_index)
+    throw std::invalid_argument("polarization subtraction has a noncanonical storage identity");
+  if (source.transition_index >= 0) {
+    const MultilevelPopulationUpdate *population = NULL;
+    for (const MultilevelPopulationUpdate &candidate : plan.multilevel_population_updates)
+      if (candidate.region.chunk == source.chunk && candidate.ft == source_ft &&
+          candidate.state_index == source.state_index) {
+        if (population)
+          throw std::invalid_argument("multilevel subtraction has duplicate population owners");
+        population = &candidate;
+      }
+    if (!population || uint32_t(source.transition_index) >= population->transitions)
+      throw std::invalid_argument("multilevel subtraction has no matching population action");
+    const uint32_t ordinal = polarization_storage_layout_ordinal(p_key.aux);
+    if (!ordinal || ((ordinal - 1) / 2) % population->transitions !=
+                        uint32_t(source.transition_index) ||
+        (ordinal - 1) % 2)
+      throw std::invalid_argument("multilevel subtraction P has the wrong transition ordinal");
+  }
   nvidia::polarization_subtract_launch result = {};
   result.precision = scalar_precision_for(state.plan_, source.target,
                                           "polarization subtraction target");
@@ -2668,13 +3185,14 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
   const uint32_t supported_variants = constitutive_has_pml | constitutive_one_offdiagonal |
                                       constitutive_two_offdiagonals |
                                       constitutive_has_nonlinearity | constitutive_has_minus_p |
-                                      constitutive_axis_override;
+                                      constitutive_axis_override |
+                                      constitutive_copy_w_previous;
   if (source.region.variant_key & ~supported_variants)
     throw std::invalid_argument("constitutive descriptor requires unsupported auxiliary state");
-  if (is_valid(source.previous_w))
-    throw std::invalid_argument("constitutive descriptor contains unsupported auxiliary arrays");
 
   const bool have_pml = (source.region.variant_key & constitutive_has_pml) != 0;
+  const bool copy_previous =
+      (source.region.variant_key & constitutive_copy_w_previous) != 0;
   const bool have_nonlinearity =
       (source.region.variant_key & constitutive_has_nonlinearity) != 0;
   const bool have_offdiagonal1 = (source.region.variant_key & constitutive_one_offdiagonal) != 0;
@@ -2687,7 +3205,10 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
       (have_offdiagonal2 && !is_valid(source.cross2)))
     throw std::invalid_argument(
         "constitutive descriptor anisotropy bits and operand arrays disagree");
-  if (have_pml != is_valid(source.pml.sig) || have_pml != is_valid(source.target_w))
+  if (have_pml != is_valid(source.pml.sig) ||
+      (have_pml && !is_valid(source.target_w)) ||
+      (!have_pml && is_valid(source.target_w) && !copy_previous) ||
+      copy_previous != is_valid(source.previous_w))
     throw std::invalid_argument("constitutive descriptor PML bit and auxiliary arrays disagree");
   if (!have_pml && (is_valid(source.pml.kap) || is_valid(source.pml.siginv)))
     throw std::invalid_argument("constitutive descriptor has a partial disabled PML profile");
@@ -2727,6 +3248,24 @@ nvidia::constitutive_launch compile_constitutive(const ConstitutiveUpdate &sourc
   result.cross2_stride = source.cross2_stride;
   result.target_w = optional_mutable_device_address(state, source.target_w, result.precision,
                                                     "constitutive PML target");
+  result.previous_w = optional_mutable_device_address(
+      state, source.previous_w, result.precision, "constitutive previous W");
+  const ArrayId previous_source = is_valid(source.target_w) ? source.target_w : source.target;
+  result.previous_w_source = copy_previous
+                                 ? device_address(state, previous_source,
+                                                  "constitutive previous-W source")
+                                 : NULL;
+  result.previous_w_elements = 0;
+  if (copy_previous) {
+    const ArraySpec &previous_spec = state.plan_.arrays[source.previous_w.value];
+    const ArraySpec &source_spec = state.plan_.arrays[previous_source.value];
+    require_same_precision(state.plan_, source.previous_w, result.precision,
+                           "constitutive previous W");
+    if (previous_spec.role != array_role::field || source_spec.role != array_role::field ||
+        is_valid(previous_spec.alias_of) || previous_spec.elements != source_spec.elements)
+      throw std::invalid_argument("constitutive previous-W arrays have incompatible storage");
+    result.previous_w_elements = previous_spec.elements;
+  }
   result.pml =
       compile_pml_profile(source.pml, result.region, result.precision, state, "constitutive PML");
   if (!result.primary) throw std::invalid_argument("constitutive descriptor has no primary field");
@@ -3211,15 +3750,22 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         const PolarizationDescriptor &d = f_.descriptors->polarizations[i];
         if (d.kind != SusceptibilityKind::lorentzian &&
             d.kind != SusceptibilityKind::noisy_lorentzian &&
-            d.kind != SusceptibilityKind::gyrotropic)
+            d.kind != SusceptibilityKind::gyrotropic &&
+            d.kind != SusceptibilityKind::multilevel)
           throw std::invalid_argument(std::string("NVIDIA does not support polarization kind ") +
                                       susceptibility_kind_name(d.kind));
         if (d.kind == SusceptibilityKind::lorentzian && d.lorentzian_states.empty())
           throw std::invalid_argument("NVIDIA Lorentzian descriptor has no resident state");
         if (d.kind == SusceptibilityKind::gyrotropic && d.gyrotropic_states.empty())
           throw std::invalid_argument("NVIDIA gyrotropic descriptor has no resident state");
+        if (d.kind == SusceptibilityKind::multilevel && !d.has_internal_state)
+          throw std::invalid_argument("NVIDIA multilevel descriptor has no resident state");
         if (f_.gv.dim == Dcyl && d.kind == SusceptibilityKind::gyrotropic)
           throw std::invalid_argument("NVIDIA cylindrical gyrotropic media are not supported");
+        if (f_.gv.dim == Dcyl && d.kind == SusceptibilityKind::multilevel)
+          throw std::invalid_argument("NVIDIA cylindrical multilevel media are not supported");
+        if (plan.program == StepProgram::solve_cw && d.kind == SusceptibilityKind::multilevel)
+          throw std::invalid_argument("NVIDIA solve_cw does not support multilevel media");
       }
     }
     bool has_noisy_updates = false, has_noisy_descriptors = false;
@@ -3286,6 +3832,89 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA noisy polarization stream tag collides");
       }
     }
+    bool has_multilevel = has_local_exact_multilevel(f_);
+    if (f_.descriptors)
+      for (const PolarizationDescriptor &descriptor : f_.descriptors->polarizations)
+        has_multilevel = has_multilevel || descriptor.kind == SusceptibilityKind::multilevel;
+    for (const PolarizationUpdateGroup &group : plan.polarization_groups)
+      has_multilevel = has_multilevel || group.kind == PolarizationGroupKind::multilevel;
+    has_multilevel = has_multilevel || !plan.multilevel_population_updates.empty() ||
+                     !plan.multilevel_population_terms.empty() ||
+                     !plan.multilevel_transition_updates.empty() ||
+                     !plan.multilevel_coefficients.empty();
+    if (has_multilevel) {
+      if (!f_.descriptors)
+        throw std::invalid_argument("NVIDIA live multilevel state has no descriptors");
+      std::vector<const PolarizationDescriptor *> installed_descriptors;
+      for (const PolarizationDescriptor &descriptor : f_.descriptors->polarizations)
+        if (descriptor.kind == SusceptibilityKind::multilevel)
+          installed_descriptors.push_back(&descriptor);
+      std::vector<PolarizationDescriptor> rebuilt_descriptors;
+      build_polarization_descriptors(f_, rebuilt_descriptors);
+      std::vector<const PolarizationDescriptor *> canonical_descriptors;
+      for (const PolarizationDescriptor &descriptor : rebuilt_descriptors)
+        if (descriptor.kind == SusceptibilityKind::multilevel)
+          canonical_descriptors.push_back(&descriptor);
+      if (installed_descriptors.size() != canonical_descriptors.size())
+        throw std::invalid_argument(
+            "NVIDIA multilevel descriptors differ from live exact states");
+      for (size_t i = 0; i < installed_descriptors.size(); ++i)
+        if (!same_multilevel_descriptor(*installed_descriptors[i],
+                                        *canonical_descriptors[i]))
+          throw std::invalid_argument(
+              "NVIDIA multilevel descriptor order or state differs from live authority");
+
+      DescriptorSet staged_descriptors = *f_.descriptors;
+      staged_descriptors.polarizations = rebuilt_descriptors;
+      DescriptorSet *const installed_set = f_.descriptors;
+      StepPlan canonical_polarization;
+      try {
+        f_.descriptors = &staged_descriptors;
+        canonical_polarization = build_step_plan(f_, StepProgram::ordinary);
+        f_.descriptors = installed_set;
+      }
+      catch (...) {
+        f_.descriptors = installed_set;
+        throw;
+      }
+      if (plan.polarization_groups != canonical_polarization.polarization_groups)
+        throw std::invalid_argument(
+            "NVIDIA multilevel polarization groups differ from descriptor authority");
+      if (plan.polarization_updates != canonical_polarization.polarization_updates)
+        throw std::invalid_argument(
+            "NVIDIA multilevel ordinary polarization rows differ from descriptor authority");
+      if (plan.polarization_subtractions != canonical_polarization.polarization_subtractions)
+        throw std::invalid_argument(
+            "NVIDIA multilevel subtraction rows differ from descriptor authority");
+      if (plan.multilevel_population_updates !=
+          canonical_polarization.multilevel_population_updates)
+        throw std::invalid_argument(
+            "NVIDIA multilevel population rows differ from descriptor authority");
+      if (plan.multilevel_population_terms != canonical_polarization.multilevel_population_terms)
+        throw std::invalid_argument(
+            "NVIDIA multilevel population terms differ from descriptor authority");
+      if (plan.multilevel_transition_updates !=
+          canonical_polarization.multilevel_transition_updates)
+        throw std::invalid_argument(
+            "NVIDIA multilevel transition rows differ from descriptor authority");
+      if (plan.multilevel_coefficients != canonical_polarization.multilevel_coefficients)
+        throw std::invalid_argument(
+            "NVIDIA multilevel coefficients differ from descriptor authority");
+      std::vector<const Operation *> installed_operations, canonical_operations;
+      for (const Operation &operation : plan.operations)
+        if (operation.kind == OpKind::update_polarization || operation.kind == OpKind::update_eh)
+          installed_operations.push_back(&operation);
+      for (const Operation &operation : canonical_polarization.operations)
+        if (operation.kind == OpKind::update_polarization || operation.kind == OpKind::update_eh)
+          canonical_operations.push_back(&operation);
+      if (installed_operations.size() != canonical_operations.size())
+        throw std::invalid_argument(
+            "NVIDIA multilevel polarization operation count is noncanonical");
+      for (size_t i = 0; i < installed_operations.size(); ++i)
+        if (!same_polarization_operation(*installed_operations[i], *canonical_operations[i]))
+          throw std::invalid_argument(
+              "NVIDIA multilevel polarization operation span or access set is noncanonical");
+    }
     if (!connections_are_current(f_))
       throw std::invalid_argument(
           "NVIDIA PR2 requires Phase 1 to finalize halo topology before backend compilation");
@@ -3331,6 +3960,12 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::source_point> source_points;
     std::vector<nvidia::array_copy_launch> source_copies;
     std::vector<nvidia::compiled_polarization_update> polarization_updates;
+    std::vector<NvidiaCompiledPolarizationAction> polarization_actions;
+    std::vector<nvidia::multilevel_population_launch> multilevel_population_updates;
+    std::vector<nvidia::multilevel_population_term_launch> multilevel_population_terms;
+    std::vector<nvidia::multilevel_transition_launch> multilevel_transition_updates;
+    std::vector<unsigned char> multilevel_coefficients;
+    size_t multilevel_scratch_bytes = 0;
     std::vector<nvidia::polarization_subtract_launch> polarization_subtractions;
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
@@ -3820,7 +4455,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                        op.polarization_subtraction_count;
                ++i)
             polarization_subtractions.push_back(
-                compile_polarization_subtraction(plan.polarization_subtractions[i], state));
+                compile_polarization_subtraction(plan.polarization_subtractions[i], plan, state));
           compiled.subtraction_count =
               polarization_subtractions.size() - compiled.subtraction_first;
 
@@ -4000,17 +4635,87 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         }
         case OpKind::update_polarization: {
           if (size_t(op.descriptor_index) + op.descriptor_count >
-              plan.polarization_updates.size()) {
+                  plan.polarization_updates.size() ||
+              size_t(op.polarization_group_index) + op.polarization_group_count >
+                  plan.polarization_groups.size()) {
             set_reason(local_error, oi, "polarization update span is out of range");
             break;
           }
-          compiled.polarization_first = polarization_updates.size();
-          for (size_t i = op.descriptor_index;
-               i < size_t(op.descriptor_index) + op.descriptor_count; ++i)
-            polarization_updates.push_back(
-                compile_polarization_update(plan.polarization_updates[i], state));
+          compiled.polarization_first = polarization_actions.size();
+          size_t next_ordinary = op.descriptor_index;
+          for (size_t gi = op.polarization_group_index;
+               gi < size_t(op.polarization_group_index) + op.polarization_group_count; ++gi) {
+            const PolarizationUpdateGroup &group = plan.polarization_groups[gi];
+            if (group.ft != op.ft)
+              throw std::invalid_argument("polarization group has the wrong field type");
+            if (group.kind == PolarizationGroupKind::recurrence) {
+              const size_t rows = size_t(group.recurrence_count) + group.noise_count;
+              if (group.recurrence_index != next_ordinary || group.population_count ||
+                  group.transition_count || next_ordinary + rows >
+                                                size_t(op.descriptor_index) + op.descriptor_count)
+                throw std::invalid_argument(
+                    "NVIDIA recurrence polarization group has a noncanonical span");
+              for (size_t i = 0; i < rows; ++i) {
+                const size_t update_index = polarization_updates.size();
+                polarization_updates.push_back(compile_polarization_update(
+                    plan.polarization_updates[next_ordinary++], state));
+                polarization_actions.push_back(NvidiaCompiledPolarizationAction{
+                    NvidiaCompiledPolarizationAction::Kind::ordinary, update_index});
+              }
+            }
+            else if (group.kind == PolarizationGroupKind::multilevel) {
+              if (group.recurrence_count || group.noise_count || group.population_count != 1 ||
+                  size_t(group.population_index) + group.population_count >
+                      plan.multilevel_population_updates.size() ||
+                  size_t(group.transition_index) + group.transition_count >
+                      plan.multilevel_transition_updates.size())
+                throw std::invalid_argument(
+                    "NVIDIA multilevel polarization group has a noncanonical span");
+              const MultilevelPopulationUpdate &population =
+                  plan.multilevel_population_updates[group.population_index];
+              if (population.region.chunk != group.chunk || population.ft != group.ft ||
+                  population.state_index != group.state_index ||
+                  population.term_count != group.transition_count)
+                throw std::invalid_argument(
+                    "NVIDIA multilevel group identity differs from its action span");
+              const size_t population_index = multilevel_population_updates.size();
+              multilevel_population_updates.push_back(compile_multilevel_population(
+                  population, group.transition_index, plan, state, multilevel_population_terms,
+                  multilevel_coefficients, multilevel_scratch_bytes));
+              polarization_actions.push_back(NvidiaCompiledPolarizationAction{
+                  NvidiaCompiledPolarizationAction::Kind::multilevel_population,
+                  population_index});
+              for (size_t i = group.transition_index;
+                   i < size_t(group.transition_index) + group.transition_count; ++i) {
+                if (!population.active_component_cmps)
+                  throw std::invalid_argument(
+                      "NVIDIA multilevel transition group has no active rows");
+                const size_t relative = i - group.transition_index;
+                const size_t row = relative % population.active_component_cmps;
+                const size_t transition = relative / population.active_component_cmps;
+                const size_t p_ordinal =
+                    1 + 2 * (row * population.transitions + transition);
+                const size_t population_ordinal =
+                    1 + 2 * size_t(population.active_component_cmps) * population.transitions;
+                if (p_ordinal >= UINT32_MAX || population_ordinal > UINT32_MAX)
+                  throw std::overflow_error("NVIDIA multilevel storage ordinal overflows");
+                const size_t transition_index = multilevel_transition_updates.size();
+                multilevel_transition_updates.push_back(compile_multilevel_transition(
+                    plan.multilevel_transition_updates[i], uint32_t(p_ordinal),
+                    uint32_t(population_ordinal), state, multilevel_coefficients));
+                polarization_actions.push_back(NvidiaCompiledPolarizationAction{
+                    NvidiaCompiledPolarizationAction::Kind::multilevel_transition,
+                    transition_index});
+              }
+            }
+            else
+              throw std::invalid_argument("NVIDIA polarization group has an invalid kind");
+          }
+          if (next_ordinary != size_t(op.descriptor_index) + op.descriptor_count)
+            throw std::invalid_argument(
+                "NVIDIA polarization groups do not cover the ordinary descriptor span");
           compiled.polarization_count =
-              polarization_updates.size() - compiled.polarization_first;
+              polarization_actions.size() - compiled.polarization_first;
           break;
         }
         case OpKind::restore_magnetic_fields:
@@ -4101,6 +4806,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           cylindrical_axis_updates, cylindrical_origin_actions, constitutive_updates, zero_updates,
           halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, finite_checks,
           source_batches, source_points, source_copies, polarization_updates,
+          polarization_actions, multilevel_population_updates, multilevel_population_terms,
+          multilevel_transition_updates, multilevel_coefficients, multilevel_scratch_bytes,
           polarization_subtractions, dft_updates, dft_omega, legacy_flux_updates,
           legacy_flux_terms, legacy_flux_partial_count,
           magnetic_states, magnetic_snapshot_bytes,
@@ -5429,14 +6136,38 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                              state.noisy_seed_active_slot_;
             for (size_t i = op.polarization_first;
                  i < op.polarization_first + op.polarization_count; ++i) {
-              nvidia::launch_polarization_update(executable.polarization_updates_[i],
-                                                 noisy_seed, uint64_t(f_.t),
-                                                 *state.transfer_);
-              if (executable.polarization_updates_[i].kind ==
-                      nvidia::compiled_polarization_update::kind_type::noisy_add &&
-                  nvidia::testing::consume_failure_for_testing(
-                      nvidia::testing::failure_point::noisy_add))
-                throw std::runtime_error("injected NVIDIA noisy-add postlaunch failure");
+              const NvidiaCompiledPolarizationAction &action =
+                  executable.polarization_actions_[i];
+              if (action.kind == NvidiaCompiledPolarizationAction::Kind::ordinary) {
+                nvidia::launch_polarization_update(
+                    executable.polarization_updates_[action.index], noisy_seed, uint64_t(f_.t),
+                    *state.transfer_);
+                if (executable.polarization_updates_[action.index].kind ==
+                        nvidia::compiled_polarization_update::kind_type::noisy_add &&
+                    nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::noisy_add))
+                  throw std::runtime_error("injected NVIDIA noisy-add postlaunch failure");
+              }
+              else if (action.kind ==
+                       NvidiaCompiledPolarizationAction::Kind::multilevel_population) {
+                nvidia::launch_multilevel_population(
+                    executable.multilevel_population_updates_[action.index], *state.transfer_);
+                if (nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::multilevel_population))
+                  throw std::runtime_error(
+                      "injected NVIDIA multilevel population postlaunch failure");
+              }
+              else if (action.kind ==
+                       NvidiaCompiledPolarizationAction::Kind::multilevel_transition) {
+                nvidia::launch_multilevel_transition(
+                    executable.multilevel_transition_updates_[action.index], *state.transfer_);
+                if (nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::multilevel_transition))
+                  throw std::runtime_error(
+                      "injected NVIDIA multilevel transition postlaunch failure");
+              }
+              else
+                throw std::logic_error("NVIDIA polarization schedule has an invalid action");
               count_cw_kernel();
             }
             break;
@@ -5800,9 +6531,24 @@ void NvidiaBackend::prepare_state_rebuild(BackendState &raw_state, DirtyMask) {
     throw std::logic_error("cannot migrate NVIDIA state into a changed host catalog");
 
   try {
+    std::set<uint32_t> host_authoritative_gamma_inv;
+    std::vector<PolarizationDescriptor> live_descriptors;
+    build_polarization_descriptors(f_, live_descriptors);
+    for (const PolarizationDescriptor &descriptor : live_descriptors)
+      if (descriptor.kind == SusceptibilityKind::multilevel) {
+        if (!is_valid(descriptor.multilevel_gamma_inv) ||
+            descriptor.multilevel_gamma_inv.value >= state.plan_.arrays.size())
+          throw std::logic_error("live multilevel GammaInv ArrayId is out of range");
+        host_authoritative_gamma_inv.insert(descriptor.multilevel_gamma_inv.value);
+      }
     for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
       const ArraySpec &spec = state.plan_.arrays[i];
       if (is_valid(spec.alias_of)) continue;
+      /* GammaInv is computed and owned by the host multilevel object.  The
+         resident copy is read-only and may be narrowed by mixed/f32 policy;
+         never let that representation replace the authoritative host value
+         while migrating the remaining device-owned state. */
+      if (host_authoritative_gamma_inv.count(uint32_t(i))) continue;
       const size_t bytes = storage_bytes(spec);
       state.ensure_staging(bytes);
       state.arenas_->copy_to_host_async(state.staging_.data(), spec.id.value, 0, bytes,
