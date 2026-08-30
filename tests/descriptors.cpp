@@ -26,6 +26,7 @@
 #include <meep.hpp>
 
 #include "backend/descriptors.hpp"
+#include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -438,6 +439,299 @@ static void test_dfts() {
   master_printf("dfts: %zu descriptors, %zu persistent\n", dfts.size(), persistent);
 }
 
+static void flux_components(ndim dim, direction normal, component e[2], component h[2]) {
+  switch (normal) {
+    case X: e[0] = Ey, e[1] = Ez, h[0] = Hz, h[1] = Hy; return;
+    case Y: e[0] = Ez, e[1] = Ex, h[0] = Hx, h[1] = Hz; return;
+    case R: e[0] = Ep, e[1] = Ez, h[0] = Hz, h[1] = Hp; return;
+    case P: e[0] = Ez, e[1] = Er, h[0] = Hr, h[1] = Hz; return;
+    case Z:
+      if (dim == Dcyl)
+        e[0] = Er, e[1] = Ep, h[0] = Hp, h[1] = Hr;
+      else
+        e[0] = Ex, e[1] = Ey, h[0] = Hy, h[1] = Hx;
+      return;
+    case NO_DIRECTION: break;
+  }
+  CHECK(false, "invalid test flux normal");
+}
+
+static void test_legacy_flux_descriptors() {
+  grid_volume gv = vol2d(4.0, 4.0, 8.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  fields f(&s);
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.require_component(Hx);
+  f.require_component(Hy);
+  f.require_component(Hz);
+  const volume xwhere(vec(0.25, -0.8), vec(0.25, 0.8));
+  const volume zwhere(vec(-0.7, -0.6), vec(0.7, 0.6));
+  f.add_flux_vol(X, xwhere);
+  f.add_flux_vol(Z, zwhere); // linked-list ordinal zero (newest first)
+  f.advance(1);
+
+  refresh_legacy_flux_descriptors(f);
+  const std::vector<LegacyFluxDescriptor> &fluxes = f.descriptors->legacy_fluxes;
+  CHECK(fluxes.size() == 2, "legacy flux descriptor list has %zu rows, expected 2",
+        fluxes.size());
+  if (fluxes.size() == 2)
+    CHECK(fluxes[0].recipe_signature != fluxes[1].recipe_signature,
+          "legacy flux recipe identity ignored normal/volume differences");
+  const direction normals[2] = {Z, X};
+  const volume wheres[2] = {zwhere, xwhere};
+  size_t local_terms = 0;
+  bool saw_same_grid_offsets = false;
+  for (size_t fi = 0; fi < fluxes.size() && fi < 2; ++fi) {
+    const LegacyFluxDescriptor &descriptor = fluxes[fi];
+    CHECK(descriptor.flux_ordinal == fi && descriptor.normal == normals[fi],
+          "legacy flux descriptor %zu changed linked-list order", fi);
+    component e[2], h[2];
+    flux_components(f.gv.dim, normals[fi], e, h);
+    size_t ti = 0;
+    for (uint32_t pair = 0; pair < 2; ++pair) {
+      const component cgrid = f.gv.iyee_shift(e[pair]) == f.gv.iyee_shift(h[pair])
+                                  ? e[pair]
+                                  : Centered;
+      const ChunkLoopPlan regions = prepare_loop_in_chunks(f, wheres[fi], cgrid);
+      for (size_t ri = 0; ri < regions.regions.size(); ++ri, ++ti) {
+        CHECK(ti < descriptor.terms.size(),
+              "legacy flux %zu omitted pair %u region %zu", fi, pair, ri);
+        if (ti >= descriptor.terms.size()) continue;
+        const LegacyFluxTermDescriptor &term = descriptor.terms[ti];
+        const ChunkLoopRegion &region = regions.regions[ri];
+        const fields_chunk &fc = *f.chunks[region.chunk];
+        const component ec = f.S.transform(e[pair], -region.symmetry_index);
+        const component hc = f.S.transform(h[pair], -region.symmetry_index);
+        CHECK(term.term_ordinal == pair && term.region_ordinal == ri &&
+                  term.sign == (pair ? -1 : 1),
+              "legacy flux %zu term %zu changed pair/region/sign order", fi, ti);
+        CHECK(term.chunk == region.chunk && term.e_component == ec && term.h_component == hc,
+              "legacy flux %zu term %zu has the wrong chunk or transformed components", fi, ti);
+        CHECK(term.e_real ==
+                      f.array_catalog->find({region.chunk, int(array_kind::f), int(ec), 0, 0}) &&
+                  term.e_imag ==
+                      f.array_catalog->find({region.chunk, int(array_kind::f), int(ec), 1, 0}) &&
+                  term.h_real ==
+                      f.array_catalog->find({region.chunk, int(array_kind::f), int(hc), 0, 0}) &&
+                  term.h_imag ==
+                      f.array_catalog->find({region.chunk, int(array_kind::f), int(hc), 1, 0}),
+              "legacy flux %zu term %zu has stale field identities", fi, ti);
+        ptrdiff_t eo0 = 0, eo1 = 0, ho0 = 0, ho1 = 0;
+        if (cgrid == Centered) {
+          fc.gv.yee2cent_offsets(ec, eo0, eo1);
+          fc.gv.yee2cent_offsets(hc, ho0, ho1);
+        }
+        else
+          saw_same_grid_offsets = true;
+        CHECK(term.e_offsets[0] == eo0 && term.e_offsets[1] == eo1 &&
+                  term.h_offsets[0] == ho0 && term.h_offsets[1] == ho1,
+              "legacy flux %zu term %zu changed cgrid interpolation offsets", fi, ti);
+        const complex<double> ep = region.phase * f.S.phase_shift(ec, region.symmetry_index);
+        const complex<double> hp = region.phase * f.S.phase_shift(hc, region.symmetry_index);
+        CHECK(complex<double>(term.phase_real, term.phase_imag) == conj(ep) * hp,
+              "legacy flux %zu term %zu changed the E*/H phase product", fi, ti);
+        size_t expected_base = 0;
+        for (int axis = 0; axis < 3; ++axis) {
+          const direction d = fc.gv.yucky_direction(axis);
+          const size_t count = size_t((region.end.yucky_val(axis) -
+                                       region.begin.yucky_val(axis)) /
+                                          2 +
+                                      1);
+          const ptrdiff_t stride = fc.gv.stride(d);
+          expected_base += size_t((region.begin.yucky_val(axis) -
+                                   fc.gv.little_corner().yucky_val(axis)) /
+                                  2) *
+                           size_t(stride);
+          CHECK(term.counts[axis] == count && term.strides[axis] == stride,
+                "legacy flux %zu term %zu changed loop shape at axis %d", fi, ti, axis);
+          CHECK(term.boundary_weights[axis][0] == region.weights.s0.in_direction(d) &&
+                    term.boundary_weights[axis][1] == region.weights.s1.in_direction(d) &&
+                    term.boundary_weights[axis][2] == region.weights.e0.in_direction(d) &&
+                    term.boundary_weights[axis][3] == region.weights.e1.in_direction(d),
+                "legacy flux %zu term %zu changed boundary weights at axis %d", fi, ti, axis);
+        }
+        CHECK(term.base == expected_base && term.begin == region.begin && term.end == region.end &&
+                  term.lattice_shift == region.lattice_shift &&
+                  term.symmetry_index == region.symmetry_index && term.dV0 == region.dV0 &&
+                  term.dV1 == region.dV1,
+              "legacy flux %zu term %zu changed its portable region", fi, ti);
+        ++local_terms;
+      }
+    }
+    CHECK(ti == descriptor.terms.size(),
+          "legacy flux %zu has %zu terms but exact per-pair plans consumed %zu", fi,
+          descriptor.terms.size(), ti);
+  }
+  CHECK(or_to_all(local_terms > 0), "legacy flux descriptor fixture produced no terms");
+  CHECK(or_to_all(saw_same_grid_offsets),
+        "Cartesian Z legacy flux did not exercise zero-offset shared-grid recipes");
+
+  f.descriptors->clear();
+  CHECK(f.descriptors->legacy_fluxes.empty() && f.descriptors->legacy_flux_generation == 0,
+        "DescriptorSet::clear retained legacy flux recipes");
+}
+
+static void require_all_cartesian_fields(fields &f) {
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.require_component(Hx);
+  f.require_component(Hy);
+  f.require_component(Hz);
+}
+
+static void check_flux_pair_mapping(const fields &f, const LegacyFluxDescriptor &descriptor,
+                                    const char *name) {
+  component e[2], h[2];
+  flux_components(f.gv.dim, descriptor.normal, e, h);
+  for (const LegacyFluxTermDescriptor &term : descriptor.terms) {
+    CHECK(term.term_ordinal < 2, "%s has invalid signed-product ordinal %u", name,
+          term.term_ordinal);
+    if (term.term_ordinal >= 2) continue;
+    CHECK(term.e_component == f.S.transform(e[term.term_ordinal], -term.symmetry_index) &&
+              term.h_component == f.S.transform(h[term.term_ordinal], -term.symmetry_index) &&
+              term.sign == (term.term_ordinal ? -1 : 1),
+          "%s has the wrong signed E/H mapping", name);
+  }
+}
+
+static void test_legacy_flux_direction_and_geometry_cases() {
+  { // All Cartesian normals, real fields, uneven ownership and clipped identity.
+    grid_volume gv = vol3d(2.0, 2.5, 3.0, 4.0);
+    structure s(gv, one, no_pml(), identity(), 3);
+    fields f(&s);
+    f.use_real_fields();
+    require_all_cartesian_fields(f);
+    f.add_flux_vol(X, volume(vec(0.2, -0.8, -0.7), vec(0.2, 0.9, 0.8)));
+    f.add_flux_vol(Y, volume(vec(-0.7, -0.1, -0.6), vec(0.8, -0.1, 0.7)));
+    f.add_flux_vol(Z, volume(vec(-0.6, -0.7, 0.15), vec(0.7, 0.8, 0.15)));
+    f.advance(1);
+    refresh_legacy_flux_descriptors(f);
+    const direction expected[] = {Z, Y, X};
+    CHECK(f.descriptors->legacy_fluxes.size() == 3,
+          "Cartesian direction fixture produced %zu monitors",
+          f.descriptors->legacy_fluxes.size());
+    size_t local_terms = 0;
+    for (size_t i = 0; i < f.descriptors->legacy_fluxes.size() && i < 3; ++i) {
+      const LegacyFluxDescriptor &descriptor = f.descriptors->legacy_fluxes[i];
+      CHECK(descriptor.normal == expected[i], "Cartesian monitor %zu changed list order", i);
+      check_flux_pair_mapping(f, descriptor, "Cartesian legacy flux");
+      for (const LegacyFluxTermDescriptor &term : descriptor.terms) {
+        CHECK(!is_valid(term.e_imag) && !is_valid(term.h_imag),
+              "real Cartesian flux recipe invented imaginary field arrays");
+        ++local_terms;
+      }
+    }
+    CHECK(or_to_all(local_terms > 0), "Cartesian direction fixture produced no local terms");
+
+    fields fa(&s), fb(&s);
+    require_all_cartesian_fields(fa);
+    require_all_cartesian_fields(fb);
+    fa.add_flux_vol(Z, volume(vec(-3.0, -3.0, 0.0), vec(3.0, 3.0, 0.0)));
+    fb.add_flux_vol(Z, volume(vec(-4.0, -4.0, 0.0), vec(4.0, 4.0, 0.0)));
+    fa.advance(1);
+    fb.advance(1);
+    refresh_legacy_flux_descriptors(fa);
+    refresh_legacy_flux_descriptors(fb);
+    const std::vector<LegacyFluxDescriptor> &clipped_a = fa.descriptors->legacy_fluxes;
+    const std::vector<LegacyFluxDescriptor> &clipped_b = fb.descriptors->legacy_fluxes;
+    CHECK(clipped_a.size() == 1 && clipped_b.size() == 1,
+          "clipped legacy flux fixture did not build both recipes");
+    if (clipped_a.size() == 1 && clipped_b.size() == 1) {
+      CHECK(clipped_a[0].recipe_signature != clipped_b[0].recipe_signature,
+            "clipped legacy flux volumes collide in plan identity");
+      const StepPlan plan_a = build_step_plan(fa, StepProgram::ordinary);
+      const StepPlan plan_b = build_step_plan(fb, StepProgram::ordinary);
+      CHECK(plan_a.legacy_flux_terms == plan_b.legacy_flux_terms,
+            "clipped-volume fixture did not realize the same local flux terms");
+      CHECK(compute_step_plan_signature(plan_a) != compute_step_plan_signature(plan_b),
+            "StepPlan signature ignored different requested volumes with identical clipping");
+    }
+
+    fields fnx(&s), fny(&s);
+    require_all_cartesian_fields(fnx);
+    require_all_cartesian_fields(fny);
+    const volume same_where(vec(-0.6, -0.5, -0.4), vec(0.6, 0.5, 0.4));
+    fnx.add_flux_vol(X, same_where);
+    fny.add_flux_vol(Y, same_where);
+    fnx.advance(1);
+    fny.advance(1);
+    refresh_legacy_flux_descriptors(fnx);
+    refresh_legacy_flux_descriptors(fny);
+    CHECK(fnx.descriptors->legacy_fluxes[0].recipe_signature !=
+              fny.descriptors->legacy_fluxes[0].recipe_signature,
+          "legacy flux recipe identity ignored the requested normal");
+    CHECK(compute_step_plan_signature(build_step_plan(fnx, StepProgram::ordinary)) !=
+              compute_step_plan_signature(build_step_plan(fny, StepProgram::ordinary)),
+          "StepPlan signature ignored the requested legacy flux normal");
+  }
+
+  { // Symmetry plus periodic images/Bloch phase.
+    grid_volume gv = vol2d(3.0, 3.0, 6.0);
+    structure s(gv, one, no_pml(), mirror(Y, gv), 2);
+    fields f(&s);
+    f.use_bloch(vec(0.13, 0.0));
+    f.require_component(Ex);
+    f.require_component(Ey);
+    f.require_component(Hx);
+    f.require_component(Hy);
+    f.add_flux_vol(Z, volume(vec(-2.2, -1.2), vec(2.2, 1.2)));
+    f.advance(1);
+    refresh_legacy_flux_descriptors(f);
+    bool saw_symmetry = false, saw_nontrivial_phase = false, saw_imag = false;
+    if (!f.descriptors->legacy_fluxes.empty()) {
+      const LegacyFluxDescriptor &descriptor = f.descriptors->legacy_fluxes[0];
+      check_flux_pair_mapping(f, descriptor, "symmetry/Bloch legacy flux");
+      for (const LegacyFluxTermDescriptor &term : descriptor.terms) {
+        saw_symmetry = saw_symmetry || term.symmetry_index != 0;
+        saw_nontrivial_phase = saw_nontrivial_phase || term.phase_real != 1.0 ||
+                                                     term.phase_imag != 0.0;
+        saw_imag = saw_imag || is_valid(term.e_imag) || is_valid(term.h_imag);
+      }
+    }
+    CHECK(or_to_all(saw_symmetry), "legacy flux symmetry fixture used no transformed region");
+    CHECK(or_to_all(saw_nontrivial_phase), "legacy flux Bloch fixture used only unit phases");
+    CHECK(or_to_all(saw_imag), "legacy flux Bloch fixture exported no imaginary field arrays");
+  }
+
+  { // Cylindrical R/P/Z mappings plus radial integration weights and PML storage.
+    grid_volume gv = volcyl(2.0, 2.5, 6.0);
+    structure s(gv, one, pml(0.4));
+    fields f(&s, 1);
+    f.require_component(Er);
+    f.require_component(Ep);
+    f.require_component(Ez);
+    f.require_component(Hr);
+    f.require_component(Hp);
+    f.require_component(Hz);
+    f.add_flux_vol(R, volume(veccyl(0.7, -0.6), veccyl(0.7, 0.6)));
+    f.add_flux_vol(P, volume(veccyl(0.2, -0.5), veccyl(1.4, 0.5)));
+    f.add_flux_vol(Z, volume(veccyl(0.2, 0.15), veccyl(1.5, 0.15)));
+    f.advance(1);
+    refresh_legacy_flux_descriptors(f);
+    const direction expected[] = {Z, P, R};
+    bool saw_radial_weight = false;
+    CHECK(f.descriptors->legacy_fluxes.size() == 3,
+          "cylindrical direction fixture produced %zu monitors",
+          f.descriptors->legacy_fluxes.size());
+    for (size_t i = 0; i < f.descriptors->legacy_fluxes.size() && i < 3; ++i) {
+      const LegacyFluxDescriptor &descriptor = f.descriptors->legacy_fluxes[i];
+      CHECK(descriptor.normal == expected[i], "cylindrical monitor %zu changed list order", i);
+      check_flux_pair_mapping(f, descriptor, "cylindrical legacy flux");
+      for (const LegacyFluxTermDescriptor &term : descriptor.terms) {
+        saw_radial_weight = saw_radial_weight || term.dV1 != 0.0;
+        if (descriptor.normal == P)
+          CHECK(term.e_offsets[0] == 0 && term.e_offsets[1] == 0 &&
+                    term.h_offsets[0] == 0 && term.h_offsets[1] == 0,
+                "cylindrical P flux did not retain its shared component grid");
+      }
+    }
+    CHECK(or_to_all(saw_radial_weight), "cylindrical legacy flux lost its radial dV term");
+  }
+}
+
 static void test_polarizations(const char *name, susceptibility *sus,
                                SusceptibilityKind expect_kind, bool expect_layout) {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
@@ -792,6 +1086,8 @@ int main(int argc, char **argv) {
   test_source_ordinals();
   test_derived_source_times_remain_host_custom();
   test_dfts();
+  test_legacy_flux_descriptors();
+  test_legacy_flux_direction_and_geometry_cases();
   test_polarizations("lorentzian", new lorentzian_susceptibility(1.1, 1e-5),
                      SusceptibilityKind::lorentzian, true);
   test_polarizations("noisy", new noisy_lorentzian_susceptibility(0.01, 1.1, 0.05),

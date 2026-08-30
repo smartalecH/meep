@@ -16,6 +16,7 @@
 */
 
 #include "backend/descriptors.hpp"
+#include "backend/lifecycle.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -44,6 +45,12 @@ public:
     out.push_back(st.end_time);
     out.push_back(st.slowness);
   }
+};
+
+class legacy_flux_descriptor_builder {
+public:
+  static direction normal(const flux_vol &flux) { return flux.d; }
+  static const volume &region(const flux_vol &flux) { return flux.where; }
 };
 
 class susceptibility_descriptor_builder {
@@ -418,6 +425,166 @@ uint64_t dft_plan_signature(const std::vector<DftDescriptor> &plan) {
     source_hash_mix(hash, d.Nomega);
   }
   return hash;
+}
+
+/* --- Legacy instantaneous flux monitors --------------------------------- */
+
+namespace {
+
+uint64_t legacy_flux_recipe_signature(direction normal, const volume &where) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  source_hash_mix(hash, uint64_t(normal));
+  source_hash_mix(hash, uint64_t(where.dim));
+  const vec lo = where.get_min_corner();
+  const vec hi = where.get_max_corner();
+  LOOP_OVER_DIRECTIONS(where.dim, d) {
+    source_hash_double(hash, lo.in_direction(d));
+    source_hash_double(hash, hi.in_direction(d));
+  }
+  return hash;
+}
+
+void legacy_flux_components(ndim dim, direction normal, component e[2], component h[2]) {
+  switch (normal) {
+    case X: e[0] = Ey, e[1] = Ez, h[0] = Hz, h[1] = Hy; return;
+    case Y: e[0] = Ez, e[1] = Ex, h[0] = Hx, h[1] = Hz; return;
+    case R: e[0] = Ep, e[1] = Ez, h[0] = Hz, h[1] = Hp; return;
+    case P: e[0] = Ez, e[1] = Er, h[0] = Hr, h[1] = Hz; return;
+    case Z:
+      if (dim == Dcyl)
+        e[0] = Er, e[1] = Ep, h[0] = Hp, h[1] = Hr;
+      else
+        e[0] = Ex, e[1] = Ey, h[0] = Hy, h[1] = Hx;
+      return;
+    case NO_DIRECTION: break;
+  }
+  throw std::invalid_argument("legacy flux descriptor has no normal direction");
+}
+
+ArrayId legacy_flux_field(fields &f, int chunk, component c, int cmp) {
+  const ArrayId id = f.array_catalog->find({chunk, int(array_kind::f), int(c), cmp, 0});
+  if (!is_valid(id)) return id;
+  const ArraySpec &spec = f.array_catalog->spec(id);
+  if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+      spec.elements != size_t(f.chunks[chunk]->gv.ntot()))
+    throw std::runtime_error("legacy flux field has incompatible storage metadata");
+  return id;
+}
+
+size_t legacy_flux_base(const grid_volume &gv, const ivec &begin,
+                        size_t counts[3], ptrdiff_t strides[3]) {
+  ptrdiff_t base = 0;
+  for (int axis = 0; axis < 3; ++axis) {
+    const ptrdiff_t delta = begin.yucky_val(axis) - gv.little_corner().yucky_val(axis);
+    /* Match LOOP_OVER_IVECS exactly: Centered regions can differ in parity
+       from gv.little_corner(), and the legacy macro deliberately uses
+       truncating integer division here. */
+    if (delta < 0)
+      throw std::runtime_error("legacy flux region begins before its chunk grid");
+    const ptrdiff_t stride = gv.stride(gv.yucky_direction(axis));
+    const ptrdiff_t coordinate = delta / 2;
+    if (stride < 0 || (coordinate && stride > std::numeric_limits<ptrdiff_t>::max() / coordinate) ||
+        base > std::numeric_limits<ptrdiff_t>::max() - coordinate * stride)
+      throw std::overflow_error("legacy flux region base overflow");
+    base += coordinate * stride;
+    strides[axis] = stride;
+  }
+  if (base < 0) throw std::runtime_error("legacy flux region has a negative base index");
+  return size_t(base);
+}
+
+} // namespace
+
+void build_legacy_flux_descriptors(fields &f, std::vector<LegacyFluxDescriptor> &out) {
+  out.clear();
+  if (!f.array_catalog)
+    throw std::runtime_error("legacy flux descriptors require a prepared array catalog");
+
+  uint64_t flux_ordinal = 0;
+  for (const flux_vol *flux = f.fluxes; flux; flux = flux->next, ++flux_ordinal) {
+    if (flux_ordinal > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("legacy flux descriptor index overflow");
+    const direction normal = legacy_flux_descriptor_builder::normal(*flux);
+    const volume &where = legacy_flux_descriptor_builder::region(*flux);
+    component e[2], h[2];
+    legacy_flux_components(f.gv.dim, normal, e, h);
+
+    LegacyFluxDescriptor descriptor(uint32_t(flux_ordinal), normal, where);
+    descriptor.recipe_signature = legacy_flux_recipe_signature(normal, where);
+    for (uint32_t term_ordinal = 0; term_ordinal < 2; ++term_ordinal) {
+      /* fields::integrate uses the component grid directly when both operands
+         have the same Yee shift; otherwise it interpolates both to Centered.
+         This matters for cylindrical P flux, whose E/H pairs share a grid. */
+      const component cgrid = f.gv.iyee_shift(e[term_ordinal]) ==
+                                      f.gv.iyee_shift(h[term_ordinal])
+                                  ? e[term_ordinal]
+                                  : Centered;
+      const ChunkLoopPlan regions = prepare_loop_in_chunks(f, where, cgrid);
+      for (size_t region_ordinal = 0; region_ordinal < regions.regions.size(); ++region_ordinal) {
+        if (region_ordinal > std::numeric_limits<uint32_t>::max())
+          throw std::overflow_error("legacy flux region index overflow");
+        const ChunkLoopRegion &region = regions.regions[region_ordinal];
+        if (region.chunk < 0 || region.chunk >= f.num_chunks || !f.chunks[region.chunk] ||
+            !f.chunks[region.chunk]->is_mine())
+          throw std::runtime_error("legacy flux region names a non-owned chunk");
+        fields_chunk &fc = *f.chunks[region.chunk];
+
+        LegacyFluxTermDescriptor term = {};
+        term.term_ordinal = term_ordinal;
+        term.region_ordinal = uint32_t(region_ordinal);
+        term.sign = term_ordinal ? -1 : 1;
+        term.chunk = region.chunk;
+        term.e_component = f.S.transform(e[term_ordinal], -region.symmetry_index);
+        term.h_component = f.S.transform(h[term_ordinal], -region.symmetry_index);
+        term.e_real = legacy_flux_field(f, region.chunk, term.e_component, 0);
+        term.e_imag = legacy_flux_field(f, region.chunk, term.e_component, 1);
+        term.h_real = legacy_flux_field(f, region.chunk, term.h_component, 0);
+        term.h_imag = legacy_flux_field(f, region.chunk, term.h_component, 1);
+        if ((!is_valid(term.e_real) && is_valid(term.e_imag)) ||
+            (!is_valid(term.h_real) && is_valid(term.h_imag)))
+          throw std::runtime_error("legacy flux imaginary field has no real counterpart");
+        term.begin = region.begin;
+        term.end = region.end;
+        term.lattice_shift = region.lattice_shift;
+        term.symmetry_index = region.symmetry_index;
+        for (int axis = 0; axis < 3; ++axis) {
+          const ptrdiff_t span = region.end.yucky_val(axis) - region.begin.yucky_val(axis);
+          if (span < 0 || span % 2)
+            throw std::runtime_error("legacy flux region has an invalid extent");
+          term.counts[axis] = size_t(span / 2 + 1);
+        }
+        term.base = legacy_flux_base(fc.gv, region.begin, term.counts, term.strides);
+        if (cgrid == Centered) {
+          fc.gv.yee2cent_offsets(term.e_component, term.e_offsets[0], term.e_offsets[1]);
+          fc.gv.yee2cent_offsets(term.h_component, term.h_offsets[0], term.h_offsets[1]);
+        }
+        const std::complex<double> e_phase =
+            region.phase * f.S.phase_shift(term.e_component, region.symmetry_index);
+        const std::complex<double> h_phase =
+            region.phase * f.S.phase_shift(term.h_component, region.symmetry_index);
+        const std::complex<double> product_phase = std::conj(e_phase) * h_phase;
+        term.phase_real = product_phase.real();
+        term.phase_imag = product_phase.imag();
+        for (int axis = 0; axis < 3; ++axis) {
+          const direction d = fc.gv.yucky_direction(axis);
+          term.boundary_weights[axis][0] = region.weights.s0.in_direction(d);
+          term.boundary_weights[axis][1] = region.weights.s1.in_direction(d);
+          term.boundary_weights[axis][2] = region.weights.e0.in_direction(d);
+          term.boundary_weights[axis][3] = region.weights.e1.in_direction(d);
+        }
+        term.dV0 = region.dV0;
+        term.dV1 = region.dV1;
+        descriptor.terms.push_back(term);
+      }
+    }
+    out.push_back(descriptor);
+  }
+}
+
+void refresh_legacy_flux_descriptors(fields &f) {
+  if (!f.descriptors) throw std::runtime_error("fields has no descriptor set");
+  build_legacy_flux_descriptors(f, f.descriptors->legacy_fluxes);
+  f.descriptors->legacy_flux_generation = generation(f, MutationKind::legacy_flux_definition);
 }
 
 /* --- Susceptibilities ----------------------------------------------------- */
