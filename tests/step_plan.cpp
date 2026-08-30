@@ -306,6 +306,12 @@ static void test_full_plan() {
     else
       CHECK(op.magnetic_state_index == 0 && op.magnetic_state_count == 0,
             "%s has a nonempty magnetic state span", op_kind_name(op.kind));
+    if (op.kind == OpKind::update_flux_half || op.kind == OpKind::update_flux)
+      CHECK(op.legacy_flux_index == 0 && op.legacy_flux_count == 1,
+            "%s does not cover the one live legacy flux object", op_kind_name(op.kind));
+    else
+      CHECK(op.legacy_flux_index == 0 && op.legacy_flux_count == 0,
+            "%s has a nonempty legacy flux span", op_kind_name(op.kind));
     if (op.kind == OpKind::update_dft) {
       CHECK(op.guard.kind == GuardKind::device_predicate,
             "update_dft should be a device_predicate guard (the decimation check)");
@@ -1441,6 +1447,152 @@ static void test_polarization_schema_signature() {
 #undef CHECK_SIGNATURE_FIELD
 }
 
+static void test_legacy_flux_schema_signature() {
+  StepPlan plan;
+  Operation op = {};
+  op.kind = OpKind::update_flux_half;
+  op.ft = field_type(NUM_FIELD_TYPES);
+  op.guard = guard_static(true);
+  op.legacy_flux_index = 0;
+  op.legacy_flux_count = 1;
+  op.accesses.push_back(BufferAccess{ArrayRef{ArrayId{11}, 0, 101}, AccessMode::read});
+  plan.operations.push_back(op);
+
+  LegacyFluxUpdate update = {3, 0, 1, 0x123456789abcdef0ull};
+  plan.legacy_flux_updates.push_back(update);
+
+  LegacyFluxTerm term = {};
+  term.flux_ordinal = 3;
+  term.term_ordinal = 1;
+  term.region_ordinal = 2;
+  term.sign = -1;
+  term.chunk = 4;
+  term.e_component = Ey;
+  term.h_component = Hx;
+  term.e_real = ArrayId{11};
+  term.e_imag = ArrayId{12};
+  term.h_real = ArrayId{13};
+  term.h_imag = ArrayId{14};
+  term.begin = ivec(1, 3, 5);
+  term.end = ivec(7, 9, 11);
+  term.lattice_shift = ivec(2, 0, -2);
+  term.symmetry_index = 5;
+  term.base = 17;
+  term.counts[0] = 2;
+  term.counts[1] = 3;
+  term.counts[2] = 4;
+  term.strides[0] = 1;
+  term.strides[1] = 19;
+  term.strides[2] = 43;
+  term.e_offsets[0] = -2;
+  term.e_offsets[1] = 7;
+  term.h_offsets[0] = 3;
+  term.h_offsets[1] = -11;
+  term.phase_real = 0.25;
+  term.phase_imag = -0.75;
+  for (int axis = 0; axis < 3; ++axis)
+    for (int edge = 0; edge < 4; ++edge)
+      term.boundary_weights[axis][edge] = 0.125 * (1 + axis * 4 + edge);
+  term.dV0 = 0.5;
+  term.dV1 = 0.0625;
+  plan.legacy_flux_terms.push_back(term);
+
+  const LegacyFluxUpdate update_copy = update;
+  const LegacyFluxTerm term_copy = term;
+  CHECK(update == update_copy, "identical legacy flux updates compare unequal");
+  CHECK(term == term_copy, "identical legacy flux terms compare unequal");
+  LegacyFluxUpdate changed_update = update;
+  ++changed_update.term_count;
+  CHECK(!(update == changed_update), "different legacy flux updates compare equal");
+  LegacyFluxTerm changed_term = term;
+  ++changed_term.base;
+  CHECK(!(term == changed_term), "different legacy flux terms compare equal");
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+#define CHECK_FLUX_SIGNATURE(expr, message)                                                       \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
+  } while (0)
+  CHECK_FLUX_SIGNATURE(++changed.operations[0].legacy_flux_index,
+                       "signature ignored legacy flux span start");
+  CHECK_FLUX_SIGNATURE(++changed.operations[0].legacy_flux_count,
+                       "signature ignored legacy flux span count");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_updates[0].flux_ordinal,
+                       "signature ignored legacy flux ordinal");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_updates[0].term_index,
+                       "signature ignored legacy flux term span");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_updates[0].recipe_signature,
+                       "signature ignored legacy flux recipe identity");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].region_ordinal,
+                       "signature ignored legacy flux region ordinal");
+  CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].sign = 1,
+                       "signature ignored legacy flux sign");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].chunk,
+                       "signature ignored legacy flux chunk");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].e_real.value,
+                       "signature ignored legacy flux field identity");
+  CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].begin.set_direction(
+                           X, changed.legacy_flux_terms[0].begin.in_direction(X) + 2),
+                       "signature ignored legacy flux region extent");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].base,
+                       "signature ignored legacy flux base");
+  CHECK_FLUX_SIGNATURE(--changed.legacy_flux_terms[0].e_offsets[0],
+                       "signature ignored legacy flux interpolation offset");
+  CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].phase_imag += 0.25,
+                       "signature ignored legacy flux phase");
+  CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].boundary_weights[1][2] += 0.25,
+                       "signature ignored legacy flux boundary weight");
+  CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].dV1 += 0.25,
+                       "signature ignored legacy flux radial weight");
+  CHECK_FLUX_SIGNATURE(++changed.operations[0].accesses[0].array.id.value,
+                       "signature ignored legacy flux access");
+#undef CHECK_FLUX_SIGNATURE
+
+  plan.clear();
+  CHECK(plan.legacy_flux_updates.empty() && plan.legacy_flux_terms.empty(),
+        "StepPlan::clear retained legacy flux state");
+}
+
+static void test_live_legacy_flux_spans() {
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+  f.add_flux_plane(volume(vec(0.0, -1.0), vec(0.0, 1.0)));
+  StepPlan one = build_step_plan(f, StepProgram::ordinary);
+  CHECK(one.legacy_flux_updates.size() == 1,
+        "one live legacy flux produced %zu update rows", one.legacy_flux_updates.size());
+  const LegacyFluxUpdate expected_one = {0, 0, 0, 0};
+  if (!one.legacy_flux_updates.empty())
+    CHECK(one.legacy_flux_updates[0] == expected_one,
+          "one live legacy flux has the wrong empty PR5 recipe span");
+
+  f.add_flux_plane(volume(vec(0.5, -1.0), vec(0.5, 1.0)));
+  StepPlan two = build_step_plan(f, StepProgram::ordinary);
+  CHECK(two.legacy_flux_updates.size() == 2,
+        "two live legacy fluxes produced %zu update rows", two.legacy_flux_updates.size());
+  for (size_t i = 0; i < two.legacy_flux_updates.size(); ++i) {
+    const LegacyFluxUpdate expected = {uint32_t(i), 0, 0, 0};
+    CHECK(two.legacy_flux_updates[i] == expected,
+          "legacy flux update %zu has the wrong list ordinal or PR5 recipe span", i);
+  }
+
+  size_t markers = 0;
+  for (const Operation &op : two.operations)
+    if (op.kind == OpKind::update_flux_half || op.kind == OpKind::update_flux) {
+      ++markers;
+      CHECK(op.legacy_flux_index == 0 && op.legacy_flux_count == 2,
+            "%s does not cover both live legacy flux updates", op_kind_name(op.kind));
+      /* PR5 owns the action vocabulary and live list ordinals. PR6 owns the
+         region recipes and is therefore the first layer that can attach the
+         exact field-read union to both markers. */
+      CHECK(op.accesses.empty(), "%s populated accesses before PR6 flux recipes",
+            op_kind_name(op.kind));
+    }
+  CHECK(markers == 2, "two live legacy fluxes produced %zu flux markers", markers);
+}
+
 static void test_beta_schema_signature() {
   StepPlan plan;
   plan.beta = 0.17;
@@ -1828,6 +1980,8 @@ int main(int argc, char **argv) {
   test_material_schema_signature();
   test_magnetic_schema_signature();
   test_polarization_schema_signature();
+  test_legacy_flux_schema_signature();
+  test_live_legacy_flux_spans();
   test_beta_schema_signature();
   test_bfast_schema_signature();
   test_cylindrical_schema_signature();
