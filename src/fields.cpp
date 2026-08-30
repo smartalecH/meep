@@ -642,8 +642,10 @@ void fields::remove_susceptibilities() {
 }
 
 void fields::remove_fluxes() {
+  if (!fluxes) return;
   delete fluxes;
   fluxes = NULL;
+  invalidate(*this, MutationKind::legacy_flux_definition);
 }
 
 void fields_chunk::zero_fields() {

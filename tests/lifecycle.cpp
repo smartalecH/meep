@@ -61,6 +61,8 @@ static void test_closure_table() {
       {MutationKind::source_definition, dirty_source_plan | dirty_regions | dirty_executable},
       {MutationKind::monitor_definition,
        dirty_monitor_plan | dirty_regions | dirty_storage | dirty_executable},
+      {MutationKind::legacy_flux_definition,
+       dirty_flux_plan | dirty_regions | dirty_executable},
       {MutationKind::material_values, dirty_initialization | dirty_classification},
       {MutationKind::material_region, dirty_initialization | dirty_classification},
       {MutationKind::material_phase,
@@ -125,6 +127,41 @@ static void test_generations() {
 
   clear_dirty(f, dirty_initialization);
   CHECK(!is_dirty(f, dirty_initialization), "clear_dirty did not clear");
+}
+
+static void test_legacy_flux_invalidation() {
+  const double a = 8.0;
+  grid_volume gv = vol2d(3.0, 3.0, a);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+
+  clear_dirty(f, ~DirtyMask(0));
+  const uint64_t before = generation(f, MutationKind::legacy_flux_definition);
+  f.add_flux_plane(volume(vec(0.0, -1.0), vec(0.0, 1.0)));
+  CHECK(generation(f, MutationKind::legacy_flux_definition) == before + 1,
+        "adding legacy flux did not advance its generation");
+  CHECK(is_dirty(f, dirty_flux_plan) && is_dirty(f, dirty_regions) &&
+            is_dirty(f, dirty_executable),
+        "adding legacy flux did not invalidate plan, regions, and executable");
+  CHECK(!is_dirty(f, dirty_monitor_plan) && !is_dirty(f, dirty_storage) &&
+            !is_dirty(f, dirty_halos),
+        "legacy flux addition invalidated unrelated DFT/storage/halo state");
+
+  clear_dirty(f, ~DirtyMask(0));
+  f.remove_fluxes();
+  CHECK(generation(f, MutationKind::legacy_flux_definition) == before + 2,
+        "removing legacy flux did not advance its generation");
+  CHECK(f.fluxes == NULL, "remove_fluxes left a live legacy flux list");
+  CHECK(f.dirty_mask ==
+            DirtyMask(dirty_flux_plan | dirty_regions | dirty_executable),
+        "removing legacy flux produced dirty mask 0x%03x", unsigned(f.dirty_mask));
+
+  clear_dirty(f, ~DirtyMask(0));
+  const uint64_t after_remove = generation(f, MutationKind::legacy_flux_definition);
+  f.remove_fluxes();
+  CHECK(generation(f, MutationKind::legacy_flux_definition) == after_remove,
+        "removing an empty legacy flux list advanced its generation");
+  CHECK(f.dirty_mask == dirty_none, "removing an empty legacy flux list dirtied state");
 }
 
 /* ------------------------------------------------------------------ */
@@ -307,6 +344,7 @@ int main(int argc, char **argv) {
 
   test_closure_table();
   test_generations();
+  test_legacy_flux_invalidation();
   test_advance_equivalence();
   test_finite_check_modes();
   test_mutation_lifecycle();

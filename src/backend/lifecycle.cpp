@@ -45,6 +45,12 @@ DirtyMask invalidation_closure(MutationKind cause) {
     case MutationKind::monitor_definition:
       return dirty_monitor_plan | dirty_regions | dirty_storage | dirty_executable;
 
+    /* Legacy flux owns only a pair of scalar samples. Its geometric recipes
+       and operation spans change, but no field/DFT storage or halo topology
+       does. */
+    case MutationKind::legacy_flux_definition:
+      return dirty_flux_plan | dirty_regions | dirty_executable;
+
     /* Coefficients changed in place. Classification has to re-run because a
        coefficient can become (or stop being) trivial, but in the common case
        the classification hash is unchanged and the executable is reused. */
@@ -87,6 +93,7 @@ const char *mutation_kind_name(MutationKind cause) {
     case MutationKind::source_values: return "source_values";
     case MutationKind::source_definition: return "source_definition";
     case MutationKind::monitor_definition: return "monitor_definition";
+    case MutationKind::legacy_flux_definition: return "legacy_flux_definition";
     case MutationKind::material_values: return "material_values";
     case MutationKind::material_region: return "material_region";
     case MutationKind::material_phase: return "material_phase";
@@ -111,6 +118,7 @@ const char *dirty_bit_name(DirtyBit bit) {
     case dirty_halos: return "halos";
     case dirty_executable: return "executable";
     case dirty_classification: return "classification";
+    case dirty_flux_plan: return "flux_plan";
   }
   return "?";
 }

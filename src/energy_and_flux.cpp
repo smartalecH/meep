@@ -224,6 +224,15 @@ double fields::flux_in_box(direction d, const volume &where) {
   return cur_step_flux;
 }
 
+flux_vol::flux_vol(fields *f_, direction d_, const volume &where_) : where(where_) {
+  f = f_;
+  d = d_;
+  cur_flux = cur_flux_half = 0;
+  next = f->fluxes;
+  f->fluxes = this;
+  invalidate(*f, MutationKind::legacy_flux_definition);
+}
+
 flux_vol *fields::add_flux_vol(direction d, const volume &where) {
   if (where.dim != gv.dim) meep::abort("invalid dimensionality in add_flux_vol");
   if (d == NO_DIRECTION || coordinate_mismatch(gv.dim, d))

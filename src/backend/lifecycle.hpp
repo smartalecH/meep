@@ -44,6 +44,7 @@ enum class MutationKind {
   source_values,       // amplitudes changed, same indices/components
   source_definition,   // add/remove/replace source
   monitor_definition,  // add/remove/change monitor region
+  legacy_flux_definition, // add/remove a legacy instantaneous flux accumulator
   material_values,     // coefficients changed, same represented layout
   material_region,     // coefficients changed inside a bounded region only
   material_phase,      // phase-in state changes coefficients and the operation schedule
@@ -57,7 +58,7 @@ enum class MutationKind {
 
 /* Keep in sync with fields::num_mutation_kinds in meep.hpp; lifecycle.cpp
    static_asserts that they agree. */
-const int mutation_kind_count = 13;
+const int mutation_kind_count = 14;
 
 typedef uint32_t DirtyMask;
 enum DirtyBit : DirtyMask {
@@ -69,7 +70,8 @@ enum DirtyBit : DirtyMask {
   dirty_regions = 1 << 4,
   dirty_halos = 1 << 5,
   dirty_executable = 1 << 6,
-  dirty_classification = 1 << 7
+  dirty_classification = 1 << 7,
+  dirty_flux_plan = 1 << 8
 };
 
 /* The table in §6.4 of the plan, as code. */

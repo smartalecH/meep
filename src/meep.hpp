@@ -1881,7 +1881,7 @@ public:
      which must not be included from meep.hpp (global rule 5: meep.hpp is the
      SWIG surface). Treat these as internal; use meep::invalidate() rather than
      writing them directly. */
-  static const int num_mutation_kinds = 13;
+  static const int num_mutation_kinds = 14;
   uint32_t dirty_mask;
   uint64_t mutation_generation[num_mutation_kinds];
   /* Shadows `chunk_connections_valid`: connectivity is current iff these two
@@ -2352,13 +2352,7 @@ private:
 
 class flux_vol {
 public:
-  flux_vol(fields *f_, direction d_, const volume &where_) : where(where_) {
-    f = f_;
-    d = d_;
-    cur_flux = cur_flux_half = 0;
-    next = f->fluxes;
-    f->fluxes = this;
-  }
+  flux_vol(fields *f_, direction d_, const volume &where_);
   ~flux_vol() { delete next; }
 
   void update_half() {
