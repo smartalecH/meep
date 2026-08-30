@@ -124,7 +124,7 @@ uint64_t material_phase_target_signature(const fields &f) {
   return sig;
 }
 
-ArrayId find_array(fields &f, int chunk, array_kind kind, int c, int cmp, int aux) {
+ArrayId find_array(fields &f, int chunk, array_kind kind, int c, int cmp, uint64_t aux) {
   if (!f.array_catalog) return invalid_array();
   return f.array_catalog->find(StorageKey{chunk, int(kind), c, cmp, aux});
 }
@@ -1123,6 +1123,18 @@ public:
     }
     plan_.material_phase_target_signature = material_phase_target_signature(f);
     plan_.source_signature = f_.descriptors ? source_plan_signature(f_.descriptors->sources) : 0;
+    /* Group by field family so every host segment can name one contiguous
+       callback span while retaining chunk/state order within that family. */
+    if (program == StepProgram::ordinary && f_.descriptors) {
+      const field_type families[] = {H_stuff, E_stuff};
+      for (field_type ft : families)
+        for (const PolarizationDescriptor &d : f_.descriptors->polarizations)
+          if (d.ft == ft && d.kind == SusceptibilityKind::host_custom) {
+            if (plan_.host_callbacks.size() >= std::numeric_limits<uint32_t>::max())
+              throw std::overflow_error("host callback count overflow");
+            plan_.host_callbacks.push_back(make_host_callback_descriptor(d));
+          }
+    }
   }
 
   Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
@@ -1162,6 +1174,74 @@ public:
   void add_source_evaluation(Guard guard, double src_offset);
   void add_sources(field_type ft);
   void add_dfts();
+
+  bool host_callback_span(field_type ft, uint32_t &index, uint32_t &count) const {
+    index = count = 0;
+    bool started = false, finished = false;
+    for (size_t i = 0; i < plan_.host_callbacks.size(); ++i) {
+      const bool matches = plan_.host_callbacks[i].ft == ft;
+      if (matches) {
+        if (finished) throw std::logic_error("host callbacks for one field type are not contiguous");
+        if (!started) {
+          index = uint32_t(i);
+          started = true;
+        }
+        ++count;
+      }
+      else if (started)
+        finished = true;
+    }
+    return count != 0;
+  }
+
+  void append_host_halo_span(field_type ft, uint32_t &index, uint32_t &count) {
+    if (plan_.host_halo_plans.size() >= std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("host halo descriptor index overflow");
+    index = uint32_t(plan_.host_halo_plans.size());
+    count = 0;
+    if (!f_.halos) return;
+    const field_type halo_ft = ft == E_stuff ? PE_stuff : PH_stuff;
+    for (const HaloPlan &halo : f_.halos->plans) {
+      if (halo.ft != halo_ft || halo.storage != HaloStorageDisposition::host_owned ||
+          !halo.block_elements || (halo.host_gather.empty() && halo.host_scatter.empty()))
+        continue;
+      if (plan_.host_halo_plans.size() >= std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("host halo descriptor count overflow");
+      HostHaloPlanDescriptor descriptor{
+          halo.ft, halo.phase, halo.chunks, halo.sequence_index, halo.block_offset,
+          halo.block_elements};
+      for (const HostElementRef &ref : halo.host_gather)
+        descriptor.gather_keys.push_back(f_.halos->host_arrays.key(ref.id));
+      for (const HostElementRef &ref : halo.host_scatter)
+        descriptor.scatter_keys.push_back(f_.halos->host_arrays.key(ref.id));
+      descriptor.phase_values = halo.phase_values;
+      const HaloPlan *resolved = NULL;
+      std::string error;
+      if (!resolve_host_halo_plan(f_, descriptor, resolved, &error))
+        throw std::invalid_argument(error);
+      plan_.host_halo_plans.push_back(descriptor);
+      ++count;
+    }
+  }
+
+  void add_host_marker(HostSegmentPhase phase, field_type ft, Guard guard,
+                       uint32_t operation_count) {
+    uint32_t callback_index = 0, callback_count = 0;
+    if (!host_callback_span(ft, callback_index, callback_count)) return;
+    if (plan_.operations.size() >= std::numeric_limits<uint32_t>::max() ||
+        plan_.host_segments.size() >= std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("host segment count overflow");
+    Operation &marker = add(OpKind::host_callback, ft, guard);
+    marker.descriptor_index = uint32_t(plan_.host_segments.size());
+    marker.descriptor_count = 1;
+    const uint32_t operation_index = uint32_t(plan_.operations.size());
+    uint32_t host_halo_plan_index = 0, host_halo_plan_count = 0;
+    if (phase == HostSegmentPhase::polarization_and_halo)
+      append_host_halo_span(ft, host_halo_plan_index, host_halo_plan_count);
+    plan_.host_segments.push_back(HostSegment{phase, ft, operation_index, operation_count,
+                                              callback_index, callback_count,
+                                              host_halo_plan_index, host_halo_plan_count});
+  }
 
   Operation &add_material_refresh(OpKind op_kind) {
     Operation &op = add(op_kind, field_type(NUM_FIELD_TYPES),
@@ -1353,7 +1433,60 @@ public:
     add(OpKind::transfer_halo, ft, g);
   }
 
+  void finalize_host_segments() {
+    for (size_t marker_index = 0; marker_index < plan_.operations.size(); ++marker_index) {
+      Operation &marker = plan_.operations[marker_index];
+      if (marker.kind != OpKind::host_callback) continue;
+      if (marker.descriptor_count != 1 || marker.descriptor_index >= plan_.host_segments.size())
+        throw std::logic_error("host marker has invalid segment reference");
+      const HostSegment &segment = plan_.host_segments[marker.descriptor_index];
+      std::vector<BufferAccess> additional;
+      auto append_full = [&](ArrayId id, AccessMode mode) {
+        if (!is_valid(id)) return;
+        const ArraySpec &spec = f_.array_catalog->spec(id);
+        additional.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
+      };
+      for (uint32_t ci = 0; ci < segment.callback_count; ++ci) {
+        const HostCallbackDescriptor &callback =
+            plan_.host_callbacks[size_t(segment.callback_index) + ci];
+        for (const ArrayRef &ref : callback.published_internal_refs)
+          additional.push_back(BufferAccess{ref, AccessMode::read_write});
+        fields_chunk &fc = *f_.chunks[callback.chunk];
+        if (segment.phase == HostSegmentPhase::constitutive) {
+          FOR_COMPONENTS(c) DOCMP2 {
+            if (fc.f_minus_p[c][cmp])
+              append_full(find_array(f_, callback.chunk, array_kind::f_minus_p, int(c), cmp, 0),
+                          AccessMode::read_write);
+          }
+          const uint64_t sigma_aux = uint64_t(callback.state_index) * NUM_FIELD_TYPES +
+                                     uint64_t(callback.ft);
+          FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+            append_full(find_array(f_, callback.chunk, array_kind::sigma, int(c), int(d),
+                                   sigma_aux),
+                        AccessMode::read);
+          }
+        }
+        else {
+          FOR_COMPONENTS(c) DOCMP2 {
+            const array_kind current_kind = fc.f_w[c][cmp] ? array_kind::f_w : array_kind::f;
+            append_full(find_array(f_, callback.chunk, current_kind, int(c), cmp, 0),
+                        AccessMode::read_write);
+            append_full(find_array(f_, callback.chunk, array_kind::f_w_prev, int(c), cmp, 0),
+                        AccessMode::read_write);
+          }
+        }
+      }
+      marker.accesses = build_host_segment_access_union(
+          plan_, segment.operation_index, segment.operation_count, additional,
+          f_.array_catalog);
+    }
+    std::string error;
+    if (!validate_host_segments(plan_, &error))
+      throw std::logic_error("invalid constructed host segment: " + error);
+  }
+
   StepPlan finish() {
+    finalize_host_segments();
     plan_.signature = signature_for(plan_);
     return plan_;
   }
@@ -1408,6 +1541,7 @@ public:
         sig ^= uint64_t(access.mode) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       }
     }
+    mix(sig, uint64_t(plan.host_segments.size()));
     for (const HostSegment &segment : plan.host_segments) {
       mix(sig, uint64_t(segment.phase));
       mix(sig, uint64_t(segment.ft));
@@ -1417,6 +1551,60 @@ public:
       mix(sig, uint64_t(segment.callback_count));
       mix(sig, uint64_t(segment.host_halo_plan_index));
       mix(sig, uint64_t(segment.host_halo_plan_count));
+    }
+    mix(sig, uint64_t(plan.host_halo_plans.size()));
+    for (const HostHaloPlanDescriptor &halo : plan.host_halo_plans) {
+      mix(sig, uint64_t(halo.ft));
+      mix(sig, uint64_t(halo.phase));
+      mix(sig, uint64_t(halo.chunks.first));
+      mix(sig, uint64_t(halo.chunks.second));
+      mix(sig, uint64_t(halo.sequence_index));
+      mix(sig, uint64_t(halo.block_offset));
+      mix(sig, uint64_t(halo.block_elements));
+      auto mix_host_key = [&](const HostHaloKey &key) {
+        mix(sig, uint64_t(key.chunk));
+        mix(sig, uint64_t(key.ft));
+        mix(sig, uint64_t(key.state_index));
+        mix(sig, uint64_t(key.susceptibility_id));
+        mix(sig, uint64_t(key.component_));
+        mix(sig, uint64_t(key.cmp));
+        mix(sig, uint64_t(key.internal_index));
+        mix(sig, uint64_t(key.point_index));
+        mix(sig, uint64_t(key.complex_internal));
+      };
+      mix(sig, uint64_t(halo.gather_keys.size()));
+      for (const HostHaloKey &key : halo.gather_keys) mix_host_key(key);
+      mix(sig, uint64_t(halo.scatter_keys.size()));
+      for (const HostHaloKey &key : halo.scatter_keys) mix_host_key(key);
+      mix(sig, uint64_t(halo.phase_values.size()));
+      for (const std::complex<realnum> &phase : halo.phase_values) {
+        mix_double(sig, double(phase.real()));
+        mix_double(sig, double(phase.imag()));
+      }
+    }
+    mix(sig, uint64_t(plan.host_callbacks.size()));
+    for (const HostCallbackDescriptor &callback : plan.host_callbacks) {
+      mix(sig, uint64_t(callback.chunk));
+      mix(sig, uint64_t(callback.ft));
+      mix(sig, uint64_t(callback.state_index));
+      mix(sig, uint64_t(callback.susceptibility_id));
+      mix(sig, uint64_t(callback.has_internal_state));
+      mix(sig, uint64_t(callback.layout_published));
+      mix(sig, callback.required_w);
+      mix(sig, callback.required_w_prev);
+      mix(sig, uint64_t(callback.needs_halo));
+      mix(sig, uint64_t(callback.published_internal_refs.size()));
+      for (const ArrayRef &ref : callback.published_internal_refs) hash_ref(sig, ref);
+      mix(sig, uint64_t(callback.published_layout.size()));
+      for (const PublishedInternalLayout &row : callback.published_layout) {
+        for (unsigned char ch : row.name) mix(sig, uint64_t(ch));
+        mix(sig, uint64_t(row.name.size()));
+        mix(sig, uint64_t(row.element_type));
+        mix(sig, uint64_t(row.offset_elements));
+        mix(sig, uint64_t(row.elements));
+        mix(sig, uint64_t(row.c));
+        mix(sig, uint64_t(row.cmp));
+      }
     }
     for (const CurlUpdate &d : plan.db_updates)
       hash_curl(sig, d);
@@ -1932,6 +2120,7 @@ void StepPlanBuilder::add_dfts() {
 }
 
 void StepPlanBuilder::add_polarizations(field_type ft) {
+  add_host_marker(HostSegmentPhase::polarization_and_halo, ft, guard_always(), 2);
   Operation &op = add(OpKind::update_polarization, ft);
   op.descriptor_index = uint32_t(plan_.polarization_updates.size());
   op.polarization_group_index = uint32_t(plan_.polarization_groups.size());
@@ -2705,6 +2894,7 @@ void StepPlanBuilder::add_db(field_type ft) {
 }
 
 void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
+  add_host_marker(HostSegmentPhase::constitutive, ft, guard, 1);
   Operation &op = add(OpKind::update_eh, ft, guard);
   op.descriptor_index = uint32_t(plan_.eh_updates.size());
   op.polarization_subtraction_index = uint32_t(plan_.polarization_subtractions.size());
@@ -3882,6 +4072,13 @@ bool operator==(const HostSegment &a, const HostSegment &b) {
          a.host_halo_plan_count == b.host_halo_plan_count;
 }
 
+bool operator==(const HostHaloPlanDescriptor &a, const HostHaloPlanDescriptor &b) {
+  return a.ft == b.ft && a.phase == b.phase && a.chunks == b.chunks &&
+         a.sequence_index == b.sequence_index && a.block_offset == b.block_offset &&
+         a.block_elements == b.block_elements && a.gather_keys == b.gather_keys &&
+         a.scatter_keys == b.scatter_keys && a.phase_values == b.phase_values;
+}
+
 namespace {
 
 bool same_guard(const Guard &a, const Guard &b) {
@@ -3912,7 +4109,8 @@ bool host_segment_failure(std::string *error, const std::string &message) {
 std::vector<BufferAccess>
 build_host_segment_access_union(const StepPlan &plan, uint32_t operation_index,
                                 uint32_t operation_count,
-                                const std::vector<BufferAccess> &additional) {
+                                const std::vector<BufferAccess> &additional,
+                                const CpuArrayCatalog *catalog) {
   if (uint64_t(operation_index) + uint64_t(operation_count) > plan.operations.size())
     throw std::out_of_range("host segment access span is out of range");
 
@@ -3923,14 +4121,27 @@ build_host_segment_access_union(const StepPlan &plan, uint32_t operation_index,
     if (candidate.mode != AccessMode::read && candidate.mode != AccessMode::write &&
         candidate.mode != AccessMode::read_write)
       throw std::invalid_argument("host segment access mode is invalid");
+    BufferAccess normalized = candidate;
+    if (catalog) {
+      if (candidate.array.id.value >= catalog->size())
+        throw std::invalid_argument("host segment access ArrayId is out of range");
+      const ArraySpec &source_spec = catalog->spec(candidate.array.id);
+      normalized.array.id = canonical_array(*catalog, candidate.array.id);
+      const ArraySpec &canonical_spec = catalog->spec(normalized.array.id);
+      if (candidate.array.offset != 0 || candidate.array.elements != source_spec.elements ||
+          source_spec.element_type != canonical_spec.element_type ||
+          source_spec.storage != canonical_spec.storage ||
+          source_spec.elements != canonical_spec.elements)
+        throw std::invalid_argument("host segment access does not cover a compatible full alias");
+    }
     for (BufferAccess &existing : result) {
-      if (existing.array.id != candidate.array.id) continue;
-      if (!same_host_array_ref(existing.array, candidate.array))
+      if (existing.array.id != normalized.array.id) continue;
+      if (!same_host_array_ref(existing.array, normalized.array))
         throw std::invalid_argument("host segment gives one ArrayId multiple ranges");
-      if (existing.mode != candidate.mode) existing.mode = AccessMode::read_write;
+      if (existing.mode != normalized.mode) existing.mode = AccessMode::read_write;
       return;
     }
-    result.push_back(candidate);
+    result.push_back(normalized);
   };
 
   for (uint32_t i = 0; i < operation_count; ++i)
@@ -3944,6 +4155,8 @@ build_host_segment_access_union(const StepPlan &plan, uint32_t operation_index,
 bool validate_host_segments(const StepPlan &plan, std::string *error) {
   if (error) error->clear();
   std::vector<uint32_t> segment_references(plan.host_segments.size(), 0);
+  std::vector<uint32_t> callback_references(plan.host_callbacks.size(), 0);
+  std::vector<uint32_t> halo_references(plan.host_halo_plans.size(), 0);
   std::vector<uint8_t> covered_operations(plan.operations.size(), 0);
 
   for (size_t marker_index = 0; marker_index < plan.operations.size(); ++marker_index) {
@@ -3971,6 +4184,22 @@ bool validate_host_segments(const StepPlan &plan, std::string *error) {
     if (!checked_u32_span(segment.callback_index, segment.callback_count) ||
         !checked_u32_span(segment.host_halo_plan_index, segment.host_halo_plan_count))
       return host_segment_failure(error, "host segment subordinate span overflows uint32_t");
+    if (uint64_t(segment.host_halo_plan_index) + uint64_t(segment.host_halo_plan_count) >
+        plan.host_halo_plans.size())
+      return host_segment_failure(error, "host segment halo span is out of range");
+    if (!plan.host_callbacks.empty()) {
+      if (!segment.callback_count ||
+          uint64_t(segment.callback_index) + uint64_t(segment.callback_count) >
+              plan.host_callbacks.size())
+        return host_segment_failure(error, "host segment callback span is out of range");
+      for (uint32_t i = 0; i < segment.callback_count; ++i) {
+        const size_t callback_index = size_t(segment.callback_index) + i;
+        const HostCallbackDescriptor &callback = plan.host_callbacks[callback_index];
+        if (callback.ft != segment.ft)
+          return host_segment_failure(error, "host callback field type differs from segment");
+        ++callback_references[callback_index];
+      }
+    }
     if (segment.operation_index != marker_index + 1)
       return host_segment_failure(error, "host segment does not begin immediately after marker");
     if (uint64_t(segment.operation_index) + uint64_t(segment.operation_count) >
@@ -3987,6 +4216,47 @@ bool validate_host_segments(const StepPlan &plan, std::string *error) {
       return host_segment_failure(error, "host segment has the wrong operation count");
     if (segment.phase == HostSegmentPhase::constitutive && segment.host_halo_plan_count)
       return host_segment_failure(error, "constitutive host segment has a halo span");
+    const field_type expected_halo_ft = segment.ft == E_stuff ? PE_stuff : PH_stuff;
+    for (uint32_t i = 0; i < segment.host_halo_plan_count; ++i) {
+      const size_t halo_index = size_t(segment.host_halo_plan_index) + i;
+      const HostHaloPlanDescriptor &halo = plan.host_halo_plans[halo_index];
+      if (++halo_references[halo_index] != 1)
+        return host_segment_failure(error, "host halo descriptor is referenced multiple times");
+      if (segment.phase != HostSegmentPhase::polarization_and_halo ||
+          halo.ft != expected_halo_ft)
+        return host_segment_failure(error, "host halo descriptor has the wrong field family");
+      if (halo.phase != CONNECT_PHASE && halo.phase != CONNECT_NEGATE &&
+          halo.phase != CONNECT_COPY)
+        return host_segment_failure(error, "host halo descriptor has an invalid phase");
+      if (halo.chunks.first < 0 || halo.chunks.second < 0 || !halo.block_elements ||
+          halo.sequence_index != uint32_t(halo.phase) ||
+          halo.block_elements > std::numeric_limits<size_t>::max() - halo.block_offset)
+        return host_segment_failure(error, "host halo descriptor has invalid logical metadata");
+      if ((halo.gather_keys.empty() && halo.scatter_keys.empty()) ||
+          (!halo.gather_keys.empty() && halo.gather_keys.size() != halo.block_elements) ||
+          (!halo.scatter_keys.empty() && halo.scatter_keys.size() != halo.block_elements))
+        return host_segment_failure(error, "host halo descriptor has an incomplete key sequence");
+      if ((halo.phase != CONNECT_PHASE && !halo.phase_values.empty()) ||
+          (!halo.phase_values.empty() &&
+           (halo.block_elements % 2 || halo.phase_values.size() != halo.block_elements / 2 ||
+            halo.scatter_keys.empty())))
+        return host_segment_failure(error, "host halo descriptor has invalid phase values");
+      auto validate_keys = [&](const std::vector<HostHaloKey> &keys, int chunk) {
+        for (const HostHaloKey &key : keys)
+          if (key.chunk != chunk || key.ft != int(segment.ft) || key.state_index < 0 ||
+              key.susceptibility_id < 0 || key.internal_index < 0 || key.point_index < 0 ||
+              (key.complex_internal ? (key.cmp < 0 || key.cmp > 1)
+                                    : (key.cmp != -1 || halo.phase != CONNECT_COPY)))
+            return false;
+        return true;
+      };
+      if (!validate_keys(halo.gather_keys, halo.chunks.first) ||
+          !validate_keys(halo.scatter_keys, halo.chunks.second))
+        return host_segment_failure(error, "host halo descriptor contains an invalid logical key");
+      for (size_t j = 0; j < halo_index; ++j)
+        if (plan.host_halo_plans[j] == halo)
+          return host_segment_failure(error, "host halo descriptor is duplicated");
+    }
 
     for (size_t i = 0; i < marker.accesses.size(); ++i) {
       if (!is_valid(marker.accesses[i].array.id))
@@ -4040,7 +4310,135 @@ bool validate_host_segments(const StepPlan &plan, std::string *error) {
   for (uint32_t references : segment_references)
     if (references != 1)
       return host_segment_failure(error, "host segment has no marker");
+  for (uint32_t references : callback_references)
+    if (!references)
+      return host_segment_failure(error, "host callback is not covered by any segment");
+  for (uint32_t references : halo_references)
+    if (references != 1)
+      return host_segment_failure(error, "host halo descriptor is not covered exactly once");
   return true;
+}
+
+bool resolve_host_halo_plan(fields &f, const HostHaloPlanDescriptor &descriptor,
+                            const HaloPlan *&resolved, std::string *error) {
+  resolved = NULL;
+  if (error) error->clear();
+  try {
+    if (!f.halos || (descriptor.ft != PE_stuff && descriptor.ft != PH_stuff) ||
+        (descriptor.phase != CONNECT_PHASE && descriptor.phase != CONNECT_NEGATE &&
+         descriptor.phase != CONNECT_COPY) ||
+        descriptor.chunks.first < 0 || descriptor.chunks.first >= f.num_chunks ||
+        descriptor.chunks.second < 0 || descriptor.chunks.second >= f.num_chunks ||
+        descriptor.sequence_index != uint32_t(descriptor.phase) || !descriptor.block_elements ||
+        descriptor.block_elements >
+            std::numeric_limits<size_t>::max() - descriptor.block_offset)
+      throw std::invalid_argument("host halo descriptor has invalid logical metadata");
+    const HaloPlan *live =
+        f.halos->find({descriptor.ft, descriptor.phase, descriptor.chunks});
+    if (!live || live->storage != HaloStorageDisposition::host_owned ||
+        live->ft != descriptor.ft || live->phase != descriptor.phase ||
+        live->chunks != descriptor.chunks || live->sequence_index != descriptor.sequence_index ||
+        live->block_offset != descriptor.block_offset ||
+        live->block_elements != descriptor.block_elements)
+      throw std::invalid_argument("host halo descriptor differs from the current live plan");
+    const bool owns_gather = f.chunks[live->chunks.first]->is_mine();
+    const bool owns_scatter = f.chunks[live->chunks.second]->is_mine();
+    if ((owns_gather && live->host_gather.size() != live->block_elements) ||
+        (!owns_gather && !live->host_gather.empty()) ||
+        (owns_scatter && live->host_scatter.size() != live->block_elements) ||
+        (!owns_scatter && !live->host_scatter.empty()))
+      throw std::invalid_argument("current host halo plan has an incomplete owned-side mirror");
+    if (descriptor.gather_keys.size() != live->host_gather.size() ||
+        descriptor.scatter_keys.size() != live->host_scatter.size() ||
+        descriptor.phase_values != live->phase_values)
+      throw std::invalid_argument("host halo descriptor ordered metadata changed");
+    const field_type state_ft = live->ft == PE_stuff ? E_stuff : H_stuff;
+    for (size_t i = 0; i < live->host_gather.size(); ++i) {
+      const HostElementRef &ref = live->host_gather[i];
+      if (!f.halos->host_arrays.contains(ref.id))
+        throw std::invalid_argument("current host halo gather id is stale");
+      const HostHaloKey &key = f.halos->host_arrays.key(ref.id);
+      if (key.chunk != live->chunks.first || key.ft != int(state_ft) ||
+          !(key == descriptor.gather_keys[i]))
+        throw std::invalid_argument("current host halo gather key differs from the live plan");
+    }
+    for (size_t i = 0; i < live->host_scatter.size(); ++i) {
+      const HostElementRef &ref = live->host_scatter[i];
+      if (!f.halos->host_arrays.contains(ref.id))
+        throw std::invalid_argument("current host halo scatter id is stale");
+      const HostHaloKey &key = f.halos->host_arrays.key(ref.id);
+      if (key.chunk != live->chunks.second || key.ft != int(state_ft) ||
+          !(key == descriptor.scatter_keys[i]))
+        throw std::invalid_argument("current host halo scatter key differs from the live plan");
+    }
+    if (owns_scatter && live->phase == CONNECT_PHASE &&
+        (live->block_elements % 2 || live->phase_values.size() != live->block_elements / 2))
+      throw std::invalid_argument("current host halo phase metadata is invalid");
+    resolved = live;
+    return true;
+  }
+  catch (const std::exception &e) {
+    if (error) *error = e.what();
+  }
+  return false;
+}
+
+bool validate_host_callback_plan(fields &f, const StepPlan &plan, std::string *error) {
+  if (error) error->clear();
+  try {
+    std::string structural_error;
+    if (!validate_host_segments(plan, &structural_error))
+      throw std::invalid_argument(structural_error);
+    if (plan.signature != compute_step_plan_signature(plan))
+      throw std::invalid_argument("host callback plan has a stale signature");
+    if (!f.descriptors)
+      throw std::invalid_argument("host callback validation has no installed descriptors");
+    DescriptorSet fresh = *f.descriptors;
+    build_polarization_descriptors(f, fresh.polarizations);
+    struct DescriptorRestore {
+      fields &f;
+      DescriptorSet *saved;
+      ~DescriptorRestore() { f.descriptors = saved; }
+    } restore{f, f.descriptors};
+    f.descriptors = &fresh;
+    const StepPlan expected = build_step_plan(f, plan.program);
+    for (const HostCallbackDescriptor &callback : plan.host_callbacks) {
+      ResolvedHostCallback resolved;
+      std::string resolve_error;
+      if (!resolve_host_callback(f, callback, resolved, &resolve_error))
+        throw std::invalid_argument(resolve_error);
+    }
+    if (plan.host_callbacks != expected.host_callbacks ||
+        plan.host_segments != expected.host_segments ||
+        plan.host_halo_plans != expected.host_halo_plans)
+      throw std::invalid_argument("host callback descriptors differ from the canonical live plan");
+    for (const HostHaloPlanDescriptor &halo : plan.host_halo_plans) {
+      const HaloPlan *resolved = NULL;
+      std::string resolve_error;
+      if (!resolve_host_halo_plan(f, halo, resolved, &resolve_error))
+        throw std::invalid_argument(resolve_error);
+    }
+    if (plan.operations.size() != expected.operations.size())
+      throw std::invalid_argument("host callback operation schedule differs from canonical plan");
+    for (size_t i = 0; i < plan.operations.size(); ++i) {
+      const Operation &a = plan.operations[i];
+      const Operation &b = expected.operations[i];
+      if (a.kind != OpKind::host_callback && b.kind != OpKind::host_callback) continue;
+      if (a.kind != b.kind || a.ft != b.ft || !same_guard(a.guard, b.guard) ||
+          a.descriptor_index != b.descriptor_index || a.descriptor_count != b.descriptor_count ||
+          a.accesses.size() != b.accesses.size())
+        throw std::invalid_argument("host callback marker differs from canonical plan");
+      for (size_t ai = 0; ai < a.accesses.size(); ++ai)
+        if (!same_host_array_ref(a.accesses[ai].array, b.accesses[ai].array) ||
+            a.accesses[ai].mode != b.accesses[ai].mode)
+          throw std::invalid_argument("host callback access union differs from canonical plan");
+    }
+    return true;
+  }
+  catch (const std::exception &e) {
+    if (error) *error = e.what();
+    return false;
+  }
 }
 
 /* Transcribed from fields::step_once. Read the two side by side.
@@ -4124,8 +4522,8 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
     magnetic_evaluate_h = p.operation_count();
     p.add_source_evaluation(guard_static(true), 0.5);
   }
-  const uint32_t magnetic_update_h = p.operation_count();
   p.add_eh(H_stuff);
+  const uint32_t magnetic_update_h = p.operation_count() - 1;
   p.add_boundaries(WH_stuff);
   p.add_polarizations(H_stuff);
   p.add_boundaries(PH_stuff);

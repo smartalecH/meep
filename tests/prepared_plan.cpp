@@ -55,6 +55,13 @@ public:
   }
 };
 
+class prepared_custom_lorentzian : public lorentzian_susceptibility {
+public:
+  prepared_custom_lorentzian(realnum omega_0, realnum gamma)
+      : lorentzian_susceptibility(omega_0, gamma) {}
+  susceptibility *clone() const override { return new prepared_custom_lorentzian(*this); }
+};
+
 static bool has_access(const Operation &op, ArrayId id) {
   if (!is_valid(id)) return true;
   for (size_t i = 0; i < op.accesses.size(); ++i)
@@ -161,6 +168,7 @@ static void check_prepared_updates() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
   structure s(gv, eps_slab, pml(0.5), identity(), 2);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
+  prepared_custom_lorentzian custom(0.87, 0.06);
   gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07,
                                  GYROTROPIC_SATURATED);
   const realnum ml_gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
@@ -172,6 +180,7 @@ static void check_prepared_updates() {
   multilevel_susceptibility multilevel(2, 1, ml_gamma, ml_n0, ml_alpha, ml_omega,
                                       ml_damping, ml_sigmat);
   s.add_susceptibility(eps_slab, E_stuff, susceptibility);
+  s.add_susceptibility(eps_slab, E_stuff, custom);
   s.add_susceptibility(eps_slab, E_stuff, gyro);
   s.add_susceptibility(eps_slab, E_stuff, multilevel);
   fields f(&s);
@@ -183,6 +192,9 @@ static void check_prepared_updates() {
   f.advance(2);
 
   StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  std::string host_error;
+  CHECK(validate_host_callback_plan(f, plan, &host_error),
+        "prepared custom callback plan rejected: %s", host_error.c_str());
   size_t live_dft_rows = 0;
   for (int chunk = 0; chunk < f.num_chunks; ++chunk)
     if (f.chunks[chunk]->is_mine())
@@ -192,9 +204,45 @@ static void check_prepared_updates() {
   size_t source_evaluations = 0, source_applications = 0;
   size_t dft_operations = 0;
   size_t polarization_operations = 0, polarization_rows = 0, gyrotropic_rows = 0,
-         subtraction_rows = 0, multilevel_groups = 0, multilevel_rows = 0;
+         subtraction_rows = 0, multilevel_groups = 0, multilevel_rows = 0,
+         host_markers = 0, host_callbacks = 0, host_halos = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
+    if (op.kind == OpKind::host_callback) {
+      ++host_markers;
+      CHECK(op.descriptor_count == 1 && op.descriptor_index < plan.host_segments.size(),
+            "prepared host marker has an invalid segment span");
+      if (op.descriptor_count == 1 && op.descriptor_index < plan.host_segments.size()) {
+        const HostSegment &segment = plan.host_segments[op.descriptor_index];
+        CHECK(uint64_t(segment.callback_index) + segment.callback_count <=
+                  plan.host_callbacks.size(),
+              "prepared host segment has an invalid callback span");
+        host_callbacks += segment.callback_count;
+        CHECK(uint64_t(segment.host_halo_plan_index) + segment.host_halo_plan_count <=
+                  plan.host_halo_plans.size(),
+              "prepared host segment has an invalid logical halo span");
+        for (uint32_t hi = 0; hi < segment.host_halo_plan_count; ++hi) {
+          const HostHaloPlanDescriptor &halo =
+              plan.host_halo_plans[size_t(segment.host_halo_plan_index) + hi];
+          const HaloPlan *resolved = NULL;
+          CHECK(resolve_host_halo_plan(f, halo, resolved, &host_error),
+                "prepared logical host halo failed resolution: %s", host_error.c_str());
+          CHECK(resolved && resolved->storage == HaloStorageDisposition::host_owned,
+                "prepared logical host halo did not resolve host-owned storage");
+          ++host_halos;
+        }
+      }
+      for (const BufferAccess &access : op.accesses) {
+        CHECK(is_valid(access.array.id) && access.array.id.value < f.array_catalog->size(),
+              "prepared host marker contains an invalid ArrayId");
+        if (!is_valid(access.array.id) || access.array.id.value >= f.array_catalog->size())
+          continue;
+        const ArraySpec &spec = f.array_catalog->spec(access.array.id);
+        CHECK(!is_valid(spec.alias_of), "prepared host marker retained an alias ArrayId");
+        CHECK(access.array.offset == 0 && access.array.elements == spec.elements,
+              "prepared host marker does not cover a full canonical allocation");
+      }
+    }
     if (op.kind == OpKind::evaluate_source_scalars) {
       ++source_evaluations;
       CHECK(op.descriptor_index == 0 &&
@@ -411,6 +459,10 @@ static void check_prepared_updates() {
   CHECK(or_to_all(multilevel_groups > 0 && multilevel_rows > 0),
         "prepared plan contains no multilevel groups or transition rows");
   CHECK(or_to_all(subtraction_rows > 0), "prepared plan contains no P subtractions");
+  CHECK(or_to_all(host_markers > 0 && host_callbacks > 0),
+        "prepared plan contains no custom host callback delta");
+  CHECK(or_to_all(host_halos > 0),
+        "prepared custom polarization segment contains no logical host halos");
   check_finite_value_accesses(f, plan);
   CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",
         source_evaluations);

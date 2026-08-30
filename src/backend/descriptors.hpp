@@ -30,6 +30,7 @@
 
 #include <complex>
 #include <stdint.h>
+#include <string>
 #include <vector>
 
 #include "meep.hpp"
@@ -236,7 +237,9 @@ struct PolarizationDescriptor {
   int chunk;
   field_type ft;
   int state_index;
+  int susceptibility_id;
   bool has_internal_state;
+  bool layout_published;
   LorentzianParameters lorentzian;
   double noise_amplitude;
   uint32_t noise_algorithm_version;
@@ -249,11 +252,57 @@ struct PolarizationDescriptor {
   size_t multilevel_population_points;
   std::vector<MultilevelStateArrays> multilevel_states;
   std::vector<InternalArrayLayout> internal_arrays;
+  std::vector<ArrayRef> internal_array_refs;
   size_t per_thread_scratch_elements;
   uint64_t required_w;      // bit per (component, cmp)
   uint64_t required_w_prev;
   bool needs_halo;
 };
+
+/* Pointer-free identity for one legacy host-polymorphic susceptibility.  The
+   live object is resolved from this tuple immediately before a host session;
+   no object or data pointer is retained by a descriptor or executable. */
+struct PublishedInternalLayout {
+  std::string name;
+  InternalArrayLayout::value_type element_type;
+  size_t offset_elements;
+  size_t elements;
+  component c;
+  int cmp;
+};
+
+struct HostCallbackDescriptor {
+  int chunk;
+  field_type ft;
+  int state_index;
+  int susceptibility_id;
+  bool has_internal_state;
+  bool layout_published;
+  uint64_t required_w;
+  uint64_t required_w_prev;
+  bool needs_halo;
+  std::vector<ArrayRef> published_internal_refs;
+  std::vector<PublishedInternalLayout> published_layout;
+};
+
+struct ResolvedHostCallback {
+  fields_chunk *chunk;
+  polarization_state *state;
+  ResolvedHostCallback() : chunk(NULL), state(NULL) {}
+};
+
+bool operator==(const PublishedInternalLayout &a, const PublishedInternalLayout &b);
+inline bool operator!=(const PublishedInternalLayout &a, const PublishedInternalLayout &b) {
+  return !(a == b);
+}
+bool operator==(const HostCallbackDescriptor &a, const HostCallbackDescriptor &b);
+inline bool operator!=(const HostCallbackDescriptor &a, const HostCallbackDescriptor &b) {
+  return !(a == b);
+}
+
+HostCallbackDescriptor make_host_callback_descriptor(const PolarizationDescriptor &d);
+bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
+                           ResolvedHostCallback &resolved, std::string *error = NULL);
 
 struct DescriptorSet {
   SourcePlan sources;

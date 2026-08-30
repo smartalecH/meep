@@ -22,6 +22,7 @@
 #include <string.h>
 #include <algorithm>
 #include <set>
+#include <tuple>
 #include <vector>
 
 #include <meep.hpp>
@@ -800,11 +801,21 @@ static void test_polarizations(const char *name, susceptibility *sus,
   build_polarization_descriptors(f, pols);
   CHECK(or_to_all(!pols.empty()), "%s: no polarization descriptors", name);
 
+  std::set<std::tuple<int, int, int, int> > identities;
+
   for (const PolarizationDescriptor &d : pols) {
     CHECK(d.kind == expect_kind, "%s: classified as %s, expected %s", name,
           susceptibility_kind_name(d.kind), susceptibility_kind_name(expect_kind));
+    CHECK(d.susceptibility_id >= 0, "%s: descriptor has no susceptibility identity", name);
+    CHECK(d.layout_published == expect_layout,
+          "%s: explicit layout-published bit differs from virtual result", name);
+    CHECK(identities.insert(std::make_tuple(d.chunk, int(d.ft), d.state_index,
+                                            d.susceptibility_id)).second,
+          "%s: duplicate full callback identity tuple", name);
     if (expect_layout) {
       CHECK(!d.internal_arrays.empty(), "%s: published an empty layout", name);
+      CHECK(d.internal_array_refs.size() == d.internal_arrays.size(),
+            "%s: published layout/ref counts differ", name);
       /* The published offsets must address the same memory the object's own
          interior pointers do. If they ever disagree, the object is right. */
       for (const InternalArrayLayout &l : d.internal_arrays)
@@ -812,6 +823,27 @@ static void test_polarizations(const char *name, susceptibility *sus,
     }
     else {
       CHECK(d.internal_arrays.empty(), "%s: host_custom must publish no layout", name);
+      CHECK(d.internal_array_refs.empty(), "%s: opaque custom state invented ArrayIds", name);
+    }
+    if (expect_kind == SusceptibilityKind::host_custom) {
+      const HostCallbackDescriptor callback = make_host_callback_descriptor(d);
+      CHECK(callback.chunk == d.chunk && callback.ft == d.ft &&
+                callback.state_index == d.state_index &&
+                callback.susceptibility_id == d.susceptibility_id,
+            "%s: callback identity differs from polarization descriptor", name);
+      CHECK(callback.layout_published == expect_layout &&
+                callback.published_internal_refs.size() == d.internal_array_refs.size(),
+            "%s: callback layout metadata differs from descriptor", name);
+      ResolvedHostCallback resolved;
+      std::string error;
+      CHECK(resolve_host_callback(f, callback, resolved, &error),
+            "%s: live callback did not resolve: %s", name, error.c_str());
+      CHECK(resolved.chunk == f.chunks[d.chunk] && resolved.state,
+            "%s: resolver returned the wrong transient handle", name);
+      HostCallbackDescriptor stale = callback;
+      ++stale.susceptibility_id;
+      CHECK(!resolve_host_callback(f, stale, resolved, &error),
+            "%s: stale susceptibility identity resolved", name);
     }
   }
   if (!pols.empty())

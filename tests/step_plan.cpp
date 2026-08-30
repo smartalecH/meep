@@ -58,6 +58,15 @@ namespace meep {
    public execution API or adding a production callback hook. */
 struct StepPlanTestAccess {
   static void execute(fields &f, const StepPlan &plan) { f.execute_step_plan(plan, 0); }
+  static ArraySpec &mutable_catalog_spec(CpuArrayCatalog &catalog, ArrayId id) {
+    return catalog.specs_[id.value];
+  }
+  static StorageKey &mutable_catalog_key(CpuArrayCatalog &catalog, ArrayId id) {
+    return catalog.keys_[id.value];
+  }
+  static void *&mutable_catalog_base(CpuArrayCatalog &catalog, ArrayId id) {
+    return catalog.bases_[id.value];
+  }
 };
 } // namespace meep
 
@@ -121,6 +130,29 @@ public:
 
 int host_segment_counting_lorentzian::subtract_calls = 0;
 int host_segment_counting_lorentzian::update_calls = 0;
+
+class host_segment_opaque_lorentzian : public lorentzian_susceptibility {
+public:
+  host_segment_opaque_lorentzian(realnum omega_0, realnum gamma)
+      : lorentzian_susceptibility(omega_0, gamma) {}
+  susceptibility *clone() const override { return new host_segment_opaque_lorentzian(*this); }
+  bool internal_layout(std::vector<InternalArrayLayout> &, const grid_volume &, void *) const override {
+    return false;
+  }
+};
+
+class host_segment_stateless : public susceptibility {
+public:
+  susceptibility *clone() const override { return new host_segment_stateless(*this); }
+};
+
+class inherited_gyrotropic : public gyrotropic_susceptibility {
+public:
+  inherited_gyrotropic()
+      : gyrotropic_susceptibility(vec(0.17, -0.23, 0.31), 0.8, 0.05, 0.07,
+                                  GYROTROPIC_LORENTZIAN) {}
+  susceptibility *clone() const override { return new inherited_gyrotropic(*this); }
+};
 
 class inherited_noisy_lorentzian : public noisy_lorentzian_susceptibility {
 public:
@@ -5368,6 +5400,27 @@ static void test_host_segment_access_union() {
   try { build_host_segment_access_union(plan, UINT32_MAX, 2, additional); }
   catch (const std::out_of_range &) { rejected = true; }
   CHECK(rejected, "out-of-range host access operation span was accepted");
+
+  realnum alias_storage[16] = {};
+  CpuArrayCatalog catalog;
+  const ArrayId canonical = catalog.register_array(
+      {0, int(array_kind::f), int(Ez), 0, 0}, alias_storage, 16, array_role::field,
+      ElementType::realnum_value);
+  const ArrayId alias = catalog.register_array(
+      {0, int(array_kind::f), int(Dz), 0, 0}, alias_storage, 16, array_role::field,
+      ElementType::realnum_value);
+  catalog.set_alias(alias, canonical);
+  StepPlan alias_plan;
+  Operation alias_op = host_test_operation(OpKind::update_eh, E_stuff);
+  alias_op.accesses.push_back(BufferAccess{ArrayRef{alias, 0, 16}, AccessMode::read});
+  alias_plan.operations.push_back(alias_op);
+  const std::vector<BufferAccess> canonicalized = build_host_segment_access_union(
+      alias_plan, 0, 1,
+      std::vector<BufferAccess>{BufferAccess{ArrayRef{canonical, 0, 16}, AccessMode::write}},
+      &catalog);
+  CHECK(canonicalized.size() == 1 && canonicalized[0].array.id == canonical &&
+            canonicalized[0].mode == AccessMode::read_write,
+        "host access union did not canonicalize and promote an alias pair");
 }
 
 static void test_cpu_host_marker_is_noop() {
@@ -5454,9 +5507,23 @@ static void test_host_segment_schema() {
 
   const HostSegment constitutive = {HostSegmentPhase::constitutive, E_stuff, 1, 1, 3, 2, 0, 0};
   const HostSegment polarization = {
-      HostSegmentPhase::polarization_and_halo, H_stuff, 3, 2, 5, 4, 9, 3};
+      HostSegmentPhase::polarization_and_halo, H_stuff, 3, 2, 5, 4, 0, 3};
   plan.host_segments.push_back(constitutive);
   plan.host_segments.push_back(polarization);
+  auto append_halo = [&](connect_phase phase, size_t offset, size_t count, bool gather) {
+    HostHaloPlanDescriptor halo{PH_stuff, phase, {1, 0}, uint32_t(phase), offset, count};
+    std::vector<HostHaloKey> &keys = gather ? halo.gather_keys : halo.scatter_keys;
+    for (size_t i = 0; i < count; ++i)
+      keys.push_back(HostHaloKey{gather ? 1 : 0, int(H_stuff), 2, 17, int(Hz),
+                                 phase == CONNECT_COPY && i == 0 ? -1 : int(i & 1), int(i / 2),
+                                 ptrdiff_t(i), !(phase == CONNECT_COPY && i == 0)});
+    if (!gather && phase == CONNECT_PHASE)
+      halo.phase_values.assign(count / 2, std::complex<realnum>(0.5, -0.25));
+    plan.host_halo_plans.push_back(halo);
+  };
+  append_halo(CONNECT_PHASE, 0, 8, false);
+  append_halo(CONNECT_NEGATE, 8, 4, true);
+  append_halo(CONNECT_COPY, 12, 6, true);
 
   std::string error;
   CHECK(validate_host_segments(plan, &error), "valid host segments were rejected: %s",
@@ -5485,6 +5552,35 @@ static void test_host_segment_schema() {
   CHECK_HOST_INEQUALITY(++changed.host_halo_plan_count,
                         "host segment equality ignored host halo count");
 #undef CHECK_HOST_INEQUALITY
+  const HostHaloPlanDescriptor host_halo = plan.host_halo_plans[0];
+  CHECK(host_halo == plan.host_halo_plans[0],
+        "identical host halo descriptors compare unequal");
+#define CHECK_HOST_HALO_INEQUALITY(expr, message)                                                  \
+  do {                                                                                             \
+    HostHaloPlanDescriptor changed = host_halo;                                                    \
+    expr;                                                                                          \
+    CHECK(changed != host_halo, message);                                                          \
+  } while (0)
+  CHECK_HOST_HALO_INEQUALITY(changed.ft = PE_stuff,
+                             "host halo equality ignored field type");
+  CHECK_HOST_HALO_INEQUALITY(changed.phase = CONNECT_COPY,
+                             "host halo equality ignored phase");
+  CHECK_HOST_HALO_INEQUALITY(++changed.chunks.first,
+                             "host halo equality ignored sender chunk");
+  CHECK_HOST_HALO_INEQUALITY(++changed.chunks.second,
+                             "host halo equality ignored receiver chunk");
+  CHECK_HOST_HALO_INEQUALITY(++changed.sequence_index,
+                             "host halo equality ignored sequence index");
+  CHECK_HOST_HALO_INEQUALITY(++changed.block_offset,
+                             "host halo equality ignored block offset");
+  CHECK_HOST_HALO_INEQUALITY(++changed.block_elements,
+                             "host halo equality ignored block size");
+  CHECK_HOST_HALO_INEQUALITY(++changed.scatter_keys[0].state_index,
+                             "host halo equality ignored ordered logical keys");
+  CHECK_HOST_HALO_INEQUALITY(changed.phase_values[0] +=
+                                 std::complex<realnum>(realnum(0.25), realnum(-0.125)),
+                             "host halo equality ignored phase values");
+#undef CHECK_HOST_HALO_INEQUALITY
   CHECK(!strcmp(host_segment_phase_name(HostSegmentPhase::constitutive), "constitutive"),
         "constitutive phase has the wrong name");
   CHECK(!strcmp(host_segment_phase_name(HostSegmentPhase::polarization_and_halo),
@@ -5499,7 +5595,7 @@ static void test_host_segment_schema() {
               "host_callback(E,constitutive,ops=1+1,callbacks=3+2,halos=0+0)",
           "constitutive host marker formatting is incomplete: %s", formatted[0].c_str());
     CHECK(formatted[2] ==
-              "host_callback(H,polarization_and_halo,ops=3+2,callbacks=5+4,halos=9+3)",
+              "host_callback(H,polarization_and_halo,ops=3+2,callbacks=5+4,halos=0+3)",
           "polarization host marker formatting is incomplete: %s", formatted[2].c_str());
   }
 
@@ -5527,6 +5623,25 @@ static void test_host_segment_schema() {
                        "signature ignored host halo span start");
   CHECK_HOST_SIGNATURE(++changed.host_segments[1].host_halo_plan_count,
                        "signature ignored host halo span count");
+  CHECK_HOST_SIGNATURE(changed.host_halo_plans[0].ft = PE_stuff,
+                       "signature ignored host halo field type");
+  CHECK_HOST_SIGNATURE(changed.host_halo_plans[0].phase = CONNECT_COPY,
+                       "signature ignored host halo phase");
+  CHECK_HOST_SIGNATURE(++changed.host_halo_plans[0].chunks.first,
+                       "signature ignored host halo sender chunk");
+  CHECK_HOST_SIGNATURE(++changed.host_halo_plans[0].chunks.second,
+                       "signature ignored host halo receiver chunk");
+  CHECK_HOST_SIGNATURE(++changed.host_halo_plans[0].sequence_index,
+                       "signature ignored host halo sequence index");
+  CHECK_HOST_SIGNATURE(++changed.host_halo_plans[0].block_offset,
+                       "signature ignored host halo block offset");
+  CHECK_HOST_SIGNATURE(++changed.host_halo_plans[0].block_elements,
+                       "signature ignored host halo block size");
+  CHECK_HOST_SIGNATURE(++changed.host_halo_plans[0].scatter_keys[0].point_index,
+                       "signature ignored host halo logical keys");
+  CHECK_HOST_SIGNATURE(changed.host_halo_plans[0].phase_values[0] +=
+                           std::complex<realnum>(realnum(0.125), realnum(0.25)),
+                       "signature ignored host halo phase values");
   CHECK_HOST_SIGNATURE(++changed.operations[0].guard.scalar_slot,
                        "signature ignored host marker guard");
   CHECK_HOST_SIGNATURE(changed.operations[0].accesses[0].mode = AccessMode::write,
@@ -5603,6 +5718,57 @@ static void test_host_segment_schema() {
   }
   {
     StepPlan bad = plan;
+    bad.host_halo_plans[0].ft = PE_stuff;
+    rejected(bad, "host halo with the wrong field family was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans[0].phase = connect_phase(99);
+    rejected(bad, "host halo with an invalid phase was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    ++bad.host_halo_plans[0].sequence_index;
+    rejected(bad, "host halo with the wrong sequence index was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans[0].block_elements = 0;
+    rejected(bad, "empty host halo descriptor was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans[0].block_offset = std::numeric_limits<size_t>::max();
+    rejected(bad, "overflowing host halo block span was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans[0].scatter_keys.pop_back();
+    rejected(bad, "host halo with an incomplete logical-key sequence was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    ++bad.host_halo_plans[0].scatter_keys[0].chunk;
+    rejected(bad, "host halo with a wrong-chunk logical key was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans[0].phase_values.pop_back();
+    rejected(bad, "host halo with an incomplete phase sequence was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans[1] = bad.host_halo_plans[0];
+    rejected(bad, "duplicate host halo descriptor was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_halo_plans.push_back(
+        HostHaloPlanDescriptor{PH_stuff, CONNECT_COPY, {2, 0}, 2, 18, 2});
+    rejected(bad, "unreferenced host halo descriptor was accepted");
+  }
+  {
+    StepPlan bad = plan;
     bad.operations[1].kind = OpKind::update_db;
     rejected(bad, "constitutive segment covering the wrong operation was accepted");
   }
@@ -5670,11 +5836,414 @@ static void test_host_segment_schema() {
   }
 
   plan.clear();
-  CHECK(plan.host_segments.empty(), "StepPlan::clear retained host segments");
+  CHECK(plan.host_segments.empty() && plan.host_halo_plans.empty(),
+        "StepPlan::clear retained host segments or halo descriptors");
   plan.clear();
-  CHECK(plan.host_segments.empty(), "second StepPlan::clear retained host segments");
+  CHECK(plan.host_segments.empty() && plan.host_halo_plans.empty(),
+        "second StepPlan::clear retained host segments or halo descriptors");
   CHECK(validate_host_segments(plan, &error), "empty host segment plan was rejected: %s",
         error.c_str());
+}
+
+static void test_live_host_callback_plan() {
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  host_segment_counting_lorentzian published(0.7, 0.08);
+  host_segment_opaque_lorentzian opaque(0.9, 0.06);
+  host_segment_stateless stateless;
+  lorentzian_susceptibility exact_lorentz(0.61, 0.03);
+  gyrotropic_susceptibility exact_gyro(vec(0.1, 0.2, 0.3), 0.75, 0.04);
+  inherited_noisy_lorentzian derived_noisy(0.01, 0.82, 0.05);
+  inherited_gyrotropic derived_gyro;
+  const realnum gamma_matrix[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum populations[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum omega[] = {realnum(0.63)};
+  const realnum damping[] = {realnum(0.04)};
+  const realnum sigmat[] = {1, 1, 1, 1, 1};
+  inherited_multilevel derived_multilevel(2, 1, gamma_matrix, populations, alpha, omega,
+                                          damping, sigmat);
+  /* add_susceptibility prepends. E therefore exercises custom-before-native;
+     H exercises native-before-custom as well as multiple custom states. */
+  s.add_susceptibility(one, E_stuff, exact_lorentz);
+  s.add_susceptibility(one, E_stuff, published);
+  s.add_susceptibility(one, E_stuff, derived_noisy);
+  s.add_susceptibility(one, E_stuff, stateless);
+  s.add_susceptibility(one, H_stuff, opaque);
+  s.add_susceptibility(one, H_stuff, derived_gyro);
+  s.add_susceptibility(one, H_stuff, derived_multilevel);
+  s.add_susceptibility(one, H_stuff, exact_gyro);
+  fields f(&s);
+  f.use_bloch(X, 0.17);
+  f.require_component(Ez);
+  f.require_component(Hz);
+  f.advance(2);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  std::string error;
+  CHECK(validate_host_callback_plan(f, plan, &error),
+        "live host callback plan rejected: %s", error.c_str());
+  CHECK(or_to_all(!plan.host_callbacks.empty()), "live custom fixture produced no callbacks");
+  CHECK(plan.host_segments.size() == (plan.host_callbacks.empty() ? 0 : 4),
+        "live E/H custom fixture produced %zu segments instead of 4", plan.host_segments.size());
+
+  auto coherent_descriptor_mutation_rejected = [&](int mutation) {
+    const std::vector<PolarizationDescriptor> saved = f.descriptors->polarizations;
+    std::vector<size_t> custom;
+    for (size_t i = 0; i < f.descriptors->polarizations.size(); ++i)
+      if (f.descriptors->polarizations[i].kind == SusceptibilityKind::host_custom)
+        custom.push_back(i);
+    bool injected = my_rank() == 0 && !custom.empty() &&
+                    (mutation != 2 || custom.size() > 1);
+    bool rejected = false;
+    if (injected) {
+      if (mutation == 0)
+        f.descriptors->polarizations.erase(f.descriptors->polarizations.begin() + custom[0]);
+      else if (mutation == 1) {
+        const PolarizationDescriptor duplicate = f.descriptors->polarizations[custom[0]];
+        f.descriptors->polarizations.insert(f.descriptors->polarizations.begin() + custom[0],
+                                            duplicate);
+      }
+      else
+        std::swap(f.descriptors->polarizations[custom[0]],
+                  f.descriptors->polarizations[custom[1]]);
+      try {
+        StepPlan coherent = build_step_plan(f, StepProgram::ordinary);
+        rejected = !validate_host_callback_plan(f, coherent, &error);
+      }
+      catch (const std::exception &) { rejected = true; }
+    }
+    f.descriptors->polarizations = saved;
+    CHECK(and_to_all(!injected || rejected),
+          "coherent installed-descriptor mutation %d escaped live reconstruction", mutation);
+    CHECK(or_to_all(injected), "installed-descriptor mutation %d was not exercised", mutation);
+  };
+  coherent_descriptor_mutation_rejected(0); // missing
+  coherent_descriptor_mutation_rejected(1); // extra
+  coherent_descriptor_mutation_rejected(2); // reordered
+
+  bool saw_published = false, saw_opaque = false, saw_stateless = false;
+  for (const HostCallbackDescriptor &callback : plan.host_callbacks) {
+    ResolvedHostCallback resolved;
+    CHECK(resolve_host_callback(f, callback, resolved, &error),
+          "live callback failed resolution: %s", error.c_str());
+    saw_published = saw_published || callback.layout_published;
+    saw_opaque = saw_opaque || !callback.layout_published;
+    saw_stateless = saw_stateless || !callback.has_internal_state;
+    CHECK(callback.layout_published || callback.published_internal_refs.empty(),
+          "opaque callback invented portable internal storage");
+  }
+  CHECK(or_to_all(saw_published), "fixture produced no layout-publishing custom callback");
+  CHECK(or_to_all(saw_opaque), "fixture produced no opaque custom callback");
+  CHECK(or_to_all(saw_stateless), "fixture produced no stateless custom callback");
+
+  bool checked_published_storage = false;
+  for (const HostCallbackDescriptor &callback : plan.host_callbacks) {
+    if (!callback.layout_published || callback.published_internal_refs.empty()) continue;
+    const ArrayId id = callback.published_internal_refs.front().id;
+    ArraySpec &spec = StepPlanTestAccess::mutable_catalog_spec(*f.array_catalog, id);
+    const ArraySpec saved = spec;
+    auto rejected_published_mutation = [&]() {
+      ResolvedHostCallback resolved;
+      std::vector<PolarizationDescriptor> rebuilt;
+      const bool resolver_rejected = !resolve_host_callback(f, callback, resolved, &error);
+      bool builder_rejected = false;
+      try { build_polarization_descriptors(f, rebuilt); }
+      catch (const std::exception &) { builder_rejected = true; }
+      return resolver_rejected && builder_rejected;
+    };
+    spec.storage = saved.storage == Precision::f32 ? Precision::f64 : Precision::f32;
+    CHECK(rejected_published_mutation(),
+          "custom published row with wrong storage precision was accepted");
+    spec = saved;
+
+    spec.alignment = saved.alignment + 1;
+    CHECK(rejected_published_mutation(),
+          "custom published row with wrong alignment was accepted");
+    spec = saved;
+
+    spec.role = array_role::scratch;
+    CHECK(rejected_published_mutation(),
+          "custom published row with wrong role was accepted");
+    spec = saved;
+
+    ++spec.elements;
+    CHECK(rejected_published_mutation(),
+          "custom published row with wrong extent was accepted");
+    spec = saved;
+
+    spec.alias_of = ArrayId{id.value ? 0u : uint32_t(f.array_catalog->size() - 1)};
+    CHECK(rejected_published_mutation(),
+          "custom published row with an alias binding was accepted");
+    spec = saved;
+
+    StorageKey &key = StepPlanTestAccess::mutable_catalog_key(*f.array_catalog, id);
+    const StorageKey saved_key = key;
+    ++key.aux;
+    CHECK(rejected_published_mutation(),
+          "custom published row with a wrong storage key was accepted");
+    key = saved_key;
+
+    void *&base = StepPlanTestAccess::mutable_catalog_base(*f.array_catalog, id);
+    void *const saved_base = base;
+    base = static_cast<void *>(static_cast<unsigned char *>(saved_base) + sizeof(realnum));
+    CHECK(rejected_published_mutation(),
+          "custom published row with a stale address was accepted");
+    base = saved_base;
+    checked_published_storage = true;
+    break;
+  }
+  CHECK(or_to_all(checked_published_storage),
+        "custom published storage metadata mutation was not exercised");
+
+  size_t local_native = 0, local_custom = 0;
+  bool e_custom_before_native = false, h_native_before_custom = false;
+  int first_e_custom = std::numeric_limits<int>::max();
+  int first_e_native = std::numeric_limits<int>::max();
+  int first_h_custom = std::numeric_limits<int>::max();
+  int first_h_native = std::numeric_limits<int>::max();
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind == SusceptibilityKind::host_custom) {
+      ++local_custom;
+      if (descriptor.ft == E_stuff) first_e_custom = std::min(first_e_custom, descriptor.state_index);
+      if (descriptor.ft == H_stuff) first_h_custom = std::min(first_h_custom, descriptor.state_index);
+    }
+    else {
+      ++local_native;
+      if (descriptor.ft == E_stuff) first_e_native = std::min(first_e_native, descriptor.state_index);
+      if (descriptor.ft == H_stuff) first_h_native = std::min(first_h_native, descriptor.state_index);
+    }
+  }
+  e_custom_before_native = first_e_custom < first_e_native;
+  h_native_before_custom = first_h_native < first_h_custom;
+  CHECK(or_to_all(local_custom >= 6), "fixture did not retain all derived/stateless custom states");
+  CHECK(or_to_all(local_native >= 2), "fixture lost exact built-in states");
+  CHECK(or_to_all(e_custom_before_native), "custom-before-built-in list order was not exercised");
+  CHECK(or_to_all(h_native_before_custom), "built-in-before-custom list order was not exercised");
+
+  size_t local_sigma_accesses = 0, local_host_halos = 0;
+  size_t local_minus_p_accesses = 0, local_current_w_accesses = 0,
+         local_previous_w_accesses = 0;
+  for (const HostSegment &segment : plan.host_segments) {
+    CHECK(segment.callback_count > 0 &&
+              uint64_t(segment.callback_index) + segment.callback_count <=
+                  plan.host_callbacks.size(),
+          "live host segment has an invalid callback span");
+    if (segment.phase == HostSegmentPhase::constitutive)
+      CHECK(segment.host_halo_plan_count == 0,
+            "constitutive custom segment acquired a polarization halo span");
+    else {
+      CHECK(uint64_t(segment.host_halo_plan_index) + segment.host_halo_plan_count <=
+                plan.host_halo_plans.size(),
+            "live custom segment has an out-of-range logical halo span");
+      for (uint32_t hi = 0; hi < segment.host_halo_plan_count; ++hi) {
+        const HostHaloPlanDescriptor &halo =
+            plan.host_halo_plans[size_t(segment.host_halo_plan_index) + hi];
+        const HaloPlan *resolved = NULL;
+        CHECK(resolve_host_halo_plan(f, halo, resolved, &error),
+              "live logical host halo failed resolution: %s", error.c_str());
+        CHECK(resolved && resolved->storage == HaloStorageDisposition::host_owned,
+              "logical host halo resolved to a non-host-owned plan");
+        CHECK(halo.ft == (segment.ft == E_stuff ? PE_stuff : PH_stuff),
+              "logical host halo has the wrong field family");
+        ++local_host_halos;
+      }
+    }
+    const Operation &marker = plan.operations[segment.operation_index - 1];
+    for (const BufferAccess &access : marker.accesses) {
+      CHECK(is_valid(access.array.id) && access.array.id.value < f.array_catalog->size(),
+            "host marker contains an invalid catalog access");
+      if (!is_valid(access.array.id) || access.array.id.value >= f.array_catalog->size())
+        continue;
+      const ArraySpec &spec = f.array_catalog->spec(access.array.id);
+      const StorageKey &key = f.array_catalog->key(access.array.id);
+      CHECK(!is_valid(spec.alias_of), "host marker access union retained an alias ArrayId");
+      CHECK(access.array.offset == 0 && access.array.elements == spec.elements,
+            "host marker access does not cover a full canonical allocation");
+      if (segment.phase == HostSegmentPhase::constitutive &&
+          key.kind == int(array_kind::f_minus_p)) {
+        CHECK(access.mode == AccessMode::read_write,
+              "host constitutive f-minus-P access is not read-write");
+        ++local_minus_p_accesses;
+      }
+      if (segment.phase == HostSegmentPhase::polarization_and_halo &&
+          (key.kind == int(array_kind::f) || key.kind == int(array_kind::f_w))) {
+        CHECK(access.mode == AccessMode::read_write,
+              "host polarization current-W access is not read-write");
+        ++local_current_w_accesses;
+      }
+      if (segment.phase == HostSegmentPhase::polarization_and_halo &&
+          key.kind == int(array_kind::f_w_prev)) {
+        CHECK(access.mode == AccessMode::read_write,
+              "host polarization previous-W access is not read-write");
+        ++local_previous_w_accesses;
+      }
+    }
+    for (uint32_t ci = 0; ci < segment.callback_count; ++ci) {
+      const HostCallbackDescriptor &callback =
+          plan.host_callbacks[size_t(segment.callback_index) + ci];
+      CHECK(callback.ft == segment.ft, "segment callback field-family mismatch");
+      for (const ArrayRef &ref : callback.published_internal_refs) {
+        const BufferAccess *access = find_access(marker, ref.id);
+        CHECK(access && access->mode == AccessMode::read_write && same_ref(access->array, ref),
+              "host marker omitted a published internal read-write row");
+      }
+      if (segment.phase == HostSegmentPhase::constitutive) {
+        const uint64_t sigma_aux = uint64_t(callback.state_index) * NUM_FIELD_TYPES +
+                                   uint64_t(callback.ft);
+        FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+          const ArrayId sigma = f.array_catalog->find(
+              {callback.chunk, int(array_kind::sigma), int(c), int(d), sigma_aux});
+          if (!is_valid(sigma)) continue;
+          ++local_sigma_accesses;
+          const BufferAccess *access = find_access(marker, sigma);
+          CHECK(access && (access->mode == AccessMode::read ||
+                           access->mode == AccessMode::read_write),
+                "constitutive host marker omitted sigma ArrayId %u", sigma.value);
+        }
+      }
+    }
+  }
+  CHECK(sum_to_all(local_sigma_accesses) > 0,
+        "custom constitutive sigma-access oracle was vacuous");
+  CHECK(sum_to_all(local_minus_p_accesses) > 0,
+        "custom constitutive f-minus-P access oracle was vacuous");
+  CHECK(sum_to_all(local_current_w_accesses) > 0 &&
+            sum_to_all(local_previous_w_accesses) > 0,
+        "custom polarization W/W-prev access oracle was vacuous");
+  CHECK(sum_to_all(local_host_halos) > 0,
+        "custom polarization segment produced no logical host-halo descriptors");
+  CHECK(plan.magnetic_half_step.update_h < plan.operations.size() &&
+            plan.operations[plan.magnetic_half_step.update_h].kind == OpKind::update_eh,
+        "live host marker displaced MagneticHalfStep::update_h");
+
+  bool exercised_halo_order = false, exercised_halo_key = false,
+       exercised_halo_phase = false;
+  if (!plan.host_callbacks.empty()) {
+    const uint64_t signature = plan.signature;
+#define CHECK_CALLBACK_SIGNATURE(expr, message)                                                    \
+    do {                                                                                           \
+      StepPlan changed = plan;                                                                     \
+      expr;                                                                                        \
+      CHECK(compute_step_plan_signature(changed) != signature, message);                           \
+    } while (0)
+    CHECK_CALLBACK_SIGNATURE(++changed.host_callbacks[0].chunk,
+                             "signature ignored callback chunk");
+    CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].ft = D_stuff,
+                             "signature ignored callback field type");
+    CHECK_CALLBACK_SIGNATURE(++changed.host_callbacks[0].state_index,
+                             "signature ignored callback state index");
+    CHECK_CALLBACK_SIGNATURE(++changed.host_callbacks[0].susceptibility_id,
+                             "signature ignored callback susceptibility identity");
+    CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].has_internal_state =
+                                 !changed.host_callbacks[0].has_internal_state,
+                             "signature ignored callback state presence");
+    CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].layout_published =
+                                 !changed.host_callbacks[0].layout_published,
+                             "signature ignored callback layout publication");
+    CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].required_w ^= 1,
+                             "signature ignored callback W requirements");
+    CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].required_w_prev ^= 1,
+                             "signature ignored callback W-prev requirements");
+    CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].needs_halo =
+                                 !changed.host_callbacks[0].needs_halo,
+                             "signature ignored callback halo requirement");
+    if (!plan.host_callbacks[0].published_internal_refs.empty())
+      CHECK_CALLBACK_SIGNATURE(++changed.host_callbacks[0].published_internal_refs[0].id.value,
+                               "signature ignored callback internal ArrayId");
+    if (!plan.host_callbacks[0].published_layout.empty()) {
+      CHECK_CALLBACK_SIGNATURE(changed.host_callbacks[0].published_layout[0].name += "x",
+                               "signature ignored callback layout name");
+      CHECK_CALLBACK_SIGNATURE(++changed.host_callbacks[0].published_layout[0].offset_elements,
+                               "signature ignored callback layout offset");
+    }
+    if (!plan.host_halo_plans.empty()) {
+      CHECK_CALLBACK_SIGNATURE(++changed.host_halo_plans[0].block_elements,
+                               "signature ignored logical host halo metadata");
+      StepPlan bad_halo = plan;
+      ++bad_halo.host_halo_plans[0].block_elements;
+      bad_halo.signature = compute_step_plan_signature(bad_halo);
+      CHECK(!validate_host_callback_plan(f, bad_halo, &error),
+            "re-signed stale logical host halo metadata was accepted");
+
+      for (size_t hi = 0; hi < plan.host_halo_plans.size(); ++hi) {
+        const HostHaloPlanDescriptor &source_halo = plan.host_halo_plans[hi];
+        const bool use_gather = source_halo.gather_keys.size() > 1;
+        const bool use_scatter = source_halo.scatter_keys.size() > 1;
+        if (!exercised_halo_order && (use_gather || use_scatter)) {
+          bad_halo = plan;
+          std::vector<HostHaloKey> &keys = use_gather
+                                               ? bad_halo.host_halo_plans[hi].gather_keys
+                                               : bad_halo.host_halo_plans[hi].scatter_keys;
+          std::swap(keys[0], keys[1]);
+          bad_halo.signature = compute_step_plan_signature(bad_halo);
+          CHECK(!validate_host_callback_plan(f, bad_halo, &error),
+                "re-signed reordered logical host halo was accepted");
+          exercised_halo_order = true;
+        }
+        if (!exercised_halo_key && (!source_halo.gather_keys.empty() ||
+                                    !source_halo.scatter_keys.empty())) {
+          bad_halo = plan;
+          HostHaloKey &key = !bad_halo.host_halo_plans[hi].gather_keys.empty()
+                                 ? bad_halo.host_halo_plans[hi].gather_keys[0]
+                                 : bad_halo.host_halo_plans[hi].scatter_keys[0];
+          ++key.state_index;
+          bad_halo.signature = compute_step_plan_signature(bad_halo);
+          CHECK(!validate_host_callback_plan(f, bad_halo, &error),
+                "re-signed logical host halo key mutation was accepted");
+          exercised_halo_key = true;
+        }
+        if (!exercised_halo_phase && !source_halo.phase_values.empty()) {
+          bad_halo = plan;
+          bad_halo.host_halo_plans[hi].phase_values[0] +=
+              std::complex<realnum>(realnum(0.125), realnum(-0.0625));
+          bad_halo.signature = compute_step_plan_signature(bad_halo);
+          CHECK(!validate_host_callback_plan(f, bad_halo, &error),
+                "re-signed logical host halo phase mutation was accepted");
+          exercised_halo_phase = true;
+        }
+      }
+    }
+#undef CHECK_CALLBACK_SIGNATURE
+
+    StepPlan bad = plan;
+    ++bad.host_callbacks[0].susceptibility_id;
+    bad.signature = compute_step_plan_signature(bad);
+    CHECK(!validate_host_callback_plan(f, bad, &error),
+          "re-signed stale host callback identity was accepted");
+    bad = plan;
+    bad.host_callbacks[0].layout_published = !bad.host_callbacks[0].layout_published;
+    bad.signature = compute_step_plan_signature(bad);
+    CHECK(!validate_host_callback_plan(f, bad, &error),
+          "re-signed host layout mutation was accepted");
+  }
+  CHECK(or_to_all(exercised_halo_order), "logical host halo reorder mutation was vacuous");
+  CHECK(or_to_all(exercised_halo_key), "logical host halo key mutation was vacuous");
+  CHECK(or_to_all(exercised_halo_phase), "logical host halo phase mutation was vacuous");
+
+  const bool exercise_halo_rebuild = or_to_all(!plan.host_halo_plans.empty());
+  if (exercise_halo_rebuild) {
+    const bool has_logical = !plan.host_halo_plans.empty();
+    HostHaloPlanDescriptor logical = {};
+    if (has_logical) logical = plan.host_halo_plans.front();
+    const uint64_t old_generation = f.halos->host_arrays.generation();
+    f.use_bloch(X, 0.17);
+    f.advance(1);
+    CHECK(f.halos->host_arrays.generation() != old_generation,
+          "host halo rebuild did not advance the live generation");
+    if (has_logical) {
+      const HaloPlan *resolved = NULL;
+      CHECK(resolve_host_halo_plan(f, logical, resolved, &error),
+            "pointer-free logical host halo did not resolve after rebuild: %s", error.c_str());
+    }
+  }
+
+  StepPlan cleared = plan;
+  cleared.clear();
+  cleared.clear();
+  CHECK(cleared.host_callbacks.empty() && cleared.host_segments.empty() &&
+            cleared.host_halo_plans.empty(),
+        "StepPlan double-clear retained host callback state");
 }
 
 int main(int argc, char **argv) {
@@ -5714,6 +6283,7 @@ int main(int argc, char **argv) {
   test_host_segment_access_union();
   test_cpu_host_marker_is_noop();
   test_host_segment_schema();
+  test_live_host_callback_plan();
 
   if (failures) {
     master_printf("step_plan: %d FAILURE(S)\n", failures);

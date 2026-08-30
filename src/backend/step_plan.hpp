@@ -38,6 +38,7 @@
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
 #include "backend/descriptors.hpp"
+#include "backend/halo_plan.hpp"
 
 namespace meep {
 
@@ -101,6 +102,26 @@ struct HostSegment {
 
 bool operator==(const HostSegment &a, const HostSegment &b);
 inline bool operator!=(const HostSegment &a, const HostSegment &b) { return !(a == b); }
+
+/* Stable, pointer-free identity for one live PR2 host-owned PE/PH plan.  The
+   current HaloPlan and generation-local HostHaloIds are resolved only when a
+   host segment is entered. */
+struct HostHaloPlanDescriptor {
+  field_type ft;
+  connect_phase phase;
+  chunk_pair chunks;
+  uint32_t sequence_index;
+  size_t block_offset;
+  size_t block_elements;
+  std::vector<HostHaloKey> gather_keys;
+  std::vector<HostHaloKey> scatter_keys;
+  std::vector<std::complex<realnum> > phase_values;
+};
+
+bool operator==(const HostHaloPlanDescriptor &a, const HostHaloPlanDescriptor &b);
+inline bool operator!=(const HostHaloPlanDescriptor &a, const HostHaloPlanDescriptor &b) {
+  return !(a == b);
+}
 
 /* The guard mechanism is recorded in the plan rather than resolved by the
    executor because it determines graph structure in Phase 2: a device_predicate
@@ -727,6 +748,8 @@ struct StepPlan {
   std::vector<uint8_t> cylindrical_zero_near_origin;
   std::vector<Operation> operations;
   std::vector<HostSegment> host_segments;
+  std::vector<HostHaloPlanDescriptor> host_halo_plans;
+  std::vector<HostCallbackDescriptor> host_callbacks;
   std::vector<CurlUpdate> db_updates;
   std::vector<CylindricalRadialPrefix> cylindrical_radial_prefixes;
   std::vector<BfastUpdate> bfast_updates;
@@ -768,6 +791,8 @@ struct StepPlan {
     cylindrical_zero_near_origin.clear();
     operations.clear();
     host_segments.clear();
+    host_halo_plans.clear();
+    host_callbacks.clear();
     db_updates.clear();
     cylindrical_radial_prefixes.clear();
     bfast_updates.clear();
@@ -974,12 +999,23 @@ uint64_t compute_step_plan_signature(const StepPlan &plan);
 std::vector<BufferAccess>
 build_host_segment_access_union(const StepPlan &plan, uint32_t operation_index,
                                 uint32_t operation_count,
-                                const std::vector<BufferAccess> &additional);
+                                const std::vector<BufferAccess> &additional,
+                                const CpuArrayCatalog *catalog = NULL);
 
 /* Structural validation for host_callback markers. This checks only the PR 5
    operation-span contract. PR 6 additionally validates callback identities
    and the bounds of callback spans once that vector exists. */
 bool validate_host_segments(const StepPlan &plan, std::string *error = NULL);
+
+/* Resolve every callback against current live state, then compare the
+   callback/segment representation with an independently rebuilt plan. */
+bool validate_host_callback_plan(fields &f, const StepPlan &plan,
+                                 std::string *error = NULL);
+
+/* Resolve a logical descriptor against the current connectivity generation
+   and validate its complete owned-side host mirror. */
+bool resolve_host_halo_plan(fields &f, const HostHaloPlanDescriptor &descriptor,
+                            const HaloPlan *&resolved, std::string *error = NULL);
 
 /* Recomputed by resident preflight so externally-mutated target topology is
    rejected before phase_material_mix changes current coefficients. */

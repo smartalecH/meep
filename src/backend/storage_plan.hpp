@@ -153,6 +153,7 @@ public:
   size_t total_bytes() const;
 
 private:
+  friend struct StepPlanTestAccess;
   std::vector<ArraySpec> specs_;
   std::vector<void *> bases_;
   std::vector<StorageKey> keys_;

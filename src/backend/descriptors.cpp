@@ -634,6 +634,36 @@ uint64_t polarization_component_bit(component c, int cmp) {
   return uint64_t(1) << (2 * int(c) + cmp);
 }
 
+void *checked_internal_row_address(void *base, size_t offset_elements, size_t elements) {
+  if (!base) throw std::runtime_error("published polarization layout has no backing state");
+  if (elements > std::numeric_limits<size_t>::max() - offset_elements ||
+      offset_elements + elements > std::numeric_limits<size_t>::max() / sizeof(realnum))
+    throw std::overflow_error("published polarization layout byte offset overflow");
+  const uintptr_t begin = reinterpret_cast<uintptr_t>(base);
+  const size_t bytes = offset_elements * sizeof(realnum);
+  if (bytes > std::numeric_limits<uintptr_t>::max() - begin)
+    throw std::overflow_error("published polarization layout address overflow");
+  return reinterpret_cast<void *>(begin + bytes);
+}
+
+void validate_internal_layout_overlap(const std::vector<InternalArrayLayout> &layout) {
+  for (size_t i = 0; i < layout.size(); ++i) {
+    const size_t i_scale = layout[i].element_type == InternalArrayLayout::complex_realnum ? 2 : 1;
+    if (layout[i].elements > std::numeric_limits<size_t>::max() / i_scale ||
+        layout[i].offset_elements >
+            std::numeric_limits<size_t>::max() - layout[i].elements * i_scale)
+      throw std::overflow_error("published polarization layout extent overflow");
+    const size_t i_end = layout[i].offset_elements + layout[i].elements * i_scale;
+    for (size_t j = 0; j < i; ++j) {
+      const size_t j_scale =
+          layout[j].element_type == InternalArrayLayout::complex_realnum ? 2 : 1;
+      const size_t j_end = layout[j].offset_elements + layout[j].elements * j_scale;
+      if (layout[i].offset_elements < j_end && layout[j].offset_elements < i_end)
+        throw std::runtime_error("published polarization layout rows overlap");
+    }
+  }
+}
+
 void build_lorentzian_state_arrays(fields &f, fields_chunk &fc, polarization_state *state,
                                    PolarizationDescriptor &d) {
   const size_t ntot = size_t(fc.gv.ntot());
@@ -887,7 +917,9 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         d.chunk = i;
         d.ft = ft;
         d.state_index = si;
+        d.susceptibility_id = p->s->get_id();
         d.has_internal_state = p->data != NULL;
+        d.layout_published = false;
         d.kind = classify_susceptibility(p->s);
         d.lorentzian = LorentzianParameters{0.0, 0.0, false};
         d.noise_amplitude = 0.0;
@@ -905,8 +937,52 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         /* A susceptibility that does not publish a layout classifies as
            host_custom regardless of what it is -- that is the escape hatch
            that keeps unknown third-party subclasses working. */
-        if (!p->s->internal_layout(d.internal_arrays, fc.gv, p->data))
+        d.layout_published = p->s->internal_layout(d.internal_arrays, fc.gv, p->data);
+        if (!d.layout_published) {
           d.kind = SusceptibilityKind::host_custom;
+          d.internal_arrays.clear();
+        }
+
+        if (d.layout_published) {
+          if (!f.array_catalog)
+            throw std::runtime_error("published polarization layout requires a prepared catalog");
+          if (!p->data && !d.internal_arrays.empty())
+            throw std::runtime_error("stateless polarization published nonempty internal layout");
+          validate_internal_layout_overlap(d.internal_arrays);
+          std::set<uint32_t> ids;
+          for (size_t li = 0; li < d.internal_arrays.size(); ++li) {
+            const InternalArrayLayout &entry = d.internal_arrays[li];
+            if (!entry.name || !entry.elements)
+              throw std::runtime_error("published polarization layout has an invalid row");
+            void *const address =
+                checked_internal_row_address(
+                    p->data, entry.offset_elements,
+                    entry.elements *
+                        (entry.element_type == InternalArrayLayout::complex_realnum ? 2 : 1));
+            ArrayId id = invalid_array();
+            ptrdiff_t offset = 0;
+            if (!f.array_catalog->locate(address, id, offset) || offset != 0 ||
+                !is_valid(id) || id.value >= f.array_catalog->size() ||
+                !ids.insert(id.value).second)
+              throw std::runtime_error("published polarization row lacks a distinct ArrayId");
+            const ArraySpec &spec = f.array_catalog->spec(id);
+            const StorageKey &key = f.array_catalog->key(id);
+            const Precision native_precision =
+                sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+            const ElementType type = entry.element_type == InternalArrayLayout::complex_realnum
+                                         ? ElementType::complex_realnum
+                                         : ElementType::realnum_value;
+            if (key.chunk != i || key.kind != int(array_kind::polarization_internal) ||
+                key.component_ != int(entry.c) || key.cmp != entry.cmp ||
+                key.aux != polarization_storage_aux(ft, si, li) ||
+                spec.role != array_role::polarization || spec.element_type != type ||
+                spec.storage != native_precision || spec.alignment != alignof(realnum) ||
+                spec.elements != entry.elements || is_valid(spec.alias_of) ||
+                f.array_catalog->resolve_untyped(id) != address)
+              throw std::runtime_error("published polarization row has incompatible storage");
+            d.internal_array_refs.push_back(ArrayRef{id, 0, entry.elements});
+          }
+        }
 
         if (d.kind == SusceptibilityKind::lorentzian ||
             d.kind == SusceptibilityKind::noisy_lorentzian) {
@@ -972,6 +1048,143 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         out.push_back(d);
       }
     }
+  }
+}
+
+bool operator==(const PublishedInternalLayout &a, const PublishedInternalLayout &b) {
+  return a.name == b.name && a.element_type == b.element_type &&
+         a.offset_elements == b.offset_elements && a.elements == b.elements && a.c == b.c &&
+         a.cmp == b.cmp;
+}
+
+bool operator==(const HostCallbackDescriptor &a, const HostCallbackDescriptor &b) {
+  if (a.chunk != b.chunk || a.ft != b.ft || a.state_index != b.state_index ||
+      a.susceptibility_id != b.susceptibility_id ||
+      a.has_internal_state != b.has_internal_state || a.layout_published != b.layout_published ||
+      a.required_w != b.required_w || a.required_w_prev != b.required_w_prev ||
+      a.needs_halo != b.needs_halo || a.published_layout != b.published_layout ||
+      a.published_internal_refs.size() != b.published_internal_refs.size())
+    return false;
+  for (size_t i = 0; i < a.published_internal_refs.size(); ++i) {
+    const ArrayRef &x = a.published_internal_refs[i];
+    const ArrayRef &y = b.published_internal_refs[i];
+    if (x.id != y.id || x.offset != y.offset || x.elements != y.elements) return false;
+  }
+  return true;
+}
+
+HostCallbackDescriptor make_host_callback_descriptor(const PolarizationDescriptor &d) {
+  if (d.kind != SusceptibilityKind::host_custom)
+    throw std::invalid_argument("host callback descriptor requires host_custom polarization");
+  HostCallbackDescriptor result;
+  result.chunk = d.chunk;
+  result.ft = d.ft;
+  result.state_index = d.state_index;
+  result.susceptibility_id = d.susceptibility_id;
+  result.has_internal_state = d.has_internal_state;
+  result.layout_published = d.layout_published;
+  result.required_w = d.required_w;
+  result.required_w_prev = d.required_w_prev;
+  result.needs_halo = d.needs_halo;
+  result.published_internal_refs = d.internal_array_refs;
+  for (const InternalArrayLayout &entry : d.internal_arrays) {
+    PublishedInternalLayout row;
+    row.name = entry.name ? entry.name : "";
+    row.element_type = entry.element_type;
+    row.offset_elements = entry.offset_elements;
+    row.elements = entry.elements;
+    row.c = entry.c;
+    row.cmp = entry.cmp;
+    result.published_layout.push_back(row);
+  }
+  return result;
+}
+
+bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
+                           ResolvedHostCallback &resolved, std::string *error) {
+  resolved = ResolvedHostCallback();
+  if (error) error->clear();
+  try {
+    if (descriptor.chunk < 0 || descriptor.chunk >= f.num_chunks ||
+        (descriptor.ft != E_stuff && descriptor.ft != H_stuff))
+      throw std::invalid_argument("host callback has invalid chunk or field type");
+    fields_chunk *fc = f.chunks[descriptor.chunk];
+    if (!fc->is_mine()) throw std::invalid_argument("host callback refers to an unowned chunk");
+    if (descriptor.state_index < 0)
+      throw std::invalid_argument("host callback has negative state index");
+    polarization_state *state = fc->pol[descriptor.ft];
+    for (int i = 0; state && i < descriptor.state_index; ++i) state = state->next;
+    if (!state) throw std::invalid_argument("host callback state index is absent");
+    if (state->s->get_id() != descriptor.susceptibility_id ||
+        classify_susceptibility(state->s) != SusceptibilityKind::host_custom ||
+        (state->data != NULL) != descriptor.has_internal_state)
+      throw std::invalid_argument("host callback live identity changed");
+
+    std::vector<InternalArrayLayout> layout;
+    const bool published = state->s->internal_layout(layout, fc->gv, state->data);
+    if (published != descriptor.layout_published || layout.size() != descriptor.published_layout.size())
+      throw std::invalid_argument("host callback published layout changed");
+    if (descriptor.published_internal_refs.size() != layout.size())
+      throw std::invalid_argument("host callback layout/ref count differs");
+    if (published && !f.array_catalog)
+      throw std::invalid_argument("host callback published layout has no catalog");
+    validate_internal_layout_overlap(layout);
+    std::set<uint32_t> ids;
+    for (size_t li = 0; li < layout.size(); ++li) {
+      const InternalArrayLayout &live = layout[li];
+      PublishedInternalLayout value;
+      value.name = live.name ? live.name : "";
+      value.element_type = live.element_type;
+      value.offset_elements = live.offset_elements;
+      value.elements = live.elements;
+      value.c = live.c;
+      value.cmp = live.cmp;
+      if (value != descriptor.published_layout[li])
+        throw std::invalid_argument("host callback published layout row changed");
+      void *const address =
+          checked_internal_row_address(
+              state->data, live.offset_elements,
+              live.elements *
+                  (live.element_type == InternalArrayLayout::complex_realnum ? 2 : 1));
+      const ArrayRef &ref = descriptor.published_internal_refs[li];
+      if (!is_valid(ref.id) || ref.id.value >= f.array_catalog->size() || ref.offset != 0 ||
+          ref.elements != live.elements || !ids.insert(ref.id.value).second)
+        throw std::invalid_argument("host callback internal reference is invalid");
+      const StorageKey &key = f.array_catalog->key(ref.id);
+      const ArraySpec &spec = f.array_catalog->spec(ref.id);
+      const Precision native_precision =
+          sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+      const ElementType type = live.element_type == InternalArrayLayout::complex_realnum
+                                   ? ElementType::complex_realnum
+                                   : ElementType::realnum_value;
+      if (key.chunk != descriptor.chunk || key.kind != int(array_kind::polarization_internal) ||
+          key.component_ != int(live.c) || key.cmp != live.cmp ||
+          key.aux != polarization_storage_aux(descriptor.ft, descriptor.state_index, li) ||
+          spec.role != array_role::polarization || spec.element_type != type ||
+          spec.storage != native_precision || spec.alignment != alignof(realnum) ||
+          spec.elements != live.elements || is_valid(spec.alias_of) ||
+          f.array_catalog->resolve_untyped(ref.id) != address)
+        throw std::invalid_argument("host callback internal reference is stale");
+    }
+
+    uint64_t required_w = 0;
+    bool needs_halo = false;
+    FOR_COMPONENTS(c) {
+      DOCMP2 if (state->s->needs_P(c, cmp, fc->f))
+        required_w |= polarization_component_bit(c, cmp);
+      if (state->s->needs_W_notowned(c, fc->f)) needs_halo = true;
+    }
+    const uint64_t required_w_prev = state->s->needs_W_prev() ? required_w : 0;
+    if (required_w != descriptor.required_w || required_w_prev != descriptor.required_w_prev ||
+        needs_halo != descriptor.needs_halo)
+      throw std::invalid_argument("host callback field requirements changed");
+    resolved.chunk = fc;
+    resolved.state = state;
+    return true;
+  }
+  catch (const std::exception &e) {
+    if (error) *error = e.what();
+    return false;
   }
 }
 
