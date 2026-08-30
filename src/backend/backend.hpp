@@ -234,9 +234,12 @@ public:
 
   /* Called while the old state and executable are still alive, before a
      storage-layout rebuild or backend replacement can destroy authoritative
-     resident values. Host-authoritative backends may override this as a no-op;
-     the default refuses the rebuild so a future device backend cannot silently
-     discard data merely because it forgot to implement migration. */
+     resident values. Mutable field, N, P, and P_prev rows must be materialized
+     on the host, but immutable host-authored rows such as multilevel GammaInv
+     must not be overwritten by a lower-precision resident round trip.
+     Host-authoritative backends may override this as a no-op; the default
+     refuses the rebuild so a future device backend cannot silently discard
+     data merely because it forgot to implement migration. */
   virtual void prepare_state_rebuild(BackendState &, DirtyMask) {
     throw std::logic_error("backend does not support authority-safe state rebuild");
   }

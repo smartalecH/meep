@@ -148,6 +148,13 @@ void multilevel_susceptibility::init_internal_data(realnum *W[NUM_FIELD_COMPONEN
                                                    const grid_volume &gv, void *data) const {
   multilevel_data *d = (multilevel_data *)data;
   size_t sz_data = d->sz_data;
+  /* Reinitialization is also used by fields::zero_fields/reset.  Release the
+     convenience pointer tables before clearing the blob; otherwise memset
+     loses their addresses and every reset leaks two tables per active row. */
+  FOR_COMPONENTS(c) DOCMP2 {
+    delete[] d->P[c][cmp];
+    delete[] d->P_prev[c][cmp];
+  }
   memset(d, 0, sz_data);
   d->sz_data = sz_data;
   size_t ntot = d->ntot = gv.ntot();
