@@ -358,7 +358,8 @@ private:
    retryable; after enter_callback(), any incomplete exit poisons the backend. */
 class HostCustomFallbackSession {
 public:
-  explicit HostCustomFallbackSession(ExecutionBackend &backend);
+  HostCustomFallbackSession(ExecutionBackend &backend, uint32_t operation_index,
+                            const HostSegment &segment);
   ~HostCustomFallbackSession();
 
   /* Record the exact number of susceptibility virtuals entered by this

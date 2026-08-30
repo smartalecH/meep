@@ -183,6 +183,7 @@ struct lifetime_counts {
   bool omit_custom_last_segment;
   bool undercount_custom_last_segment;
   bool redistribute_custom_callbacks;
+  bool reorder_custom_first_step;
   bool reorder_custom_second_step;
   bool cw_saw_transient_mode;
   bool cw_final_dft_at_entry_time;
@@ -220,7 +221,7 @@ struct lifetime_counts {
         fail_custom_later_before_entry(false), fail_custom_after_entry(false),
         reenter_custom_callback(false), omit_custom_last_segment(false),
         undercount_custom_last_segment(false), redistribute_custom_callbacks(false),
-        reorder_custom_second_step(false),
+        reorder_custom_first_step(false), reorder_custom_second_step(false),
         cw_saw_transient_mode(false),
         cw_final_dft_at_entry_time(false),
         cw_status(CwSolveStatus::converged) {}
@@ -232,14 +233,21 @@ struct tracking_state : BackendState {
   lifetime_counts &counts;
 };
 
+struct tracking_custom_segment {
+  uint32_t operation_index;
+  HostSegment identity;
+  size_t callback_count;
+};
+
 struct tracking_executable : Executable {
-  tracking_executable(lifetime_counts &counts_, const std::vector<size_t> &custom_callbacks_)
-      : counts(counts_), custom_callbacks(custom_callbacks_) {
+  tracking_executable(lifetime_counts &counts_,
+                      const std::vector<tracking_custom_segment> &custom_segments_)
+      : counts(counts_), custom_segments(custom_segments_) {
     ++counts.executables_created;
   }
   ~tracking_executable() override { ++counts.executables_destroyed; }
   lifetime_counts &counts;
-  std::vector<size_t> custom_callbacks;
+  std::vector<tracking_custom_segment> custom_segments;
 };
 
 struct tracking_cw_executable : Executable {
@@ -307,8 +315,10 @@ public:
     for (const PolarizationUpdate &update : plan.polarization_updates)
       if (update.kind == PolarizationUpdateKind::gyrotropic)
         counts.gyrotropic_update_at_compile = true;
-    std::vector<size_t> custom_callbacks;
-    for (const Operation &op : plan.operations) {
+    std::vector<tracking_custom_segment> custom_segments;
+    for (size_t operation_index = 0; operation_index < plan.operations.size();
+         ++operation_index) {
+      const Operation &op = plan.operations[operation_index];
       if (op.kind != OpKind::host_callback || op.descriptor_count != 1 ||
           op.descriptor_index >= plan.host_segments.size())
         continue;
@@ -320,9 +330,10 @@ public:
         if (segment.phase != HostSegmentPhase::constitutive || callback.has_internal_state)
           ++callback_count;
       }
-      custom_callbacks.push_back(callback_count);
+      custom_segments.push_back(tracking_custom_segment{
+          uint32_t(operation_index), segment, callback_count});
     }
-    Executable *result = new tracking_executable(counts, custom_callbacks);
+    Executable *result = new tracking_executable(counts, custom_segments);
     if (counts.corrupt_catalog_after_compile) f.array_catalog->clear();
     return result;
   }
@@ -332,24 +343,26 @@ public:
     if (execute_custom && host_custom_fallback_enabled()) {
       tracking_executable &compiled = static_cast<tracking_executable &>(executable);
       for (int step = 0; step < num_steps; ++step)
-        for (size_t segment = 0; segment < compiled.custom_callbacks.size(); ++segment) {
+        for (size_t segment = 0; segment < compiled.custom_segments.size(); ++segment) {
           if (counts.omit_custom_last_segment &&
-              segment + 1 == compiled.custom_callbacks.size())
+              segment + 1 == compiled.custom_segments.size())
             continue;
-          HostCustomFallbackSession session(*this);
+          const size_t callback_segment =
+              ((counts.reorder_custom_first_step && step == 0) ||
+               (counts.reorder_custom_second_step && step == 1))
+                  ? compiled.custom_segments.size() - segment - 1
+                  : segment;
+          const tracking_custom_segment &actual = compiled.custom_segments[callback_segment];
+          HostCustomFallbackSession session(*this, actual.operation_index, actual.identity);
           if ((counts.fail_custom_before_entry && segment == 0) ||
               (counts.fail_custom_later_before_entry && segment == 1))
             throw std::runtime_error("injected pre-callback host custom failure");
           session.record_download(32);
-          const size_t callback_segment =
-              counts.reorder_custom_second_step && step == 1
-                  ? compiled.custom_callbacks.size() - segment - 1
-                  : segment;
-          size_t callback_count = compiled.custom_callbacks[callback_segment];
+          size_t callback_count = actual.callback_count;
           if (counts.undercount_custom_last_segment &&
-              segment + 1 == compiled.custom_callbacks.size() && callback_count)
+              segment + 1 == compiled.custom_segments.size() && callback_count)
             --callback_count;
-          if (counts.redistribute_custom_callbacks && compiled.custom_callbacks.size() >= 2) {
+          if (counts.redistribute_custom_callbacks && compiled.custom_segments.size() >= 2) {
             if (segment == 0 && callback_count)
               --callback_count;
             else if (segment == 1)
@@ -357,7 +370,7 @@ public:
           }
           session.enter_callback(callback_count);
           if (counts.reenter_custom_callback && segment == 0) {
-            HostCustomFallbackSession nested(*this);
+            HostCustomFallbackSession nested(*this, actual.operation_index, actual.identity);
             (void)nested;
           }
           if (counts.fail_custom_after_entry && segment == 0)
@@ -4236,7 +4249,32 @@ static void test_resident_host_custom_policy_lifecycle() {
   }
 
   /* The concrete staging and transfer recorders precheck both halves of each
-     pair. A byte overflow must not leave its count incremented. */
+     pair. Neither a count nor byte overflow may partially update its peer. */
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    backend_set_host_custom_counter_for_testing(
+        *tracking, HostCustomFallbackCounter::staging_allocations,
+        std::numeric_limits<uint64_t>::max());
+    backend_set_host_custom_counter_for_testing(*tracking,
+                                                HostCustomFallbackCounter::staging_bytes, 17);
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { overflowed = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(overflowed &&
+              stats.staging_allocations == std::numeric_limits<uint64_t>::max() &&
+              stats.staging_bytes == 17 && stats.sessions == 0 &&
+              stats.retryable_failures == 1 && !tracking->is_poisoned(),
+          "staging allocation count overflow changed its paired byte field");
+  }
   {
     grid_volume gv = vol2d(2.0, 2.0, 8.0);
     structure s(gv, unit_epsilon, no_pml(), identity(), 2);
@@ -4276,6 +4314,29 @@ static void test_resident_host_custom_policy_lifecycle() {
     f.backend = tracking;
     f.options = warned_custom_options();
     f.advance(1);
+    const uint64_t bytes_before = tracking->host_custom_fallback_stats().download_bytes;
+    backend_set_host_custom_counter_for_testing(*tracking, HostCustomFallbackCounter::downloads,
+                                                std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::overflow_error &) { overflowed = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(overflowed && stats.downloads == std::numeric_limits<uint64_t>::max() &&
+              stats.download_bytes == bytes_before && stats.callbacks == 4 &&
+              stats.retryable_failures == 1 && !tracking->is_poisoned(),
+          "download count overflow changed its paired byte field");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
     backend_set_host_custom_counter_for_testing(*tracking, HostCustomFallbackCounter::downloads,
                                                 7);
     backend_set_host_custom_counter_for_testing(
@@ -4296,6 +4357,29 @@ static void test_resident_host_custom_policy_lifecycle() {
     CHECK(stats.downloads == 9 && stats.download_bytes == 64 &&
               stats.completed_sessions == 4 && !tracking->is_poisoned(),
           "download accounting overflow was not retryable");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    const uint64_t bytes_before = tracking->host_custom_fallback_stats().upload_bytes;
+    backend_set_host_custom_counter_for_testing(*tracking, HostCustomFallbackCounter::uploads,
+                                                std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::overflow_error &) { overflowed = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(overflowed && stats.uploads == std::numeric_limits<uint64_t>::max() &&
+              stats.upload_bytes == bytes_before && stats.callbacks == 6 &&
+              stats.poisoned_failures == 1 && tracking->is_poisoned(),
+          "upload count overflow changed its paired byte field or escaped poison");
   }
   {
     grid_volume gv = vol2d(2.0, 2.0, 8.0);
@@ -4377,6 +4461,36 @@ static void test_resident_host_custom_policy_lifecycle() {
   };
   expect_schedule_poison("same-total callback redistribution", true, false);
   expect_schedule_poison("second-step callback reorder", false, true);
+
+  /* A stateful-only plan has the same callback count in both segments. The
+     canonical operation/segment identity must still reject either a first-step
+     swap or a swap after one complete step, before charging the bad session. */
+  auto expect_equal_count_reorder = [](const char *label, bool second_step) {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    counts.reorder_custom_first_step = !second_step;
+    counts.reorder_custom_second_step = second_step;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    bool rejected = false;
+    try { f.advance(second_step ? 2 : 1); }
+    catch (const std::logic_error &) { rejected = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    const uint64_t completed_before_reorder = second_step ? 2 : 0;
+    const uint64_t callbacks_before_reorder = second_step ? 4 : 0;
+    CHECK(rejected && tracking->is_poisoned() &&
+              stats.sessions == completed_before_reorder &&
+              stats.completed_sessions == completed_before_reorder &&
+              stats.callbacks == callbacks_before_reorder && stats.poisoned_failures == 1,
+          "%s was accepted or charged before its identity mismatch", label);
+  };
+  expect_equal_count_reorder("equal-count first-step segment reorder", false);
+  expect_equal_count_reorder("equal-count second-step segment reorder", true);
 
   /* A stateless custom susceptibility contributes no constitutive virtual but
      still receives update_P. advance(2) also pins exact per-step multiplication

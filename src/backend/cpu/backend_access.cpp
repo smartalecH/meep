@@ -378,7 +378,9 @@ void ExecutionBackend::note_host_custom_staging_allocation(size_t bytes) {
                        bytes, "staging allocation", "staging byte");
 }
 
-HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend)
+HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend,
+                                                     uint32_t operation_index,
+                                                     const HostSegment &segment)
     : backend_(backend), expected_callback_count_(0), entered_(false), complete_(false) {
   if (!backend_.host_custom_enabled_)
     throw std::logic_error("host custom fallback session is not enabled");
@@ -393,24 +395,26 @@ HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend)
     throw std::logic_error("host custom fallback session exceeds the prepared schedule");
 
   const StepPlan &plan = *backend_.host_custom_dispatch_plan_;
-  size_t operation_index = backend_.host_custom_next_operation_;
-  while (operation_index < plan.operations.size() &&
-         plan.operations[operation_index].kind != OpKind::host_callback)
-    ++operation_index;
-  if (operation_index == plan.operations.size()) {
-    operation_index = 0;
-    while (operation_index < plan.operations.size() &&
-           plan.operations[operation_index].kind != OpKind::host_callback)
-      ++operation_index;
+  size_t expected_operation_index = backend_.host_custom_next_operation_;
+  while (expected_operation_index < plan.operations.size() &&
+         plan.operations[expected_operation_index].kind != OpKind::host_callback)
+    ++expected_operation_index;
+  if (expected_operation_index == plan.operations.size()) {
+    expected_operation_index = 0;
+    while (expected_operation_index < plan.operations.size() &&
+           plan.operations[expected_operation_index].kind != OpKind::host_callback)
+      ++expected_operation_index;
   }
-  if (operation_index == plan.operations.size())
+  if (expected_operation_index == plan.operations.size())
     throw std::logic_error("host custom fallback schedule contains no next host segment");
-  const Operation &op = plan.operations[operation_index];
-  const HostSegment &segment = plan.host_segments[op.descriptor_index];
-  for (uint32_t i = 0; i < segment.callback_count; ++i) {
+  const Operation &expected_op = plan.operations[expected_operation_index];
+  const HostSegment &expected_segment = plan.host_segments[expected_op.descriptor_index];
+  if (operation_index != expected_operation_index || segment != expected_segment)
+    throw std::logic_error("host custom segment identity does not match the prepared schedule");
+  for (uint32_t i = 0; i < expected_segment.callback_count; ++i) {
     const HostCallbackDescriptor &callback =
-        plan.host_callbacks[size_t(segment.callback_index) + i];
-    if (segment.phase != HostSegmentPhase::constitutive || callback.has_internal_state)
+        plan.host_callbacks[size_t(expected_segment.callback_index) + i];
+    if (expected_segment.phase != HostSegmentPhase::constitutive || callback.has_internal_state)
       ++expected_callback_count_;
   }
 
@@ -418,7 +422,7 @@ HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend)
      commits cannot fail after the first callback becomes reachable. */
   ++backend_.host_custom_stats_.sessions;
   ++backend_.host_custom_claimed_sessions_;
-  backend_.host_custom_next_operation_ = operation_index + 1;
+  backend_.host_custom_next_operation_ = expected_operation_index + 1;
   backend_.host_custom_session_active_ = true;
 }
 
