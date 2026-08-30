@@ -234,6 +234,12 @@ __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   target[i] += (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * previous;
 }
 
+template <typename T>
+__global__ void copy_previous_w_kernel(const T *source, T *target, size_t elements) {
+  const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (index < elements) target[index] = source[index];
+}
+
 template <typename T> __global__ void zero_kernel(zero_launch update, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
@@ -479,6 +485,21 @@ void launch_constitutive(const constitutive_launch &update, const stream &execut
     throw std::invalid_argument("NVIDIA constitutive nonlinear state is incomplete");
   if (pml && (!update.target_w || !update.pml.kappa))
     throw std::invalid_argument("NVIDIA constitutive PML state is incomplete");
+#define COPY_PREVIOUS_W(T)                                                                       \
+  do {                                                                                            \
+    if (update.previous_w) {                                                                      \
+      if (!update.previous_w_source || !update.previous_w_elements)                               \
+        throw std::invalid_argument("NVIDIA constitutive previous-W state is incomplete");      \
+      unsigned int copy_blocks = 0, copy_threads = 0;                                             \
+      linear_launch_geometry(update.previous_w_elements, copy_blocks, copy_threads);              \
+      copy_previous_w_kernel<T>                                                                   \
+          <<<copy_blocks, copy_threads, 0,                                                        \
+             static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(                      \
+              static_cast<const T *>(update.previous_w_source),                                  \
+              static_cast<T *>(update.previous_w), update.previous_w_elements);                   \
+      check_cuda(cudaPeekAtLastError(), "launch NVIDIA constitutive previous-W copy");           \
+    }                                                                                             \
+  } while (0)
 #define LAUNCH_CONSTITUTIVE(T, P, O, N) \
   launch_constitutive_t<T, P, O, N>(update, execution_stream)
 #define DISPATCH_CONSTITUTIVE(T)                                                                  \
@@ -506,10 +527,17 @@ void launch_constitutive(const constitutive_launch &update, const stream &execut
                   : LAUNCH_CONSTITUTIVE(T, false, 0, false);                                      \
     }                                                                                             \
   } while (0)
-  if (update.precision == scalar_precision::f32)
+  if (update.precision == scalar_precision::f32) {
+    COPY_PREVIOUS_W(float);
     DISPATCH_CONSTITUTIVE(float);
-  else
+  }
+  else if (update.precision == scalar_precision::f64) {
+    COPY_PREVIOUS_W(double);
     DISPATCH_CONSTITUTIVE(double);
+  }
+  else
+    throw std::invalid_argument("NVIDIA constitutive launch has invalid precision");
+#undef COPY_PREVIOUS_W
 #undef DISPATCH_CONSTITUTIVE
 #undef LAUNCH_CONSTITUTIVE
 }

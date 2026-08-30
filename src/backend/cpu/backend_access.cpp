@@ -250,9 +250,11 @@ std::string validate_multilevel_plan(const fields &f, const StepPlan &plan,
 
   std::vector<const Operation *> installed_ops, canonical_ops;
   for (const Operation &op : plan.operations)
-    if (op.kind == OpKind::update_polarization) installed_ops.push_back(&op);
+    if (op.kind == OpKind::update_polarization || op.kind == OpKind::update_eh)
+      installed_ops.push_back(&op);
   for (const Operation &op : canonical.operations)
-    if (op.kind == OpKind::update_polarization) canonical_ops.push_back(&op);
+    if (op.kind == OpKind::update_polarization || op.kind == OpKind::update_eh)
+      canonical_ops.push_back(&op);
   if (plan.coordinate_generation != canonical.coordinate_generation)
     return "installed multilevel coordinate generation is not canonical";
   if (plan.polarization_updates != canonical.polarization_updates)
@@ -273,7 +275,7 @@ std::string validate_multilevel_plan(const fields &f, const StepPlan &plan,
     return "installed multilevel polarization operation count is not canonical";
   for (size_t i = 0; i < installed_ops.size(); ++i)
     if (!same_polarization_operation(*installed_ops[i], *canonical_ops[i]))
-      return "installed multilevel polarization operation is not canonical";
+      return "installed multilevel polarization/subtraction operation is not canonical";
   return std::string();
 }
 

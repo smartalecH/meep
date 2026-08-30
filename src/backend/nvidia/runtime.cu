@@ -211,6 +211,13 @@ device_properties properties_for_device(int device) {
   return result;
 }
 
+size_t free_memory_for_device(int device) {
+  device_scope scope(device);
+  size_t free_bytes = 0, total_bytes = 0;
+  check(cudaMemGetInfo(&free_bytes, &total_bytes), "cudaMemGetInfo");
+  return free_bytes;
+}
+
 int runtime_version() {
   int version = 0;
   check(cudaRuntimeGetVersion(&version), "cudaRuntimeGetVersion");

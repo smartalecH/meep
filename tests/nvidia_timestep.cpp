@@ -12,11 +12,13 @@
 #include <string.h>
 
 #include <algorithm>
+#include <map>
 #include <memory>
 #include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <meep.hpp>
@@ -140,10 +142,28 @@ static void test_polarization_coefficient_rounding() {
 #endif
 }
 
+static void test_polarization_storage_key_encoding() {
+  const uint64_t electric = polarization_storage_aux(E_stuff, 7, 1025);
+  const uint64_t magnetic = polarization_storage_aux(H_stuff, 7, 1025);
+  const uint64_t later = polarization_storage_aux(E_stuff, 8, 1);
+  require(electric != magnetic && electric != later && magnetic != later,
+          "polarization storage keys collide across field families or state ordinals");
+  require(polarization_storage_field_type(electric) == E_stuff &&
+              polarization_storage_field_type(magnetic) == H_stuff &&
+              polarization_storage_state_index(electric) == 7 &&
+              polarization_storage_state_index(magnetic) == 7 &&
+              polarization_storage_state_index(later) == 8 &&
+              polarization_storage_layout_ordinal(electric) == 1025 &&
+              polarization_storage_layout_ordinal(magnetic) == 1025 &&
+              polarization_storage_layout_ordinal(later) == 1,
+          "polarization storage key decoding lost field, state, or 32-bit layout ordinal");
+}
+
 static double isotropic_eps(const vec &p) { return p.x() < 0.0 ? 2.0 : 3.0; }
 static double uniform_conductivity(const vec &) { return 0.17; }
 static double phase_target_conductivity(const vec &) { return 0.29; }
 static double unit_value(const vec &) { return 1.0; }
+static double zero_value(const vec &) { return 0.0; }
 static double chi2_value(const vec &) { return 0.03125; }
 static double chi3_value(const vec &) { return 0.0625; }
 
@@ -201,6 +221,16 @@ public:
   susceptibility *clone() const override { return new inherited_noisy_lorentzian(*this); }
 };
 
+class inherited_multilevel : public multilevel_susceptibility {
+public:
+  inherited_multilevel(int levels, int transitions, const realnum *Gamma, const realnum *N0,
+                       const realnum *alpha, const realnum *omega, const realnum *gamma,
+                       const realnum *sigmat)
+      : multilevel_susceptibility(levels, transitions, Gamma, N0, alpha, omega, gamma,
+                                  sigmat) {}
+  susceptibility *clone() const override { return new inherited_multilevel(*this); }
+};
+
 static realnum initial_value(size_t array, size_t element) {
   return realnum(0.02 * sin(double(17 * array + element)) +
                  0.01 * cos(double(3 * array + 5 * element)));
@@ -243,6 +273,32 @@ static void initialize_fields(fields &cpu, fields &gpu, bool f32, double scale =
   }
 }
 
+static void initialize_multilevel_fields(fields &cpu, fields &gpu, bool f32,
+                                         double scale = 1.0) {
+  require(cpu.array_catalog->size() == gpu.array_catalog->size(),
+          "CPU and NVIDIA multilevel catalogs have different sizes");
+  for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &cpu_spec = cpu.array_catalog->spec(id);
+    const StorageKey &key = cpu.array_catalog->key(id);
+    const bool gamma_inv =
+        key.kind == int(array_kind::polarization_internal) &&
+        polarization_storage_layout_ordinal(key.aux) == 0;
+    if (is_valid(cpu_spec.alias_of) || gamma_inv ||
+        (cpu_spec.role != array_role::field && cpu_spec.role != array_role::polarization) ||
+        cpu_spec.element_type != ElementType::realnum_value)
+      continue;
+    std::vector<realnum> values(cpu_spec.elements);
+    for (size_t j = 0; j < values.size(); ++j) {
+      values[j] = realnum(scale * initial_value(i, j));
+      if (f32) values[j] = realnum(float(values[j]));
+    }
+    memcpy(cpu.array_catalog->resolve_untyped(id), values.data(), values.size() * sizeof(realnum));
+    gpu.backend->write(ArrayRef{id, 0, values.size()}, values.data(),
+                       values.size() * sizeof(realnum));
+  }
+}
+
 static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
   for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
     const ArrayId id{uint32_t(i)};
@@ -261,9 +317,10 @@ static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
       if (error > tolerance * scale) {
         const StorageKey &key = cpu.array_catalog->key(id);
         fprintf(stderr,
-                "array %zu (%s,c=%d,cmp=%d,aux=%d) element %zu differs: cpu=%.17g "
+                "array %zu (%s,c=%d,cmp=%d,aux=%llu) element %zu differs: cpu=%.17g "
                 "nvidia=%.17g error=%.3g tol=%.3g\n",
-                i, array_kind_name(array_kind(key.kind)), key.component_, key.cmp, key.aux, j,
+                i, array_kind_name(array_kind(key.kind)), key.component_, key.cmp,
+                static_cast<unsigned long long>(key.aux), j,
                 double(expected[j]), double(observed[j]), error, tolerance * scale);
         meep::abort("NVIDIA timestep differs from CPU");
       }
@@ -303,9 +360,10 @@ static void compare_live_fields_by_key(fields &cpu, fields &gpu, double toleranc
       const double scale = 1.0 + fabs(double(expected[j]));
       if (error > tolerance * scale) {
         fprintf(stderr,
-                "live array (%s,c=%d,cmp=%d,aux=%d) element %zu differs: cpu=%.17g "
+                "live array (%s,c=%d,cmp=%d,aux=%llu) element %zu differs: cpu=%.17g "
                 "nvidia=%.17g error=%.3g tol=%.3g\n",
-                array_kind_name(array_kind(key.kind)), key.component_, key.cmp, key.aux, j,
+                array_kind_name(array_kind(key.kind)), key.component_, key.cmp,
+                static_cast<unsigned long long>(key.aux), j,
                 double(expected[j]), double(observed[j]), error, tolerance * scale);
         meep::abort("NVIDIA live timestep state differs from CPU");
       }
@@ -366,9 +424,10 @@ static void compare_material_rows(fields &cpu, fields &gpu, double tolerance) {
       const double scale = 1.0 + fabs(double(expected[j]));
       if (error > tolerance * scale) {
         fprintf(stderr,
-                "material row (%s,c=%d,aux=%d) element %zu differs: cpu=%.17g "
+                "material row (%s,c=%d,aux=%llu) element %zu differs: cpu=%.17g "
                 "nvidia=%.17g error=%.3g tol=%.3g\n",
-                array_kind_name(kind), key.component_, key.aux, j, double(expected[j]),
+                array_kind_name(kind), key.component_,
+                static_cast<unsigned long long>(key.aux), j, double(expected[j]),
                 double(observed[j]), error, tolerance * scale);
         meep::abort("NVIDIA material phase differs from CPU");
       }
@@ -3179,6 +3238,610 @@ static void run_gyrotropic_case(const char *name, precision_policy_kind policy, 
                 precision_policy_name(policy));
 }
 
+static void add_multilevel_test_medium(structure &s, field_type ft, bool large) {
+  const realnum gamma3[] = {realnum(0.02), realnum(-0.01), realnum(0.0),
+                            realnum(-0.005), realnum(0.03), realnum(-0.004),
+                            realnum(0.0), realnum(-0.006), realnum(0.025)};
+  const realnum n03[] = {realnum(0.7), realnum(0.2), realnum(0.1)};
+  const realnum alpha3[] = {realnum(-0.4), realnum(0.0), realnum(0.4),
+                            realnum(-0.3), realnum(0.0), realnum(0.3)};
+  const realnum omega2[] = {realnum(0.43), realnum(0.71)};
+  const realnum damping2[] = {realnum(0.035), realnum(0.057)};
+  const realnum sigmat2[] = {realnum(0.8), realnum(0.9), realnum(1.0), realnum(1.1),
+                             realnum(1.2), realnum(0.6), realnum(0.7), realnum(0.85),
+                             realnum(0.95), realnum(1.05)};
+  const realnum gamma2[] = {realnum(0.02), realnum(-0.01), realnum(-0.005), realnum(0.03)};
+  const realnum n02[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha2[] = {realnum(-0.4), realnum(0.4)};
+  const realnum omega1[] = {realnum(0.53)};
+  const realnum damping1[] = {realnum(0.045)};
+  const realnum sigmat1[] = {realnum(0.75), realnum(0.85), realnum(0.95), realnum(1.05),
+                             realnum(1.15)};
+  if (large) {
+    multilevel_susceptibility susceptibility(3, 2, gamma3, n03, alpha3, omega2, damping2,
+                                             sigmat2);
+    s.add_susceptibility(unit_value, ft, susceptibility);
+  }
+  else {
+    multilevel_susceptibility susceptibility(2, 1, gamma2, n02, alpha2, omega1, damping1,
+                                             sigmat1);
+    s.add_susceptibility(unit_value, ft, susceptibility);
+  }
+}
+
+static void run_multilevel_case(const char *name, precision_policy_kind policy,
+                                const grid_volume &gv, bool real_fields, bool magnetic,
+                                bool large) {
+  std::unique_ptr<structure> cpu_structure(
+      new structure(gv, isotropic_eps, no_pml(), identity(), 2));
+  std::unique_ptr<structure> gpu_structure(
+      new structure(gv, isotropic_eps, no_pml(), identity(), 2));
+  const field_type ft = magnetic ? H_stuff : E_stuff;
+  add_multilevel_test_medium(*cpu_structure, ft, large);
+  add_multilevel_test_medium(*gpu_structure, ft, large);
+
+  fields cpu(cpu_structure.get());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(gpu_structure.get(), options);
+  if (real_fields) {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  else {
+    const vec bloch = gv.dim == D3 ? vec(0.09, -0.07, 0.05) : vec(0.09, -0.07);
+    cpu.use_bloch(bloch);
+    gpu.use_bloch(bloch);
+  }
+  const component components[] = {magnetic ? Hx : Ex, magnetic ? Hy : Ey,
+                                  magnetic ? Hz : Ez};
+  const size_t component_count = gv.dim == D1 ? 1 : 3;
+  for (size_t i = 0; i < component_count; ++i) {
+    const component c = components[i];
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_multilevel_fields(cpu, gpu, narrowed, 0.002);
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 1e-8;
+  const int checkpoints[] = {1, 2, 20};
+  int previous = 0;
+  for (int checkpoint : checkpoints) {
+    const int delta = checkpoint - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoint;
+  }
+  master_printf("nvidia_timestep: multilevel-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void run_multilevel_multitile_pml_case(precision_policy_kind policy) {
+  const grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  const boundary_region boundaries = pml(0.45, X) + pml(0.45, Y);
+  linear_anisotropic_material cpu_material(true), gpu_material(true);
+  std::unique_ptr<structure> cpu_structure(
+      new structure(gv, cpu_material, boundaries, identity(), 1));
+  std::unique_ptr<structure> gpu_structure(
+      new structure(gv, gpu_material, boundaries, identity(), 1));
+  add_multilevel_test_medium(*cpu_structure, E_stuff, true);
+  add_multilevel_test_medium(*gpu_structure, E_stuff, true);
+
+  fields cpu(cpu_structure.get(), 0, 0, true, 0, 4);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(gpu_structure.get(), options, 0, 0, true, 0, 4);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  const component components[] = {Ex, Ey, Ez};
+  for (component c : components) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+
+  const StepPlan prepared = build_step_plan(gpu, StepProgram::ordinary);
+  std::map<std::tuple<int, int, int>, size_t> tile_counts;
+  std::map<uint32_t, size_t> previous_copy_counts;
+  bool multitile = false;
+  for (const ConstitutiveUpdate &update : prepared.eh_updates) {
+    const std::tuple<int, int, int> identity(update.region.chunk, int(update.region.c),
+                                             update.region.cmp);
+    multitile = multitile || ++tile_counts[identity] > 1;
+    const bool copy =
+        (update.region.variant_key & constitutive_copy_w_previous) != 0;
+    require(copy == is_valid(update.previous_w),
+            "NVIDIA multilevel multi-tile previous-W operand and copy bit disagree");
+    if (copy) ++previous_copy_counts[update.previous_w.value];
+  }
+  bool owns_previous = false;
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    if (gpu.array_catalog->key(id).kind != int(array_kind::f_w_prev)) continue;
+    owns_previous = true;
+    require(previous_copy_counts[id.value] == 1,
+            "NVIDIA multilevel multi-tile plan did not copy f_w_prev exactly once");
+  }
+  require(multitile && owns_previous,
+          "NVIDIA multilevel PML fixture did not produce multi-tile previous-W storage");
+
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_multilevel_fields(cpu, gpu, narrowed, 0.002);
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 3e-8;
+  const int checkpoints[] = {1, 2, 12};
+  int previous = 0;
+  double maximum_relative = 0.0, maximum_absolute = 0.0;
+  for (int checkpoint : checkpoints) {
+    const int delta = checkpoint - previous;
+    cpu.advance(delta);
+    gpu.advance(delta);
+    size_t array = 0, element = 0;
+    double absolute = 0.0;
+    maximum_relative = std::max(maximum_relative,
+                                max_field_difference(cpu, gpu, array, element, absolute));
+    maximum_absolute = std::max(maximum_absolute, absolute);
+    if (checkpoint == 1 && sizeof(realnum) == sizeof(double) && !narrowed) {
+      bool checked_previous = false;
+      for (size_t i = 0; i < cpu.array_catalog->size(); ++i) {
+        const ArrayId id{uint32_t(i)};
+        const ArraySpec &spec = cpu.array_catalog->spec(id);
+        if (cpu.array_catalog->key(id).kind != int(array_kind::f_w_prev) ||
+            is_valid(spec.alias_of) || spec.element_type != ElementType::realnum_value)
+          continue;
+        checked_previous = true;
+        const realnum *expected = cpu.array_catalog->resolve<realnum>(id);
+        std::vector<realnum> observed(spec.elements);
+        gpu.backend->read(ArrayRef{id, 0, spec.elements}, observed.data(),
+                          observed.size() * sizeof(realnum));
+        for (size_t j = 0; j < observed.size(); ++j)
+          require(fabs(double(observed[j]) - double(expected[j])) <=
+                      1e-13 * (1.0 + fabs(double(expected[j]))),
+                  "NVIDIA multilevel first-step f_w_prev copy differs from CPU");
+      }
+      require(checked_previous,
+              "NVIDIA multilevel first-step oracle found no f_w_prev storage");
+    }
+    compare_fields(cpu, gpu, tolerance);
+    previous = checkpoint;
+  }
+  master_printf("nvidia_timestep: multilevel-multitile-pml/%s PASS "
+                "(max relative %.3g, absolute %.3g)\n",
+                precision_policy_name(policy), maximum_relative, maximum_absolute);
+}
+
+static void test_multilevel_backend_reselection() {
+  const grid_volume gv = vol2d(2.4, 2.0, 7.0);
+  structure reference_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  structure migrating_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  add_multilevel_test_medium(reference_structure, E_stuff, true);
+  add_multilevel_test_medium(migrating_structure, E_stuff, true);
+  fields reference(&reference_structure);
+  fields migrating(&migrating_structure);
+  reference.use_real_fields();
+  migrating.use_real_fields();
+  const component components[] = {Ex, Ey, Ez};
+  for (component c : components) {
+    reference.require_component(c);
+    migrating.require_component(c);
+  }
+  gaussian_src_time reference_source(0.31, 0.14), migrating_source(0.31, 0.14);
+  reference.add_point_source(Ez, reference_source, vec(0.21, 0.17), 0.23);
+  migrating.add_point_source(Ez, migrating_source, vec(0.21, 0.17), 0.23);
+  reference.advance(2);
+  migrating.advance(2);
+
+  execution_options nvidia_options;
+  nvidia_options.backend = backend_kind::nvidia;
+  nvidia_options.precision = precision_policy_kind::native;
+  migrating.select_backend(nvidia_options);
+  migrating.init_backend();
+  compare_fields(reference, migrating, 0.0);
+  reference.advance(1);
+  migrating.advance(1);
+  compare_fields(reference, migrating, sizeof(realnum) == sizeof(float) ? 8e-5 : 3e-8);
+  require(migrating.backend_state && migrating.executable && !migrating.backend->is_poisoned(),
+          "multilevel CPU-to-NVIDIA selection did not publish a usable resident epoch");
+
+  execution_options cpu_options;
+  migrating.select_backend(cpu_options);
+  compare_fields(reference, migrating, sizeof(realnum) == sizeof(float) ? 8e-5 : 3e-8);
+  reference.advance(1);
+  migrating.advance(1);
+  compare_fields(reference, migrating, sizeof(realnum) == sizeof(float) ? 8e-5 : 3e-8);
+
+  migrating.select_backend(nvidia_options);
+  migrating.init_backend();
+  compare_fields(reference, migrating, sizeof(realnum) == sizeof(float) ? 8e-5 : 3e-8);
+  reference.advance(1);
+  migrating.advance(1);
+  compare_fields(reference, migrating, sizeof(realnum) == sizeof(float) ? 8e-5 : 3e-8);
+  require(migrating.backend_state && migrating.executable && !migrating.backend->is_poisoned(),
+          "multilevel NVIDIA re-selection did not restore a usable resident epoch");
+  master_printf("nvidia_timestep: multilevel backend reselection PASS\n");
+}
+
+static void test_multilevel_gamma_inv_host_authority() {
+  if (sizeof(realnum) != sizeof(double)) return;
+  const precision_policy_kind policies[] = {precision_policy_kind::mixed,
+                                            precision_policy_kind::f32};
+  for (precision_policy_kind policy : policies) {
+    const grid_volume gv = vol2d(2.4, 2.0, 7.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+    add_multilevel_test_medium(s, E_stuff, true);
+    fields f(&s);
+    f.use_real_fields();
+    f.require_component(Ex);
+    f.require_component(Ey);
+    f.require_component(Ez);
+    f.advance(1);
+    build_storage_catalog(f, *f.array_catalog, *f.storage_plan);
+
+    std::vector<StorageKey> keys;
+    std::vector<std::vector<realnum> > authoritative;
+    for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+      const ArrayId id{uint32_t(i)};
+      const ArraySpec &spec = f.array_catalog->spec(id);
+      const StorageKey &key = f.array_catalog->key(id);
+      if (key.kind != int(array_kind::polarization_internal) ||
+          key.component_ != int(Centered) || key.cmp != -1 ||
+          polarization_storage_layout_ordinal(key.aux) != 0 ||
+          is_valid(spec.alias_of))
+        continue;
+      keys.push_back(key);
+      authoritative.push_back(std::vector<realnum>(spec.elements));
+      memcpy(authoritative.back().data(), f.array_catalog->resolve_untyped(id),
+             spec.elements * sizeof(realnum));
+    }
+    require(!keys.empty(), "multilevel GammaInv authority fixture has no host matrix");
+
+    execution_options nvidia_options;
+    nvidia_options.backend = backend_kind::nvidia;
+    nvidia_options.precision = policy;
+    f.select_backend(nvidia_options);
+    f.init_backend();
+    bool observed_narrowing = false;
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const ArrayId id = f.array_catalog->find(keys[i]);
+      require(is_valid(id), "NVIDIA multilevel migration lost GammaInv storage");
+      std::vector<realnum> resident(authoritative[i].size());
+      f.backend->read(ArrayRef{id, 0, resident.size()}, resident.data(),
+                      resident.size() * sizeof(realnum));
+      observed_narrowing = observed_narrowing ||
+                           memcmp(resident.data(), authoritative[i].data(),
+                                  resident.size() * sizeof(realnum)) != 0;
+    }
+    require(observed_narrowing,
+            "multilevel GammaInv authority fixture did not exercise narrowed storage");
+    f.advance(1);
+
+    execution_options cpu_options;
+    f.select_backend(cpu_options);
+    for (size_t i = 0; i < keys.size(); ++i) {
+      const ArrayId id = f.array_catalog->find(keys[i]);
+      require(is_valid(id), "multilevel CPU migration lost GammaInv storage");
+      const ArraySpec &spec = f.array_catalog->spec(id);
+      require(spec.elements == authoritative[i].size() &&
+                  memcmp(f.array_catalog->resolve_untyped(id), authoritative[i].data(),
+                         spec.elements * sizeof(realnum)) == 0,
+              "narrowed NVIDIA GammaInv overwrote host-authoritative coefficients");
+    }
+  }
+  master_printf("nvidia_timestep: multilevel GammaInv host authority PASS\n");
+}
+
+static void test_multilevel_zero_row() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  std::unique_ptr<structure> cpu_structure(
+      new structure(gv, isotropic_eps, no_pml(), identity(), 1));
+  std::unique_ptr<structure> gpu_structure(
+      new structure(gv, isotropic_eps, no_pml(), identity(), 1));
+  const realnum gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum omega[] = {realnum(0.63)};
+  const realnum damping[] = {realnum(0.04)};
+  const realnum sigmat[] = {1, 1, 1, 1, 1};
+  multilevel_susceptibility cpu_multilevel(2, 1, gamma, n0, alpha, omega, damping, sigmat);
+  multilevel_susceptibility gpu_multilevel(2, 1, gamma, n0, alpha, omega, damping, sigmat);
+  cpu_structure->add_susceptibility(zero_value, E_stuff, cpu_multilevel);
+  gpu_structure->add_susceptibility(zero_value, E_stuff, gpu_multilevel);
+  fields cpu(cpu_structure.get());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(gpu_structure.get(), options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  cpu.require_component(Ez);
+  gpu.require_component(Ez);
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+  initialize_multilevel_fields(cpu, gpu, false, 0.002);
+  cpu.advance(2);
+  gpu.advance(2);
+  require(gpu.step_plans[0] && gpu.step_plans[0]->multilevel_population_updates.size() == 1 &&
+              gpu.step_plans[0]->multilevel_population_terms.empty() &&
+              gpu.step_plans[0]->multilevel_transition_updates.empty(),
+          "NVIDIA multilevel zero-row fixture did not retain population-only evolution");
+  compare_fields(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 2e-12);
+  master_printf("nvidia_timestep: multilevel-zero-row PASS\n");
+}
+
+static void test_multilevel_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  add_multilevel_test_medium(s, E_stuff, true);
+  lorentzian_susceptibility ordinary(0.73, 0.06, false);
+  s.add_susceptibility(unit_value, E_stuff, ordinary);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ex);
+  gpu.require_component(Ey);
+  gpu.require_component(Ez);
+  gpu.advance(1);
+  require(gpu.step_plans[0] && gpu.backend_state && gpu.executable,
+          "NVIDIA multilevel rejection fixture did not publish an executable");
+  const StepPlan baseline = *gpu.step_plans[0];
+  BackendState *const state = gpu.backend_state;
+  Executable *const executable = gpu.executable;
+  const nvidia::memory_accounting memory = nvidia::current_memory_accounting();
+  require(!baseline.multilevel_population_updates.empty() &&
+              baseline.multilevel_population_terms.size() >= 2 &&
+              baseline.multilevel_transition_updates.size() >= 2 &&
+              !baseline.polarization_groups.empty() &&
+              !baseline.polarization_subtractions.empty(),
+          "NVIDIA multilevel rejection fixture lacks canonical rows");
+  size_t multilevel_group_index = baseline.polarization_groups.size();
+  for (size_t i = 0; i < baseline.polarization_groups.size(); ++i)
+    if (baseline.polarization_groups[i].kind == PolarizationGroupKind::multilevel) {
+      multilevel_group_index = i;
+      break;
+    }
+  require(multilevel_group_index < baseline.polarization_groups.size(),
+          "NVIDIA multilevel rejection fixture has no multilevel group");
+
+  StepPlan malformed = baseline;
+  ++malformed.multilevel_population_updates[0].levels;
+  expect_compile_rejected(gpu, malformed, "population rows differ");
+  malformed = baseline;
+  malformed.multilevel_population_updates[0].gamma_inv =
+      malformed.multilevel_population_updates[0].populations;
+  expect_compile_rejected(gpu, malformed, "population rows differ");
+  malformed = baseline;
+  std::swap(malformed.multilevel_population_terms[0],
+            malformed.multilevel_population_terms[1]);
+  expect_compile_rejected(gpu, malformed, "population terms differ");
+  malformed = baseline;
+  malformed.multilevel_transition_updates[0].p =
+      malformed.multilevel_transition_updates[0].p_prev;
+  expect_compile_rejected(gpu, malformed, "transition rows differ");
+  malformed = baseline;
+  --malformed.polarization_groups[multilevel_group_index].transition_count;
+  expect_compile_rejected(gpu, malformed, "polarization groups differ");
+  malformed = baseline;
+  for (PolarizationUpdateGroup &group : malformed.polarization_groups)
+    if (group.kind == PolarizationGroupKind::multilevel)
+      group.kind = PolarizationGroupKind::recurrence;
+  malformed.multilevel_population_updates.clear();
+  malformed.multilevel_population_terms.clear();
+  malformed.multilevel_transition_updates.clear();
+  malformed.multilevel_coefficients.clear();
+  expect_compile_rejected(gpu, malformed, "polarization groups differ");
+  PolarizationDescriptor *installed_multilevel = NULL, *installed_lorentz = NULL;
+  for (PolarizationDescriptor &descriptor : gpu.descriptors->polarizations)
+    if (descriptor.kind == SusceptibilityKind::multilevel) {
+      installed_multilevel = &descriptor;
+    }
+    else if (descriptor.kind == SusceptibilityKind::lorentzian)
+      installed_lorentz = &descriptor;
+  require(installed_multilevel && installed_lorentz,
+          "NVIDIA multilevel rejection fixture lacks a supported replacement descriptor");
+  const PolarizationDescriptor saved_multilevel = *installed_multilevel;
+  *installed_multilevel = *installed_lorentz;
+  expect_compile_rejected(gpu, malformed, "descriptors differ from live exact states");
+  *installed_multilevel = saved_multilevel;
+  malformed = baseline;
+  malformed.polarization_subtractions[0].transition_index = 7;
+  expect_compile_rejected(gpu, malformed, "subtraction rows differ");
+  malformed = baseline;
+  for (Operation &op : malformed.operations)
+    if ((op.kind == OpKind::update_polarization || op.kind == OpKind::update_eh) &&
+        !op.accesses.empty()) {
+      op.accesses[0].mode = AccessMode::write;
+      break;
+    }
+  expect_compile_rejected(gpu, malformed, "operation span or access set");
+
+  const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+  require(gpu.backend_state == state && gpu.executable == executable &&
+              !gpu.backend->is_poisoned() &&
+              memory.device_bytes_current == after.device_bytes_current &&
+              memory.pinned_bytes_current == after.pinned_bytes_current,
+          "rejected NVIDIA multilevel compile mutated the live epoch");
+  master_printf("nvidia_timestep: multilevel compile rejections PASS\n");
+}
+
+static void test_multilevel_lifecycle() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  add_multilevel_test_medium(s, E_stuff, true);
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ex);
+  gpu.require_component(Ey);
+  gpu.require_component(Ez);
+  gpu.advance(1);
+  BackendState *const state = gpu.backend_state;
+  Executable *const executable = gpu.executable;
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_transfer_accounting();
+  gpu.advance(1);
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  require(gpu.backend_state == state && gpu.executable == executable &&
+              transfers.host_to_device_calls == 0 && transfers.device_to_host_calls == 0 &&
+              memory_before.device_bytes_current == memory_after.device_bytes_current &&
+              memory_before.pinned_bytes_current == memory_after.pinned_bytes_current,
+          "NVIDIA multilevel steady step allocated, transferred, or rebuilt");
+
+  structure retry_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  add_multilevel_test_medium(retry_structure, E_stuff, true);
+  fields retry(&retry_structure, options);
+  retry.use_real_fields();
+  retry.require_component(Ex);
+  retry.require_component(Ey);
+  retry.require_component(Ez);
+  retry.init_backend();
+  BackendState *const prepared_state = retry.backend_state;
+  nvidia::testing::fail_next(nvidia::testing::failure_point::device_allocate);
+  bool failed = false;
+  try { retry.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && retry.t == 0 && retry.backend_state == prepared_state &&
+              !retry.executable && !retry.backend->is_poisoned(),
+          "NVIDIA multilevel compile allocation failure published or dispatched");
+  retry.advance(1);
+  require(retry.executable && retry.t == 1,
+          "NVIDIA multilevel compile allocation failure was not retryable");
+
+  structure population_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  add_multilevel_test_medium(population_structure, E_stuff, true);
+  fields population_failure(&population_structure, options);
+  population_failure.use_real_fields();
+  population_failure.require_component(Ez);
+  population_failure.advance(1);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::multilevel_population);
+  failed = false;
+  try { population_failure.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && population_failure.backend->is_poisoned(),
+          "NVIDIA multilevel population postlaunch failure did not poison");
+
+  structure transition_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  add_multilevel_test_medium(transition_structure, E_stuff, true);
+  fields transition_failure(&transition_structure, options);
+  transition_failure.use_real_fields();
+  transition_failure.require_component(Ez);
+  transition_failure.advance(1);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::multilevel_transition);
+  failed = false;
+  try { transition_failure.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && transition_failure.backend->is_poisoned(),
+          "NVIDIA multilevel transition postlaunch failure did not poison");
+  master_printf("nvidia_timestep: multilevel lifecycle PASS\n");
+}
+
+static void test_multilevel_composition() {
+  const grid_volume gv = vol3d(2.0, 1.8, 1.6, 5.0);
+  const boundary_region boundaries = pml(0.35, X) + pml(0.35, Y);
+  structure s(gv, isotropic_eps, boundaries, identity(), 4);
+  add_multilevel_test_medium(s, E_stuff, true);
+  add_multilevel_test_medium(s, H_stuff, false);
+  lorentzian_susceptibility lorentz(0.73, 0.06, false);
+  noisy_lorentzian_susceptibility noisy(0.015625, 0.91, 0.04, false);
+  gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.83, 0.05, 0.13,
+                                 GYROTROPIC_LORENTZIAN);
+  s.add_susceptibility(unit_value, E_stuff, lorentz);
+  s.add_susceptibility(unit_value, E_stuff, noisy);
+  s.add_susceptibility(unit_value, H_stuff, gyro);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_bloch(vec(0.09, -0.07, 0.05));
+  const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
+  for (component c : components) gpu.require_component(c);
+  gaussian_src_time source(0.31, 0.14);
+  source.is_integrated = true;
+  gpu.add_point_source(Ez, source, vec(0.31, 0.27, 0.19),
+                       std::complex<double>(0.17, -0.08));
+  component monitor_component = Ez;
+  dft_fields monitor = gpu.add_dft_fields(&monitor_component, 1, gpu.v, 0.31, 0.31, 1);
+  flux_vol *flux =
+      gpu.add_flux_vol(Z, volume(vec(-0.7, -0.6, 0.0), vec(0.7, 0.6, 0.0)));
+  set_random_seed(0x13572468UL);
+  gpu.advance(2);
+  require(gpu.step_plans[0] && gpu.executable && !gpu.backend->is_poisoned(),
+          "NVIDIA multilevel composition did not publish a usable executable");
+  bool multilevel_e = false, multilevel_h = false, ordinary = false, noisy_row = false,
+       gyro_row = false, source_op = false, dft_op = false, flux_half = false,
+       flux_full = false;
+  for (const PolarizationUpdateGroup &group : gpu.step_plans[0]->polarization_groups) {
+    if (group.kind == PolarizationGroupKind::multilevel) {
+      multilevel_e = multilevel_e || group.ft == E_stuff;
+      multilevel_h = multilevel_h || group.ft == H_stuff;
+    }
+  }
+  for (const PolarizationUpdate &update : gpu.step_plans[0]->polarization_updates) {
+    ordinary = ordinary || update.kind == PolarizationUpdateKind::lorentzian;
+    noisy_row = noisy_row || update.kind == PolarizationUpdateKind::noisy_add;
+    gyro_row = gyro_row || update.kind == PolarizationUpdateKind::gyrotropic;
+  }
+  for (const Operation &op : gpu.step_plans[0]->operations) {
+    source_op = source_op || op.kind == OpKind::apply_sources;
+    dft_op = dft_op || op.kind == OpKind::update_dft;
+    flux_half = flux_half || op.kind == OpKind::update_flux_half;
+    flux_full = flux_full || op.kind == OpKind::update_flux;
+  }
+  require(multilevel_e && multilevel_h && ordinary && noisy_row && gyro_row && source_op &&
+              dft_op && flux_half && flux_full && std::isfinite(flux->flux()),
+          "NVIDIA multilevel composition omitted a requested feature");
+  master_printf("nvidia_timestep: multilevel composition PASS\n");
+}
+
+static void test_multilevel_capability_rejections() {
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  {
+    const grid_volume gv = volcyl(2.0, 2.0, 6.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    add_multilevel_test_medium(s, E_stuff, false);
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ez);
+    require_advance_rejected(gpu, "multilevel polarization does not support cylindrical");
+  }
+  {
+    const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    add_multilevel_test_medium(s, E_stuff, false);
+    fields gpu(&s, options);
+    gpu.require_component(Ez);
+    gaussian_src_time source(0.31, 0.14);
+    gpu.add_point_source(Ez, source, vec(0.25, 0.25), 0.2);
+    bool rejected = false;
+    try { (void)gpu.solve_cw(1e-4, 1, std::complex<double>(0.3, 0.0), 2); }
+    catch (const std::exception &error) {
+      const std::string message(error.what());
+      rejected = message.find("multilevel") != std::string::npos ||
+                 message.find("dispersion, polarization") != std::string::npos;
+    }
+    require(rejected, "NVIDIA solve_cw accepted exact multilevel polarization");
+  }
+  master_printf("nvidia_timestep: multilevel capability rejections PASS\n");
+}
+
 static void run_finite_diagnostic_case(const char *name, precision_policy_kind policy,
                                        FiniteCheckMode mode, bool poison, realnum value,
                                        bool expect_rejection, int expected_step) {
@@ -3284,7 +3947,10 @@ static noisy_snapshot capture_noisy_group(fields &f, field_type ft, int state_in
       continue;
     const ArraySpec &spec = f.array_catalog->spec(update.p);
     StorageKey key = f.array_catalog->key(update.p);
-    key.aux -= state_index * 1024;
+    require(polarization_storage_field_type(key.aux) == ft &&
+                polarization_storage_state_index(key.aux) == state_index,
+            "NVIDIA noisy state has the wrong packed storage identity");
+    key.aux = polarization_storage_layout_ordinal(key.aux);
     result.keys.push_back(key);
     result.values.push_back(std::vector<realnum>(spec.elements));
     f.backend->read(ArrayRef{update.p, 0, spec.elements}, result.values.back().data(),
@@ -4035,7 +4701,7 @@ static void test_noisy_capability_rejections() {
   const realnum omega[] = {realnum(0.73)};
   const realnum gamma[] = {realnum(0.06)};
   const realnum sigmat[] = {realnum(1), realnum(1), realnum(1), realnum(0), realnum(0)};
-  multilevel_susceptibility multilevel(2, 1, Gamma, N0, alpha, omega, gamma, sigmat);
+  inherited_multilevel multilevel(2, 1, Gamma, N0, alpha, omega, gamma, sigmat);
   structure multilevel_structure(gv, isotropic_eps, no_pml(), identity(), 1);
   multilevel_structure.add_susceptibility(unit_value, E_stuff, multilevel);
   fields multilevel_fields(&multilevel_structure, options);
@@ -4044,10 +4710,7 @@ static void test_noisy_capability_rejections() {
   rejected = false;
   try { multilevel_fields.advance(1); }
   catch (const std::exception &) { rejected = true; }
-  require(rejected &&
-              (!multilevel_fields.backend_state ||
-               !multilevel_fields.backend_state->random_seed_snapshot_accepted),
-          "NVIDIA accepted multilevel polarization or published noisy seed metadata");
+  require(rejected, "NVIDIA accepted a derived multilevel host-custom susceptibility");
 
   noisy_lorentzian_susceptibility noisy(0.03125, 0.73, 0.06);
   structure cw_structure(gv, isotropic_eps, no_pml(), identity(), 1);
@@ -4165,8 +4828,10 @@ int main(int argc, char **argv) {
   const bool material_only = getenv("MEEP_NVIDIA_TIMESTEP_MATERIAL_ONLY") != NULL;
   const bool flux_only = getenv("MEEP_NVIDIA_TIMESTEP_FLUX_ONLY") != NULL;
   const bool noisy_only = getenv("MEEP_NVIDIA_TIMESTEP_NOISY_ONLY") != NULL;
+  const bool multilevel_only = getenv("MEEP_NVIDIA_TIMESTEP_MULTILEVEL_ONLY") != NULL;
   const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
+  test_polarization_storage_key_encoding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
     master_printf("nvidia_timestep: coefficient checks PASS\n");
     return 0;
@@ -4217,6 +4882,15 @@ int main(int argc, char **argv) {
     master_printf("nvidia_timestep: noisy rejection checks PASS\n");
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_TIMESTEP_MULTILEVEL_LIFECYCLE_ONLY")) {
+    test_multilevel_lifecycle();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_TIMESTEP_MULTILEVEL_REJECTIONS_ONLY")) {
+    test_multilevel_compile_rejections();
+    test_multilevel_capability_rejections();
+    return 0;
+  }
   if (const char *mode = getenv("MEEP_NVIDIA_TIMESTEP_NOISY_PROFILE")) {
     test_noisy_profile(mode);
     return 0;
@@ -4232,6 +4906,16 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (multilevel_only) {
+      run_multilevel_case("d1-real-e-l2t1", policies[p], vol1d(2.4, 7.0), true, false,
+                          false);
+      run_multilevel_case("d2-real-e-l3t2", policies[p], vol2d(2.4, 2.0, 7.0), true, false,
+                          true);
+      run_multilevel_case("d3-complex-h-l3t2", policies[p],
+                          vol3d(1.8, 1.6, 1.4, 5.0), false, true, true);
+      run_multilevel_multitile_pml_case(policies[p]);
+      continue;
+    }
     if (noisy_only) {
       run_noisy_replay_case(policies[p]);
       run_noisy_composition_case(policies[p]);
@@ -4330,7 +5014,7 @@ int main(int argc, char **argv) {
                      false, 2, &bloch2, 0.17);
     }
     if (gyro_only || beta_only || bfast_only || magnetic_only || material_only || flux_only ||
-        noisy_only)
+        noisy_only || multilevel_only)
       continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
@@ -4393,6 +5077,17 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   if (noisy_only) {
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (multilevel_only) {
+    test_multilevel_zero_row();
+    test_multilevel_composition();
+    test_multilevel_compile_rejections();
+    test_multilevel_capability_rejections();
+    test_multilevel_lifecycle();
+    test_multilevel_backend_reselection();
+    test_multilevel_gamma_inv_host_authority();
     master_printf("nvidia_timestep: PASS\n");
     return 0;
   }
