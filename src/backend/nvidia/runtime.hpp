@@ -235,7 +235,10 @@ enum class failure_point {
   cw_reduction,
   cw_scalar_copy,
   cw_unpack,
-  cw_breakdown
+  cw_breakdown,
+  noisy_seed_copy,
+  noisy_seed_sync,
+  noisy_add
 };
 void fail_next(failure_point point);
 void clear_failure();

@@ -21,8 +21,11 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
+#include <typeinfo>
 #include <vector>
 
 #include "backend/initialization_plan.hpp"
@@ -52,6 +55,39 @@ polarization_coefficients derive_polarization_coefficients(double omega_0, doubl
   polarization_coefficients result = {double(omega0dtsqr), double(gamma1inv), double(gamma1),
                                       drude ? 0.0 : double(omega0dtsqr)};
   return result;
+}
+
+double derive_noisy_amplitude(double omega_0, double gamma, double noise_amplitude,
+                              double dt_value) {
+  const realnum gamma2pi = realnum(gamma) * 2 * pi;
+  const realnum omega2pi = realnum(omega_0) * 2 * pi;
+  const realnum dt = realnum(dt_value);
+  const realnum amplitude = omega2pi * realnum(noise_amplitude) * sqrt(gamma2pi) * dt * dt /
+                            (1 + gamma2pi * dt / 2);
+  return double(amplitude);
+}
+
+bool valid_noisy_coefficients(double omega_0, double gamma, double noise_amplitude,
+                              double dt_value) {
+  if (!std::isfinite(omega_0) || !std::isfinite(gamma) ||
+      !std::isfinite(noise_amplitude) || !std::isfinite(dt_value) || dt_value <= 0.0 ||
+      !std::isfinite(double(realnum(omega_0))) || !std::isfinite(double(realnum(gamma))) ||
+      !std::isfinite(double(realnum(noise_amplitude))) ||
+      !std::isfinite(double(realnum(dt_value))))
+    return false;
+  const realnum gamma2pi = realnum(gamma) * 2 * pi;
+  const realnum omega2pi = realnum(omega_0) * 2 * pi;
+  const realnum dt = realnum(dt_value);
+  if (!std::isfinite(double(gamma2pi)) || gamma2pi < realnum(0) ||
+      !std::isfinite(double(omega2pi)))
+    return false;
+  const realnum root = sqrt(gamma2pi);
+  const realnum denominator = 1 + gamma2pi * dt / 2;
+  if (!std::isfinite(double(root)) || !std::isfinite(double(denominator)) ||
+      denominator == realnum(0))
+    return false;
+  const realnum amplitude = omega2pi * realnum(noise_amplitude) * root * dt * dt / denominator;
+  return std::isfinite(double(amplitude));
 }
 
 gyrotropic_coefficients derive_gyrotropic_coefficients(double omega_0, double gamma,
@@ -483,10 +519,12 @@ public:
         transfer_failed_(false),
         device_authoritative_(false), magnetic_snapshot_bytes_(0),
         magnetic_snapshot_layout_fingerprint_(0), magnetic_snapshot_valid_(false),
-        cw_skip_source_evaluation_(false), cw_workspace_allocations_(0) {
+        cw_skip_source_evaluation_(false), cw_workspace_allocations_(0),
+        noisy_seed_active_slot_(-1), noisy_seed_staged_slot_(-1) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_));
+    noisy_seed_slots_.allocate(2 * sizeof(nvidia::noisy_seed_block), device_);
   }
 
   ~NvidiaBackendState() override {}
@@ -525,6 +563,9 @@ public:
   size_t cw_workspace_allocations_;
   NvidiaCwStatistics cw_statistics_;
   std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
+  nvidia::device_buffer noisy_seed_slots_;
+  int noisy_seed_active_slot_;
+  int noisy_seed_staged_slot_;
 };
 
 struct NvidiaCompiledOperation {
@@ -644,6 +685,7 @@ public:
         constitutive_updates_(constitutive_updates), zero_updates_(zero_updates),
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
+        has_noisy_updates_(false),
         polarization_subtractions_(polarization_subtractions), dft_updates_(dft_updates),
         legacy_flux_updates_(legacy_flux_updates), legacy_flux_terms_(legacy_flux_terms),
         legacy_flux_global_(legacy_flux_updates.size(), 0.0),
@@ -652,6 +694,10 @@ public:
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
         material_target_signature_(material_target_signature),
         source_scalar_count_(source_scalar_count) {
+    for (const nvidia::compiled_polarization_update &update : polarization_updates_)
+      has_noisy_updates_ = has_noisy_updates_ ||
+                           update.kind ==
+                               nvidia::compiled_polarization_update::kind_type::noisy_add;
     try {
       nvidia::device_scope scope(state.device_);
       if (!halo_gathers.empty()) {
@@ -750,6 +796,7 @@ public:
   std::vector<nvidia::source_batch_launch> source_batches_;
   std::vector<nvidia::array_copy_launch> source_copies_;
   std::vector<nvidia::compiled_polarization_update> polarization_updates_;
+  bool has_noisy_updates_;
   std::vector<nvidia::polarization_subtract_launch> polarization_subtractions_;
   std::vector<nvidia::dft_launch> dft_updates_;
   std::vector<NvidiaCompiledLegacyFluxUpdate> legacy_flux_updates_;
@@ -1501,6 +1548,39 @@ nvidia::gyrotropic_update_launch compile_gyrotropic_update(
   return result;
 }
 
+bool same_polarization_access(const BufferAccess &a, const BufferAccess &b) {
+  return a.array.id == b.array.id && a.array.offset == b.array.offset &&
+         a.array.elements == b.array.elements && a.mode == b.mode;
+}
+
+bool same_polarization_operation(const Operation &a, const Operation &b) {
+  if (a.kind != b.kind || a.ft != b.ft || a.descriptor_index != b.descriptor_index ||
+      a.descriptor_count != b.descriptor_count ||
+      a.material_refresh_index != b.material_refresh_index ||
+      a.material_refresh_count != b.material_refresh_count ||
+      a.beta_descriptor_index != b.beta_descriptor_index ||
+      a.beta_descriptor_count != b.beta_descriptor_count ||
+      a.cylindrical_m_descriptor_index != b.cylindrical_m_descriptor_index ||
+      a.cylindrical_m_descriptor_count != b.cylindrical_m_descriptor_count ||
+      a.cylindrical_origin_action_index != b.cylindrical_origin_action_index ||
+      a.cylindrical_origin_action_count != b.cylindrical_origin_action_count ||
+      a.polarization_subtraction_index != b.polarization_subtraction_index ||
+      a.polarization_subtraction_count != b.polarization_subtraction_count ||
+      a.magnetic_state_index != b.magnetic_state_index ||
+      a.magnetic_state_count != b.magnetic_state_count ||
+      a.legacy_flux_index != b.legacy_flux_index ||
+      a.legacy_flux_count != b.legacy_flux_count ||
+      a.source_descriptor_index != b.source_descriptor_index ||
+      a.source_descriptor_count != b.source_descriptor_count ||
+      a.guard.kind != b.guard.kind || a.guard.scalar_slot != b.guard.scalar_slot ||
+      a.guard.variant_index != b.guard.variant_index ||
+      a.source_time_offset != b.source_time_offset || a.accesses.size() != b.accesses.size())
+    return false;
+  for (size_t i = 0; i < a.accesses.size(); ++i)
+    if (!same_polarization_access(a.accesses[i], b.accesses[i])) return false;
+  return true;
+}
+
 nvidia::compiled_polarization_update compile_polarization_update(
     const PolarizationUpdate &source, NvidiaBackendState &state) {
   nvidia::compiled_polarization_update result = {};
@@ -1513,6 +1593,87 @@ nvidia::compiled_polarization_update compile_polarization_update(
       result.kind = nvidia::compiled_polarization_update::kind_type::gyrotropic;
       result.gyrotropic = compile_gyrotropic_update(source, state);
       break;
+    case PolarizationUpdateKind::noisy_add: {
+      if (source.region.variant_key || !is_valid(source.p) || !is_valid(source.diagonal_sigma) ||
+          is_valid(source.p_prev) || is_valid(source.p_cross1) ||
+          is_valid(source.p_prev_cross1) || is_valid(source.p_cross2) ||
+          is_valid(source.p_prev_cross2) || is_valid(source.primary_w) ||
+          is_valid(source.cross_w1) || is_valid(source.cross_w2) ||
+          is_valid(source.offdiagonal_sigma1) || is_valid(source.offdiagonal_sigma2) ||
+          source.primary_stride || source.cross_stride1 || source.cross_stride2 ||
+          source.noise_algorithm_version != counter_random_algorithm_version ||
+          source.state_index < 0 || uint64_t(source.state_index) > UINT32_MAX ||
+          source.region.chunk < 0 || uint64_t(source.region.chunk) > UINT32_MAX ||
+          (source.ft != E_stuff && source.ft != H_stuff) ||
+          source.region.cmp < 0 || source.region.cmp > 1 ||
+          (source.ft == E_stuff ? !is_electric(source.region.c)
+                                : !is_magnetic(source.region.c)) ||
+          source.alpha != 0.0 || source.gyro_model != GYROTROPIC_LORENTZIAN ||
+          !nvidia::valid_noisy_coefficients(source.omega_0, source.gamma,
+                                            source.noise_amplitude, source.dt))
+        throw std::invalid_argument("noisy polarization descriptor is noncanonical");
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 3; ++j)
+          if (source.gyro_tensor[i][j] != 0.0)
+            throw std::invalid_argument("noisy polarization descriptor has a gyro tensor");
+      if (source.p.value >= state.plan_.arrays.size() ||
+          source.p.value >= state.plan_.keys.size() ||
+          source.diagonal_sigma.value >= state.plan_.arrays.size() ||
+          source.diagonal_sigma.value >= state.plan_.keys.size())
+        throw std::out_of_range("noisy polarization descriptor ArrayId is out of range");
+      const ArraySpec &p_spec = state.plan_.arrays[source.p.value];
+      const StorageKey &p_key = state.plan_.keys[source.p.value];
+      const ArraySpec &sigma_spec = state.plan_.arrays[source.diagonal_sigma.value];
+      const StorageKey &sigma_key = state.plan_.keys[source.diagonal_sigma.value];
+      if (source.state_index >
+          (std::numeric_limits<int>::max() - int(source.ft)) / NUM_FIELD_TYPES)
+        throw std::overflow_error("noisy polarization sigma identity overflows");
+      const int sigma_aux = source.state_index * NUM_FIELD_TYPES + int(source.ft);
+      if (p_spec.id != source.p || p_spec.role != array_role::polarization ||
+          p_spec.element_type != ElementType::realnum_value || is_valid(p_spec.alias_of) ||
+          p_key.chunk != source.region.chunk ||
+          p_key.kind != int(array_kind::polarization_internal) ||
+          p_key.component_ != int(source.region.c) || p_key.cmp != source.region.cmp ||
+          p_key.aux < 0 || p_key.aux / 1024 != source.state_index)
+        throw std::invalid_argument("noisy polarization P has the wrong storage identity");
+      if (sigma_spec.id != source.diagonal_sigma || sigma_spec.role != array_role::material ||
+          sigma_spec.element_type != ElementType::realnum_value ||
+          is_valid(sigma_spec.alias_of) || sigma_key.chunk != source.region.chunk ||
+          sigma_key.kind != int(array_kind::sigma) ||
+          sigma_key.component_ != int(source.region.c) ||
+          sigma_key.cmp != int(component_direction(source.region.c)) ||
+          sigma_key.aux != sigma_aux)
+        throw std::invalid_argument("noisy polarization sigma has the wrong storage identity");
+      nvidia::noisy_add_launch launch = {};
+      launch.region = flat_region_for(source.region);
+      launch.precision = scalar_precision_for(state.plan_, source.p, "noisy polarization P");
+      require_same_precision(state.plan_, source.diagonal_sigma, launch.precision,
+                             "noisy polarization sigma");
+      launch.p = device_address(state, source.p, "noisy polarization P");
+      launch.diagonal_sigma =
+          device_address(state, source.diagonal_sigma, "noisy polarization sigma");
+      launch.amplitude = nvidia::derive_noisy_amplitude(
+          source.omega_0, source.gamma, source.noise_amplitude, source.dt);
+      if (!std::isfinite(launch.amplitude))
+        throw std::invalid_argument("noisy polarization amplitude is not finite");
+      const int global_rank = my_global_rank();
+      if (global_rank < 0 || uint64_t(global_rank) > UINT32_MAX)
+        throw std::invalid_argument("noisy polarization global rank is out of range");
+      launch.stream_tag = counter_random_stream_tag(
+          source.noise_algorithm_version, uint32_t(global_rank), uint32_t(source.region.chunk),
+          uint32_t(source.ft), uint32_t(source.state_index), uint32_t(source.region.c),
+          uint32_t(source.region.cmp));
+      launch.point_ordinal_base = 0;
+      const ptrdiff_t region_min = ptrdiff_t(launch.region.base);
+      const ptrdiff_t region_max = checked_region_max(launch.region);
+      validate_index_range(state.plan_, source.p, region_min, region_max,
+                           "noisy polarization P");
+      validate_index_range(state.plan_, source.diagonal_sigma, region_min, region_max,
+                           "noisy polarization sigma");
+      result.kind = nvidia::compiled_polarization_update::kind_type::noisy_add;
+      result.noisy = launch;
+      break;
+    }
     default: throw std::invalid_argument("polarization descriptor has an invalid update kind");
   }
   return result;
@@ -2939,6 +3100,57 @@ void NvidiaBackend::finalize_storage(const StoragePlan &, BackendState &raw_stat
      migration require the PR2 operation lowering and are not guessed here. */
 }
 
+void NvidiaBackend::refresh_noisy_seed(const RandomSeedSnapshot &candidate,
+                                       BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  if (!state.initialized_ || state.transfer_failed_)
+    throw std::logic_error("NVIDIA noisy seed refresh requires an initialized usable state");
+  if (!candidate.initialized || !candidate.semantic_seed_valid ||
+      candidate.algorithm_version != counter_random_algorithm_version)
+    throw std::invalid_argument("NVIDIA noisy seed refresh received invalid metadata");
+  const int slot = state.noisy_seed_active_slot_ == 0 ? 1 : 0;
+  const nvidia::noisy_seed_block block = {candidate.semantic_seed,
+                                          candidate.algorithm_version};
+  nvidia::device_scope scope(state.device_);
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::noisy_seed_copy))
+    throw std::runtime_error("injected NVIDIA noisy seed copy failure");
+  try {
+    nvidia::copy_host_to_device_async(
+        state.noisy_seed_slots_, size_t(slot) * sizeof(block), &block, sizeof(block),
+        *state.transfer_);
+  }
+  catch (...) {
+    state.noisy_seed_staged_slot_ = -1;
+    throw;
+  }
+  try {
+    state.transfer_->synchronize();
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::noisy_seed_sync))
+      throw std::runtime_error("injected NVIDIA noisy seed synchronization failure");
+  }
+  catch (...) {
+    state.noisy_seed_staged_slot_ = -1;
+    state.transfer_failed_ = true;
+    poison();
+    throw;
+  }
+  state.noisy_seed_staged_slot_ = slot;
+}
+
+void NvidiaBackend::commit_noisy_seed(BackendState &raw_state) noexcept {
+  NvidiaBackendState *state = dynamic_cast<NvidiaBackendState *>(&raw_state);
+  if (!state || state->noisy_seed_staged_slot_ < 0) return;
+  state->noisy_seed_active_slot_ = state->noisy_seed_staged_slot_;
+  state->noisy_seed_staged_slot_ = -1;
+}
+
+void NvidiaBackend::discard_noisy_seed(BackendState &raw_state) noexcept {
+  NvidiaBackendState *state = dynamic_cast<NvidiaBackendState *>(&raw_state);
+  if (state) state->noisy_seed_staged_slot_ = -1;
+}
+
 Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
   if (!state.initialized_)
@@ -2998,6 +3210,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       for (size_t i = 0; i < f_.descriptors->polarizations.size(); ++i) {
         const PolarizationDescriptor &d = f_.descriptors->polarizations[i];
         if (d.kind != SusceptibilityKind::lorentzian &&
+            d.kind != SusceptibilityKind::noisy_lorentzian &&
             d.kind != SusceptibilityKind::gyrotropic)
           throw std::invalid_argument(std::string("NVIDIA does not support polarization kind ") +
                                       susceptibility_kind_name(d.kind));
@@ -3007,6 +3220,70 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA gyrotropic descriptor has no resident state");
         if (f_.gv.dim == Dcyl && d.kind == SusceptibilityKind::gyrotropic)
           throw std::invalid_argument("NVIDIA cylindrical gyrotropic media are not supported");
+      }
+    }
+    bool has_noisy_updates = false, has_noisy_descriptors = false;
+    for (const PolarizationUpdate &update : plan.polarization_updates)
+      has_noisy_updates = has_noisy_updates || update.kind == PolarizationUpdateKind::noisy_add;
+    typedef std::tuple<int, int, int> NoisyGroupTuple;
+    std::vector<NoisyGroupTuple> live_noisy_groups, descriptor_noisy_groups;
+    for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+      if (!f_.chunks[chunk] || !f_.chunks[chunk]->is_mine()) continue;
+      FOR_FIELD_TYPES(ft) {
+        int state_index = 0;
+        for (const polarization_state *p = f_.chunks[chunk]->pol[ft]; p;
+             p = p->next, ++state_index)
+          if (p->s && typeid(*p->s) == typeid(noisy_lorentzian_susceptibility))
+            live_noisy_groups.push_back(NoisyGroupTuple(chunk, int(ft), state_index));
+      }
+    }
+    if (f_.descriptors)
+      for (const PolarizationDescriptor &descriptor : f_.descriptors->polarizations)
+        if (descriptor.kind == SusceptibilityKind::noisy_lorentzian) {
+          has_noisy_descriptors = true;
+          descriptor_noisy_groups.push_back(
+              NoisyGroupTuple(descriptor.chunk, int(descriptor.ft), descriptor.state_index));
+        }
+    if (!live_noisy_groups.empty() || has_noisy_updates || has_noisy_descriptors) {
+      if (live_noisy_groups != descriptor_noisy_groups)
+        throw std::invalid_argument(
+            "NVIDIA noisy susceptibility descriptors differ from live linked-list order");
+      const StepPlan canonical_polarization = build_polarization_validation_plan(f_);
+      if (plan.polarization_updates != canonical_polarization.polarization_updates)
+        throw std::invalid_argument(
+            "NVIDIA noisy polarization rows differ from descriptor authority");
+      std::vector<const Operation *> installed_operations, canonical_operations;
+      for (const Operation &operation : plan.operations)
+        if (operation.kind == OpKind::update_polarization)
+          installed_operations.push_back(&operation);
+      for (const Operation &operation : canonical_polarization.operations)
+        if (operation.kind == OpKind::update_polarization)
+          canonical_operations.push_back(&operation);
+      if (installed_operations.size() != canonical_operations.size())
+        throw std::invalid_argument(
+            "NVIDIA noisy polarization operation count is noncanonical");
+      for (size_t i = 0; i < installed_operations.size(); ++i)
+        if (!same_polarization_operation(*installed_operations[i], *canonical_operations[i]))
+          throw std::invalid_argument(
+              "NVIDIA noisy polarization operation span or access set is noncanonical");
+      typedef std::tuple<int, int, int, int, int> StreamTuple;
+      std::set<StreamTuple> tuples;
+      std::set<uint64_t> tags;
+      const int global_rank = my_global_rank();
+      if (global_rank < 0 || uint64_t(global_rank) > UINT32_MAX)
+        throw std::invalid_argument("NVIDIA noisy polarization global rank is out of range");
+      for (const PolarizationUpdate &update : plan.polarization_updates) {
+        if (update.kind != PolarizationUpdateKind::noisy_add) continue;
+        const StreamTuple tuple(update.region.chunk, int(update.ft), update.state_index,
+                                int(update.region.c), update.region.cmp);
+        if (!tuples.insert(tuple).second)
+          throw std::invalid_argument("NVIDIA noisy polarization stream tuple is duplicated");
+        const uint64_t tag = counter_random_stream_tag(
+            update.noise_algorithm_version, uint32_t(global_rank),
+            uint32_t(update.region.chunk), uint32_t(update.ft), uint32_t(update.state_index),
+            uint32_t(update.region.c), uint32_t(update.region.cmp));
+        if (!tags.insert(tag).second)
+          throw std::invalid_argument("NVIDIA noisy polarization stream tag collides");
       }
     }
     if (!connections_are_current(f_))
@@ -5009,6 +5286,8 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     throw std::logic_error("NVIDIA executable was compiled for a different storage layout");
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
+  if (executable.has_noisy_updates_ && f_.t < 0)
+    throw std::invalid_argument("NVIDIA noisy polarization timestep is negative");
   nvidia::validate_material_phase_state(f_, executable.material_target_signature_);
 
   const FiniteCheckMode finite_mode = finite_check_mode();
@@ -5142,13 +5421,26 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             }
             break;
           case OpKind::update_polarization:
+            {
+              const nvidia::noisy_seed_block *noisy_seed = NULL;
+              if (state.noisy_seed_active_slot_ >= 0)
+                noisy_seed = static_cast<const nvidia::noisy_seed_block *>(
+                                 state.noisy_seed_slots_.opaque_handle()) +
+                             state.noisy_seed_active_slot_;
             for (size_t i = op.polarization_first;
                  i < op.polarization_first + op.polarization_count; ++i) {
               nvidia::launch_polarization_update(executable.polarization_updates_[i],
+                                                 noisy_seed, uint64_t(f_.t),
                                                  *state.transfer_);
+              if (executable.polarization_updates_[i].kind ==
+                      nvidia::compiled_polarization_update::kind_type::noisy_add &&
+                  nvidia::testing::consume_failure_for_testing(
+                      nvidia::testing::failure_point::noisy_add))
+                throw std::runtime_error("injected NVIDIA noisy-add postlaunch failure");
               count_cw_kernel();
             }
             break;
+            }
           case OpKind::transfer_halo:
             for (size_t i = op.first; i < op.first + op.count; ++i) {
               nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);

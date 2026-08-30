@@ -17,7 +17,7 @@ DONE = $(SRC:.cpp=.done)
 
 LIBMEEP = $(top_builddir)/src/libmeep.la
 MEEPLIBS = $(LIBMEEP)
-AM_CPPFLAGS = -I$(top_srcdir)/src -DDATADIR=\"$(srcdir)/\"
+AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)/src -DDATADIR=\"$(srcdir)/\"
 
 .SUFFIXES = .dac .done
 

@@ -11,8 +11,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <memory>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,12 +27,12 @@
 #include "backend/halo_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "backend/precision.hpp"
 #include "backend/prepare.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
-#include "backend/nvidia/runtime.hpp"
 #include "meep_internals.hpp"
 
 using namespace meep;
@@ -190,6 +192,13 @@ public:
 
 private:
   bool anisotropic_;
+};
+
+class inherited_noisy_lorentzian : public noisy_lorentzian_susceptibility {
+public:
+  inherited_noisy_lorentzian(realnum amplitude, realnum omega, realnum gamma)
+      : noisy_lorentzian_susceptibility(amplitude, omega, gamma) {}
+  susceptibility *clone() const override { return new inherited_noisy_lorentzian(*this); }
 };
 
 static realnum initial_value(size_t array, size_t element) {
@@ -2153,7 +2162,7 @@ static void require_advance_rejected(fields &f, const char *expected) {
   try {
     f.advance(1);
   }
-  catch (const std::runtime_error &error) {
+  catch (const std::exception &error) {
     rejected = std::string(error.what()).find(expected) != std::string::npos;
   }
   require(rejected, "NVIDIA unsupported configuration was not rejected as expected");
@@ -3230,21 +3239,866 @@ static void test_finite_diagnostics(precision_policy_kind policy) {
                              std::numeric_limits<realnum>::quiet_NaN(), false, 2);
 }
 
+struct noisy_snapshot {
+  std::vector<StorageKey> keys;
+  std::vector<std::vector<realnum> > values;
+};
+
+static noisy_snapshot capture_noisy_state(fields &f) {
+  noisy_snapshot result;
+  for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (spec.role != array_role::polarization || is_valid(spec.alias_of) ||
+        spec.element_type != ElementType::realnum_value)
+      continue;
+    result.keys.push_back(f.array_catalog->key(id));
+    result.values.push_back(std::vector<realnum>(spec.elements));
+    f.backend->read(ArrayRef{id, 0, spec.elements}, result.values.back().data(),
+                    spec.elements * sizeof(realnum));
+  }
+  return result;
+}
+
+static bool same_noisy_snapshot(const noisy_snapshot &a, const noisy_snapshot &b) {
+  if (a.keys.size() != b.keys.size() || a.values.size() != b.values.size()) return false;
+  for (size_t i = 0; i < a.keys.size(); ++i)
+    if (!(a.keys[i] == b.keys[i]) || a.values[i].size() != b.values[i].size() ||
+        memcmp(a.values[i].data(), b.values[i].data(),
+               a.values[i].size() * sizeof(realnum)) != 0)
+      return false;
+  return true;
+}
+
+static noisy_snapshot capture_noisy_group(fields &f, field_type ft, int state_index,
+                                          component selected_component = Dielectric) {
+  require(f.step_plans[0] && f.array_catalog,
+          "NVIDIA noisy group capture requires an installed plan and catalog");
+  noisy_snapshot result;
+  std::set<uint32_t> seen;
+  for (const PolarizationUpdate &update : f.step_plans[0]->polarization_updates) {
+    if (update.kind != PolarizationUpdateKind::noisy_add || update.ft != ft ||
+        update.state_index != state_index ||
+        (selected_component != Dielectric && update.region.c != selected_component) ||
+        !seen.insert(update.p.value).second)
+      continue;
+    const ArraySpec &spec = f.array_catalog->spec(update.p);
+    StorageKey key = f.array_catalog->key(update.p);
+    key.aux -= state_index * 1024;
+    result.keys.push_back(key);
+    result.values.push_back(std::vector<realnum>(spec.elements));
+    f.backend->read(ArrayRef{update.p, 0, spec.elements}, result.values.back().data(),
+                    spec.elements * sizeof(realnum));
+  }
+  std::vector<size_t> order(result.keys.size());
+  for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+    const StorageKey &x = result.keys[a], &y = result.keys[b];
+    if (x.chunk != y.chunk) return x.chunk < y.chunk;
+    if (x.kind != y.kind) return x.kind < y.kind;
+    if (x.component_ != y.component_) return x.component_ < y.component_;
+    if (x.cmp != y.cmp) return x.cmp < y.cmp;
+    return x.aux < y.aux;
+  });
+  noisy_snapshot sorted;
+  for (size_t i : order) {
+    sorted.keys.push_back(result.keys[i]);
+    sorted.values.push_back(result.values[i]);
+  }
+  return sorted;
+}
+
+static noisy_snapshot run_noisy_order_fixture(precision_policy_kind policy, int mode) {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility target(0.03125, 0.73, 0.06, false);
+  noisy_lorentzian_susceptibility inserted(0.01953125, 1.17, 0.035, true);
+  s.add_susceptibility(unit_value, E_stuff, target);
+  if (mode != 0) s.add_susceptibility(unit_value, E_stuff, inserted);
+  if (mode == 2) {
+    s.remove_susceptibilities();
+    s.add_susceptibility(unit_value, E_stuff, target);
+  }
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  set_random_seed(0x10293847UL);
+  gpu.advance(1);
+  const int target_state = mode == 1 ? 1 : 0;
+  noisy_snapshot result = capture_noisy_group(gpu, E_stuff, target_state, Ez);
+  require(!result.values.empty(), "NVIDIA noisy order fixture produced no target state");
+  return result;
+}
+
+static void test_noisy_rebuild_lifecycle() {
+  const precision_policy_kind policy = precision_policy_kind::native;
+  const auto zero_resident = [](fields &f) {
+    for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+      const ArrayId id{uint32_t(i)};
+      const ArraySpec &spec = f.array_catalog->spec(id);
+      if (is_valid(spec.alias_of) || spec.element_type != ElementType::realnum_value ||
+          (spec.role != array_role::field && spec.role != array_role::polarization))
+        continue;
+      std::vector<realnum> zero(spec.elements, realnum(0));
+      f.backend->write(ArrayRef{id, 0, spec.elements}, zero.data(),
+                       spec.elements * sizeof(realnum));
+    }
+  };
+  const noisy_snapshot baseline = run_noisy_order_fixture(policy, 0);
+  const noisy_snapshot shifted = run_noisy_order_fixture(policy, 1);
+  const noisy_snapshot restored = run_noisy_order_fixture(policy, 2);
+  require(!same_noisy_snapshot(baseline, shifted),
+          "NVIDIA noisy stream did not change when an earlier state changed its ordinal");
+  require(same_noisy_snapshot(baseline, restored),
+          "NVIDIA noisy remove/add did not restore semantic state identity");
+
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  noisy_lorentzian_susceptibility noisy(0.03125, 0.73, 0.06, false);
+  structure resident_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  resident_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  execution_options nvidia_options;
+  nvidia_options.backend = backend_kind::nvidia;
+  nvidia_options.precision = policy;
+  fields resident(&resident_structure, nvidia_options);
+  resident.use_real_fields();
+  resident.require_component(Ez);
+  set_random_seed(0x55667788UL);
+  resident.advance(1);
+  const noisy_snapshot resident_baseline = capture_noisy_group(resident, E_stuff, 0, Ez);
+  const size_t initial_catalog_size = resident.array_catalog->size();
+  const uint64_t initial_layout_generation =
+      resident.mutation_generation[size_t(MutationKind::field_layout)];
+
+  zero_resident(resident);
+  resident.t = 0;
+  resident.require_component(Ex);
+  set_random_seed(0x55667788UL);
+  resident.advance(1);
+  require(resident.backend_state && resident.executable &&
+              resident.array_catalog->size() > initial_catalog_size &&
+              resident.mutation_generation[size_t(MutationKind::field_layout)] >
+                  initial_layout_generation,
+          "NVIDIA noisy field growth did not rebuild the resident catalog");
+  require(same_noisy_snapshot(resident_baseline,
+                              capture_noisy_group(resident, E_stuff, 0, Ez)),
+          "NVIDIA noisy catalog replacement changed the semantic stream");
+
+  zero_resident(resident);
+  resident.t = 0;
+  execution_options cpu_options;
+  resident.select_backend(cpu_options);
+  resident.select_backend(nvidia_options);
+  set_random_seed(0x55667788UL);
+  resident.advance(1);
+  require(same_noisy_snapshot(resident_baseline,
+                              capture_noisy_group(resident, E_stuff, 0, Ez)),
+          "NVIDIA noisy backend reselection changed the semantic stream");
+
+  structure migrating_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  migrating_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields migrating(&migrating_structure);
+  migrating.use_real_fields();
+  migrating.require_component(Ez);
+  migrating.select_backend(nvidia_options);
+  set_random_seed(0x55667788UL);
+  migrating.advance(1);
+  require(same_noisy_snapshot(resident_baseline,
+                              capture_noisy_group(migrating, E_stuff, 0, Ez)),
+          "CPU-to-NVIDIA noisy selection changed the semantic stream");
+  master_printf("nvidia_timestep: noisy rebuild lifecycle PASS\n");
+}
+
+static noisy_snapshot run_noisy_seed_case(precision_policy_kind policy, unsigned long seed,
+                                          bool drude, field_type ft, bool complex_fields,
+                                          realnum noise_amplitude, bool exact_noisy = true) {
+  const grid_volume gv = vol3d(2.0, 1.8, 1.6, 5.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(noise_amplitude, 0.73, 0.06, drude);
+  lorentzian_susceptibility ordinary(0.73, 0.06, drude);
+  if (exact_noisy)
+    s.add_susceptibility(unit_value, ft, noisy);
+  else
+    s.add_susceptibility(unit_value, ft, ordinary);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&s, options);
+  if (complex_fields)
+    gpu.use_bloch(vec(0.11, 0.07, 0.05));
+  else
+    gpu.use_real_fields();
+  gpu.require_component(ft == E_stuff ? Ez : Hz);
+  set_random_seed(seed);
+  gpu.init_backend();
+  gpu.advance(3);
+  require(gpu.backend_state && gpu.executable &&
+              gpu.backend_state->random_seed_snapshot_accepted == exact_noisy,
+          "NVIDIA noisy run did not publish seed metadata");
+  return capture_noisy_state(gpu);
+}
+
+static void run_noisy_replay_case(precision_policy_kind policy) {
+  const noisy_snapshot first =
+      run_noisy_seed_case(policy, 0x12345678UL, false, E_stuff, false, realnum(0.03125));
+  const noisy_snapshot replay =
+      run_noisy_seed_case(policy, 0x12345678UL, false, E_stuff, false, realnum(0.03125));
+  const noisy_snapshot changed =
+      run_noisy_seed_case(policy, 0x87654321UL, false, E_stuff, false, realnum(0.03125));
+  const noisy_snapshot wrapped = run_noisy_seed_case(
+      policy, 0x12345678UL + (1UL << 32), false, E_stuff, false, realnum(0.03125));
+  const noisy_snapshot magnetic =
+      run_noisy_seed_case(policy, 0x12345678UL, true, H_stuff, true, realnum(0.0625));
+  const noisy_snapshot zero_noise =
+      run_noisy_seed_case(policy, 0x12345678UL, false, E_stuff, false, realnum(0));
+  const noisy_snapshot ordinary =
+      run_noisy_seed_case(policy, 0x12345678UL, false, E_stuff, false, realnum(0), false);
+  require(!first.values.empty() && same_noisy_snapshot(first, replay),
+          "NVIDIA noisy fixed-seed replay is not bitwise stable");
+  require(same_noisy_snapshot(first, wrapped),
+          "NVIDIA noisy seed did not preserve low-32-bit equivalence");
+  require(!same_noisy_snapshot(first, changed),
+          "NVIDIA noisy stream did not change with semantic seed");
+  require(!magnetic.values.empty(), "NVIDIA noisy Drude magnetic run produced no state");
+  require(same_noisy_snapshot(zero_noise, ordinary),
+          "NVIDIA finite zero-noise path differs from ordinary Lorentz recurrence");
+  set_random_seed(424242);
+  const int expected_mt = random_int(0, 1000000);
+  (void)run_noisy_seed_case(policy, 424242, false, E_stuff, false, realnum(0.03125));
+  const int observed_mt = random_int(0, 1000000);
+  set_random_seed(424242);
+  (void)random_seed_snapshot();
+  require(observed_mt == expected_mt,
+          "NVIDIA counter-noise execution consumed the legacy MT stream");
+  master_printf("nvidia_timestep: noisy-replay/%s PASS\n", precision_policy_name(policy));
+}
+
+static void require_noisy_composition_plan(fields &gpu, bool expect_phase,
+                                           bool expect_negate, bool expect_diagonal,
+                                           bool expect_anisotropic) {
+  require(gpu.step_plans[0] && gpu.descriptors && gpu.halos,
+          "NVIDIA noisy composition did not publish its prepared plan");
+  const StepPlan &plan = *gpu.step_plans[0];
+  std::set<int> chunks;
+  std::set<int> electric_states;
+  std::set<int> magnetic_states;
+  bool saw_diagonal = false, saw_anisotropic = false;
+  bool saw_source = false, saw_dft = false, saw_flux_half = false, saw_flux = false;
+  for (const PolarizationUpdate &update : plan.polarization_updates) {
+    const uint32_t offdiagonal =
+        update.region.variant_key &
+        (polarization_one_offdiagonal | polarization_two_offdiagonals);
+    if (update.kind == PolarizationUpdateKind::lorentzian) {
+      saw_diagonal |= offdiagonal == 0;
+      saw_anisotropic |= offdiagonal != 0;
+    }
+    if (update.kind != PolarizationUpdateKind::noisy_add) continue;
+    chunks.insert(update.region.chunk);
+    (update.ft == E_stuff ? electric_states : magnetic_states).insert(update.state_index);
+  }
+  for (const Operation &op : plan.operations) {
+    saw_source |= op.kind == OpKind::apply_sources;
+    saw_dft |= op.kind == OpKind::update_dft;
+    saw_flux_half |= op.kind == OpKind::update_flux_half;
+    saw_flux |= op.kind == OpKind::update_flux;
+  }
+  unsigned halo_phases = 0;
+  for (const HaloPlan &halo : gpu.halos->plans)
+    if ((halo.ft == PE_stuff || halo.ft == PH_stuff) && halo.same_rank && halo.block_elements)
+      halo_phases |= 1u << unsigned(halo.phase);
+  require(chunks.size() >= 2, "NVIDIA noisy composition did not span multiple chunks");
+  require(electric_states.count(0) && electric_states.count(1),
+          "NVIDIA noisy composition lost linked-list E-state order");
+  require(magnetic_states.count(0), "NVIDIA noisy composition lost its H/Drude state");
+  if (expect_diagonal)
+    require(saw_diagonal, "NVIDIA noisy composition did not exercise diagonal sigma rows");
+  if (expect_anisotropic)
+    require(saw_anisotropic,
+            "NVIDIA noisy composition did not exercise anisotropic sigma rows");
+  require(saw_source && saw_dft && saw_flux_half && saw_flux,
+          "NVIDIA noisy composition omitted source, DFT, or legacy-flux operations");
+  require((halo_phases & (1u << CONNECT_COPY)) != 0,
+          "NVIDIA noisy composition omitted COPY polarization halos");
+  if (expect_phase)
+    require((halo_phases & (1u << CONNECT_PHASE)) != 0,
+            "NVIDIA noisy composition omitted PHASE polarization halos");
+  if (expect_negate)
+    require((halo_phases & (1u << CONNECT_NEGATE)) != 0,
+            "NVIDIA noisy composition omitted NEGATE polarization halos");
+  bool saw_pml = false;
+  for (const CurlUpdate &update : plan.db_updates)
+    saw_pml |= update.region.variant_key != 0;
+  require(saw_pml || expect_negate,
+          "NVIDIA noisy composition omitted the requested PML physics");
+}
+
+static void run_noisy_composition_case(precision_policy_kind policy) {
+  const grid_volume gv = vol3d(2.4, 2.0, 1.6, 6.0);
+  const boundary_region boundaries = pml(0.35, X) + pml(0.35, Y);
+  linear_anisotropic_material material(true, true);
+  dispersion_sigma_material anisotropic_sigma(true);
+  dispersion_sigma_material diagonal_sigma(false);
+  structure s(gv, material, boundaries, identity(), 4);
+  noisy_lorentzian_susceptibility electric_lorentz(0.015625, 0.73, 0.06, false);
+  noisy_lorentzian_susceptibility electric_drude(-0.01171875, 0.28, 0.09, true);
+  noisy_lorentzian_susceptibility magnetic_drude(0.0078125, 0.41, 0.04, true);
+  s.add_susceptibility(anisotropic_sigma, E_stuff, electric_lorentz);
+  s.add_susceptibility(diagonal_sigma, E_stuff, electric_drude);
+  s.add_susceptibility(anisotropic_sigma, H_stuff, magnetic_drude);
+
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&s, options);
+  gpu.use_bloch(vec(0.11, 0.07, 0.05));
+  const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
+  for (component c : components) gpu.require_component(c);
+  gaussian_src_time source(0.31, 0.14);
+  source.is_integrated = true;
+  gpu.add_point_source(Ez, source, vec(0.37, 0.41, 0.29),
+                       std::complex<double>(0.21, -0.13));
+  component monitor_component = Ez;
+  dft_fields monitor = gpu.add_dft_fields(&monitor_component, 1, gpu.v, 0.31, 0.31, 1);
+  flux_vol *flux =
+      gpu.add_flux_vol(Z, volume(vec(-0.75, -0.65, 0.0), vec(0.75, 0.65, 0.0)));
+  set_random_seed(0x13579bdfUL);
+  gpu.advance(2);
+  require_noisy_composition_plan(gpu, true, false, false, true);
+  require(std::isfinite(flux->flux()),
+          "NVIDIA noisy source/DFT/flux composition published a nonfinite flux");
+
+  structure negate_structure(gv, isotropic_eps, no_pml(), -mirror(Y, gv), 2);
+  negate_structure.add_susceptibility(diagonal_sigma, E_stuff, electric_lorentz);
+  negate_structure.add_susceptibility(diagonal_sigma, E_stuff, electric_drude);
+  negate_structure.add_susceptibility(diagonal_sigma, H_stuff, magnetic_drude);
+  fields negate(&negate_structure, options);
+  negate.use_real_fields();
+  for (component c : components) negate.require_component(c);
+  gaussian_src_time negate_source(0.31, 0.14);
+  negate.add_point_source(Ez, negate_source, vec(0.37, 0.41, 0.29), 0.21);
+  component negate_monitor_component = Ez;
+  dft_fields negate_monitor =
+      negate.add_dft_fields(&negate_monitor_component, 1, negate.v, 0.31, 0.31, 1);
+  flux_vol *negate_flux =
+      negate.add_flux_vol(Z, volume(vec(-0.75, -0.65, 0.0), vec(0.75, 0.65, 0.0)));
+  set_random_seed(0x2468ace0UL);
+  negate.advance(2);
+  require_noisy_composition_plan(negate, false, true, true, false);
+  require(std::isfinite(negate_flux->flux()),
+          "NVIDIA noisy NEGATE composition published a nonfinite flux");
+  master_printf("nvidia_timestep: noisy-composition/%s PASS\n",
+                precision_policy_name(policy));
+}
+
+static void run_noisy_sigma_diagnostic_case(precision_policy_kind policy,
+                                            realnum noise_amplitude,
+                                            realnum dynamic_sigma,
+                                            const char *name) {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  noisy_lorentzian_susceptibility noisy(noise_amplitude, 0.73, 0.06, false);
+  s.add_susceptibility(unit_value, E_stuff, noisy);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  set_finite_check_mode(FiniteCheckMode::step);
+  set_random_seed(0x31415926UL);
+  gpu.advance(1);
+  const PolarizationUpdate *target = NULL;
+  for (const PolarizationUpdate &update : gpu.step_plans[0]->polarization_updates)
+    if (update.kind == PolarizationUpdateKind::noisy_add && update.region.c == Ez) {
+      target = &update;
+      break;
+    }
+  require(target && is_valid(target->diagonal_sigma),
+          "NVIDIA noisy diagnostic fixture lacks its sigma row");
+  const ArraySpec &sigma_spec = gpu.array_catalog->spec(target->diagonal_sigma);
+  std::vector<realnum> sigma(sigma_spec.elements, dynamic_sigma);
+  gpu.backend->write(ArrayRef{target->diagonal_sigma, 0, sigma.size()}, sigma.data(),
+                     sigma.size() * sizeof(realnum));
+  bool rejected = false;
+  try { gpu.advance(2); }
+  catch (const std::runtime_error &error) {
+    rejected = std::string(error.what()).find("simulation fields are NaN or Inf") !=
+               std::string::npos;
+  }
+  if (!(rejected && gpu.nonfinite_flag && gpu.first_bad_component == int(Ez)))
+    fprintf(stderr,
+            "noisy diagnostic %s: rejected=%d flag=%u component=%d expected=%d step=%d\n",
+            name, int(rejected), gpu.nonfinite_flag, gpu.first_bad_component, int(Ez),
+            gpu.first_bad_step);
+  require(rejected && gpu.nonfinite_flag && gpu.first_bad_component == int(Ez),
+          "NVIDIA noisy dynamic-sigma diagnostic lacked component attribution");
+  set_finite_check_mode(FiniteCheckMode::off);
+  master_printf("nvidia_timestep: noisy-diagnostic-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void test_noisy_sigma_diagnostics(precision_policy_kind policy) {
+  run_noisy_sigma_diagnostic_case(policy, realnum(0.03125), realnum(-1), "negative");
+  run_noisy_sigma_diagnostic_case(policy, realnum(0.03125),
+                                  std::numeric_limits<realnum>::quiet_NaN(), "nan");
+  run_noisy_sigma_diagnostic_case(policy, realnum(0.03125),
+                                  std::numeric_limits<realnum>::infinity(), "infinite");
+  run_noisy_sigma_diagnostic_case(policy, realnum(0), realnum(-1), "zero-amplitude-negative");
+}
+
+struct resident_value_snapshot {
+  std::vector<ArrayId> ids;
+  std::vector<std::vector<realnum> > values;
+};
+
+static resident_value_snapshot capture_resident_values(fields &f) {
+  resident_value_snapshot result;
+  for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (is_valid(spec.alias_of) || spec.element_type != ElementType::realnum_value ||
+        (spec.role != array_role::field && spec.role != array_role::polarization))
+      continue;
+    result.ids.push_back(id);
+    result.values.push_back(std::vector<realnum>(spec.elements));
+    f.backend->read(ArrayRef{id, 0, spec.elements}, result.values.back().data(),
+                    spec.elements * sizeof(realnum));
+  }
+  return result;
+}
+
+static void restore_resident_values(fields &f, const resident_value_snapshot &snapshot) {
+  for (size_t i = 0; i < snapshot.ids.size(); ++i)
+    f.backend->write(ArrayRef{snapshot.ids[i], 0, snapshot.values[i].size()},
+                     snapshot.values[i].data(), snapshot.values[i].size() * sizeof(realnum));
+}
+
+static bool same_resident_values(const resident_value_snapshot &a,
+                                 const resident_value_snapshot &b) {
+  if (a.ids != b.ids || a.values.size() != b.values.size()) return false;
+  for (size_t i = 0; i < a.values.size(); ++i)
+    if (a.values[i].size() != b.values[i].size() ||
+        memcmp(a.values[i].data(), b.values[i].data(),
+               a.values[i].size() * sizeof(realnum)) != 0)
+      return false;
+  return true;
+}
+
+static void test_noisy_lifecycle() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 0.73, 0.06);
+  s.add_susceptibility(unit_value, E_stuff, noisy);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  set_random_seed(0x12345678UL);
+  gpu.init_backend();
+  gpu.advance(2);
+  BackendState *const state = gpu.backend_state;
+  Executable *const executable = gpu.executable;
+  const int replay_time = gpu.t;
+  const resident_value_snapshot baseline = capture_resident_values(gpu);
+
+  nvidia::testing::reset_transfer_accounting();
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  gpu.advance(1);
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  const nvidia::testing::transfer_accounting steady =
+      nvidia::testing::current_transfer_accounting();
+  const resident_value_snapshot seed_s = capture_resident_values(gpu);
+  require(steady.host_to_device_calls == 0 && steady.device_to_host_calls == 0 &&
+              memory_before.device_bytes_current == memory_after.device_bytes_current &&
+              memory_before.pinned_bytes_current == memory_after.pinned_bytes_current,
+          "NVIDIA noisy steady step allocated or transferred host data");
+
+  restore_resident_values(gpu, baseline);
+  gpu.t = replay_time;
+  set_random_seed(0x87654321UL);
+  nvidia::testing::reset_transfer_accounting();
+  gpu.advance(1);
+  const nvidia::testing::transfer_accounting changed =
+      nvidia::testing::current_transfer_accounting();
+  const resident_value_snapshot seed_t = capture_resident_values(gpu);
+  require(changed.host_to_device_calls == 1 &&
+              changed.host_to_device_bytes == sizeof(nvidia::noisy_seed_block) &&
+              changed.device_to_host_calls == 0 && !same_resident_values(seed_s, seed_t),
+          "NVIDIA noisy reseed transfer or output differs");
+
+  restore_resident_values(gpu, baseline);
+  gpu.t = replay_time;
+  restore_random_seed();
+  gpu.advance(1);
+  require(same_resident_values(seed_s, capture_resident_values(gpu)) &&
+              gpu.backend_state == state && gpu.executable == executable,
+          "NVIDIA noisy S/T/restore replay changed state or executable identity");
+
+  restore_resident_values(gpu, baseline);
+  gpu.t = replay_time;
+  set_random_seed(0x12345678UL);
+  nvidia::testing::reset_transfer_accounting();
+  gpu.advance(1);
+  const nvidia::testing::transfer_accounting repeated =
+      nvidia::testing::current_transfer_accounting();
+  require(same_resident_values(seed_s, capture_resident_values(gpu)) &&
+              repeated.host_to_device_calls == 1 &&
+              repeated.host_to_device_bytes == sizeof(nvidia::noisy_seed_block) &&
+              gpu.backend_state == state && gpu.executable == executable,
+          "NVIDIA repeated semantic seed did not refresh without rebuilding");
+
+  set_random_seed(0x31415926UL);
+  const resident_value_snapshot retry_input = capture_resident_values(gpu);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::noisy_seed_copy);
+  bool failed = false;
+  const int before_failure_time = gpu.t;
+  try { gpu.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && !gpu.backend->is_poisoned() && gpu.t == before_failure_time &&
+              gpu.backend_state == state && gpu.executable == executable,
+          "retryable NVIDIA noisy seed copy failure changed the live epoch");
+  gpu.advance(1);
+  const resident_value_snapshot retry_output = capture_resident_values(gpu);
+  restore_resident_values(gpu, retry_input);
+  gpu.t = before_failure_time;
+  set_random_seed(0x31415926UL);
+  gpu.advance(1);
+  require(same_resident_values(retry_output, capture_resident_values(gpu)),
+          "NVIDIA noisy seed-copy retry differs from a clean same-key dispatch");
+
+  nvidia::testing::fail_next(nvidia::testing::failure_point::noisy_add);
+  failed = false;
+  try { gpu.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && gpu.backend->is_poisoned(),
+          "NVIDIA noisy postlaunch failure did not poison the backend");
+  require_advance_rejected(gpu, "poisoned");
+  std::vector<realnum> rejected_read(1);
+  bool read_rejected = false;
+  try {
+    gpu.backend->read(ArrayRef{ArrayId{0}, 0, 1}, rejected_read.data(), sizeof(realnum));
+  }
+  catch (const std::exception &) { read_rejected = true; }
+  require(read_rejected, "NVIDIA noisy poisoned backend accepted a readback");
+  bool reselection_rejected = false;
+  try {
+    execution_options cpu_options;
+    gpu.select_backend(cpu_options);
+  }
+  catch (const std::exception &error) {
+    reselection_rejected = std::string(error.what()).find("poison") != std::string::npos;
+  }
+  require(reselection_rejected,
+          "NVIDIA noisy poisoned backend accepted migration/reselection");
+
+  structure replacement_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  replacement_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields sync_failure(&replacement_structure, options);
+  sync_failure.use_real_fields();
+  sync_failure.require_component(Ez);
+  set_random_seed(0x27182818UL);
+  sync_failure.init_backend();
+  sync_failure.advance(1);
+  set_random_seed(0x16180339UL);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::noisy_seed_sync);
+  failed = false;
+  try { sync_failure.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && sync_failure.backend->is_poisoned(),
+          "NVIDIA noisy seed synchronization failure did not poison");
+  structure recovered_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  recovered_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields recovered(&recovered_structure, options);
+  recovered.use_real_fields();
+  recovered.require_component(Ez);
+  set_random_seed(0x16180339UL);
+  recovered.advance(1);
+  require(recovered.backend_state && recovered.executable && !recovered.backend->is_poisoned(),
+          "replacement NVIDIA noisy state was not usable after seed-sync poison");
+
+  structure cold_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  cold_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields cold(&cold_structure, options);
+  cold.use_real_fields();
+  cold.require_component(Ez);
+  set_random_seed(0xabcdef01UL);
+  const int expected_mt = random_int(0, 1000000);
+  set_random_seed(0xabcdef01UL);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::device_allocate);
+  failed = false;
+  try { cold.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && !cold.backend->is_poisoned() && cold.t == 0 && !cold.backend_state &&
+              !cold.executable && random_int(0, 1000000) == expected_mt,
+          "cold NVIDIA noisy allocation failure dispatched, drew MT state, or published epoch");
+  cold.advance(1);
+  const noisy_snapshot cold_retry = capture_noisy_group(cold, E_stuff, 0, Ez);
+  structure clean_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  clean_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields clean(&clean_structure, options);
+  clean.use_real_fields();
+  clean.require_component(Ez);
+  set_random_seed(0xabcdef01UL);
+  clean.advance(1);
+  require(same_noisy_snapshot(cold_retry, capture_noisy_group(clean, E_stuff, 0, Ez)),
+          "cold NVIDIA noisy allocation retry differs from clean execution");
+
+  structure compile_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  compile_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields compile_failure(&compile_structure, options);
+  compile_failure.use_real_fields();
+  compile_failure.require_component(Ez);
+  set_random_seed(0xabcdef01UL);
+  compile_failure.init_backend();
+  BackendState *const prepared_state = compile_failure.backend_state;
+  require(prepared_state && !compile_failure.executable &&
+              !prepared_state->random_seed_snapshot_accepted,
+          "NVIDIA noisy compile-failure fixture was not cold at executable publication");
+  nvidia::testing::fail_next(nvidia::testing::failure_point::device_allocate);
+  failed = false;
+  try { compile_failure.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && !compile_failure.backend->is_poisoned() && compile_failure.t == 0 &&
+              compile_failure.backend_state == prepared_state && !compile_failure.executable &&
+              !prepared_state->random_seed_snapshot_accepted,
+          "NVIDIA noisy executable allocation failure published or dispatched");
+  compile_failure.advance(1);
+  require(same_noisy_snapshot(cold_retry,
+                              capture_noisy_group(compile_failure, E_stuff, 0, Ez)),
+          "NVIDIA noisy executable allocation retry differs from clean execution");
+  master_printf("nvidia_timestep: noisy lifecycle PASS\n");
+}
+
+static void test_noisy_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 0.73, 0.06);
+  s.add_susceptibility(unit_value, E_stuff, noisy);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  set_random_seed(12345);
+  gpu.advance(1);
+  require(gpu.step_plans[0] && gpu.backend_state,
+          "NVIDIA noisy rejection fixture did not prepare a plan");
+  const StepPlan baseline = *gpu.step_plans[0];
+  BackendState *const live_state = gpu.backend_state;
+  Executable *const live_executable = gpu.executable;
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  const resident_value_snapshot values_before = capture_resident_values(gpu);
+  size_t noisy_index = baseline.polarization_updates.size();
+  for (size_t i = 0; i < baseline.polarization_updates.size(); ++i)
+    if (baseline.polarization_updates[i].kind == PolarizationUpdateKind::noisy_add) {
+      noisy_index = i;
+      break;
+    }
+  require(noisy_index < baseline.polarization_updates.size(),
+          "NVIDIA noisy rejection fixture has no noise row");
+
+  StepPlan malformed = baseline;
+  malformed.polarization_updates[noisy_index].dt = 0.0;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  ++malformed.polarization_updates[noisy_index].noise_algorithm_version;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].region.chunk = -1;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].state_index = -1;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].region.cmp = 2;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].ft = H_stuff;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].omega_0 =
+      std::numeric_limits<double>::infinity();
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].gamma = -0.01;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].noise_amplitude =
+      std::numeric_limits<double>::quiet_NaN();
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].region.counts[2] = 0;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  for (int axis = 0; axis < 3; ++axis)
+    if (malformed.polarization_updates[noisy_index].region.counts[axis] > 1) {
+      malformed.polarization_updates[noisy_index].region.strides[axis] = 0;
+      break;
+    }
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates[noisy_index].p =
+      malformed.polarization_updates[noisy_index].diagonal_sigma;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  for (Operation &op : malformed.operations)
+    if (op.kind == OpKind::update_polarization) {
+      op.guard = guard_device(7);
+      break;
+    }
+  expect_compile_rejected(gpu, malformed, "operation span or access set");
+  malformed = baseline;
+  for (Operation &op : malformed.operations)
+    if (op.kind == OpKind::update_polarization && !op.accesses.empty()) {
+      op.accesses[0].mode = AccessMode::write;
+      break;
+    }
+  expect_compile_rejected(gpu, malformed, "operation span or access set");
+  malformed = baseline;
+  malformed.polarization_updates.erase(malformed.polarization_updates.begin() + noisy_index);
+  for (Operation &op : malformed.operations)
+    if (op.kind == OpKind::update_polarization && op.ft == E_stuff) --op.descriptor_count;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  malformed = baseline;
+  malformed.polarization_updates.push_back(malformed.polarization_updates[noisy_index]);
+  for (Operation &op : malformed.operations)
+    if (op.kind == OpKind::update_polarization && op.ft == E_stuff) ++op.descriptor_count;
+  expect_compile_rejected(gpu, malformed, "descriptor authority");
+  if (noisy_index > 0) {
+    malformed = baseline;
+    std::swap(malformed.polarization_updates[noisy_index - 1],
+              malformed.polarization_updates[noisy_index]);
+    expect_compile_rejected(gpu, malformed, "descriptor authority");
+  }
+
+  PolarizationDescriptor *descriptor = NULL;
+  for (PolarizationDescriptor &candidate : gpu.descriptors->polarizations)
+    if (candidate.kind == SusceptibilityKind::noisy_lorentzian) {
+      descriptor = &candidate;
+      break;
+    }
+  require(descriptor, "NVIDIA noisy rejection fixture has no descriptor");
+  descriptor->kind = SusceptibilityKind::lorentzian;
+  expect_compile_rejected(gpu, baseline, "live linked-list order");
+  descriptor->kind = SusceptibilityKind::noisy_lorentzian;
+
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  require(gpu.backend_state == live_state && gpu.executable == live_executable &&
+              !gpu.backend->is_poisoned() &&
+              memory_before.device_bytes_current == memory_after.device_bytes_current &&
+              memory_before.pinned_bytes_current == memory_after.pinned_bytes_current &&
+              same_resident_values(values_before, capture_resident_values(gpu)),
+          "rejected NVIDIA noisy compile mutated the live epoch or device state");
+
+  const int saved_t = gpu.t;
+  gpu.t = -1;
+  bool rejected = false;
+  try { gpu.backend->advance(*gpu.executable, *gpu.backend_state, 1); }
+  catch (const std::invalid_argument &) { rejected = true; }
+  gpu.t = saved_t;
+  require(rejected && !gpu.backend->is_poisoned(),
+          "NVIDIA noisy negative timestep was accepted or poisoned predispatch");
+  master_printf("nvidia_timestep: noisy compile rejections PASS\n");
+}
+
+static void test_noisy_capability_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+
+  inherited_noisy_lorentzian derived(0.03125, 0.73, 0.06);
+  structure derived_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  derived_structure.add_susceptibility(unit_value, E_stuff, derived);
+  fields derived_fields(&derived_structure, options);
+  derived_fields.use_real_fields();
+  derived_fields.require_component(Ez);
+  set_random_seed(12345);
+  bool rejected = false;
+  try { derived_fields.advance(1); }
+  catch (const std::exception &) { rejected = true; }
+  require(rejected &&
+              (!derived_fields.backend_state ||
+               !derived_fields.backend_state->random_seed_snapshot_accepted),
+          "NVIDIA accepted a derived noisy host-custom susceptibility or seed metadata");
+
+  const realnum Gamma[] = {realnum(0), realnum(0.02), realnum(0), realnum(-0.02)};
+  const realnum N0[] = {realnum(1), realnum(0)};
+  const realnum alpha[] = {realnum(-0.2), realnum(0.2)};
+  const realnum omega[] = {realnum(0.73)};
+  const realnum gamma[] = {realnum(0.06)};
+  const realnum sigmat[] = {realnum(1), realnum(1), realnum(1), realnum(0), realnum(0)};
+  multilevel_susceptibility multilevel(2, 1, Gamma, N0, alpha, omega, gamma, sigmat);
+  structure multilevel_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  multilevel_structure.add_susceptibility(unit_value, E_stuff, multilevel);
+  fields multilevel_fields(&multilevel_structure, options);
+  multilevel_fields.use_real_fields();
+  multilevel_fields.require_component(Ez);
+  rejected = false;
+  try { multilevel_fields.advance(1); }
+  catch (const std::exception &) { rejected = true; }
+  require(rejected &&
+              (!multilevel_fields.backend_state ||
+               !multilevel_fields.backend_state->random_seed_snapshot_accepted),
+          "NVIDIA accepted multilevel polarization or published noisy seed metadata");
+
+  noisy_lorentzian_susceptibility noisy(0.03125, 0.73, 0.06);
+  structure cw_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  cw_structure.add_susceptibility(unit_value, E_stuff, noisy);
+  fields cw(&cw_structure, options);
+  cw.require_component(Ez);
+  rejected = false;
+  try { (void)cw.solve_cw(1e-4, 1, std::complex<double>(0.3, 0.0), 2); }
+  catch (const std::exception &) { rejected = true; }
+  require(rejected && (!cw.backend_state || !cw.backend_state->random_seed_snapshot_accepted),
+          "NVIDIA solve_cw accepted noisy polarization or published seed metadata");
+  master_printf("nvidia_timestep: noisy capability rejections PASS\n");
+}
+
+static void test_noisy_profile(const char *mode) {
+  const bool reseed = !strcmp(mode, "reseed");
+  require(reseed || !strcmp(mode, "steady"), "unknown NVIDIA noisy profile mode");
+  const grid_volume gv = vol3d(2.0, 2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 0.73, 0.06);
+  s.add_susceptibility(unit_value, E_stuff, noisy);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  set_random_seed(12345);
+  gpu.advance(2);
+  if (reseed) set_random_seed(67890);
+  nvidia::testing::reset_transfer_accounting();
+  const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+  gpu.advance(8);
+  const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(transfers.host_to_device_calls == size_t(reseed) &&
+              transfers.host_to_device_bytes ==
+                  (reseed ? sizeof(nvidia::noisy_seed_block) : size_t(0)) &&
+              transfers.device_to_host_calls == 0 &&
+              before.device_bytes_current == after.device_bytes_current &&
+              before.pinned_bytes_current == after.pinned_bytes_current,
+          "NVIDIA noisy profile transfer/allocation contract differs");
+  master_printf("nvidia_timestep: noisy profile %s PASS\n", mode);
+}
+
 static void test_rejections() {
   const grid_volume gv = vol2d(2.0, 2.0, 6.0);
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
 
-  {
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    s.add_susceptibility(unit_value, E_stuff,
-                         noisy_lorentzian_susceptibility(0.01, 1.1, 0.05));
-    fields f(&s, options);
-    f.use_real_fields();
-    f.require_component(Ez);
-    require_advance_rejected(f, "noisy_lorentzian");
-  }
 }
 
 static void test_compile_allocation_retry() {
@@ -3310,6 +4164,7 @@ int main(int argc, char **argv) {
   const bool magnetic_only = getenv("MEEP_NVIDIA_TIMESTEP_MAGNETIC_ONLY") != NULL;
   const bool material_only = getenv("MEEP_NVIDIA_TIMESTEP_MATERIAL_ONLY") != NULL;
   const bool flux_only = getenv("MEEP_NVIDIA_TIMESTEP_FLUX_ONLY") != NULL;
+  const bool noisy_only = getenv("MEEP_NVIDIA_TIMESTEP_NOISY_ONLY") != NULL;
   const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
@@ -3350,6 +4205,22 @@ int main(int argc, char **argv) {
     test_material_compile_rejections();
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_TIMESTEP_NOISY_LIFECYCLE_ONLY")) {
+    test_noisy_lifecycle();
+    test_noisy_rebuild_lifecycle();
+    master_printf("nvidia_timestep: noisy lifecycle checks PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_TIMESTEP_NOISY_REJECTIONS_ONLY")) {
+    test_noisy_compile_rejections();
+    test_noisy_capability_rejections();
+    master_printf("nvidia_timestep: noisy rejection checks PASS\n");
+    return 0;
+  }
+  if (const char *mode = getenv("MEEP_NVIDIA_TIMESTEP_NOISY_PROFILE")) {
+    test_noisy_profile(mode);
+    return 0;
+  }
   const grid_volume gv2 = vol2d(3.0, 2.0, 8.0);
   const grid_volume gv3 = vol3d(2.0, 2.0, 2.0, 5.0);
   const vec bloch2(0.17, 0.11);
@@ -3361,6 +4232,12 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (noisy_only) {
+      run_noisy_replay_case(policies[p]);
+      run_noisy_composition_case(policies[p]);
+      test_noisy_sigma_diagnostics(policies[p]);
+      continue;
+    }
     if (flux_only) {
       run_legacy_flux_case("real-two-monitor", policies[p], false);
       run_legacy_flux_case("complex-bloch-two-monitor", policies[p], true);
@@ -3452,7 +4329,8 @@ int main(int argc, char **argv) {
       run_bfast_case("d2-beta-composed", gv2, policies[p], false, positive_k, false,
                      false, 2, &bloch2, 0.17);
     }
-    if (gyro_only || beta_only || bfast_only || magnetic_only || material_only || flux_only)
+    if (gyro_only || beta_only || bfast_only || magnetic_only || material_only || flux_only ||
+        noisy_only)
       continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
@@ -3513,6 +4391,10 @@ int main(int argc, char **argv) {
              (1u << 1) | (1u << 2) | (1u << 3), 1u << 5, false, false,
              &magnetic_two_offdiagonals, true, true, Hz);
     test_finite_diagnostics(policies[p]);
+  }
+  if (noisy_only) {
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
   }
   if (magnetic_only) {
     test_magnetic_pre_step_and_recompile();
