@@ -262,6 +262,19 @@ bool backend_write_host_range(fields &f, const void *host_address, size_t elemen
    of backend reads and before entering the next MPI/HDF5 collective. */
 void backend_reconcile_host_access(const std::string &local_error, const char *site);
 
+/* Publish final legacy-flux scalars by checked newest-first ordinal. The
+   half-step samples remain backend-private. */
+void backend_publish_legacy_flux(fields &f, const double *values, size_t count, const char *site);
+/* Rebuild only the legacy-flux recipe vectors and marker operations while
+   preserving the already-compiled ordinary operands. Resident classification
+   may deliberately remove host-only coefficient rows from the live catalog,
+   so a flux-only mutation must not regenerate unrelated curl/constitutive
+   descriptors from that reduced catalog. */
+StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
+                                          const StepPlan &stable);
+bool backend_try_refresh_legacy_flux(fields &f, const char *site);
+void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
+
 /* Preserve resident-authoritative values and retire the old backend objects
    before a host-side field-layout mutation can delete or replace their
    catalogued storage. Every rank must enter this boundary together. */

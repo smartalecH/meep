@@ -31,6 +31,7 @@ namespace meep {
 
 static int cw_clone_fail_after_for_testing = -1;
 static bool cw_plan_corruption_for_testing = false;
+static int legacy_flux_prepare_failure_rank_for_testing = -1;
 
 void backend_set_cw_clone_fail_after_for_testing(int checkpoints) {
   cw_clone_fail_after_for_testing = checkpoints;
@@ -43,6 +44,10 @@ void backend_cw_clone_checkpoint() {
 
 void backend_set_cw_plan_corruption_for_testing(bool enabled) {
   cw_plan_corruption_for_testing = enabled;
+}
+
+void backend_set_legacy_flux_prepare_failure_for_testing(int rank) {
+  legacy_flux_prepare_failure_rank_for_testing = rank;
 }
 
 namespace {
@@ -602,6 +607,213 @@ void backend_reconcile_host_access(const std::string &local_error, const char *s
   throw std::runtime_error(std::string(site) + ": " + local_error);
 }
 
+void backend_publish_legacy_flux(fields &f, const double *values, size_t count, const char *site) {
+  std::string local_error;
+  size_t live_count = 0;
+  for (const flux_vol *flux = f.fluxes; flux; flux = flux->next) ++live_count;
+  if (count && !values)
+    local_error = "legacy flux publication has no result buffer";
+  else if (count != live_count)
+    local_error = "legacy flux publication result count differs from the live list";
+  else if (!f.descriptors || f.descriptors->legacy_fluxes.size() != live_count ||
+           f.descriptors->legacy_flux_generation !=
+               generation(f, MutationKind::legacy_flux_definition))
+    local_error = "legacy flux publication has stale descriptors";
+  else
+    for (size_t ordinal = 0; ordinal < live_count; ++ordinal)
+      if (f.descriptors->legacy_fluxes[ordinal].flux_ordinal != ordinal) {
+        local_error = "legacy flux publication has a noncanonical list ordinal";
+        break;
+      }
+  backend_reconcile_host_access(local_error, site);
+
+  size_t ordinal = 0;
+  for (flux_vol *flux = f.fluxes; flux; flux = flux->next, ++ordinal)
+    flux->cur_flux = values[ordinal];
+}
+
+static bool is_legacy_flux_marker(OpKind kind) {
+  return kind == OpKind::update_flux_half || kind == OpKind::update_flux;
+}
+
+StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
+                                          const StepPlan &stable) {
+  if (stable.program != program)
+    throw std::logic_error("legacy flux refresh stable plan has the wrong program");
+  const StepPlan fresh = build_step_plan(f, program);
+  StepPlan replacement = stable;
+  replacement.legacy_flux_updates = fresh.legacy_flux_updates;
+  replacement.legacy_flux_terms = fresh.legacy_flux_terms;
+  replacement.operations.clear();
+  replacement.operations.reserve(fresh.operations.size());
+
+  size_t stable_index = 0;
+  for (const Operation &fresh_op : fresh.operations) {
+    if (is_legacy_flux_marker(fresh_op.kind)) {
+      replacement.operations.push_back(fresh_op);
+      continue;
+    }
+    while (stable_index < stable.operations.size() &&
+           is_legacy_flux_marker(stable.operations[stable_index].kind))
+      ++stable_index;
+    if (stable_index == stable.operations.size())
+      throw std::logic_error("legacy flux refresh changed the non-flux operation count");
+    const Operation &stable_op = stable.operations[stable_index++];
+    if (stable_op.kind != fresh_op.kind || stable_op.ft != fresh_op.ft ||
+        stable_op.source_time_offset != fresh_op.source_time_offset ||
+        stable_op.guard.kind != fresh_op.guard.kind ||
+        stable_op.guard.scalar_slot != fresh_op.guard.scalar_slot ||
+        stable_op.guard.variant_index != fresh_op.guard.variant_index)
+      throw std::logic_error("legacy flux refresh changed the non-flux operation schedule");
+    replacement.operations.push_back(stable_op);
+  }
+  while (stable_index < stable.operations.size() &&
+         is_legacy_flux_marker(stable.operations[stable_index].kind))
+    ++stable_index;
+  if (stable_index != stable.operations.size())
+    throw std::logic_error("legacy flux refresh dropped a non-flux operation");
+  replacement.signature = compute_step_plan_signature(replacement);
+  return replacement;
+}
+
+bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return false;
+  const bool refresh = or_to_all(is_dirty(f, dirty_flux_plan));
+  if (!refresh) return false;
+
+  /* The small replacement below is valid only when the remaining dirty state
+     is exactly the legacy-flux closure.  In particular, it must not clear
+     dirty_executable while a boundary/material/storage mutation still needs
+     the conservative staged epoch.  Source/monitor descriptors have already
+     been refreshed by init_backend before this hook is reached. */
+  const DirtyMask flux_closure =
+      DirtyMask(dirty_flux_plan | dirty_regions | dirty_executable);
+  bool stable_provenance_mismatch = false;
+  if (f.step_plans[0]) {
+    stable_provenance_mismatch =
+        !f.descriptors ||
+        f.step_plans[0]->source_signature != source_plan_signature(f.descriptors->sources) ||
+        dft_plan_signature(f.step_plans[0]->dft_updates) !=
+            dft_plan_signature(f.descriptors->dfts);
+  }
+  const bool mixed_structural = or_to_all(
+      (f.dirty_mask & ~flux_closure) != dirty_none || stable_provenance_mismatch);
+
+  std::string local_error;
+  size_t local_definition = size_t(legacy_flux_definition_signature(f));
+  size_t reference_definition = local_definition;
+  broadcast(0, &reference_definition, 1);
+  if (local_definition != reference_definition)
+    local_error = "legacy flux definitions differ across MPI ranks";
+  if (legacy_flux_prepare_failure_rank_for_testing == my_rank())
+    local_error = "injected legacy flux descriptor preparation failure";
+  backend_reconcile_host_access(local_error, site);
+
+  if (mixed_structural) {
+    if (f.backend_state) try {
+        f.backend->prepare_state_rebuild(*f.backend_state, DirtyMask(f.dirty_mask));
+      }
+      catch (const std::exception &e) {
+        local_error = e.what();
+      }
+      catch (...) {
+        local_error = "unknown legacy flux state-migration failure";
+      }
+    backend_reconcile_host_access(local_error, site);
+
+    std::unique_ptr<PreparedBackendEpoch> prepared_epoch;
+    try {
+      prepared_epoch.reset(new PreparedBackendEpoch(f));
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown legacy flux epoch preparation failure";
+    }
+    const bool prepare_failed = or_to_all(!local_error.empty());
+    if (prepare_failed) {
+      prepared_epoch.reset();
+      if (local_error.empty())
+        throw std::runtime_error(std::string(site) +
+                                 ": legacy flux epoch preparation failed on another MPI rank");
+      throw std::runtime_error(std::string(site) + ": " + local_error);
+    }
+
+    try {
+      f.require_source_components();
+      f.init_backend();
+      f.ensure_backend_executable();
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown legacy flux epoch compilation failure";
+    }
+    const bool compile_failed = or_to_all(!local_error.empty());
+    if (compile_failed) {
+      prepared_epoch.reset();
+      if (local_error.empty())
+        throw std::runtime_error(std::string(site) +
+                                 ": legacy flux epoch compilation failed on another MPI rank");
+      throw std::runtime_error(std::string(site) + ": " + local_error);
+    }
+    prepared_epoch->commit();
+    return true;
+  }
+
+  std::unique_ptr<DescriptorSet> replacement_descriptors;
+  std::unique_ptr<StepPlan> replacement_plan;
+  Executable *replacement_executable = NULL;
+  DescriptorSet *live_descriptors = f.descriptors;
+  try {
+    replacement_descriptors.reset(new DescriptorSet(*live_descriptors));
+    build_legacy_flux_descriptors(f, replacement_descriptors->legacy_fluxes);
+    replacement_descriptors->legacy_flux_generation =
+        generation(f, MutationKind::legacy_flux_definition);
+    replacement_descriptors->regions.clear();
+
+    f.descriptors = replacement_descriptors.get();
+    replacement_plan.reset(new StepPlan(
+        f.step_plans[0]
+            ? build_legacy_flux_only_step_plan(f, StepProgram::ordinary, *f.step_plans[0])
+            : build_step_plan(f, StepProgram::ordinary)));
+    replacement_executable = f.backend->compile(*replacement_plan, *f.backend_state);
+    if (!replacement_executable)
+      throw std::runtime_error("backend returned no legacy-flux replacement executable");
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown legacy flux refresh failure";
+  }
+  f.descriptors = live_descriptors;
+
+  const bool failed = or_to_all(!local_error.empty());
+  if (failed) {
+    delete replacement_executable;
+    if (local_error.empty())
+      throw std::runtime_error(std::string(site) +
+                               ": legacy flux refresh failed on another MPI rank");
+    throw std::runtime_error(std::string(site) + ": " + local_error);
+  }
+
+  DescriptorSet *old_descriptors = f.descriptors;
+  StepPlan *old_plans[2] = {f.step_plans[0], f.step_plans[1]};
+  Executable *old_executable = f.executable;
+  f.descriptors = replacement_descriptors.release();
+  f.step_plans[0] = replacement_plan.release();
+  f.step_plans[1] = old_plans[1];
+  f.executable = replacement_executable;
+  clear_dirty(f, dirty_flux_plan | dirty_regions | dirty_executable);
+  delete old_executable;
+  delete old_plans[0];
+  delete old_descriptors;
+  return true;
+}
+
 void backend_preflight_field_layout_change(fields &f, DirtyMask reasons, const char *site) {
   std::string local_error;
   if (f.backend_state && f.backend && f.backend->requires_full_storage_preparation()) {
@@ -908,10 +1120,16 @@ void fields::init_backend() {
   if (or_to_all(backend->is_poisoned()))
     throw std::runtime_error("fields::init_backend: resident backend is poisoned");
   if (!backend->requires_full_storage_preparation()) {
-    /* On the initial CPU step the lazy storage pass below the executor builds
-       descriptors after the catalog is complete. Once storage is current,
-       source-only mutations can refresh their descriptors without promoting
-       the CPU path to eager storage preparation. */
+    /* Most CPU execution keeps its historical lazy storage preparation.
+       Legacy flux is the exception: its pointer-free recipes need final
+       catalog ArrayIds before the first StepPlan is built, so a cold CPU flux
+       step completes storage here. Once storage is current, value-only plan
+       mutations refresh without another preparation pass. */
+    const bool refresh_flux_after_cpu_rebuild = fluxes && is_dirty(*this, dirty_storage);
+    if (refresh_flux_after_cpu_rebuild) {
+      prepare_storage();
+      dirty_mask |= dirty_flux_plan | dirty_regions | dirty_executable;
+    }
     if (!is_dirty(*this, dirty_storage)) refresh_operation_descriptors(*this);
     if (!backend_state) backend_state = backend->create_state(*storage_plan);
     /* CPU storage is the host storage, so value mutations require no transfer. */
@@ -951,7 +1169,34 @@ void fields::init_backend() {
     classify_and_finalize();
 
   const bool rebuild_state = !backend_state || is_dirty(*this, dirty_storage);
+  const bool refresh_flux_after_rebuild =
+      rebuild_state &&
+      (fluxes || (descriptors && !descriptors->legacy_fluxes.empty()) ||
+       is_dirty(*this, dirty_flux_plan));
+  std::unique_ptr<PreparedMaterialCoefficientStorage> prepared_coefficients;
+  std::unique_ptr<StepPlan> preclassification_ordinary;
   if (rebuild_state) {
+    std::string flux_error;
+    size_t local_flux_definition = size_t(legacy_flux_definition_signature(*this));
+    size_t reference_flux_definition = local_flux_definition;
+    broadcast(0, &reference_flux_definition, 1);
+    if (local_flux_definition != reference_flux_definition)
+      flux_error = "legacy flux definitions differ across MPI ranks";
+    backend_reconcile_host_access(flux_error, "fields::init_backend legacy flux preflight");
+
+    std::string coefficient_error;
+    try {
+      prepared_coefficients = prepare_material_coefficient_storage(*this);
+    }
+    catch (const std::exception &e) {
+      coefficient_error = e.what();
+    }
+    catch (...) {
+      coefficient_error = "unknown resident material coefficient preparation failure";
+    }
+    backend_reconcile_host_access(coefficient_error,
+                                  "fields::init_backend material coefficients");
+
     if (backend_state) {
       std::string local_error;
       if (synchronized_magnetic_fields)
@@ -963,10 +1208,34 @@ void fields::init_backend() {
     /* Unlike the CPU path, a resident backend needs the complete catalog before
        it allocates. This is intentionally gated by the backend capability so
        default CPU preparation remains lazy and checkpoint-bitwise identical. */
+    if (prepared_coefficients) prepared_coefficients->commit();
     prepare_storage();
     /* Boundary construction is also lazy on CPU. Resident compilation needs
        the finalized metal-zero and halo schedules before it snapshots state. */
     connect_chunks();
+    if (refresh_flux_after_rebuild) {
+      std::unique_ptr<DescriptorSet> staged_descriptors;
+      DescriptorSet *const live_descriptors = descriptors;
+      std::string plan_error;
+      try {
+        staged_descriptors.reset(new DescriptorSet(*live_descriptors));
+        build_legacy_flux_descriptors(*this, staged_descriptors->legacy_fluxes);
+        staged_descriptors->legacy_flux_generation =
+            generation(*this, MutationKind::legacy_flux_definition);
+        descriptors = staged_descriptors.get();
+        preclassification_ordinary.reset(
+            new StepPlan(build_step_plan(*this, StepProgram::ordinary)));
+      }
+      catch (const std::exception &e) {
+        plan_error = e.what();
+      }
+      catch (...) {
+        plan_error = "unknown pre-classification ordinary-plan failure";
+      }
+      descriptors = live_descriptors;
+      backend_reconcile_host_access(plan_error,
+                                    "fields::init_backend legacy flux stable plan");
+    }
     backend_state = backend->create_state(*storage_plan);
     dirty_mask |= dirty_initialization | dirty_classification;
   }
@@ -975,6 +1244,14 @@ void fields::init_backend() {
      while the old executable is still alive; advance() destroys that artifact
      only after this succeeds and a new StepPlan exists. */
   refresh_operation_descriptors(*this);
+
+  /* A resident catalog replacement invalidates every ArrayId in an existing
+     flux recipe. Re-dirty the flux closure without advancing the public
+     definition generation; backend_try_refresh_legacy_flux performs its
+     collective definition preflight and rebuilds against the complete new
+     catalog before compilation. */
+  if (refresh_flux_after_rebuild)
+    dirty_mask |= dirty_flux_plan | dirty_regions | dirty_executable;
 
   if (is_dirty(*this, dirty_initialization)) {
     delete initialization_plan;
@@ -989,6 +1266,10 @@ void fields::init_backend() {
       meep::abort("meep: backend classification disagrees with the prepared host state");
     backend->finalize_storage(*storage_plan, *backend_state);
     clear_dirty(*this, dirty_classification);
+  }
+  if (preclassification_ordinary) {
+    delete step_plans[0];
+    step_plans[0] = preclassification_ordinary.release();
   }
 }
 
