@@ -2312,6 +2312,7 @@ public:
   void unset_solve_cw_omega();
 
 private:
+  friend void backend_classify_and_finalize(fields &);
   int synchronized_magnetic_fields; // count number of nested synchs
   double last_wall_time;
   std::vector<time_sink> was_working_on;

@@ -89,6 +89,11 @@ MaterialClassification classify(fields &f, const StoragePlan &plan);
    components), meaning pass 1 has to be re-entered exactly once. */
 bool apply_classification(fields &f, const MaterialClassification &cls);
 
+/* Execute the private pass-2 transition. Kept backend-private so tests and
+   future resident preparation can exercise the exact classification boundary
+   without exposing fields::classify_and_finalize through the public/SWIG API. */
+void backend_classify_and_finalize(fields &f);
+
 const char *classification_summary(const MaterialClassification &cls);
 
 } // namespace meep
