@@ -64,14 +64,41 @@ void fields::advance(int n) {
   backend_refresh_noisy_seed(*this, *step_plans[0], "fields::advance noisy seed refresh");
   backend_prepare_host_custom_dispatch(*this, *executable, *backend_state, n,
                                        "fields::advance custom fallback preflight");
+  const bool collective_noisy_dispatch =
+      backend->requires_full_storage_preparation() && backend_state->noisy_preflight_required;
+  if (!collective_noisy_dispatch) {
+    try {
+      backend->advance(*executable, *backend_state, n);
+      backend_finish_host_custom_dispatch(*this, "fields::advance custom fallback dispatch");
+    }
+    catch (...) {
+      const bool poison = backend_abort_host_custom_dispatch(*this);
+      if (backend->requires_full_storage_preparation() && poison) backend->poison();
+      throw;
+    }
+    return;
+  }
+
+  std::string local_error;
   try {
     backend->advance(*executable, *backend_state, n);
     backend_finish_host_custom_dispatch(*this, "fields::advance custom fallback dispatch");
   }
+  catch (const std::exception &e) {
+    (void)backend_abort_host_custom_dispatch(*this);
+    local_error = e.what();
+  }
   catch (...) {
-    const bool poison = backend_abort_host_custom_dispatch(*this);
-    if (backend->requires_full_storage_preparation() && poison) backend->poison();
-    throw;
+    (void)backend_abort_host_custom_dispatch(*this);
+    local_error = "unknown backend advance failure";
+  }
+  backend_note_noisy_collective_for_testing();
+  const bool failed = or_to_all(!local_error.empty());
+  if (failed) {
+    backend->poison();
+    if (local_error.empty())
+      throw std::runtime_error("backend advance failed on another MPI rank");
+    throw std::runtime_error(local_error);
   }
 }
 
@@ -79,14 +106,47 @@ void fields::ensure_backend_executable() {
   /* A legacy flux add/remove keeps storage stable but changes collective
      region recipes and both flux-marker access sets. Stage descriptors, both
      plans, and the replacement executable as one resident transaction. */
-  if (backend_try_refresh_legacy_flux(*this, "fields::advance legacy flux refresh")) return;
+  if (backend_try_refresh_legacy_flux(*this, "fields::advance legacy flux refresh")) {
+    bool local_noisy = false;
+    for (const PolarizationUpdate &update : step_plans[0]->polarization_updates)
+      local_noisy = local_noisy || update.kind == PolarizationUpdateKind::noisy_add;
+    backend_state->noisy_preflight_required = or_to_all(local_noisy);
+    backend_state->noisy_static_validation_required =
+        backend_state->noisy_preflight_required;
+    return;
+  }
 
   /* step_plan_for clears dirty_executable, so remember whether the compiled
      backend artifact was stale before asking it to rebuild the data plan. */
   const bool local_recompile = !executable || is_dirty(*this, dirty_executable);
-  const bool recompile =
-      backend->requires_full_storage_preparation() ? or_to_all(local_recompile) : local_recompile;
   const StepPlan &plan = step_plan_for(StepProgram::ordinary);
+  bool recompile = local_recompile;
+  if (backend->requires_full_storage_preparation()) {
+    bool local_noisy = false;
+    for (const PolarizationUpdate &update : plan.polarization_updates)
+      local_noisy = local_noisy || update.kind == PolarizationUpdateKind::noisy_add;
+    const bool inspect_noisy_signature = local_noisy || backend_state->noisy_plan_validated ||
+                                         backend_state->noisy_preflight_required;
+    const uint64_t recomputed_signature =
+        inspect_noisy_signature ? compute_step_plan_signature(plan) : plan.signature;
+    const bool changed_validated_plan = backend_state->noisy_plan_validated &&
+                                        (backend_state->noisy_validated_plan_signature !=
+                                             plan.signature ||
+                                         recomputed_signature != plan.signature);
+    const bool preserve_validated_presence = backend_state->noisy_plan_validated &&
+                                             backend_state->noisy_preflight_required;
+    const bool require_static_validation =
+        changed_validated_plan || (local_noisy && !backend_state->noisy_plan_validated);
+    size_t local_status = size_t(local_recompile) | (size_t(local_noisy) << 1) |
+                          (size_t(preserve_validated_presence) << 2) |
+                          (size_t(require_static_validation) << 3);
+    size_t global_status = 0;
+    bw_or_to_all(&local_status, &global_status, 1);
+    recompile = (global_status & 1) != 0;
+    backend_state->noisy_preflight_required =
+        (global_status & (size_t(2) | size_t(4))) != 0;
+    backend_state->noisy_static_validation_required = (global_status & size_t(8)) != 0;
+  }
   if (!recompile) return;
 
   Executable *previous = executable;

@@ -11,9 +11,13 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <new>
+#include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <typeinfo>
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
@@ -33,6 +37,9 @@ namespace meep {
 static int cw_clone_fail_after_for_testing = -1;
 static bool cw_plan_corruption_for_testing = false;
 static int legacy_flux_prepare_failure_rank_for_testing = -1;
+static int noisy_preflight_failure_rank_for_testing = -1;
+static int noisy_preflight_failure_mode_for_testing = 0;
+static size_t noisy_collective_count_for_testing = 0;
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
   for (int chunk = 0; chunk < f.num_chunks; ++chunk)
@@ -61,31 +68,354 @@ void backend_set_legacy_flux_prepare_failure_for_testing(int rank) {
   legacy_flux_prepare_failure_rank_for_testing = rank;
 }
 
-void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site) {
-  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
-  bool has_noisy_actions = false;
-  for (const PolarizationUpdate &update : plan.polarization_updates)
-    has_noisy_actions = has_noisy_actions || update.kind == PolarizationUpdateKind::noisy_add;
-  if (!has_noisy_actions) return;
-  if (!f.backend_state) throw std::logic_error(std::string(site) + ": missing backend state");
+void backend_set_noisy_preflight_failure_for_testing(int rank, int mode) {
+  noisy_preflight_failure_rank_for_testing = rank;
+  noisy_preflight_failure_mode_for_testing = mode;
+}
 
-  const RandomSeedSnapshot candidate = ensure_random_seed_snapshot();
-  BackendState &state = *f.backend_state;
-  if (state.random_seed_snapshot_accepted &&
-      state.accepted_random_seed.generation == candidate.generation)
-    return;
+void backend_reset_noisy_collective_count_for_testing() {
+  noisy_collective_count_for_testing = 0;
+}
 
+size_t backend_noisy_collective_count_for_testing() {
+  return noisy_collective_count_for_testing;
+}
+
+void backend_note_noisy_collective_for_testing() {
+  ++noisy_collective_count_for_testing;
+}
+
+namespace {
+
+typedef std::tuple<int, int, int> NoisyGroupTuple;
+typedef std::tuple<int, int, int, int, int> NoisyStreamTuple;
+
+bool finite_in_realnum(double value) {
+  return std::isfinite(value) && std::isfinite(double(realnum(value)));
+}
+
+bool noisy_region_fits(const fields &f, ArrayId id, array_role role,
+                       const UpdateRegion &region) {
+  if (!f.array_catalog || !is_valid(id) || id.value >= f.array_catalog->size()) return false;
+  const ArraySpec &spec = f.array_catalog->spec(id);
+  if (spec.role != role || spec.element_type != ElementType::realnum_value ||
+      is_valid(spec.alias_of) || !f.array_catalog->resolve_untyped(id))
+    return false;
+  __int128 low = region.base, high = region.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!region.counts[axis] || (region.counts[axis] > 1 && region.strides[axis] == 0))
+      return false;
+    const __int128 delta = __int128(region.counts[axis] - 1) * region.strides[axis];
+    if (delta < 0)
+      low += delta;
+    else
+      high += delta;
+  }
+  return low >= 0 && high >= low && high < __int128(spec.elements);
+}
+
+bool same_noisy_access(const BufferAccess &a, const BufferAccess &b) {
+  return a.array.id == b.array.id && a.array.offset == b.array.offset &&
+         a.array.elements == b.array.elements && a.mode == b.mode;
+}
+
+bool same_noisy_operation(const Operation &a, const Operation &b) {
+  if (a.kind != b.kind || a.ft != b.ft || a.descriptor_index != b.descriptor_index ||
+      a.descriptor_count != b.descriptor_count ||
+      a.material_refresh_index != b.material_refresh_index ||
+      a.material_refresh_count != b.material_refresh_count ||
+      a.beta_descriptor_index != b.beta_descriptor_index ||
+      a.beta_descriptor_count != b.beta_descriptor_count ||
+      a.cylindrical_m_descriptor_index != b.cylindrical_m_descriptor_index ||
+      a.cylindrical_m_descriptor_count != b.cylindrical_m_descriptor_count ||
+      a.cylindrical_origin_action_index != b.cylindrical_origin_action_index ||
+      a.cylindrical_origin_action_count != b.cylindrical_origin_action_count ||
+      a.polarization_subtraction_index != b.polarization_subtraction_index ||
+      a.polarization_subtraction_count != b.polarization_subtraction_count ||
+      a.magnetic_state_index != b.magnetic_state_index ||
+      a.magnetic_state_count != b.magnetic_state_count ||
+      a.legacy_flux_index != b.legacy_flux_index ||
+      a.legacy_flux_count != b.legacy_flux_count ||
+      a.source_descriptor_index != b.source_descriptor_index ||
+      a.source_descriptor_count != b.source_descriptor_count ||
+      a.guard.kind != b.guard.kind || a.guard.scalar_slot != b.guard.scalar_slot ||
+      a.guard.variant_index != b.guard.variant_index ||
+      a.source_time_offset != b.source_time_offset || a.accesses.size() != b.accesses.size())
+    return false;
+  for (size_t i = 0; i < a.accesses.size(); ++i)
+    if (!same_noisy_access(a.accesses[i], b.accesses[i])) return false;
+  return true;
+}
+
+bool full_seed_snapshot_equal(const RandomSeedSnapshot &a, const RandomSeedSnapshot &b) {
+  return a.semantic_seed == b.semantic_seed &&
+         a.saved_semantic_seed == b.saved_semantic_seed && a.generation == b.generation &&
+         a.algorithm_version == b.algorithm_version && a.initialized == b.initialized &&
+         a.semantic_seed_valid == b.semantic_seed_valid &&
+         a.saved_semantic_seed_valid == b.saved_semantic_seed_valid &&
+         a.explicit_seed == b.explicit_seed &&
+         a.saved_explicit_seed == b.saved_explicit_seed;
+}
+
+bool valid_noisy_coefficient(const PolarizationUpdate &update) {
+  if (!finite_in_realnum(update.omega_0) || !finite_in_realnum(update.gamma) ||
+      !finite_in_realnum(update.dt) || update.dt <= 0.0 ||
+      !finite_in_realnum(update.noise_amplitude))
+    return false;
+  const realnum noise_amplitude = realnum(update.noise_amplitude);
+  const realnum gamma = realnum(update.gamma);
+  const realnum omega_0 = realnum(update.omega_0);
+  const realnum dt = realnum(update.dt);
+  const realnum g2pi = gamma * 2 * pi;
+  const realnum w2pi = omega_0 * 2 * pi;
+  if (!std::isfinite(double(g2pi)) || g2pi < realnum(0) ||
+      !std::isfinite(double(w2pi)))
+    return false;
+  const realnum root = sqrt(g2pi);
+  const realnum denominator = 1 + g2pi * dt / 2;
+  if (!std::isfinite(double(root)) || !std::isfinite(double(denominator)) ||
+      denominator == realnum(0))
+    return false;
+  /* Exact finite zero follows the deterministic recurrence without creating a
+     signed-zero noise store, but the CPU has already evaluated the common
+     sqrt/denominator coefficient path above. */
+  if (noise_amplitude == realnum(0)) return true;
+  const realnum amplitude =
+      w2pi * noise_amplitude * root * dt * dt / denominator;
+  return std::isfinite(double(amplitude));
+}
+
+std::string validate_noisy_plan(const fields &f, const StepPlan &plan,
+                                bool &local_noisy_actions, size_t &stream_count,
+                                uint64_t &first_stream_tag) {
+  local_noisy_actions = false;
+  stream_count = 0;
+  first_stream_tag = 0;
+  if (!f.array_catalog) return "noisy RNG preflight has no array catalog";
+
+  std::vector<NoisyGroupTuple> live_groups;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk] || !f.chunks[chunk]->is_mine()) continue;
+    FOR_FIELD_TYPES(ft) {
+      int state_index = 0;
+      for (const polarization_state *p = f.chunks[chunk]->pol[ft]; p;
+           p = p->next, ++state_index)
+        if (p->s && typeid(*p->s) == typeid(noisy_lorentzian_susceptibility))
+          live_groups.push_back(NoisyGroupTuple(chunk, int(ft), state_index));
+    }
+  }
+  std::vector<NoisyGroupTuple> descriptor_groups;
+  if (f.descriptors)
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (descriptor.kind == SusceptibilityKind::noisy_lorentzian)
+        descriptor_groups.push_back(
+            NoisyGroupTuple(descriptor.chunk, int(descriptor.ft), descriptor.state_index));
+  if (live_groups != descriptor_groups)
+    return "noisy susceptibility descriptors do not match the live linked-list order";
+
+  StepPlan canonical;
   try {
-    f.backend->refresh_noisy_seed(candidate, state);
+    canonical = build_polarization_validation_plan(const_cast<fields &>(f));
   }
   catch (const std::exception &e) {
-    throw std::runtime_error(std::string(site) + ": " + e.what());
+    return e.what();
   }
   catch (...) {
-    throw std::runtime_error(std::string(site) + ": unknown noisy seed refresh failure");
+    return "unknown canonical noisy polarization-plan failure";
   }
-  state.accepted_random_seed = candidate;
-  state.random_seed_snapshot_accepted = true;
+  std::vector<const Operation *> installed_ops, canonical_ops;
+  for (const Operation &op : plan.operations)
+    if (op.kind == OpKind::update_polarization) installed_ops.push_back(&op);
+  for (const Operation &op : canonical.operations)
+    if (op.kind == OpKind::update_polarization) canonical_ops.push_back(&op);
+  const int global_rank = my_global_rank();
+  if (global_rank < 0 || uint64_t(global_rank) > uint64_t(UINT32_MAX))
+    return "noisy RNG global rank is out of range";
+  if (f.t < 0) return "noisy RNG timestep is negative";
+
+  std::set<NoisyStreamTuple> tuples;
+  std::set<uint64_t> tags;
+  size_t noisy_seen = 0;
+  for (const PolarizationUpdate &update : plan.polarization_updates) {
+    if (update.kind != PolarizationUpdateKind::noisy_add) continue;
+    local_noisy_actions = true;
+    ++noisy_seen;
+    if (noisy_preflight_failure_mode_for_testing == 4 &&
+        noisy_preflight_failure_rank_for_testing == my_rank() && noisy_seen == 1)
+      return "injected noisy group validation failure";
+    const int c = int(update.region.c);
+    if (update.region.chunk < 0 || update.region.chunk >= f.num_chunks ||
+        uint64_t(update.region.chunk) > uint64_t(UINT32_MAX) ||
+        (update.ft != E_stuff && update.ft != H_stuff) ||
+        update.state_index < 0 || uint64_t(update.state_index) > uint64_t(UINT32_MAX) ||
+        c < 0 || c >= NUM_FIELD_COMPONENTS ||
+        (update.ft == E_stuff ? !is_electric(update.region.c)
+                              : !is_magnetic(update.region.c)) ||
+        (update.region.cmp != 0 && update.region.cmp != 1) ||
+        update.noise_algorithm_version != counter_random_algorithm_version ||
+        !valid_noisy_coefficient(update))
+      return "noisy polarization action metadata, range, or coefficient is invalid";
+
+    uint64_t points = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      if (!update.region.counts[axis] ||
+          points > UINT64_MAX / uint64_t(update.region.counts[axis]))
+        return "noisy owned-point extent overflows uint64";
+      points *= uint64_t(update.region.counts[axis]);
+    }
+    if (!points) return "noisy owned-point extent is empty";
+    if (!noisy_region_fits(f, update.p, array_role::polarization, update.region) ||
+        !noisy_region_fits(f, update.diagonal_sigma, array_role::material, update.region))
+      return "noisy polarization action array range is invalid";
+
+    const NoisyStreamTuple tuple(update.region.chunk, int(update.ft), update.state_index, c,
+                                 update.region.cmp);
+    if (!tuples.insert(tuple).second) return "duplicate noisy RNG stream tuple";
+    uint64_t tag = counter_random_stream_tag(
+        update.noise_algorithm_version, uint32_t(global_rank), uint32_t(update.region.chunk),
+        uint32_t(update.ft), uint32_t(update.state_index), uint32_t(c),
+        uint32_t(update.region.cmp));
+    if (noisy_preflight_failure_mode_for_testing == 6 &&
+        noisy_preflight_failure_rank_for_testing == my_rank() && noisy_seen == 2 && !tags.empty())
+      tag = *tags.begin();
+    if (!tags.insert(tag).second) return "noisy RNG static stream tag collision";
+    if (!stream_count) first_stream_tag = tag;
+    ++stream_count;
+  }
+  if (plan.polarization_updates != canonical.polarization_updates)
+    return "installed polarization rows differ from the descriptor-authoritative plan";
+  if (installed_ops.size() != canonical_ops.size())
+    return "installed polarization operation count is noncanonical";
+  for (size_t i = 0; i < installed_ops.size(); ++i)
+    if (!same_noisy_operation(*installed_ops[i], *canonical_ops[i]))
+      return "installed polarization operation span or access set is noncanonical";
+  return std::string();
+}
+
+std::string validate_noisy_snapshot(const RandomSeedSnapshot &snapshot) {
+  if (!snapshot.initialized || !snapshot.semantic_seed_valid || snapshot.generation == 0)
+    return "noisy RNG semantic seed is not valid";
+  if (snapshot.algorithm_version != counter_random_algorithm_version)
+    return "noisy RNG algorithm version is unsupported";
+  if (!snapshot.saved_semantic_seed_valid && snapshot.saved_explicit_seed)
+    return "noisy RNG saved-seed metadata is inconsistent";
+  return std::string();
+}
+
+} // namespace
+
+void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
+  if (!f.backend_state) throw std::logic_error(std::string(site) + ": missing backend state");
+  if (!f.backend_state->noisy_preflight_required) return;
+
+  BackendState &state = *f.backend_state;
+  std::string local_error;
+  bool local_noisy_actions = false;
+  size_t local_stream_count = state.noisy_stream_count;
+  uint64_t local_first_stream_tag = state.noisy_first_stream_tag;
+  for (const PolarizationUpdate &update : plan.polarization_updates)
+    local_noisy_actions =
+        local_noisy_actions || update.kind == PolarizationUpdateKind::noisy_add;
+  const bool injected_static_validation = noisy_preflight_failure_mode_for_testing == 4 ||
+                                          noisy_preflight_failure_mode_for_testing == 6;
+  const bool validate_static = state.noisy_static_validation_required ||
+                               injected_static_validation;
+
+  if (validate_static) {
+    try {
+      local_error = validate_noisy_plan(f, plan, local_noisy_actions, local_stream_count,
+                                        local_first_stream_tag);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown noisy plan validation failure";
+    }
+    size_t local_status = size_t(!local_error.empty()) | (size_t(local_noisy_actions) << 1);
+    size_t global_status = 0;
+    backend_note_noisy_collective_for_testing();
+    bw_or_to_all(&local_status, &global_status, 1);
+    if (global_status & 1) {
+      if (local_error.empty())
+        throw std::runtime_error(std::string(site) +
+                                 ": noisy plan validation failed on another MPI rank");
+      throw std::runtime_error(std::string(site) + ": " + local_error);
+    }
+    state.noisy_preflight_required = (global_status & 2) != 0;
+    state.noisy_static_validation_required = false;
+    state.noisy_plan_validated = true;
+    state.noisy_validated_plan_signature = plan.signature;
+    state.noisy_stream_count = local_stream_count;
+    state.noisy_first_stream_tag = local_first_stream_tag;
+    if (!state.noisy_preflight_required) return;
+  }
+
+  RandomSeedSnapshot candidate = ensure_random_seed_snapshot();
+  if (noisy_preflight_failure_rank_for_testing == my_rank()) {
+    if (noisy_preflight_failure_mode_for_testing == 1) candidate.semantic_seed_valid = false;
+    if (noisy_preflight_failure_mode_for_testing == 2) ++candidate.algorithm_version;
+    if (noisy_preflight_failure_mode_for_testing == 3) candidate.generation = 0;
+    if (noisy_preflight_failure_mode_for_testing == 5) ++candidate.saved_semantic_seed;
+    if (noisy_preflight_failure_mode_for_testing == 7)
+      candidate.generation = state.accepted_random_seed.generation > 1
+                                 ? state.accepted_random_seed.generation - 1
+                                 : 0;
+  }
+  local_error = validate_noisy_snapshot(candidate);
+  if (local_error.empty() && state.random_seed_snapshot_accepted &&
+      candidate.generation < state.accepted_random_seed.generation)
+    local_error = "noisy RNG generation regressed";
+  if (local_error.empty() && state.random_seed_snapshot_accepted &&
+      candidate.generation == state.accepted_random_seed.generation &&
+      !full_seed_snapshot_equal(candidate, state.accepted_random_seed))
+    local_error = "noisy RNG snapshot changed without a new generation";
+  const bool refresh = local_error.empty() &&
+                       (!state.random_seed_snapshot_accepted ||
+                        state.accepted_random_seed.generation != candidate.generation);
+  size_t local_status = size_t(!local_error.empty()) | (size_t(refresh) << 1);
+  size_t global_status = 0;
+  backend_note_noisy_collective_for_testing();
+  bw_or_to_all(&local_status, &global_status, 1);
+  if (global_status & 1) {
+    if (local_error.empty())
+      throw std::runtime_error(std::string(site) +
+                               ": noisy seed validation failed on another MPI rank");
+    throw std::runtime_error(std::string(site) + ": " + local_error);
+  }
+  const bool any_refresh = (global_status & 2) != 0;
+  if (any_refresh) {
+    try {
+      if (refresh) f.backend->refresh_noisy_seed(candidate, state);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown noisy seed refresh failure";
+    }
+    local_status = size_t(!local_error.empty()) | (size_t(f.backend->is_poisoned()) << 1);
+    global_status = 0;
+    backend_note_noisy_collective_for_testing();
+    bw_or_to_all(&local_status, &global_status, 1);
+    const bool hook_failed = (global_status & 1) != 0;
+    const bool hook_poisoned = (global_status & 2) != 0;
+    if (hook_poisoned) f.backend->poison();
+    if (hook_failed || hook_poisoned) {
+      if (refresh) f.backend->discard_noisy_seed(state);
+      if (local_error.empty())
+        throw std::runtime_error(std::string(site) +
+                                 (hook_poisoned ? ": noisy seed refresh poisoned another MPI rank"
+                                                : ": noisy seed refresh failed on another MPI rank"));
+      throw std::runtime_error(std::string(site) + ": " + local_error);
+    }
+    if (refresh) f.backend->commit_noisy_seed(state);
+  }
+  if (refresh) {
+    state.accepted_random_seed = candidate;
+    state.random_seed_snapshot_accepted = true;
+  }
 }
 
 namespace {
