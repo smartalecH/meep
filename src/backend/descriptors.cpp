@@ -16,6 +16,7 @@
 */
 
 #include "backend/descriptors.hpp"
+#include "backend/backend.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/random_state.hpp"
 #include "backend/storage_plan.hpp"
@@ -500,6 +501,19 @@ size_t legacy_flux_base(const grid_volume &gv, const ivec &begin,
 
 } // namespace
 
+uint64_t legacy_flux_definition_signature(const fields &f) {
+  uint64_t hash = 0xcbf29ce484222325ull;
+  uint64_t count = 0;
+  for (const flux_vol *flux = f.fluxes; flux; flux = flux->next, ++count) {
+    source_hash_mix(hash, count);
+    source_hash_mix(hash, legacy_flux_recipe_signature(
+                              legacy_flux_descriptor_builder::normal(*flux),
+                              legacy_flux_descriptor_builder::region(*flux)));
+  }
+  source_hash_mix(hash, count);
+  return hash;
+}
+
 void build_legacy_flux_descriptors(fields &f, std::vector<LegacyFluxDescriptor> &out) {
   out.clear();
   if (!f.array_catalog)
@@ -824,13 +838,26 @@ void refresh_operation_descriptors(fields &f, bool rebuild_all) {
     build_dft_descriptors(f, f.descriptors->dfts);
   if (rebuild_all) build_polarization_descriptors(f, f.descriptors->polarizations);
 
+  const bool cpu_flux_refresh =
+      !rebuild_all && is_dirty(f, dirty_flux_plan) && !backend_host_refresh_required(f);
+  const bool resident_flux_refresh = is_dirty(f, dirty_flux_plan) && backend_host_refresh_required(f);
+  if (cpu_flux_refresh) refresh_legacy_flux_descriptors(f);
+
   /* Region plans are produced for a particular public query/monitor volume by
      prepare_loop_in_chunks rather than from one global definition. The shared
      DescriptorSet therefore acts only as their cache: invalidation discards
      it, and the consumer rebuilds the requested regions on demand. */
-  if (rebuild_all || is_dirty(f, dirty_regions)) f.descriptors->regions.clear();
+  if ((rebuild_all || is_dirty(f, dirty_regions)) && !resident_flux_refresh)
+    f.descriptors->regions.clear();
 
-  clear_dirty(f, dirty_source_plan | dirty_monitor_plan | dirty_regions);
+  DirtyMask completed = DirtyMask(dirty_source_plan | dirty_monitor_plan);
+  if (cpu_flux_refresh) completed |= dirty_flux_plan;
+  /* A legacy-flux refresh owns its collective region planning and clears the
+     shared region bit only when the staged descriptor/executable transaction
+     commits. Preserve it here so a compile failure leaves the full closure
+     retryable. */
+  if (cpu_flux_refresh || !is_dirty(f, dirty_flux_plan)) completed |= dirty_regions;
+  clear_dirty(f, completed);
 }
 
 } // namespace meep
