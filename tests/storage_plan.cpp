@@ -30,9 +30,13 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <set>
+#include <string>
+#include <tuple>
 #include <typeinfo>
+#include <unordered_map>
 #include <vector>
 
 #include <meep.hpp>
@@ -51,9 +55,17 @@ static int failures = 0;
 #define CHECK(cond, ...)                                                                           \
   do {                                                                                             \
     if (!(cond)) {                                                                                 \
-      master_printf("FAIL (%s:%d): ", __FILE__, __LINE__);                                         \
-      master_printf(__VA_ARGS__);                                                                  \
-      master_printf("\n");                                                                         \
+      if (my_rank() == 0) {                                                                        \
+        master_printf("FAIL (%s:%d): ", __FILE__, __LINE__);                                       \
+        master_printf(__VA_ARGS__);                                                                \
+        master_printf("\n");                                                                       \
+      }                                                                                            \
+      else {                                                                                       \
+        printf("FAIL rank %d (%s:%d): ", my_rank(), __FILE__, __LINE__);                           \
+        printf(__VA_ARGS__);                                                                       \
+        printf("\n");                                                                              \
+        fflush(stdout);                                                                            \
+      }                                                                                            \
       ++failures;                                                                                  \
     }                                                                                              \
   } while (0)
@@ -131,6 +143,73 @@ static void test_coverage(const char *name, structure &s, bool with_flux, const 
 }
 
 static double unit_sigma(const vec &) { return 1.0; }
+static double one_value(const vec &) { return 1.0; }
+
+static void test_polarization_storage_keys() {
+  struct Case {
+    field_type ft;
+    int state;
+    size_t ordinal;
+  } cases[] = {{E_stuff, 0, 0}, {H_stuff, 0, 0}, {E_stuff, 1, 1023},
+               {E_stuff, 1, 1024}, {H_stuff, 17, 65537},
+               {E_stuff,
+                int((uint64_t(std::numeric_limits<uint32_t>::max()) - uint64_t(E_stuff)) /
+                    NUM_FIELD_TYPES),
+                std::numeric_limits<uint32_t>::max()}};
+  std::set<uint64_t> packed;
+  for (const Case &c : cases) {
+    const uint64_t aux = polarization_storage_aux(c.ft, c.state, c.ordinal);
+    CHECK(packed.insert(aux).second, "polarization storage key packing collided");
+    CHECK(polarization_storage_field_type(aux) == c.ft,
+          "polarization storage key lost field type %d", int(c.ft));
+    CHECK(polarization_storage_state_index(aux) == c.state,
+          "polarization storage key lost state index %d", c.state);
+    CHECK(polarization_storage_layout_ordinal(aux) == uint32_t(c.ordinal),
+          "polarization storage key lost layout ordinal %zu", c.ordinal);
+  }
+  bool rejected = false;
+  try { (void)polarization_storage_aux(E_stuff, -1, 0); }
+  catch (const std::overflow_error &) { rejected = true; }
+  CHECK(rejected, "polarization storage key accepted a negative state index");
+  if (std::numeric_limits<size_t>::max() > std::numeric_limits<uint32_t>::max()) {
+    rejected = false;
+    try {
+      (void)polarization_storage_aux(E_stuff, 0,
+                                     size_t(std::numeric_limits<uint32_t>::max()) + 1);
+    }
+    catch (const std::overflow_error &) { rejected = true; }
+    CHECK(rejected, "polarization storage key accepted an overflowing layout ordinal");
+  }
+  rejected = false;
+  try { (void)polarization_storage_aux(D_stuff, 0, 0); }
+  catch (const std::overflow_error &) { rejected = true; }
+  CHECK(rejected, "polarization storage key accepted an invalid field type");
+  rejected = false;
+  try { (void)polarization_storage_field_type(uint64_t(D_stuff) << 32); }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "polarization storage key decoded an invalid field type");
+  rejected = false;
+  try {
+    const int max_state = int((uint64_t(std::numeric_limits<uint32_t>::max()) -
+                               uint64_t(E_stuff)) /
+                              NUM_FIELD_TYPES);
+    (void)polarization_storage_aux(E_stuff, max_state + 1, 0);
+  }
+  catch (const std::overflow_error &) { rejected = true; }
+  CHECK(rejected, "polarization storage key accepted an overflowing state identity");
+
+  const int h_max_state =
+      int((uint64_t(std::numeric_limits<uint32_t>::max()) - uint64_t(H_stuff)) /
+          NUM_FIELD_TYPES);
+  const uint64_t h_max = polarization_storage_aux(H_stuff, h_max_state, 0);
+  CHECK(polarization_storage_field_type(h_max) == H_stuff &&
+            polarization_storage_state_index(h_max) == h_max_state,
+        "polarization storage key lost the maximum magnetic state identity");
+  rejected = false;
+  try { (void)polarization_storage_aux(H_stuff, h_max_state + 1, 0); }
+  catch (const std::overflow_error &) { rejected = true; }
+  CHECK(rejected, "polarization storage key accepted an overflowing magnetic state identity");
+}
 
 static void test_polarization_halo_remap() {
   grid_volume gv = vol2d(4.0, 4.0, 10.0);
@@ -232,7 +311,7 @@ static void test_noisy_lorentzian_storage(bool complex_fields) {
         std::set<std::pair<int, int> > actual_pairs;
         for (size_t li = 0; li < layout.size(); ++li) {
           const InternalArrayLayout &entry = layout[li];
-          const int aux = state_index * 1024 + int(li);
+          const uint64_t aux = polarization_storage_aux(ft, state_index, li);
           const ArrayId id = f.array_catalog->find(
               StorageKey{chunk, int(array_kind::polarization_internal), int(entry.c), entry.cmp,
                          aux});
@@ -344,6 +423,696 @@ static void test_noisy_lorentzian_storage(bool complex_fields) {
         "noisy cmp1 coverage does not match real/complex fixture mode");
   CHECK(or_to_all(pe_refs > 0), "no noisy electric polarization halo was remapped");
   CHECK(or_to_all(ph_refs > 0), "no noisy magnetic polarization halo was remapped");
+}
+
+struct MultilevelExpected {
+  int levels;
+  int transitions;
+  const realnum *gamma_diagonal;
+  const realnum *initial_populations;
+};
+
+static const realnum ml_e0_gamma_diagonal[] = {realnum(0.02), realnum(0.03), realnum(0.04)};
+static const realnum ml_e0_populations[] = {realnum(0.7), realnum(0.2), realnum(0.1)};
+static const realnum ml_e1_gamma_diagonal[] = {realnum(0.015), realnum(0.025)};
+static const realnum ml_e1_populations[] = {realnum(0.8), realnum(0.2)};
+static const realnum ml_h0_gamma_diagonal[] = {realnum(0.01), realnum(0.02), realnum(0.03),
+                                               realnum(0.04)};
+static const realnum ml_h0_populations[] = {realnum(0.55), realnum(0.25), realnum(0.15),
+                                            realnum(0.05)};
+
+static MultilevelExpected expected_multilevel_state(field_type ft, int state_index) {
+  /* add_susceptibility prepends, so the second E state is state zero. */
+  if (ft == E_stuff && state_index == 0)
+    return MultilevelExpected{2, 1, ml_e1_gamma_diagonal, ml_e1_populations};
+  if (ft == E_stuff && state_index == 1)
+    return MultilevelExpected{3, 2, ml_e0_gamma_diagonal, ml_e0_populations};
+  if (ft == H_stuff && state_index == 0)
+    return MultilevelExpected{4, 3, ml_h0_gamma_diagonal, ml_h0_populations};
+  return MultilevelExpected{0, 0, NULL, NULL};
+}
+
+static void add_multilevel_test_states(structure &s) {
+  const realnum e0_Gamma[] = {realnum(0.02), 0, 0, 0, realnum(0.03), 0, 0, 0,
+                              realnum(0.04)};
+  const realnum e0_alpha[] = {realnum(-0.2), 0, realnum(0.2), realnum(-0.3), 0,
+                              realnum(0.3)};
+  const realnum e0_omega[] = {realnum(0.73), realnum(0.91)};
+  const realnum e0_gamma[] = {realnum(0.06), realnum(0.08)};
+  const realnum e0_sigmat[] = {1, 1, 1, 1, 1, 2, 2, 2, 2, 2};
+  multilevel_susceptibility e0(3, 2, e0_Gamma, ml_e0_populations, e0_alpha, e0_omega,
+                               e0_gamma, e0_sigmat);
+
+  const realnum e1_Gamma[] = {realnum(0.015), 0, 0, realnum(0.025)};
+  const realnum e1_alpha[] = {realnum(-0.25), realnum(0.25)};
+  const realnum e1_omega[] = {realnum(0.67)};
+  const realnum e1_gamma[] = {realnum(0.04)};
+  const realnum e1_sigmat[] = {3, 3, 3, 3, 3};
+  multilevel_susceptibility e1(2, 1, e1_Gamma, ml_e1_populations, e1_alpha, e1_omega,
+                               e1_gamma, e1_sigmat);
+
+  const realnum h0_Gamma[] = {realnum(0.01), 0, 0, 0, 0, realnum(0.02), 0, 0,
+                              0, 0, realnum(0.03), 0, 0, 0, 0, realnum(0.04)};
+  const realnum h0_alpha[] = {realnum(-0.1), 0, 0, realnum(0.1), realnum(-0.2), 0,
+                              0, realnum(0.2), realnum(-0.3), 0, 0, realnum(0.3)};
+  const realnum h0_omega[] = {realnum(0.59), realnum(0.83), realnum(1.07)};
+  const realnum h0_gamma[] = {realnum(0.03), realnum(0.05), realnum(0.07)};
+  const realnum h0_sigmat[] = {4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6};
+  multilevel_susceptibility h0(4, 3, h0_Gamma, ml_h0_populations, h0_alpha, h0_omega,
+                               h0_gamma, h0_sigmat);
+
+  s.add_susceptibility(unit_sigma, E_stuff, e0);
+  s.add_susceptibility(unit_sigma, E_stuff, e1);
+  s.add_susceptibility(unit_sigma, H_stuff, h0);
+}
+
+struct MultilevelRowIdentity {
+  field_type ft;
+  int state_index;
+  component c;
+  int cmp;
+  int transition;
+  std::string name;
+};
+
+static void prepare_all_vector_components(fields &f, bool complex_fields) {
+  if (complex_fields)
+    f.use_bloch(vec(0.07, -0.11, 0.05));
+  else
+    f.use_real_fields();
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.require_component(Hx);
+  f.require_component(Hy);
+  f.require_component(Hz);
+  f.advance(2);
+  f.zero_fields();
+}
+
+static size_t validate_multilevel_storage(fields &f, bool complex_fields,
+                                          std::map<uint32_t, MultilevelRowIdentity> &rows,
+                                          std::vector<StorageKey> &keys) {
+  rows.clear();
+  keys.clear();
+  size_t local_expected_rows = 0;
+  size_t local_catalogued_rows = 0;
+  size_t local_states = 0;
+  size_t local_owned_chunks = 0;
+  std::set<uint32_t> ids;
+  std::set<const void *> addresses;
+  std::vector<std::pair<uintptr_t, uintptr_t> > address_intervals;
+
+  for (size_t id_value = 0; id_value < f.array_catalog->size(); ++id_value)
+    if (f.array_catalog->key(ArrayId{uint32_t(id_value)}).kind ==
+        int(array_kind::polarization_internal))
+      ++local_catalogued_rows;
+
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    ++local_owned_chunks;
+    fields_chunk &fc = *f.chunks[chunk];
+    FOR_FIELD_TYPES(ft) {
+      int state_index = 0;
+      for (polarization_state *state = fc.pol[ft]; state; state = state->next, ++state_index) {
+        if (typeid(*state->s) != typeid(multilevel_susceptibility)) continue;
+        ++local_states;
+        const MultilevelExpected expected = expected_multilevel_state(ft, state_index);
+        CHECK(expected.levels > 0 && expected.transitions > 0,
+              "unexpected multilevel state ft=%d index=%d", int(ft), state_index);
+        if (expected.levels <= 0 || expected.transitions <= 0) continue;
+
+        std::vector<std::pair<component, int> > active;
+        FOR_COMPONENTS(c) DOCMP2 {
+          realnum *const first = state->s->cinternal_notowned_ptr(0, c, cmp, 0, state->data);
+          if (first) active.push_back(std::make_pair(c, cmp));
+        }
+        std::vector<InternalArrayLayout> layout;
+        CHECK(state->s->internal_layout(layout, fc.gv, state->data),
+              "multilevel state did not publish an internal layout");
+        const size_t expected_rows = 2 + 2 * size_t(expected.transitions) * active.size();
+        CHECK(layout.size() == expected_rows,
+              "multilevel layout has %zu rows, expected %zu", layout.size(), expected_rows);
+        if (layout.size() != expected_rows) continue;
+        local_expected_rows += expected_rows;
+
+        realnum *const base = static_cast<realnum *>(state->data);
+        const size_t ntot = size_t(fc.gv.ntot());
+        const InternalArrayLayout &gamma_inv = layout.front();
+        CHECK(gamma_inv.name && !strcmp(gamma_inv.name, "GammaInv") &&
+                  gamma_inv.c == Centered && gamma_inv.cmp == -1 &&
+                  gamma_inv.element_type == InternalArrayLayout::realnum_value &&
+                  gamma_inv.elements == size_t(expected.levels) * size_t(expected.levels),
+              "multilevel GammaInv layout metadata is invalid");
+
+        size_t li = 1;
+        size_t cursor = gamma_inv.offset_elements + gamma_inv.elements;
+        for (const std::pair<component, int> &pair : active) {
+          CHECK(pair.second == 0 || complex_fields,
+                "real multilevel fixture published an imaginary state row");
+          CHECK(state->s->num_cinternal_notowned_needed(pair.first, state->data) ==
+                    expected.transitions,
+                "multilevel halo row count differs from T");
+          for (int t = 0; t < expected.transitions; ++t, li += 2) {
+            const InternalArrayLayout &p = layout[li];
+            const InternalArrayLayout &p_prev = layout[li + 1];
+            CHECK(p.name && p_prev.name && !strcmp(p.name, "P") &&
+                      !strcmp(p_prev.name, "P_prev") && p.c == pair.first &&
+                      p_prev.c == pair.first && p.cmp == pair.second &&
+                      p_prev.cmp == pair.second && p.elements == ntot &&
+                      p_prev.elements == ntot && p.offset_elements == cursor &&
+                      p_prev.offset_elements == cursor + ntot,
+                  "multilevel transition %d layout order/offset is invalid", t);
+            CHECK(base + p.offset_elements ==
+                      state->s->cinternal_notowned_ptr(t, pair.first, pair.second, 0, state->data),
+                  "multilevel transition %d P offset differs from the live halo pointer", t);
+            cursor += 2 * ntot;
+          }
+        }
+
+        const InternalArrayLayout &populations = layout.back();
+        CHECK(populations.name && !strcmp(populations.name, "N") &&
+                  populations.c == Centered && populations.cmp == -1 &&
+                  populations.element_type == InternalArrayLayout::realnum_value &&
+                  populations.elements == ntot * size_t(expected.levels) &&
+                  populations.offset_elements == cursor + size_t(expected.levels),
+              "multilevel population layout or Ntmp gap is invalid");
+        ArrayId scratch_id = invalid_array();
+        ptrdiff_t scratch_offset = 0;
+        CHECK(!f.array_catalog->locate(base + cursor, scratch_id, scratch_offset),
+              "multilevel Ntmp scratch was published in the canonical catalog");
+
+        for (size_t row = 0; row < layout.size(); ++row) {
+          const InternalArrayLayout &entry = layout[row];
+          const StorageKey key{chunk, int(array_kind::polarization_internal), int(entry.c),
+                               entry.cmp, polarization_storage_aux(ft, state_index, row)};
+          const ArrayId id = f.array_catalog->find(key);
+          CHECK(is_valid(id), "multilevel layout row %zu has no canonical ArrayId", row);
+          if (!is_valid(id)) continue;
+          const ArraySpec &spec = f.array_catalog->spec(id);
+          realnum *const address = f.array_catalog->resolve<realnum>(id);
+          CHECK(spec.role == array_role::polarization &&
+                    spec.element_type == ElementType::realnum_value &&
+                    spec.storage == (sizeof(realnum) == sizeof(float) ? Precision::f32
+                                                                      : Precision::f64) &&
+                    spec.elements == entry.elements && spec.alignment == alignof(realnum) &&
+                    !is_valid(spec.alias_of),
+                "multilevel layout row %zu has incompatible catalog metadata", row);
+          CHECK(address == base + entry.offset_elements,
+                "multilevel layout row %zu resolves to the wrong address", row);
+          CHECK(ids.insert(id.value).second, "multilevel ArrayId is reused locally");
+          CHECK(addresses.insert(address).second, "multilevel row address is reused locally");
+          const uintptr_t begin = reinterpret_cast<uintptr_t>(address);
+          const uintptr_t end = begin + spec.elements * sizeof(realnum);
+          for (const auto &prior : address_intervals)
+            CHECK(end <= prior.first || begin >= prior.second,
+                  "multilevel canonical rows overlap in host storage");
+          address_intervals.push_back(std::make_pair(begin, end));
+          CHECK(polarization_storage_field_type(key.aux) == ft &&
+                    polarization_storage_state_index(key.aux) == state_index &&
+                    polarization_storage_layout_ordinal(key.aux) == row,
+                "multilevel canonical key did not round-trip");
+          keys.push_back(key);
+
+          int transition = -1;
+          if (entry.name && !strcmp(entry.name, "P")) {
+            transition = 0;
+            for (size_t prior = 1; prior < row; prior += 2)
+              if (layout[prior].name && !strcmp(layout[prior].name, "P") &&
+                  layout[prior].c == entry.c && layout[prior].cmp == entry.cmp)
+                ++transition;
+          }
+          rows[id.value] =
+              MultilevelRowIdentity{ft, state_index, entry.c, entry.cmp, transition,
+                                    entry.name ? entry.name : ""};
+        }
+
+        const realnum tolerance = realnum(64) * std::numeric_limits<realnum>::epsilon();
+        const realnum *const gamma_values = base + gamma_inv.offset_elements;
+        for (int l1 = 0; l1 < expected.levels; ++l1)
+          for (int l2 = 0; l2 < expected.levels; ++l2) {
+            const realnum want = l1 == l2
+                                     ? realnum(1) /
+                                           (realnum(1) + expected.gamma_diagonal[l1] * fc.dt / 2)
+                                     : realnum(0);
+            CHECK(fabs(double(gamma_values[l1 * expected.levels + l2] - want)) <=
+                      double(tolerance),
+                  "multilevel GammaInv differs at (%d,%d)", l1, l2);
+          }
+        const realnum *const n_values = base + populations.offset_elements;
+        for (size_t point = 0; point < ntot; ++point)
+          for (int level = 0; level < expected.levels; ++level)
+            CHECK(n_values[point * size_t(expected.levels) + size_t(level)] ==
+                      expected.initial_populations[level],
+                  "multilevel initial population differs at point %zu level %d", point, level);
+        for (size_t row = 1; row + 1 < layout.size(); ++row) {
+          const realnum *const values = base + layout[row].offset_elements;
+          for (size_t i = 0; i < layout[row].elements; ++i)
+            CHECK(values[i] == realnum(0), "multilevel P/P_prev did not initialize to zero");
+        }
+
+        /* Make the copy oracle non-vacuous: every transition-history row and
+           every population element carries a distinct deterministic value. */
+        for (size_t row = 1; row < layout.size(); ++row) {
+          realnum *const values = base + layout[row].offset_elements;
+          for (size_t i = 0; i < layout[row].elements; ++i)
+            values[i] = realnum(0.03125 * double(row + 1) + 0.0009765625 * double(i + 1));
+        }
+
+        void *const copied_data = state->s->copy_internal_data(state->data);
+        std::vector<InternalArrayLayout> copied_layout;
+        CHECK(copied_data && state->s->internal_layout(copied_layout, fc.gv, copied_data) &&
+                  copied_layout.size() == layout.size(),
+              "multilevel copy did not preserve the published layout");
+        if (copied_data && copied_layout.size() == layout.size()) {
+          realnum *const copied_base = static_cast<realnum *>(copied_data);
+          for (size_t row = 0; row < layout.size(); ++row) {
+            CHECK(copied_layout[row].offset_elements == layout[row].offset_elements &&
+                      copied_layout[row].elements == layout[row].elements &&
+                      copied_base + copied_layout[row].offset_elements !=
+                          base + layout[row].offset_elements &&
+                      memcmp(copied_base + copied_layout[row].offset_elements,
+                             base + layout[row].offset_elements,
+                             layout[row].elements * sizeof(realnum)) == 0,
+                  "multilevel copy row %zu changed offset/value or aliases the original", row);
+            if (layout[row].elements) {
+              const realnum original = base[layout[row].offset_elements];
+              copied_base[copied_layout[row].offset_elements] = original + realnum(row + 1);
+              CHECK(base[layout[row].offset_elements] == original,
+                    "mutating copied multilevel row %zu changed the original", row);
+            }
+          }
+        }
+        state->s->delete_internal_data(copied_data);
+      }
+    }
+  }
+
+  CHECK(local_catalogued_rows == local_expected_rows,
+        "catalog has %zu multilevel rows, expected %zu", local_catalogued_rows,
+        local_expected_rows);
+  CHECK(local_expected_rows > 0 || local_owned_chunks == 0,
+        "an owning rank has no multilevel rows");
+  CHECK(local_states == 3 * local_owned_chunks,
+        "owned chunks contain %zu multilevel states, expected %zu", local_states,
+        3 * local_owned_chunks);
+  CHECK(audit_storage_catalog(f, *f.array_catalog, true) == 0,
+        "multilevel storage left reachable arrays uncatalogued");
+  return local_expected_rows;
+}
+
+static void validate_global_multilevel_key_ownership(fields &f, bool complex_fields) {
+  const field_type families[] = {E_stuff, H_stuff};
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    for (field_type ft : families) {
+      const int state_count = ft == E_stuff ? 2 : 1;
+      for (int state_index = 0; state_index < state_count; ++state_index) {
+        const MultilevelExpected expected = expected_multilevel_state(ft, state_index);
+        size_t row = 0;
+        const StorageKey gamma{chunk, int(array_kind::polarization_internal), int(Centered), -1,
+                               polarization_storage_aux(ft, state_index, row++)};
+        CHECK(sum_to_all(is_valid(f.array_catalog->find(gamma)) ? 1 : 0) == 1,
+              "multilevel GammaInv key is not owned by exactly one rank");
+        FOR_COMPONENTS(c) {
+          if (type(c) != ft || !f.gv.has_field(c)) continue;
+          for (int cmp = 0; cmp < (complex_fields ? 2 : 1); ++cmp)
+            for (int t = 0; t < expected.transitions; ++t) {
+              const StorageKey p{chunk, int(array_kind::polarization_internal), int(c), cmp,
+                                 polarization_storage_aux(ft, state_index, row++)};
+              const StorageKey p_prev{chunk, int(array_kind::polarization_internal), int(c), cmp,
+                                      polarization_storage_aux(ft, state_index, row++)};
+              CHECK(sum_to_all(is_valid(f.array_catalog->find(p)) ? 1 : 0) == 1,
+                    "multilevel P key is not owned by exactly one rank");
+              CHECK(sum_to_all(is_valid(f.array_catalog->find(p_prev)) ? 1 : 0) == 1,
+                    "multilevel P_prev key is not owned by exactly one rank");
+            }
+        }
+        const StorageKey populations{
+            chunk, int(array_kind::polarization_internal), int(Centered), -1,
+            polarization_storage_aux(ft, state_index, row)};
+        CHECK(sum_to_all(is_valid(f.array_catalog->find(populations)) ? 1 : 0) == 1,
+              "multilevel population key is not owned by exactly one rank");
+      }
+    }
+}
+
+static void test_multilevel_storage(bool complex_fields) {
+  grid_volume gv = vol3d(1.5, 1.5, 1.5, 4.0);
+  structure s(gv, one_value, no_pml(), identity(), 8);
+  add_multilevel_test_states(s);
+  fields f(&s);
+  prepare_all_vector_components(f, complex_fields);
+
+  std::map<uint32_t, MultilevelRowIdentity> rows;
+  std::vector<StorageKey> keys;
+  validate_multilevel_storage(f, complex_fields, rows, keys);
+  validate_global_multilevel_key_ownership(f, complex_fields);
+
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    std::set<uint64_t> scalar_keys;
+    std::set<uint32_t> scalar_ids;
+    std::set<const void *> scalar_addresses;
+    for (field_type ft : {E_stuff, H_stuff}) {
+      const MultilevelExpected expected = expected_multilevel_state(ft, 0);
+      const size_t active_pairs = size_t(3) * size_t(complex_fields ? 2 : 1);
+      const size_t n_row = 1 + 2 * size_t(expected.transitions) * active_pairs;
+      for (size_t row : {size_t(0), n_row}) {
+        const StorageKey key{chunk, int(array_kind::polarization_internal), int(Centered), -1,
+                             polarization_storage_aux(ft, 0, row)};
+        const ArrayId id = f.array_catalog->find(key);
+        if (!is_valid(id)) continue;
+        CHECK(scalar_keys.insert(key.aux).second && scalar_ids.insert(id.value).second &&
+                  scalar_addresses.insert(f.array_catalog->resolve_untyped(id)).second,
+              "E0/H0 GammaInv/N scalar rows collide");
+      }
+    }
+    CHECK(scalar_keys.size() == (f.chunks[chunk]->is_mine() ? 4u : 0u),
+          "owned E0/H0 scalar rows are not four distinct canonical arrays");
+  }
+
+  bool saw_pe = false, saw_ph = false, saw_copy = false, saw_phase = false;
+  bool did_local_copy_roundtrip = false;
+  bool did_phase_transform = false;
+  for (const HaloPlan &source : f.halos->plans) {
+    if (source.ft != PE_stuff && source.ft != PH_stuff) continue;
+    HaloPlan canonical;
+    std::string why;
+    const bool remapped = remap_halo_plan(source, f.halos->arrays, *f.array_catalog,
+                                          f.is_real ? 1 : 2, canonical, why);
+    CHECK(remapped, "multilevel polarization halo did not remap: %s", why.c_str());
+    if (!remapped) continue;
+    if (source.block_elements && source.phase == CONNECT_COPY) saw_copy = true;
+    if (source.block_elements && source.phase == CONNECT_PHASE) {
+      bool nontrivial = false;
+      for (const std::complex<realnum> &value : source.phase_values)
+        nontrivial = nontrivial || value != std::complex<realnum>(1, 0);
+      saw_phase = saw_phase || nontrivial;
+    }
+    std::vector<ElementRef> source_refs, canonical_refs;
+    for (int side = 0; side < 2; ++side) {
+      if (side == 0) {
+        expand_gather(source, source_refs);
+        expand_gather(canonical, canonical_refs);
+      }
+      else {
+        expand_scatter(source, source_refs);
+        expand_scatter(canonical, canonical_refs);
+      }
+      CHECK(source_refs.size() == canonical_refs.size(),
+            "multilevel halo changed size during canonical remap");
+      for (size_t j = 0; j < source_refs.size() && j < canonical_refs.size();) {
+        const ElementRef &from = source_refs[j], &to = canonical_refs[j];
+        const bool valid = to.array.value < f.array_catalog->size() && rows.count(to.array.value);
+        CHECK(valid, "multilevel halo did not resolve to a published multilevel row");
+        if (!valid) {
+          ++j;
+          continue;
+        }
+        CHECK(f.halos->arrays.base(from.array) + from.index ==
+                  f.array_catalog->resolve<realnum>(to.array) + to.index,
+              "multilevel halo source/canonical addresses differ");
+        const MultilevelRowIdentity &row = rows[to.array.value];
+        CHECK(row.name == "P" && row.transition >= 0,
+              "multilevel halo references non-current state %s", row.name.c_str());
+        CHECK((source.ft == PE_stuff && row.ft == E_stuff) ||
+                  (source.ft == PH_stuff && row.ft == H_stuff),
+              "multilevel halo references the wrong field family");
+        if (source.ft == PE_stuff) saw_pe = true;
+        if (source.ft == PH_stuff) saw_ph = true;
+        const MultilevelExpected expected = expected_multilevel_state(row.ft, row.state_index);
+        CHECK(row.transition == 0,
+              "multilevel boundary group starts at transition %d instead of zero",
+              row.transition);
+        const size_t interleave = size_t(complex_fields ? 2 : 1);
+        const size_t group = size_t(expected.transitions) * interleave;
+        CHECK(j + group <= canonical_refs.size(), "multilevel boundary group is truncated");
+        for (size_t offset = 0; offset < group && j + offset < canonical_refs.size(); ++offset) {
+          const ElementRef &group_ref = canonical_refs[j + offset];
+          const bool group_valid = group_ref.array.value < f.array_catalog->size() &&
+                                   rows.count(group_ref.array.value);
+          CHECK(group_valid, "multilevel boundary group contains an invalid row");
+          if (!group_valid) continue;
+          const MultilevelRowIdentity &actual = rows[group_ref.array.value];
+          const int want_transition = int(offset / interleave);
+          const int want_cmp = complex_fields ? int(offset % interleave) : row.cmp;
+          CHECK(actual.ft == row.ft && actual.state_index == row.state_index &&
+                    actual.c == row.c && actual.transition == want_transition &&
+                    actual.cmp == want_cmp,
+                "multilevel boundary group does not contain exact transitions 0..T-1");
+        }
+        j += group;
+      }
+    }
+
+    if (!did_local_copy_roundtrip && source.same_rank && source.phase == CONNECT_COPY &&
+        source.block_elements) {
+      std::vector<ElementRef> scatter;
+      expand_scatter(source, scatter);
+      std::vector<realnum> block(source.block_offset + source.block_elements, realnum(0));
+      f.pack_halo(source, block.data());
+      for (const ElementRef &ref : scatter)
+        *(f.halos->arrays.base(ref.array) + ref.index) = realnum(0);
+      f.unpack_halo(source, block.data());
+      for (size_t j = 0; j < scatter.size(); ++j)
+        CHECK(*(f.halos->arrays.base(scatter[j].array) + scatter[j].index) ==
+                  block[source.block_offset + j],
+              "same-rank multilevel COPY did not round-trip element %zu", j);
+      did_local_copy_roundtrip = true;
+    }
+    if (!did_phase_transform && source.phase == CONNECT_PHASE && source.block_elements) {
+      std::vector<ElementRef> scatter;
+      expand_scatter(source, scatter);
+      if (scatter.size() == source.block_elements && !scatter.empty()) {
+        CHECK(source.phase_values.size() == source.block_elements / 2,
+              "multilevel PHASE plan has the wrong phase count");
+        if (source.phase_values.size() != source.block_elements / 2) continue;
+        std::vector<realnum> block(source.block_offset + source.block_elements, realnum(0));
+        for (size_t j = 0; j < source.block_elements; ++j)
+          block[source.block_offset + j] = realnum(0.125 * double(j + 1));
+        std::map<realnum *, realnum> expected;
+        for (size_t j = 0; j < source.block_elements / 2; ++j) {
+          const std::complex<realnum> value =
+              source.phase_values[j] *
+              std::complex<realnum>(block[source.block_offset + 2 * j],
+                                    block[source.block_offset + 2 * j + 1]);
+          expected[f.halos->arrays.base(scatter[2 * j].array) + scatter[2 * j].index] =
+              value.real();
+          expected[f.halos->arrays.base(scatter[2 * j + 1].array) +
+                   scatter[2 * j + 1].index] = value.imag();
+        }
+        f.unpack_halo(source, block.data());
+        for (const auto &entry : expected) {
+          const realnum scale = std::max(realnum(1), realnum(fabs(double(entry.second))));
+          CHECK(fabs(double(*entry.first - entry.second)) <=
+                    double(8 * std::numeric_limits<realnum>::epsilon() * scale),
+                "multilevel PHASE transform differs");
+        }
+        did_phase_transform = true;
+      }
+    }
+  }
+  CHECK(or_to_all(saw_pe), "no multilevel PE halo row was remapped");
+  CHECK(or_to_all(saw_ph), "no multilevel PH halo row was remapped");
+  CHECK(or_to_all(saw_copy), "no multilevel COPY halo row was exercised");
+  CHECK(or_to_all(saw_phase) == complex_fields,
+        "multilevel PHASE coverage does not match real/complex mode");
+  CHECK(or_to_all(did_phase_transform) == complex_fields,
+        "multilevel PHASE transform coverage does not match real/complex mode");
+  CHECK(or_to_all(did_local_copy_roundtrip),
+        "no same-rank multilevel COPY plan was round-tripped");
+
+  for (const HaloPlan &source : f.halos->plans)
+    if ((source.ft == PE_stuff || source.ft == PH_stuff) && source.block_elements) {
+      std::vector<ElementRef> before_gather, before_scatter, after;
+      expand_gather(source, before_gather);
+      expand_scatter(source, before_scatter);
+      CpuArrayCatalog incomplete;
+      HaloPlan rejected;
+      std::string why;
+      const size_t catalog_size = f.array_catalog->size();
+      CHECK(!remap_halo_plan(source, f.halos->arrays, incomplete, f.is_real ? 1 : 2, rejected,
+                             why) && !why.empty(),
+            "multilevel halo remap accepted a missing canonical catalog");
+      expand_gather(source, after);
+      CHECK(after.size() == before_gather.size(),
+            "failed multilevel remap mutated the source gather plan");
+      for (size_t j = 0; j < after.size() && j < before_gather.size(); ++j)
+        CHECK(after[j].array == before_gather[j].array && after[j].index == before_gather[j].index,
+              "failed multilevel remap changed source gather element %zu", j);
+      expand_scatter(source, after);
+      CHECK(after.size() == before_scatter.size(),
+            "failed multilevel remap mutated the source scatter plan");
+      for (size_t j = 0; j < after.size() && j < before_scatter.size(); ++j)
+        CHECK(after[j].array == before_scatter[j].array &&
+                  after[j].index == before_scatter[j].index,
+              "failed multilevel remap changed source scatter element %zu", j);
+      CHECK(f.array_catalog->size() == catalog_size,
+            "failed multilevel remap mutated the published catalog");
+      break;
+    }
+
+  std::unordered_map<StorageKey, const void *, StorageKeyHash> addresses_before_zero;
+  std::unordered_map<StorageKey, std::vector<realnum>, StorageKeyHash> gamma_before_zero;
+  for (const StorageKey &key : keys) {
+    const ArrayId id = f.array_catalog->find(key);
+    if (!is_valid(id)) continue;
+    realnum *const values = f.array_catalog->resolve<realnum>(id);
+    addresses_before_zero[key] = values;
+    const MultilevelRowIdentity &row = rows[id.value];
+    if (row.name == "GammaInv")
+      gamma_before_zero[key] =
+          std::vector<realnum>(values, values + f.array_catalog->spec(id).elements);
+    else
+      for (size_t i = 0; i < f.array_catalog->spec(id).elements; ++i)
+        values[i] = realnum(9.5);
+  }
+  f.zero_fields();
+  for (const StorageKey &key : keys) {
+    const ArrayId id = f.array_catalog->find(key);
+    CHECK(is_valid(id) && f.array_catalog->resolve_untyped(id) == addresses_before_zero[key],
+          "zero_fields changed multilevel canonical storage identity");
+    if (!is_valid(id)) continue;
+    realnum *const values = f.array_catalog->resolve<realnum>(id);
+    const MultilevelRowIdentity &row = rows[id.value];
+    if (row.name == "GammaInv")
+      CHECK(memcmp(values, gamma_before_zero[key].data(),
+                   gamma_before_zero[key].size() * sizeof(realnum)) == 0,
+            "zero_fields changed multilevel GammaInv");
+    else if (row.name == "P" || row.name == "P_prev") {
+      for (size_t i = 0; i < f.array_catalog->spec(id).elements; ++i)
+        CHECK(values[i] == realnum(0), "zero_fields did not clear multilevel P state");
+    }
+    else if (row.name == "N") {
+      const MultilevelExpected expected = expected_multilevel_state(row.ft, row.state_index);
+      for (size_t i = 0; i < f.array_catalog->spec(id).elements; ++i)
+        CHECK(values[i] == expected.initial_populations[i % size_t(expected.levels)],
+              "zero_fields did not restore multilevel population state");
+    }
+  }
+}
+
+static void test_multilevel_negate_halo() {
+  grid_volume gv = vol2d(2.0, 2.0, 5.0);
+  structure s(gv, one_value, no_pml(), -mirror(Y, gv), 4);
+  add_multilevel_test_states(s);
+  fields f(&s);
+  prepare_all_vector_components(f, false);
+
+  std::map<uint32_t, MultilevelRowIdentity> rows;
+  std::vector<StorageKey> keys;
+  validate_multilevel_storage(f, false, rows, keys);
+  bool saw_negate = false, did_negate_transform = false;
+  for (const HaloPlan &source : f.halos->plans) {
+    if ((source.ft != PE_stuff && source.ft != PH_stuff) ||
+        source.phase != CONNECT_NEGATE || !source.block_elements)
+      continue;
+    HaloPlan canonical;
+    std::string why;
+    const bool remapped = remap_halo_plan(source, f.halos->arrays, *f.array_catalog, 1,
+                                          canonical, why);
+    CHECK(remapped, "multilevel NEGATE halo did not remap: %s", why.c_str());
+    if (!remapped) continue;
+    std::vector<ElementRef> refs;
+    expand_gather(canonical, refs);
+    for (const ElementRef &ref : refs) {
+      const bool valid = ref.array.value < f.array_catalog->size() && rows.count(ref.array.value);
+      CHECK(valid && rows[ref.array.value].name == "P",
+            "multilevel NEGATE halo references a non-current polarization row");
+    }
+    saw_negate = saw_negate || !refs.empty();
+    expand_scatter(canonical, refs);
+    for (const ElementRef &ref : refs) {
+      const bool valid = ref.array.value < f.array_catalog->size() && rows.count(ref.array.value);
+      CHECK(valid && rows[ref.array.value].name == "P",
+            "multilevel NEGATE halo scatter references a non-current polarization row");
+    }
+    saw_negate = saw_negate || !refs.empty();
+    std::vector<ElementRef> source_scatter;
+    expand_scatter(source, source_scatter);
+    if (!did_negate_transform && source_scatter.size() == source.block_elements &&
+        !source_scatter.empty()) {
+      std::vector<realnum> block(source.block_offset + source.block_elements, realnum(0));
+      std::map<realnum *, realnum> expected;
+      for (size_t j = 0; j < source.block_elements; ++j)
+        block[source.block_offset + j] = realnum(0.25 * double(j + 1));
+      for (size_t j = 0; j < source_scatter.size(); ++j)
+        expected[f.halos->arrays.base(source_scatter[j].array) + source_scatter[j].index] =
+            -block[source.block_offset + j];
+      f.unpack_halo(source, block.data());
+      for (const auto &entry : expected)
+        CHECK(*entry.first == entry.second, "multilevel NEGATE transform differs");
+      did_negate_transform = true;
+    }
+  }
+  CHECK(or_to_all(saw_negate), "no multilevel NEGATE halo row was exercised");
+  CHECK(or_to_all(did_negate_transform), "no multilevel NEGATE transform was executed");
+}
+
+static void test_multilevel_growth_and_removal() {
+  grid_volume gv = vol2d(2.0, 2.0, 5.0);
+  structure s(gv, one_value, no_pml(), identity(), 3);
+  add_multilevel_test_states(s);
+  fields f(&s);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.advance(2);
+  f.zero_fields();
+
+  std::vector<StorageKey> before_keys;
+  std::unordered_map<StorageKey, const void *, StorageKeyHash> before_addresses;
+  const size_t before_catalog_size = f.array_catalog->size();
+  bool owns_chunk = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+  for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const StorageKey key = f.array_catalog->key(id);
+    if (key.kind != int(array_kind::polarization_internal)) continue;
+    before_keys.push_back(key);
+    before_addresses[key] = f.array_catalog->resolve_untyped(id);
+  }
+  f.require_component(Hz);
+  f.advance(1);
+  CHECK(f.array_catalog->size() > before_catalog_size || !owns_chunk,
+        "field growth did not rebuild the canonical catalog with new field rows");
+  size_t after_rows = 0;
+  for (size_t i = 0; i < f.array_catalog->size(); ++i)
+    if (f.array_catalog->key(ArrayId{uint32_t(i)}).kind ==
+        int(array_kind::polarization_internal))
+      ++after_rows;
+  CHECK(after_rows == before_keys.size(),
+        "field growth synthesized new multilevel rows outside the live blob");
+  CHECK(owns_chunk || (before_keys.empty() && after_rows == 0),
+        "idle rank published multilevel storage during field growth");
+  for (const StorageKey &key : before_keys) {
+    const ArrayId id = f.array_catalog->find(key);
+    CHECK(is_valid(id) && f.array_catalog->resolve_untyped(id) == before_addresses[key],
+          "field growth failed to preserve an authoritative live multilevel row");
+  }
+
+  /* The distributed fields/structure clone path is a PR7 lifecycle gate: its
+     legacy structure_chunk copy constructor does not initialize non-owned
+     coefficient pointers. Exercise PR3's removal/rebuild contract in the
+     non-shared case here, and leave distributed clone/removal to PR7. */
+  if (count_processors() != 1) return;
+  f.remove_susceptibilities();
+  /* Force a public field-layout rebuild here. Automatic resident lifecycle
+     selection after removal is a PR7 gate; PR3 verifies that a requested
+     storage/halo rebuild publishes no stale multilevel rows or references. */
+  f.use_bloch(X, 0.0);
+  f.advance(1);
+  for (size_t i = 0; i < f.array_catalog->size(); ++i)
+    CHECK(f.array_catalog->key(ArrayId{uint32_t(i)}).kind !=
+              int(array_kind::polarization_internal),
+          "removed multilevel state remains in the canonical catalog");
+  for (const HaloPlan &plan : f.halos->plans)
+    if (plan.ft == PE_stuff || plan.ft == PH_stuff) {
+      std::vector<ElementRef> refs;
+      expand_gather(plan, refs);
+      CHECK(refs.empty(), "removed multilevel state remains in a polarization gather plan");
+      expand_scatter(plan, refs);
+      CHECK(refs.empty(), "removed multilevel state remains in a polarization scatter plan");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -558,7 +1327,8 @@ static void test_material_phase_storage_union() {
         {array_kind::condinv, Dz, Z, prepared.condinv[Dz][Z]},
     };
     for (const ExpectedRow &row : expected) {
-      const ArrayId id = catalog.find(StorageKey{i, int(row.kind), int(row.c), -1, int(row.d)});
+      const ArrayId id =
+          catalog.find(StorageKey{i, int(row.kind), int(row.c), -1, uint64_t(row.d)});
       CHECK(is_valid(id) && catalog.resolve<realnum>(id) == row.address,
             "prepared current material row did not resolve through its canonical ArrayId");
     }
@@ -685,12 +1455,18 @@ int main(int argc, char **argv) {
 
   test_mid_run_source();
   test_mid_run_susceptibility();
+  test_polarization_storage_keys();
   test_polarization_halo_remap();
   test_noisy_lorentzian_storage(false);
   test_noisy_lorentzian_storage(true);
+  test_multilevel_storage(false);
+  test_multilevel_storage(true);
+  test_multilevel_negate_halo();
+  test_multilevel_growth_and_removal();
   test_material_phase_storage_union();
   test_material_coefficient_storage();
 
+  failures = sum_to_all(failures);
   if (failures) {
     master_printf("storage_plan: %d FAILURE(S)\n", failures);
     return 1;

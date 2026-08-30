@@ -385,6 +385,8 @@ public:
   virtual int num_cinternal_notowned_needed(component c, void *P_internal_data) const;
   virtual realnum *cinternal_notowned_ptr(int inotowned, component c, int cmp, int n,
                                           void *P_internal_data) const;
+  virtual bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &gv,
+                               void *P_internal_data) const;
 
   // always need notowned W and W_prev for E dot dP/dt terms
   virtual bool needs_W_notowned(component c, realnum *W[NUM_FIELD_COMPONENTS][2]) const {
