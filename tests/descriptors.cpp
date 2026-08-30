@@ -26,6 +26,7 @@
 #include <meep.hpp>
 
 #include "backend/descriptors.hpp"
+#include "backend/random_state.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
@@ -70,6 +71,15 @@ public:
       : lorentzian_susceptibility(w, g) {}
   virtual susceptibility *clone() const {
     return new inherited_lorentzian_susceptibility(*this);
+  }
+};
+
+class inherited_noisy_lorentzian_susceptibility : public noisy_lorentzian_susceptibility {
+public:
+  inherited_noisy_lorentzian_susceptibility(realnum amplitude, realnum omega, realnum gamma)
+      : noisy_lorentzian_susceptibility(amplitude, omega, gamma) {}
+  virtual susceptibility *clone() const {
+    return new inherited_noisy_lorentzian_susceptibility(*this);
   }
 };
 
@@ -895,6 +905,73 @@ static void test_lorentzian_contract() {
   CHECK(or_to_all(state_count > 0), "Lorentzian descriptors contained no bound state arrays");
 }
 
+static void test_noisy_lorentzian_contract(bool complex_fields) {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  noisy_lorentzian_susceptibility electric(0.03125, 1.25, 0.075, false);
+  noisy_lorentzian_susceptibility magnetic_drude(0.0625, 0.8, 0.125, true);
+  s.add_susceptibility(one, E_stuff, electric);
+  s.add_susceptibility(one, H_stuff, magnetic_drude);
+  fields f(&s);
+  if (complex_fields)
+    f.use_bloch(vec(0.07, 0.11));
+  else
+    f.use_real_fields();
+  gaussian_src_time g(0.3, 0.1);
+  f.add_point_source(Ez, g, vec(0.11, 0.13));
+  f.add_point_source(Hz, g, vec(-0.17, 0.09));
+  f.advance(2);
+
+  size_t electric_count = 0, magnetic_count = 0, state_rows = 0;
+  bool saw_cmp0 = false, saw_cmp1 = false;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::noisy_lorentzian) continue;
+    CHECK(d.noise_algorithm_version == counter_random_algorithm_version,
+          "noisy descriptor has the wrong counter-RNG version");
+    polarization_state *live = f.chunks[d.chunk]->pol[d.ft];
+    for (int state = 0; live && state < d.state_index; ++state)
+      live = live->next;
+    CHECK(live && typeid(*live->s) == typeid(noisy_lorentzian_susceptibility),
+          "noisy descriptor state ordinal does not resolve to the exact live type");
+    if (d.ft == E_stuff) {
+      ++electric_count;
+      CHECK(d.noise_amplitude == realnum(0.03125) &&
+                d.lorentzian.omega_0 == realnum(1.25) &&
+                d.lorentzian.gamma == realnum(0.075) && !d.lorentzian.drude,
+            "electric noisy Lorentz descriptor lost its exact parameters");
+    }
+    else if (d.ft == H_stuff) {
+      ++magnetic_count;
+      CHECK(d.noise_amplitude == realnum(0.0625) &&
+                d.lorentzian.omega_0 == realnum(0.8) &&
+                d.lorentzian.gamma == realnum(0.125) && d.lorentzian.drude,
+            "magnetic noisy Drude descriptor lost its exact parameters");
+    }
+    CHECK(d.gyrotropic_states.empty() && d.per_thread_scratch_elements == 0,
+          "noisy Lorentz descriptor invented gyrotropic or scratch state");
+    CHECK(d.internal_arrays.size() == 2 * d.lorentzian_states.size(),
+          "noisy Lorentz descriptor does not contain exact P/P_prev pairs");
+    for (const LorentzianStateArrays &state : d.lorentzian_states) {
+      ++state_rows;
+      saw_cmp0 = saw_cmp0 || state.cmp == 0;
+      saw_cmp1 = saw_cmp1 || state.cmp == 1;
+      CHECK(is_valid(state.p) && is_valid(state.p_prev) && state.p != state.p_prev,
+            "noisy Lorentz descriptor lacks distinct P/P_prev ArrayIds");
+      CHECK(state.elements == size_t(f.chunks[d.chunk]->gv.ntot()),
+            "noisy Lorentz state has the wrong extent");
+    }
+  }
+  const bool saw_electric = or_to_all(electric_count > 0);
+  const bool saw_magnetic = or_to_all(magnetic_count > 0);
+  CHECK(saw_electric && saw_magnetic,
+        "noisy descriptor fixture did not cover both electric Lorentz and magnetic Drude");
+  CHECK(or_to_all(state_rows > 0), "noisy descriptors contained no bound state rows");
+  const bool global_cmp0 = or_to_all(saw_cmp0);
+  const bool global_cmp1 = or_to_all(saw_cmp1);
+  CHECK(global_cmp0 && global_cmp1 == complex_fields,
+        "noisy descriptor cmp coverage does not match real/complex mode");
+}
+
 /* Polarization state is a snapshot of the field layout at allocation time.
    Growing the live fields later must not make its descriptor advertise state
    arrays that do not exist.  Two chunks leave idle ranks at np=4, while the
@@ -1092,6 +1169,9 @@ int main(int argc, char **argv) {
                      SusceptibilityKind::lorentzian, true);
   test_polarizations("noisy", new noisy_lorentzian_susceptibility(0.01, 1.1, 0.05),
                      SusceptibilityKind::noisy_lorentzian, true);
+  test_polarizations("derived noisy Lorentzian",
+                     new inherited_noisy_lorentzian_susceptibility(0.01, 1.1, 0.05),
+                     SusceptibilityKind::host_custom, true);
   test_polarizations("third-party opaque", new opaque_susceptibility(1.1, 1e-5),
                      SusceptibilityKind::host_custom, false);
   test_polarizations("derived Lorentzian", new inherited_lorentzian_susceptibility(1.1, 1e-5),
@@ -1104,6 +1184,8 @@ int main(int argc, char **argv) {
   test_layout_matches_pointers();
   test_gyrotropic_layout_matches_pointers();
   test_lorentzian_contract();
+  test_noisy_lorentzian_contract(false);
+  test_noisy_lorentzian_contract(true);
   test_lorentzian_layout_after_field_growth();
   test_gyrotropic_contract();
   test_gyrotropic_layout_after_field_growth();

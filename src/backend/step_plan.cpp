@@ -325,6 +325,8 @@ void append_polarization_update_group_impl(fields &f, StepPlan &plan, Operation 
     if ((update.kind != PolarizationUpdateKind::lorentzian &&
          update.kind != PolarizationUpdateKind::gyrotropic) ||
         update.kind != recurrence_kind ||
+        !is_valid(update.p) || !is_valid(update.p_prev) || !is_valid(update.primary_w) ||
+        !is_valid(update.diagonal_sigma) || update.p == update.p_prev ||
         update.noise_amplitude != 0.0 || update.noise_algorithm_version != 0 ||
         !same_polarization_group(identity, update))
       throw std::invalid_argument("malformed polarization recurrence group");
@@ -1836,16 +1838,23 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
     const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
     if (descriptor.ft != ft ||
         (descriptor.kind != SusceptibilityKind::lorentzian &&
+         descriptor.kind != SusceptibilityKind::noisy_lorentzian &&
          descriptor.kind != SusceptibilityKind::gyrotropic))
       continue;
     if (descriptor.chunk < 0 || descriptor.chunk >= f_.num_chunks)
       meep::abort("polarization descriptor has invalid chunk");
     fields_chunk &fc = *f_.chunks[descriptor.chunk];
+    std::vector<PolarizationUpdate> recurrences;
+    std::vector<PolarizationUpdate> noise_additions;
 
-    for (size_t si = 0; descriptor.kind == SusceptibilityKind::lorentzian &&
+    for (size_t si = 0;
+         (descriptor.kind == SusceptibilityKind::lorentzian ||
+          descriptor.kind == SusceptibilityKind::noisy_lorentzian) &&
                         si < descriptor.lorentzian_states.size();
          ++si) {
       const LorentzianStateArrays &state = descriptor.lorentzian_states[si];
+      if (!is_valid(state.p) || !is_valid(state.p_prev) || state.p == state.p_prev)
+        throw std::invalid_argument("polarization descriptor has invalid Lorentz state arrays");
       const direction primary_direction = component_direction(state.c);
       direction cross_direction1 = cycle_direction(fc.gv.dim, primary_direction, 1);
       direction cross_direction2 = cycle_direction(fc.gv.dim, primary_direction, 2);
@@ -1857,6 +1866,7 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       update.kind = PolarizationUpdateKind::lorentzian;
       update.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
                                   fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
+      update.ft = ft;
       update.state_index = descriptor.state_index;
       update.p = state.p;
       update.p_prev = state.p_prev;
@@ -1902,32 +1912,54 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
         std::swap(update.cross_stride1, update.cross_stride2);
       }
 
-      if (!is_valid(update.primary_w) || !is_valid(update.diagonal_sigma)) continue;
-      if (is_valid(update.offdiagonal_sigma1))
-        update.region.variant_key |= polarization_one_offdiagonal;
-      else
-        update.cross_w1 = invalid_array();
-      if (is_valid(update.offdiagonal_sigma2))
-        update.region.variant_key |= polarization_two_offdiagonals;
-      else
-        update.cross_w2 = invalid_array();
-      if (descriptor.lorentzian.drude) update.region.variant_key |= polarization_drude;
       update.omega_0 = descriptor.lorentzian.omega_0;
       update.gamma = descriptor.lorentzian.gamma;
       update.alpha = 0.0;
       memset(update.gyro_tensor, 0, sizeof(update.gyro_tensor));
       update.gyro_model = GYROTROPIC_LORENTZIAN;
       update.dt = fc.dt;
+      update.noise_amplitude = 0.0;
+      update.noise_algorithm_version = 0;
 
-      plan_.polarization_updates.push_back(update);
-      add_access(f_, op, update.p, AccessMode::read_write);
-      add_access(f_, op, update.p_prev, AccessMode::read_write);
-      add_access(f_, op, update.primary_w, AccessMode::read);
-      add_access(f_, op, update.cross_w1, AccessMode::read);
-      add_access(f_, op, update.cross_w2, AccessMode::read);
-      add_access(f_, op, update.diagonal_sigma, AccessMode::read);
-      add_access(f_, op, update.offdiagonal_sigma1, AccessMode::read);
-      add_access(f_, op, update.offdiagonal_sigma2, AccessMode::read);
+      if (is_valid(update.primary_w) && is_valid(update.diagonal_sigma)) {
+        if (is_valid(update.offdiagonal_sigma1))
+          update.region.variant_key |= polarization_one_offdiagonal;
+        else
+          update.cross_w1 = invalid_array();
+        if (is_valid(update.offdiagonal_sigma2))
+          update.region.variant_key |= polarization_two_offdiagonals;
+        else
+          update.cross_w2 = invalid_array();
+        if (descriptor.lorentzian.drude) update.region.variant_key |= polarization_drude;
+        recurrences.push_back(update);
+      }
+
+      if (descriptor.kind == SusceptibilityKind::noisy_lorentzian && is_valid(update.p) &&
+          is_valid(update.diagonal_sigma)) {
+        PolarizationUpdate noise = {};
+        noise.kind = PolarizationUpdateKind::noisy_add;
+        noise.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
+                                   fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
+        noise.ft = ft;
+        noise.state_index = descriptor.state_index;
+        noise.p = update.p;
+        noise.p_prev = invalid_array();
+        noise.p_cross1 = noise.p_prev_cross1 = invalid_array();
+        noise.p_cross2 = noise.p_prev_cross2 = invalid_array();
+        noise.primary_w = noise.cross_w1 = noise.cross_w2 = invalid_array();
+        noise.diagonal_sigma = update.diagonal_sigma;
+        noise.offdiagonal_sigma1 = noise.offdiagonal_sigma2 = invalid_array();
+        noise.primary_stride = noise.cross_stride1 = noise.cross_stride2 = 0;
+        noise.omega_0 = descriptor.lorentzian.omega_0;
+        noise.gamma = descriptor.lorentzian.gamma;
+        noise.alpha = 0.0;
+        memset(noise.gyro_tensor, 0, sizeof(noise.gyro_tensor));
+        noise.gyro_model = GYROTROPIC_LORENTZIAN;
+        noise.dt = fc.dt;
+        noise.noise_amplitude = descriptor.noise_amplitude;
+        noise.noise_algorithm_version = descriptor.noise_algorithm_version;
+        noise_additions.push_back(noise);
+      }
     }
 
     for (size_t si = 0; descriptor.kind == SusceptibilityKind::gyrotropic &&
@@ -1945,6 +1977,7 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
       update.kind = PolarizationUpdateKind::gyrotropic;
       update.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
                                   fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
+      update.ft = ft;
       update.state_index = descriptor.state_index;
       update.p = state.p[int(d0)];
       update.p_prev = state.p_prev[int(d0)];
@@ -1982,21 +2015,11 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
              sizeof(update.gyro_tensor));
       update.gyro_model = descriptor.gyrotropic.model;
       update.dt = fc.dt;
-
-      plan_.polarization_updates.push_back(update);
-      add_access(f_, op, update.p, AccessMode::read_write);
-      add_access(f_, op, update.p_prev, AccessMode::read_write);
-      add_access(f_, op, update.p_cross1, AccessMode::read_write);
-      add_access(f_, op, update.p_prev_cross1, AccessMode::read_write);
-      add_access(f_, op, update.p_cross2, AccessMode::read_write);
-      add_access(f_, op, update.p_prev_cross2, AccessMode::read_write);
-      add_access(f_, op, update.primary_w, AccessMode::read);
-      add_access(f_, op, update.cross_w1, AccessMode::read);
-      add_access(f_, op, update.cross_w2, AccessMode::read);
-      add_access(f_, op, update.diagonal_sigma, AccessMode::read);
-      add_access(f_, op, update.offdiagonal_sigma1, AccessMode::read);
-      add_access(f_, op, update.offdiagonal_sigma2, AccessMode::read);
+      update.noise_amplitude = 0.0;
+      update.noise_algorithm_version = 0;
+      recurrences.push_back(update);
     }
+    append_polarization_update_group(f_, plan_, op, recurrences, noise_additions);
   }
   op.descriptor_count = uint32_t(plan_.polarization_updates.size()) - op.descriptor_index;
 }
@@ -2426,23 +2449,25 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
     for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
       const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
       if (descriptor.ft != ft) continue;
-      const size_t state_count = descriptor.kind == SusceptibilityKind::lorentzian
+      const bool lorentz_family = descriptor.kind == SusceptibilityKind::lorentzian ||
+                                  descriptor.kind == SusceptibilityKind::noisy_lorentzian;
+      const size_t state_count = lorentz_family
                                      ? descriptor.lorentzian_states.size()
                                  : descriptor.kind == SusceptibilityKind::gyrotropic
                                      ? descriptor.gyrotropic_states.size()
                                      : 0;
       for (size_t si = 0; si < state_count; ++si) {
-        const component state_c = descriptor.kind == SusceptibilityKind::lorentzian
+        const component state_c = lorentz_family
                                       ? descriptor.lorentzian_states[si].c
                                       : descriptor.gyrotropic_states[si].c;
-        const int state_cmp = descriptor.kind == SusceptibilityKind::lorentzian
+        const int state_cmp = lorentz_family
                                   ? descriptor.lorentzian_states[si].cmp
                                   : descriptor.gyrotropic_states[si].cmp;
-        const ArrayId state_p = descriptor.kind == SusceptibilityKind::lorentzian
+        const ArrayId state_p = lorentz_family
                                     ? descriptor.lorentzian_states[si].p
                                     : descriptor.gyrotropic_states[si]
                                           .p[int(component_direction(state_c))];
-        const size_t state_elements = descriptor.kind == SusceptibilityKind::lorentzian
+        const size_t state_elements = lorentz_family
                                           ? descriptor.lorentzian_states[si].elements
                                           : descriptor.gyrotropic_states[si].elements;
         const component target_component = field_type_component(ft2, state_c);
