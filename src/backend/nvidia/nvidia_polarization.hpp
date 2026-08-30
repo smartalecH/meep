@@ -55,10 +55,43 @@ struct gyrotropic_update_launch {
   scalar_precision precision;
 };
 
+struct noisy_seed_block {
+  uint32_t semantic_seed;
+  uint32_t algorithm_version;
+};
+
+struct counter_random_words {
+  uint32_t lane[4];
+};
+
+struct counter_random_input {
+  uint32_t semantic_seed;
+  uint64_t stream_tag;
+  uint64_t point_ordinal;
+  uint64_t timestep;
+};
+
+void launch_counter_random_samples_for_testing(const counter_random_input *inputs,
+                                               counter_random_words *words,
+                                               double *uniform_pairs, double *normals,
+                                               size_t count, unsigned int threads,
+                                               const stream &stream);
+
+struct noisy_add_launch {
+  flat_region region;
+  void *p;
+  const void *diagonal_sigma;
+  double amplitude;
+  uint64_t stream_tag;
+  uint64_t point_ordinal_base;
+  scalar_precision precision;
+};
+
 struct compiled_polarization_update {
-  enum class kind_type : unsigned int { lorentzian, gyrotropic } kind;
+  enum class kind_type : unsigned int { lorentzian, gyrotropic, noisy_add } kind;
   polarization_update_launch lorentzian;
   gyrotropic_update_launch gyrotropic;
+  noisy_add_launch noisy;
 };
 
 struct polarization_subtract_launch {
@@ -71,6 +104,7 @@ struct polarization_subtract_launch {
 void launch_polarization_update(const polarization_update_launch &update, const stream &stream);
 void launch_gyrotropic_update(const gyrotropic_update_launch &update, const stream &stream);
 void launch_polarization_update(const compiled_polarization_update &update,
+                                const noisy_seed_block *seed, uint64_t timestep,
                                 const stream &stream);
 void launch_polarization_subtract(const polarization_subtract_launch &update,
                                   const stream &stream);

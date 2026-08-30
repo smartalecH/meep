@@ -127,6 +127,7 @@ struct gyrotropic_coefficients {
 
 polarization_coefficients derive_polarization_coefficients(double omega_0, double gamma,
                                                            double dt, bool drude);
+double derive_noisy_amplitude(double omega_0, double gamma, double noise_amplitude, double dt);
 gyrotropic_coefficients derive_gyrotropic_coefficients(double omega_0, double gamma,
                                                        double alpha,
                                                        const double gyro_tensor[3][3], double dt,
@@ -152,6 +153,9 @@ public:
 
   Executable *compile(const StepPlan &plan, BackendState &state) override;
   void advance(Executable &executable, BackendState &state, int num_steps) override;
+  void refresh_noisy_seed(const RandomSeedSnapshot &candidate, BackendState &state) override;
+  void commit_noisy_seed(BackendState &state) noexcept override;
+  void discard_noisy_seed(BackendState &state) noexcept override;
   bool supports_magnetic_synchronization() const override { return true; }
   void preflight_magnetic_transition(Executable &executable, BackendState &state,
                                      bool synchronize) override;
