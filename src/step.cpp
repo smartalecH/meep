@@ -61,7 +61,14 @@ void fields::advance(int n) {
   if (n <= 0) return;
   init_backend();
   ensure_backend_executable();
-  backend->advance(*executable, *backend_state, n);
+  backend_refresh_noisy_seed(*this, *step_plans[0], "fields::advance noisy seed refresh");
+  try {
+    backend->advance(*executable, *backend_state, n);
+  }
+  catch (...) {
+    if (backend->requires_full_storage_preparation()) backend->poison();
+    throw;
+  }
 }
 
 void fields::ensure_backend_executable() {
