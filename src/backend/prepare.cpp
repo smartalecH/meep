@@ -430,35 +430,38 @@ void fields::prepare_storage_if_stale(field_type ft) {
 
 /* The two-pass boundary. Kept separate from prepare_storage_for() so the
    re-entry bound below is explicit and assertable. */
-void fields::classify_and_finalize() {
-  MaterialClassification cls = classify(*this, *storage_plan);
+void backend_classify_and_finalize(fields &f) {
+  MaterialClassification cls = classify(f, *f.storage_plan);
 
-  if (cls.hash != prepared_classification_hash) {
-    if (prepared_classification_hash) dirty_mask |= dirty_executable;
+  if (cls.hash != f.prepared_classification_hash) {
+    if (f.prepared_classification_hash) f.dirty_mask |= dirty_executable;
     /* Component promotion is discovered from owned chunks, but recursive
        preparation contains collectives.  Every rank must either re-enter or
        skip it together, including ranks that own no affected chunk. */
-    const bool promoted = or_to_all(apply_classification(*this, cls));
-    prepared_classification_hash = cls.hash;
+    const bool promoted = or_to_all(apply_classification(f, cls));
+    f.prepared_classification_hash = cls.hash;
 
     if (promoted) {
       /* Discovering an anisotropic coupling in 2D adds field components, which
          changes storage and halo topology and therefore re-enters pass 1. The
          re-entry is bounded to a single iteration because classification
          depends only on material values, which pass 1 does not modify. */
-      ++classification_reentries;
-      assert(classification_reentries <= 1 && "classification re-entered pass 1 more than once");
-      require_source_components();
-      prepare_storage();
+      ++f.classification_reentries;
+      assert(f.classification_reentries <= 1 &&
+             "classification re-entered pass 1 more than once");
+      f.require_source_components();
+      f.prepare_storage();
     }
   }
   else {
     /* Unchanged hash: the common case after a material *value* change. Reuse
        everything, including (from PR 5) the compiled executable. Still publish
        the tiling, since a fresh chunk may have been prepared. */
-    apply_classification(*this, cls);
+    apply_classification(f, cls);
   }
 }
+
+void fields::classify_and_finalize() { backend_classify_and_finalize(*this); }
 
 void prepare_dfts(fields &f, StoragePlan &) {
   /* dft_chunk allocates in its constructor, not during stepping, so DFT
