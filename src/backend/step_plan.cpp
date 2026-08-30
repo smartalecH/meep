@@ -4002,6 +4002,13 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   return p.finish();
 }
 
+StepPlan build_polarization_validation_plan(fields &f) {
+  StepPlanBuilder p(f, StepProgram::ordinary);
+  p.add_polarizations(H_stuff);
+  p.add_polarizations(E_stuff);
+  return p.finish();
+}
+
 void format_step_plan(const StepPlan &p, std::vector<std::string> &out) {
   out.clear();
   char buf[128];

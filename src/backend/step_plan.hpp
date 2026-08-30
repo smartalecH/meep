@@ -926,6 +926,12 @@ bool validate_cw_plan(fields &f, const StepPlan &step_plan, const CwPlan &plan,
    fields::step_once by eye, it is wrong. */
 StepPlan build_step_plan(fields &f, StepProgram program);
 
+/* Builds only the two canonical polarization operations from the current
+   descriptor/catalog authority.  Resident noisy preflight uses this narrow
+   view so unrelated reduced-catalog curl/material rows cannot invalidate a
+   stable ordinary plan. */
+StepPlan build_polarization_validation_plan(fields &f);
+
 /* Direct transcription of fields_to_array/array_to_fields.  Construction is
    rank-local and performs no collective operation. */
 CwStateLayout build_cw_state_layout(fields &f);

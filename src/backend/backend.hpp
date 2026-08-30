@@ -58,7 +58,11 @@ struct Executable {
 struct BackendState {
   BackendState()
       : cw_executable(NULL), cw_storage_fingerprint(0), cw_step_plan_signature(0),
-        cw_plan_signature(0), accepted_random_seed(), random_seed_snapshot_accepted(false) {}
+        cw_plan_signature(0), accepted_random_seed(), random_seed_snapshot_accepted(false),
+        noisy_preflight_required(false), noisy_plan_validated(false),
+        noisy_static_validation_required(false), noisy_validated_plan_signature(0),
+        noisy_stream_count(0),
+        noisy_first_stream_tag(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
   void clear_cw_executable() {
@@ -75,6 +79,12 @@ struct BackendState {
   uint64_t cw_plan_signature;
   RandomSeedSnapshot accepted_random_seed;
   bool random_seed_snapshot_accepted;
+  bool noisy_preflight_required;
+  bool noisy_plan_validated;
+  bool noisy_static_validation_required;
+  uint64_t noisy_validated_plan_signature;
+  size_t noisy_stream_count;
+  uint64_t noisy_first_stream_tag;
 };
 
 struct InitializationPlan; // src/backend/initialization_plan.hpp
@@ -166,14 +176,16 @@ public:
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
   virtual void advance(Executable &, BackendState &, int num_steps) = 0;
 
-  /* Refresh backend-private noisy-RNG metadata without rebuilding storage or
+  /* Stage backend-private noisy-RNG metadata without rebuilding storage or
      executable state. Throwing must leave the previously active seed usable;
      an implementation may poison itself only after an irreversible/enqueued
-     transfer failure. The caller publishes the candidate host snapshot only
-     after this hook returns successfully. */
+     transfer failure. No staged seed becomes active until the collective
+     caller invokes the no-throw commit hook on every successful rank. */
   virtual void refresh_noisy_seed(const RandomSeedSnapshot &, BackendState &) {
     throw std::logic_error("backend does not implement noisy seed refresh");
   }
+  virtual void commit_noisy_seed(BackendState &) noexcept {}
+  virtual void discard_noisy_seed(BackendState &) noexcept {}
 
   /* A resident CW solve is one coarse operation. CPU declines this hook and
      keeps the legacy solver unchanged. preflight_cw must not invoke source
@@ -290,6 +302,10 @@ StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
 bool backend_try_refresh_legacy_flux(fields &f, const char *site);
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
+void backend_set_noisy_preflight_failure_for_testing(int rank, int mode);
+void backend_reset_noisy_collective_count_for_testing();
+size_t backend_noisy_collective_count_for_testing();
+void backend_note_noisy_collective_for_testing();
 void backend_set_legacy_flux_descriptor_failure_for_testing(int rank, int flux_ordinal);
 
 /* Preserve resident-authoritative values and retire the old backend objects
