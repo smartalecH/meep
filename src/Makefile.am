@@ -2,7 +2,7 @@ lib_LTLIBRARIES = libmeep.la
 include_HEADERS = meep.hpp
 pkginclude_HEADERS = meep/mympi.hpp meep/vec.hpp meep/meep-config.h meepgeom.hpp material_data.hpp adjust_verbosity.hpp
 
-AM_CPPFLAGS = -I$(top_srcdir)/src
+AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)/src
 
 BUILT_SOURCES = sphere-quad.h step_generic_stride1.cpp meep/meep-config.h
 

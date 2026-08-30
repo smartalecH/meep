@@ -1,6 +1,7 @@
 /* Copyright (C) 2005-2026 Massachusetts Institute of Technology */
 
 #include "backend/nvidia/nvidia_polarization.hpp"
+#include "meep/meep-config.h"
 
 #include <cuda_runtime_api.h>
 
@@ -10,6 +11,61 @@
 namespace meep {
 namespace nvidia {
 namespace {
+
+#if MEEP_SINGLE
+typedef float build_realnum;
+#else
+typedef double build_realnum;
+#endif
+
+__host__ __device__ counter_random_words philox4x32_10(uint32_t seed, uint64_t stream_tag,
+                                                        uint64_t point, uint64_t timestep) {
+  uint32_t c0 = uint32_t(point), c1 = uint32_t(point >> 32);
+  uint32_t c2 = uint32_t(timestep), c3 = uint32_t(timestep >> 32);
+  uint32_t k0 = seed ^ uint32_t(stream_tag), k1 = uint32_t(stream_tag >> 32);
+  for (int round = 0; round < 10; ++round) {
+    const uint64_t p0 = uint64_t(0xD2511F53u) * c0;
+    const uint64_t p1 = uint64_t(0xCD9E8D57u) * c2;
+    const uint32_t n0 = uint32_t(p1 >> 32) ^ c1 ^ k0;
+    const uint32_t n1 = uint32_t(p1);
+    const uint32_t n2 = uint32_t(p0 >> 32) ^ c3 ^ k1;
+    const uint32_t n3 = uint32_t(p0);
+    c0 = n0;
+    c1 = n1;
+    c2 = n2;
+    c3 = n3;
+    if (round != 9) {
+      k0 += 0x9E3779B9u;
+      k1 += 0xBB67AE85u;
+    }
+  }
+  counter_random_words result = {{c0, c1, c2, c3}};
+  return result;
+}
+
+__host__ __device__ double normal_from_words(const counter_random_words &words) {
+  const double u0 = (double(words.lane[0]) + 0.5) * 0x1p-32;
+  const double u1 = (double(words.lane[1]) + 0.5) * 0x1p-32;
+  const double radius = sqrt(-2.0 * log(u0));
+  const double theta = 0x1.921fb54442d18p+2 * u1;
+  return radius * cos(theta);
+}
+
+__global__ void counter_random_sample_kernel(const counter_random_input *inputs,
+                                             counter_random_words *words,
+                                             double *uniform_pairs, double *normals,
+                                             size_t count) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const counter_random_input input = inputs[i];
+  const counter_random_words sample =
+      philox4x32_10(input.semantic_seed, input.stream_tag, input.point_ordinal,
+                    input.timestep);
+  words[i] = sample;
+  uniform_pairs[2 * i] = (double(sample.lane[0]) + 0.5) * 0x1p-32;
+  uniform_pairs[2 * i + 1] = (double(sample.lane[1]) + 0.5) * 0x1p-32;
+  normals[i] = normal_from_words(sample);
+}
 
 void check_cuda(cudaError_t result, const char *operation) {
   if (result == cudaSuccess) return;
@@ -148,6 +204,23 @@ __global__ void polarization_subtract_kernel(polarization_subtract_launch update
     static_cast<T *>(update.target)[i] -= static_cast<const T *>(update.p)[i];
 }
 
+template <typename T>
+__global__ void noisy_add_kernel(noisy_add_launch update, const noisy_seed_block *seed,
+                                 uint64_t timestep, size_t points) {
+  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= points) return;
+  const ptrdiff_t i = region_index(update.region, linear);
+  const build_realnum sigma = build_realnum(static_cast<const T *>(update.diagonal_sigma)[i]);
+  const build_realnum standard_deviation = build_realnum(update.amplitude) * sqrt(sigma);
+  if (standard_deviation == build_realnum(0)) return;
+  const uint64_t point = update.point_ordinal_base + uint64_t(linear);
+  const counter_random_words words =
+      philox4x32_10(seed->semantic_seed, update.stream_tag, point, timestep);
+  const double sample = normal_from_words(words);
+  T *p = static_cast<T *>(update.p);
+  p[i] = T(double(p[i]) + double(standard_deviation) * sample);
+}
+
 void launch_geometry(size_t points, unsigned int &blocks, unsigned int &threads) {
   if (!points) throw std::invalid_argument("NVIDIA polarization launch is empty");
   threads = 256;
@@ -190,7 +263,38 @@ void launch_gyrotropic_t(const gyrotropic_update_launch &update,
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA gyrotropic update");
 }
 
+template <typename T>
+void launch_noisy_t(const noisy_add_launch &update, const noisy_seed_block *seed,
+                    uint64_t timestep, const stream &execution_stream) {
+  const size_t points = checked_points(update.region);
+  if (points - 1 > UINT64_MAX - update.point_ordinal_base)
+    throw std::overflow_error("NVIDIA noisy polarization point ordinal overflow");
+  unsigned int blocks = 0, threads = 0;
+  launch_geometry(points, blocks, threads);
+  noisy_add_kernel<T>
+      <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+          update, seed, timestep, points);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA noisy polarization addition");
+}
+
 } // namespace
+
+void launch_counter_random_samples_for_testing(const counter_random_input *inputs,
+                                               counter_random_words *words,
+                                               double *uniform_pairs, double *normals,
+                                               size_t count, unsigned int threads,
+                                               const stream &execution_stream) {
+  if (!inputs || !words || !uniform_pairs || !normals || !count || !threads || threads > 1024)
+    throw std::invalid_argument("NVIDIA counter-random sampler has invalid launch operands");
+  const size_t block_count = (count + threads - 1) / threads;
+  if (block_count > std::numeric_limits<unsigned int>::max())
+    throw std::overflow_error("NVIDIA counter-random sampler grid overflow");
+  counter_random_sample_kernel
+      <<<static_cast<unsigned int>(block_count), threads, 0,
+         static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
+          inputs, words, uniform_pairs, normals, count);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA counter-random sampler");
+}
 
 void launch_polarization_update(const polarization_update_launch &update,
                                 const stream &execution_stream) {
@@ -264,6 +368,7 @@ void launch_gyrotropic_update(const gyrotropic_update_launch &update,
 }
 
 void launch_polarization_update(const compiled_polarization_update &update,
+                                const noisy_seed_block *seed, uint64_t timestep,
                                 const stream &execution_stream) {
   switch (update.kind) {
     case compiled_polarization_update::kind_type::lorentzian:
@@ -271,6 +376,18 @@ void launch_polarization_update(const compiled_polarization_update &update,
       break;
     case compiled_polarization_update::kind_type::gyrotropic:
       launch_gyrotropic_update(update.gyrotropic, execution_stream);
+      break;
+    case compiled_polarization_update::kind_type::noisy_add:
+      if (!seed)
+        throw std::invalid_argument("NVIDIA noisy polarization update has no seed block");
+      if (!update.noisy.p || !update.noisy.diagonal_sigma)
+        throw std::invalid_argument("NVIDIA noisy polarization update has incomplete operands");
+      if (update.noisy.precision == scalar_precision::f32)
+        launch_noisy_t<float>(update.noisy, seed, timestep, execution_stream);
+      else if (update.noisy.precision == scalar_precision::f64)
+        launch_noisy_t<double>(update.noisy, seed, timestep, execution_stream);
+      else
+        throw std::invalid_argument("NVIDIA noisy polarization update has invalid precision");
       break;
     default: throw std::invalid_argument("NVIDIA polarization update has invalid kind");
   }
