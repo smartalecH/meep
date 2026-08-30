@@ -89,6 +89,10 @@ struct lifetime_counts {
   size_t bfast_updates_at_compile;
   size_t cylindrical_m_updates_at_compile;
   size_t cylindrical_origin_actions_at_compile;
+  size_t legacy_flux_updates_at_compile;
+  size_t legacy_flux_terms_at_compile;
+  size_t legacy_flux_half_accesses_at_compile;
+  size_t legacy_flux_final_accesses_at_compile;
   bool gyrotropic_update_at_compile;
   bool polarization_zero_at_create;
   bool connections_current_at_create;
@@ -121,7 +125,9 @@ struct lifetime_counts {
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
         bfast_updates_at_compile(0), cylindrical_m_updates_at_compile(0),
-        cylindrical_origin_actions_at_compile(0), gyrotropic_update_at_compile(false),
+        cylindrical_origin_actions_at_compile(0), legacy_flux_updates_at_compile(0),
+        legacy_flux_terms_at_compile(0), legacy_flux_half_accesses_at_compile(0),
+        legacy_flux_final_accesses_at_compile(0), gyrotropic_update_at_compile(false),
         polarization_zero_at_create(true), connections_current_at_create(false),
         rebuild_saw_live_imaginary(false), migrate_authoritative_value(false),
         authoritative_value(0), fail_rebuild(false), fail_create_state(false),
@@ -195,6 +201,16 @@ public:
     counts.bfast_updates_at_compile = plan.bfast_updates.size();
     counts.cylindrical_m_updates_at_compile = plan.cylindrical_m_updates.size();
     counts.cylindrical_origin_actions_at_compile = plan.cylindrical_origin_actions.size();
+    counts.legacy_flux_updates_at_compile = plan.legacy_flux_updates.size();
+    counts.legacy_flux_terms_at_compile = plan.legacy_flux_terms.size();
+    counts.legacy_flux_half_accesses_at_compile = 0;
+    counts.legacy_flux_final_accesses_at_compile = 0;
+    for (const Operation &op : plan.operations) {
+      if (op.kind == OpKind::update_flux_half)
+        counts.legacy_flux_half_accesses_at_compile = op.accesses.size();
+      if (op.kind == OpKind::update_flux)
+        counts.legacy_flux_final_accesses_at_compile = op.accesses.size();
+    }
     for (const PolarizationUpdate &update : plan.polarization_updates)
       if (update.kind == PolarizationUpdateKind::gyrotropic)
         counts.gyrotropic_update_at_compile = true;
@@ -532,6 +548,13 @@ struct BackendEpochSnapshot {
     if (descriptors) {
       mix(descriptor_hash, source_plan_signature(descriptors->sources));
       mix(descriptor_hash, dft_plan_signature(descriptors->dfts));
+      mix(descriptor_hash, descriptors->legacy_flux_generation);
+      mix(descriptor_hash, descriptors->legacy_fluxes.size());
+      for (const LegacyFluxDescriptor &flux : descriptors->legacy_fluxes) {
+        mix(descriptor_hash, flux.flux_ordinal);
+        mix(descriptor_hash, flux.recipe_signature);
+        mix(descriptor_hash, flux.terms.size());
+      }
       mix(descriptor_hash, descriptors->polarizations.size());
       mix_vector(descriptor_hash, descriptors->regions);
     }
@@ -2154,6 +2177,49 @@ static void build(structure **sp, fields **fp, const execution_options *opts) {
 
 static double phase_conductivity(const vec &) { return 0.2; }
 
+static void test_resident_material_coefficient_preparation() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5));
+  s.set_conductivity(Dz, phase_conductivity);
+  fields f(&s);
+  f.require_component(Ez);
+  bool missing_before = false;
+  for (int i = 0; i < f.num_chunks; ++i)
+    if (f.chunks[i]->is_mine())
+      missing_before |= f.chunks[i]->s->conductivity[Dz][Z] &&
+                        !f.chunks[i]->s->condinv[Dz][Z];
+  CHECK(or_to_all(missing_before),
+        "resident coefficient fixture did not begin with a lazy conductivity inverse");
+
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts, true);
+  f.advance(1);
+  bool all_catalogued = true, saw_catalogued = false;
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    structure_chunk &chunk = *f.chunks[i]->s;
+    if (!chunk.conductivity[Dz][Z]) continue;
+    saw_catalogued = true;
+    const ArrayId id = f.array_catalog->find(
+        StorageKey{i, int(array_kind::condinv), int(Dz), -1, int(Z)});
+    all_catalogued &= chunk.condinv[Dz][Z] && !chunk.condinv_stale && is_valid(id) &&
+                       f.array_catalog->resolve<realnum>(id) == chunk.condinv[Dz][Z];
+  }
+  const bool global_catalogued = and_to_all(all_catalogued);
+  const bool global_saw_catalogued = or_to_all(saw_catalogued);
+  bool all_curl_inverses = true, saw_conductive_curl = false;
+  for (const CurlUpdate &update : f.step_plans[0]->db_updates)
+    if (update.region.variant_key & curl_has_conductivity) {
+      saw_conductive_curl = true;
+      all_curl_inverses &= is_valid(update.condinv);
+    }
+  const bool global_curl_inverses = and_to_all(all_curl_inverses);
+  const bool global_saw_conductive_curl = or_to_all(saw_conductive_curl);
+  CHECK(global_catalogued && global_saw_catalogued && global_curl_inverses &&
+            global_saw_conductive_curl,
+        "resident preparation did not materialize and catalog conductivity inverse storage");
+}
+
 static void test_material_phase_transaction() {
   structure *current;
   fields *f;
@@ -2985,6 +3051,384 @@ static void test_backend_lifecycle_epoch() {
   CHECK(counts.states_destroyed == 2 && counts.executables_destroyed == 2,
         "polymorphic backend artifacts were not destroyed exactly once");
   delete s;
+}
+
+static uint64_t non_flux_step_plan_signature(const StepPlan &source) {
+  StepPlan plan = source;
+  plan.legacy_flux_updates.clear();
+  plan.legacy_flux_terms.clear();
+  std::vector<Operation> operations;
+  operations.reserve(plan.operations.size());
+  for (const Operation &op : plan.operations)
+    if (op.kind != OpKind::update_flux_half && op.kind != OpKind::update_flux)
+      operations.push_back(op);
+  plan.operations.swap(operations);
+  plan.signature = compute_step_plan_signature(plan);
+  return plan.signature;
+}
+
+static void test_resident_legacy_flux_lifecycle() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->require_component(Ey);
+  f->require_component(Hy);
+  f->require_component(Hz);
+  flux_vol *older = f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+
+  CHECK(f->backend_state && f->executable && f->descriptors->legacy_fluxes.size() == 1 &&
+            counts.legacy_flux_updates_at_compile == 1,
+        "initial resident flux setup did not publish one compiled recipe");
+  CHECK(or_to_all(counts.legacy_flux_terms_at_compile > 0),
+        "resident flux setup produced no integration terms on any rank");
+  CHECK(counts.legacy_flux_half_accesses_at_compile ==
+            counts.legacy_flux_final_accesses_at_compile,
+        "legacy flux markers do not have identical access sets");
+
+  BackendState *const state = f->backend_state;
+  Executable *const old_executable = f->executable;
+  DescriptorSet *const old_descriptors = f->descriptors;
+  StepPlan *const old_ordinary = f->step_plans[0];
+  StepPlan *const old_cw = f->step_plans[1];
+  const uint64_t stable_nonflux_signature = non_flux_step_plan_signature(*old_ordinary);
+  flux_vol *newer = f->add_flux_vol(Y, volume(vec(-0.8, -0.2), vec(0.8, -0.2)));
+  f->descriptors->regions.push_back(ChunkLoopRegion());
+  const BackendEpochSnapshot failed_entry(*f);
+  counts.fail_compile = my_rank() == 0;
+  bool failed = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  counts.fail_compile = false;
+  CHECK(sum_to_all(int(failed)) == count_processors(),
+        "rank-asymmetric legacy flux compile failure was not reconciled");
+  CHECK(failed_entry.matches(*f) && f->backend_state == state && f->executable == old_executable &&
+            f->descriptors == old_descriptors && f->step_plans[0] == old_ordinary &&
+            f->step_plans[1] == old_cw && is_dirty(*f, dirty_flux_plan) &&
+            is_dirty(*f, dirty_regions) && is_dirty(*f, dirty_executable),
+        "failed legacy flux refresh partially published its resident epoch");
+  CHECK(older->flux() == 0.0 && newer->flux() == 0.0,
+        "failed legacy flux refresh changed a public scalar");
+
+  const int created_before_retry = counts.executables_created;
+  const int destroyed_before_retry = counts.executables_destroyed;
+  f->advance(1);
+  CHECK(f->backend_state == state && f->executable != old_executable &&
+            f->descriptors != old_descriptors && f->step_plans[0] != old_ordinary &&
+            f->step_plans[1] == old_cw &&
+            counts.states_created == 1 &&
+            counts.states_destroyed == 0 &&
+            counts.executables_created == created_before_retry + 1 &&
+            counts.executables_destroyed == destroyed_before_retry + 1 &&
+            counts.legacy_flux_updates_at_compile == 2 &&
+            non_flux_step_plan_signature(*f->step_plans[0]) == stable_nonflux_signature &&
+            !is_dirty(*f, dirty_flux_plan) && !is_dirty(*f, dirty_regions) &&
+            !is_dirty(*f, dirty_executable),
+        "successful legacy flux refresh changed non-flux work or did not atomically replace code");
+
+  const double values[2] = {1.25, -2.5};
+  backend_publish_legacy_flux(*f, values, 2, "legacy flux publication test");
+  CHECK(newer->flux() == values[0] && older->flux() == values[1],
+        "legacy flux publication did not follow newest-first checked ordinals");
+  const double before_bad[2] = {newer->flux(), older->flux()};
+  failed = false;
+  try {
+    backend_publish_legacy_flux(*f, values, 1, "legacy flux bad-count test");
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(sum_to_all(int(failed)) == count_processors() && newer->flux() == before_bad[0] &&
+            older->flux() == before_bad[1],
+        "bad legacy flux publication count partially changed public scalars");
+
+  const uint32_t saved_ordinal = f->descriptors->legacy_fluxes[0].flux_ordinal;
+  if (my_rank() == 0) ++f->descriptors->legacy_fluxes[0].flux_ordinal;
+  failed = false;
+  try {
+    backend_publish_legacy_flux(*f, values, 2, "legacy flux bad-ordinal test");
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(sum_to_all(int(failed)) == count_processors() && newer->flux() == before_bad[0] &&
+            older->flux() == before_bad[1],
+        "bad legacy flux ordinal partially changed public scalars");
+  f->descriptors->legacy_fluxes[0].flux_ordinal = saved_ordinal;
+
+  /* A legacy-flux mutation may be composed with an unrelated structural
+     invalidation.  That combination must take the conservative staged-epoch
+     route: the small descriptor/executable replacement must neither consume
+     the other dirty bits nor hide its required state replacement. */
+  flux_vol *composed =
+      f->add_flux_vol(X, volume(vec(-0.4, -0.5), vec(-0.4, 0.5)));
+  invalidate(*f, MutationKind::boundary_topology);
+  BackendState *const composition_old_state = f->backend_state;
+  Executable *const composition_old_executable = f->executable;
+  const BackendEpochSnapshot composition_entry(*f);
+  counts.fail_compile = my_rank() == 0;
+  failed = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  counts.fail_compile = false;
+  CHECK(sum_to_all(int(failed)) == count_processors() && composition_entry.matches(*f) &&
+            f->backend_state == composition_old_state &&
+            f->executable == composition_old_executable && is_dirty(*f, dirty_flux_plan) &&
+            is_dirty(*f, dirty_halos) && is_dirty(*f, dirty_executable) &&
+            composed->flux() == 0.0,
+        "failed mixed legacy-flux epoch partially consumed structural invalidation");
+  f->advance(1);
+  BackendState *const composition_state = f->backend_state;
+  CHECK(composition_state != composition_old_state && f->executable != composition_old_executable &&
+            f->descriptors->legacy_fluxes.size() == 3 && !is_dirty(*f, dirty_flux_plan) &&
+            !is_dirty(*f, dirty_halos) && !is_dirty(*f, dirty_executable),
+        "mixed legacy-flux invalidation did not replace the full resident epoch");
+
+  gaussian_src_time composed_source(0.23, 0.1);
+  composed_source.is_integrated = false;
+  f->add_point_source(Ey, composed_source, vec(0.0, 0.0));
+  f->add_flux_vol(X, volume(vec(0.35, -0.4), vec(0.35, 0.4)));
+  f->advance(1);
+  const bool source_present = or_to_all(!f->descriptors->sources.sources.empty());
+  CHECK(f->backend_state != composition_state && source_present &&
+            f->descriptors->legacy_fluxes.size() == 4 && !is_dirty(*f, dirty_source_plan) &&
+            !is_dirty(*f, dirty_flux_plan) && !is_dirty(*f, dirty_executable) &&
+            f->step_plans[0]->source_signature ==
+                source_plan_signature(f->descriptors->sources),
+        "same-advance source and legacy-flux refresh did not publish one complete executable");
+
+  component dft_component = Ez;
+  dft_fields dft_monitor =
+      f->add_dft_fields(&dft_component, 1, f->v, 0.3, 0.3, 1, 2);
+  (void)dft_monitor;
+  f->add_flux_vol(Y, volume(vec(-0.35, -0.4), vec(-0.35, 0.4)));
+  BackendState *const dft_old_state = f->backend_state;
+  f->advance(1);
+  CHECK(f->backend_state != dft_old_state && f->descriptors->legacy_fluxes.size() == 5 &&
+            f->step_plans[0]->source_signature ==
+                source_plan_signature(f->descriptors->sources) &&
+            dft_plan_signature(f->step_plans[0]->dft_updates) ==
+                dft_plan_signature(f->descriptors->dfts) &&
+            !is_dirty(*f, dirty_flux_plan) && !is_dirty(*f, dirty_executable),
+        "same-advance DFT and legacy-flux refresh preserved a stale non-flux plan");
+
+  const uint64_t remove_nonflux_signature =
+      non_flux_step_plan_signature(*f->step_plans[0]);
+  f->remove_fluxes();
+  BackendState *const remove_state = f->backend_state;
+  Executable *const remove_executable = f->executable;
+  backend_set_legacy_flux_prepare_failure_for_testing(0);
+  failed = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  backend_set_legacy_flux_prepare_failure_for_testing(-1);
+  CHECK(sum_to_all(int(failed)) == count_processors() && f->backend_state == remove_state &&
+            f->executable == remove_executable && is_dirty(*f, dirty_flux_plan),
+        "failed zero-monitor legacy flux refresh changed resident artifacts");
+  f->advance(1);
+  CHECK(f->backend_state == remove_state && f->descriptors->legacy_fluxes.empty() &&
+            counts.legacy_flux_updates_at_compile == 0 &&
+            non_flux_step_plan_signature(*f->step_plans[0]) == remove_nonflux_signature,
+        "legacy flux removal did not publish an empty recipe set without rebuilding state");
+
+  delete f;
+  delete s;
+}
+
+static void test_resident_legacy_flux_rank_mismatch() {
+  if (count_processors() == 1) return;
+
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->require_component(Ey);
+    f->require_component(Hy);
+    f->require_component(Hz);
+    if (my_rank() == 0)
+      f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    bool failed = false;
+    try {
+      f->advance(1);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    CHECK(sum_to_all(int(failed)) == count_processors() && !f->backend_state && !f->executable,
+          "cold rank-asymmetric legacy flux definition reached resident construction");
+    delete f;
+    delete s;
+  }
+
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->require_component(Ey);
+    f->require_component(Hy);
+    f->require_component(Hz);
+    flux_vol *flux =
+        f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    f->advance(1);
+    delete f->executable;
+    f->executable = NULL;
+    delete f->backend_state;
+    f->backend_state = NULL;
+    delete f->backend;
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    if (my_rank() == 0)
+      f->add_flux_vol(Y, volume(vec(-0.8, -0.2), vec(0.8, -0.2)));
+    invalidate(*f, MutationKind::precision_policy, "legacy flux backend reselection test");
+    bool failed = false;
+    try {
+      f->advance(1);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    CHECK(sum_to_all(int(failed)) == count_processors() && !f->backend_state && !f->executable,
+          "backend reselection accepted rank-asymmetric legacy flux definitions");
+    delete f;
+    delete s;
+  }
+
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->require_component(Ey);
+  f->require_component(Hy);
+  f->require_component(Hz);
+  f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+  BackendState *const state = f->backend_state;
+  Executable *const executable = f->executable;
+
+  if (my_rank() == 0)
+    f->add_flux_vol(Y, volume(vec(-0.8, -0.2), vec(0.8, -0.2)));
+  bool failed = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  CHECK(sum_to_all(int(failed)) == count_processors() && f->backend_state == state &&
+            f->executable == executable,
+        "rank-asymmetric legacy flux definition was not rejected before replacement");
+
+  delete f;
+  delete s;
+}
+
+static void test_resident_legacy_flux_catalog_rebuild() {
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->require_component(Ey);
+    f->require_component(Hy);
+    f->require_component(Hz);
+    flux_vol *flux =
+        f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    f->advance(1);
+    BackendState *const old_state = f->backend_state;
+    const uint64_t flux_generation =
+        generation(*f, MutationKind::legacy_flux_definition);
+    const double published = 3.25;
+    backend_publish_legacy_flux(*f, &published, 1, "legacy flux catalog continuity test");
+
+    invalidate(*f, MutationKind::field_layout, "legacy flux catalog rebuild test");
+    f->advance(1);
+    CHECK(f->backend_state != old_state && f->descriptors->legacy_fluxes.size() == 1 &&
+              counts.legacy_flux_updates_at_compile == 1 &&
+              generation(*f, MutationKind::legacy_flux_definition) == flux_generation &&
+              !is_dirty(*f, dirty_flux_plan) && flux->flux() == published,
+          "clean legacy flux recipe was not rebound after resident catalog replacement");
+    delete f;
+    delete s;
+  }
+
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->require_component(Ey);
+    f->require_component(Hy);
+    f->require_component(Hz);
+    flux_vol *flux =
+        f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    f->advance(2);
+    CHECK(f->descriptors->legacy_flux_generation ==
+                generation(*f, MutationKind::legacy_flux_definition) &&
+              f->descriptors->legacy_fluxes.size() == 1 && f->step_plans[0] &&
+              f->step_plans[0]->legacy_flux_updates.size() == 1 &&
+              f->step_plans[0]->legacy_flux_terms.size() ==
+                  f->descriptors->legacy_fluxes[0].terms.size(),
+          "cold CPU multi-step advance retained an empty or stale legacy flux recipe");
+    CHECK(or_to_all(!f->descriptors->legacy_fluxes[0].terms.empty()),
+          "cold CPU multi-step advance produced no legacy flux terms on any rank");
+    size_t half_accesses = 0, final_accesses = 0;
+    for (const Operation &op : f->step_plans[0]->operations) {
+      if (op.kind == OpKind::update_flux_half) half_accesses = op.accesses.size();
+      if (op.kind == OpKind::update_flux) final_accesses = op.accesses.size();
+    }
+    const bool any_cpu_flux_access = or_to_all(half_accesses > 0);
+    CHECK(half_accesses == final_accesses && any_cpu_flux_access,
+          "cold CPU legacy flux plan omitted or mismatched marker accesses");
+
+    const uint64_t cpu_flux_generation =
+        generation(*f, MutationKind::legacy_flux_definition);
+    invalidate(*f, MutationKind::field_layout, "CPU legacy flux catalog rebuild test");
+    f->advance(1);
+    const StepPlan rebuilt_cpu_plan = build_step_plan(*f, StepProgram::ordinary);
+    const bool any_rebuilt_cpu_flux_term =
+        or_to_all(!f->step_plans[0]->legacy_flux_terms.empty());
+    CHECK(f->descriptors->legacy_flux_generation == cpu_flux_generation &&
+              f->descriptors->legacy_fluxes.size() == 1 &&
+              f->step_plans[0]->signature == rebuilt_cpu_plan.signature &&
+              f->step_plans[0]->legacy_flux_updates.size() == 1 &&
+              f->step_plans[0]->legacy_flux_terms.size() ==
+                  f->descriptors->legacy_fluxes[0].terms.size() &&
+              any_rebuilt_cpu_flux_term,
+          "established CPU legacy flux recipe was stale after catalog replacement");
+    const double cpu_flux = flux->flux();
+    delete f->executable;
+    f->executable = NULL;
+    delete f->backend_state;
+    f->backend_state = NULL;
+    delete f->backend;
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    invalidate(*f, MutationKind::precision_policy, "CPU-to-resident legacy flux test");
+    f->advance(1);
+    CHECK(f->backend_state && f->executable && f->descriptors->legacy_fluxes.size() == 1 &&
+              counts.legacy_flux_updates_at_compile == 1 && !is_dirty(*f, dirty_flux_plan) &&
+              flux->flux() == cpu_flux,
+          "CPU-refreshed legacy flux recipe was not rebound during resident selection");
+    delete f;
+    delete s;
+  }
 }
 
 static void test_backend_reselection_invalidates_representation() {
@@ -4046,6 +4490,14 @@ int main(int argc, char **argv) {
     master_printf("backend_api: cylindrical checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_FLUX_ONLY")) {
+    test_resident_legacy_flux_lifecycle();
+    test_resident_legacy_flux_rank_mismatch();
+    test_resident_legacy_flux_catalog_rebuild();
+    if (failures) return 1;
+    master_printf("backend_api: legacy flux checks passed\n");
+    return 0;
+  }
   if (getenv("MEEP_BACKEND_API_MAGNETIC_ONLY")) {
     test_backend_reselection_invalidates_representation();
     test_resident_magnetic_dispatch();
@@ -4054,6 +4506,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_MATERIAL_ONLY")) {
+    test_resident_material_coefficient_preparation();
     test_material_phase_transaction();
     test_material_phase_cpu_to_resident_preparation();
     if (failures) return 1;
@@ -4086,6 +4539,7 @@ int main(int argc, char **argv) {
   test_backend_lifecycle_epoch();
   test_backend_reselection_invalidates_representation();
   test_resident_magnetic_dispatch();
+  test_resident_material_coefficient_preparation();
   test_material_phase_transaction();
   test_material_phase_cpu_to_resident_preparation();
   test_resident_cw_lifecycle();

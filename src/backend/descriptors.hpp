@@ -292,6 +292,9 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
    are descriptor metadata and are included. */
 uint64_t dft_plan_signature(const std::vector<DftDescriptor> &plan);
 void build_legacy_flux_descriptors(fields &f, std::vector<LegacyFluxDescriptor> &out);
+/* Ordered public-definition fingerprint used to reject rank-asymmetric list,
+   normal, or requested-volume mutations before collective region planning. */
+uint64_t legacy_flux_definition_signature(const fields &f);
 /* Rebuild the owned DescriptorSet recipes and stamp the live list generation.
    PR7/8 use this at their collective transactional refresh boundary. */
 void refresh_legacy_flux_descriptors(fields &f);
