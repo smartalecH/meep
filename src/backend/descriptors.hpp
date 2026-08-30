@@ -217,6 +217,8 @@ struct PolarizationDescriptor {
   field_type ft;
   int state_index;
   LorentzianParameters lorentzian;
+  double noise_amplitude;
+  uint32_t noise_algorithm_version;
   std::vector<LorentzianStateArrays> lorentzian_states;
   GyrotropicParameters gyrotropic;
   std::vector<GyrotropicStateArrays> gyrotropic_states;
