@@ -12,8 +12,10 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <memory>
+#include <new>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -38,6 +40,27 @@
 #include "meep_internals.hpp"
 
 using namespace meep;
+
+/* The host-fallback steady-state gate needs to observe ordinary C++ heap
+   allocation, not only CUDA device/pinned allocation accounting. Keep this
+   disabled outside the narrow warmed-up advance window below. */
+static std::atomic<bool> count_heap_allocations(false);
+static std::atomic<size_t> heap_allocation_calls(0);
+
+void *operator new(std::size_t bytes) {
+  void *result = malloc(bytes ? bytes : 1);
+  if (!result) throw std::bad_alloc();
+  if (count_heap_allocations.load(std::memory_order_relaxed)) {
+    heap_allocation_calls.fetch_add(1, std::memory_order_relaxed);
+  }
+  return result;
+}
+
+void *operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete(void *pointer) noexcept { free(pointer); }
+void operator delete[](void *pointer) noexcept { free(pointer); }
+void operator delete(void *pointer, std::size_t) noexcept { free(pointer); }
+void operator delete[](void *pointer, std::size_t) noexcept { free(pointer); }
 
 static void require(bool condition, const char *message) {
   if (!condition) {
@@ -226,6 +249,31 @@ public:
   inherited_lorentzian(realnum omega, realnum gamma, bool drude = false)
       : lorentzian_susceptibility(omega, gamma, drude) {}
   susceptibility *clone() const override { return new inherited_lorentzian(*this); }
+};
+
+struct host_callback_trace {
+  std::vector<char> events;
+};
+
+class counted_inherited_lorentzian : public lorentzian_susceptibility {
+public:
+  counted_inherited_lorentzian(realnum omega, realnum gamma, host_callback_trace *trace)
+      : lorentzian_susceptibility(omega, gamma), trace_(trace) {}
+  susceptibility *clone() const override { return new counted_inherited_lorentzian(*this); }
+  void update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
+                realnum *W_prev[NUM_FIELD_COMPONENTS][2], realnum dt, const grid_volume &gv,
+                void *data) const override {
+    trace_->events.push_back('U');
+    lorentzian_susceptibility::update_P(W, W_prev, dt, gv, data);
+  }
+  void subtract_P(field_type ft, realnum *f_minus_p[NUM_FIELD_COMPONENTS][2],
+                  void *data) const override {
+    trace_->events.push_back('S');
+    lorentzian_susceptibility::subtract_P(ft, f_minus_p, data);
+  }
+
+private:
+  host_callback_trace *trace_;
 };
 
 class inherited_multilevel : public multilevel_susceptibility {
@@ -3192,23 +3240,26 @@ static void run_host_custom_fallback_case(precision_policy_kind policy, bool mag
   structure gpu_structure(gv, isotropic_eps, boundary, identity(), 2);
   dispersion_sigma_material sigma(false);
   const field_type ft = magnetic ? H_stuff : E_stuff;
-  inherited_lorentzian custom(0.73, 0.06);
-  inherited_lorentzian custom_second(0.91, 0.045);
+  host_callback_trace cpu_trace, gpu_trace;
+  counted_inherited_lorentzian cpu_custom(0.73, 0.06, &cpu_trace);
+  counted_inherited_lorentzian cpu_custom_second(0.91, 0.045, &cpu_trace);
+  counted_inherited_lorentzian gpu_custom(0.73, 0.06, &gpu_trace);
+  counted_inherited_lorentzian gpu_custom_second(0.91, 0.045, &gpu_trace);
   lorentzian_susceptibility native(1.17, 0.035);
   if (magnetic) {
     cpu_structure.add_susceptibility(sigma, ft, native);
-    cpu_structure.add_susceptibility(sigma, ft, custom_second);
-    cpu_structure.add_susceptibility(sigma, ft, custom);
+    cpu_structure.add_susceptibility(sigma, ft, cpu_custom_second);
+    cpu_structure.add_susceptibility(sigma, ft, cpu_custom);
     gpu_structure.add_susceptibility(sigma, ft, native);
-    gpu_structure.add_susceptibility(sigma, ft, custom_second);
-    gpu_structure.add_susceptibility(sigma, ft, custom);
+    gpu_structure.add_susceptibility(sigma, ft, gpu_custom_second);
+    gpu_structure.add_susceptibility(sigma, ft, gpu_custom);
   }
   else {
-    cpu_structure.add_susceptibility(sigma, ft, custom);
-    cpu_structure.add_susceptibility(sigma, ft, custom_second);
+    cpu_structure.add_susceptibility(sigma, ft, cpu_custom);
+    cpu_structure.add_susceptibility(sigma, ft, cpu_custom_second);
     cpu_structure.add_susceptibility(sigma, ft, native);
-    gpu_structure.add_susceptibility(sigma, ft, custom);
-    gpu_structure.add_susceptibility(sigma, ft, custom_second);
+    gpu_structure.add_susceptibility(sigma, ft, gpu_custom);
+    gpu_structure.add_susceptibility(sigma, ft, gpu_custom_second);
     gpu_structure.add_susceptibility(sigma, ft, native);
   }
 
@@ -3248,7 +3299,13 @@ static void run_host_custom_fallback_case(precision_policy_kind policy, bool mag
     callbacks_per_step += segment.callback_count;
   for (const Operation &op : resident_plan.operations) {
     if (op.kind != OpKind::host_callback) continue;
+    std::set<uint32_t> access_ids;
     for (const BufferAccess &access : op.accesses) {
+      require(access_ids.insert(access.array.id.value).second,
+              "custom fallback access union contains duplicate ArrayIds");
+      require(access.mode == AccessMode::read || access.mode == AccessMode::write ||
+                  access.mode == AccessMode::read_write,
+              "custom fallback access union contains an invalid mode");
       const ArraySpec &spec = device_plan.arrays[access.array.id.value];
       const size_t bytes = access.array.elements *
                            storage_element_bytes(spec.element_type, spec.storage);
@@ -3270,40 +3327,60 @@ static void run_host_custom_fallback_case(precision_policy_kind policy, bool mag
                  (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13);
   const NvidiaHostFallbackStatistics before = backend->host_fallback_statistics_for_testing();
   const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
-  cpu.advance(2);
-  gpu.advance(2);
+  cpu_trace.events.clear();
+  gpu_trace.events.clear();
+  cpu_trace.events.reserve(4096);
+  gpu_trace.events.reserve(4096);
+  const int measured_steps = 100;
+  cpu.advance(measured_steps);
+  const size_t gpu_heap_before = heap_allocation_calls.load(std::memory_order_relaxed);
+  count_heap_allocations.store(true, std::memory_order_relaxed);
+  gpu.advance(measured_steps);
+  count_heap_allocations.store(false, std::memory_order_relaxed);
+  const size_t gpu_heap_after = heap_allocation_calls.load(std::memory_order_relaxed);
   compare_fields(cpu, gpu,
                  (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13);
+  require(!cpu_trace.events.empty() && gpu_trace.events == cpu_trace.events,
+          "custom fallback changed subtract_P/update_P call count or order");
   const NvidiaHostFallbackStatistics after = backend->host_fallback_statistics_for_testing();
-  require(after.segment_executions - before.segment_executions == 4,
+  require(after.segment_executions - before.segment_executions ==
+              size_t(measured_steps) * resident_plan.host_segments.size(),
           "custom fallback did not execute two host segments per timestep");
-  require(after.callback_resolutions - before.callback_resolutions == 2 * callbacks_per_step,
+  require(after.callback_resolutions - before.callback_resolutions ==
+              size_t(measured_steps) * callbacks_per_step,
           "custom fallback did not re-resolve the callback identity per segment");
   const bool exact_transfers =
       after.device_to_host_calls - before.device_to_host_calls ==
-                  2 * download_calls_per_step &&
+                  size_t(measured_steps) * download_calls_per_step &&
               after.host_to_device_calls - before.host_to_device_calls ==
-                  2 * upload_calls_per_step &&
+                  size_t(measured_steps) * upload_calls_per_step &&
               after.device_to_host_bytes - before.device_to_host_bytes ==
-                  2 * download_bytes_per_step &&
+                  size_t(measured_steps) * download_bytes_per_step &&
               after.host_to_device_bytes - before.host_to_device_bytes ==
-                  2 * upload_bytes_per_step &&
+                  size_t(measured_steps) * upload_bytes_per_step &&
               after.synchronizations - before.synchronizations ==
-                  4 * resident_plan.host_segments.size();
+                  size_t(measured_steps) * resident_plan.host_segments.size() &&
+              after.steady_capacity_growths == before.steady_capacity_growths &&
+              /* The inherited boundary communicator performs one allocation
+                 per step. A rebuilt StepPlan/vector would add allocations per
+                 host segment and exceed this exact warmed-up baseline. */
+              gpu_heap_after - gpu_heap_before == size_t(measured_steps);
   if (!exact_transfers)
     fprintf(stderr,
             "host fallback accounting got d2h=%zu/%zu bytes=%zu/%zu h2d=%zu/%zu bytes=%zu/%zu "
-            "sync=%zu/%zu\n",
+            "sync=%zu/%zu growth=%zu heap=%zu/%zu\n",
             after.device_to_host_calls - before.device_to_host_calls,
-            2 * download_calls_per_step,
+            size_t(measured_steps) * download_calls_per_step,
             after.device_to_host_bytes - before.device_to_host_bytes,
-            2 * download_bytes_per_step,
+            size_t(measured_steps) * download_bytes_per_step,
             after.host_to_device_calls - before.host_to_device_calls,
-            2 * upload_calls_per_step,
+            size_t(measured_steps) * upload_calls_per_step,
             after.host_to_device_bytes - before.host_to_device_bytes,
-            2 * upload_bytes_per_step,
+            size_t(measured_steps) * upload_bytes_per_step,
             after.synchronizations - before.synchronizations,
-            4 * resident_plan.host_segments.size());
+            size_t(measured_steps) * resident_plan.host_segments.size(),
+            after.steady_capacity_growths - before.steady_capacity_growths,
+            gpu_heap_after - gpu_heap_before, size_t(measured_steps));
   require(exact_transfers,
           "custom fallback transfer accounting differs from the declared compact union");
   const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
@@ -3315,6 +3392,39 @@ static void run_host_custom_fallback_case(precision_policy_kind policy, bool mag
 }
 
 static void test_host_custom_postdispatch_poison() {
+  const nvidia::testing::failure_point failures[] = {
+      nvidia::testing::failure_point::device_to_host_copy,
+      nvidia::testing::failure_point::host_segment_after_download,
+      nvidia::testing::failure_point::host_segment_after_callback,
+      nvidia::testing::failure_point::host_to_device_copy,
+      nvidia::testing::failure_point::host_segment_after_upload};
+  for (nvidia::testing::failure_point point : failures) {
+    const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    inherited_lorentzian custom(0.73, 0.06);
+    s.add_susceptibility(unit_value, E_stuff, custom);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ez);
+    f.advance(1);
+    nvidia::testing::fail_next(point);
+    bool failed = false;
+    try { f.advance(1); }
+    catch (const std::exception &) { failed = true; }
+    nvidia::testing::clear_failure();
+    require(failed && f.backend->is_poisoned(),
+            "custom fallback transfer/callback failure did not poison the resident backend");
+    failed = false;
+    try { f.advance(1); }
+    catch (const std::exception &) { failed = true; }
+    require(failed, "poisoned custom fallback backend accepted another advance");
+  }
+  master_printf("nvidia_timestep: host-custom postdispatch poison PASS\n");
+}
+
+static void test_host_custom_compile_rejections() {
   const grid_volume gv = vol2d(2.0, 2.0, 6.0);
   structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   inherited_lorentzian custom(0.73, 0.06);
@@ -3324,19 +3434,164 @@ static void test_host_custom_postdispatch_poison() {
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ez);
-  f.advance(1);
-  nvidia::testing::fail_next(nvidia::testing::failure_point::host_segment_after_callback);
-  bool failed = false;
-  try { f.advance(1); }
-  catch (const std::exception &) { failed = true; }
-  nvidia::testing::clear_failure();
-  require(failed && f.backend->is_poisoned(),
-          "custom fallback post-callback failure did not poison the resident backend");
-  failed = false;
-  try { f.advance(1); }
-  catch (const std::exception &) { failed = true; }
-  require(failed, "poisoned custom fallback backend accepted another advance");
-  master_printf("nvidia_timestep: host-custom postdispatch poison PASS\n");
+  f.init_backend();
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(f.backend);
+  require(backend && f.backend_state, "custom rejection fixture has no NVIDIA state");
+  const StepPlan canonical = build_step_plan(f, StepProgram::ordinary);
+  auto rejected = [&](StepPlan candidate, const char *label) {
+    candidate.signature = compute_step_plan_signature(candidate);
+    bool failed = false;
+    try {
+      std::unique_ptr<Executable> executable(backend->compile(candidate, *f.backend_state));
+    }
+    catch (const std::exception &) {
+      failed = true;
+    }
+    require(failed, label);
+  };
+
+  StepPlan missing = canonical;
+  missing.host_callbacks.clear();
+  missing.host_segments.clear();
+  missing.operations.erase(
+      std::remove_if(missing.operations.begin(), missing.operations.end(),
+                     [](const Operation &op) { return op.kind == OpKind::host_callback; }),
+      missing.operations.end());
+  rejected(missing, "re-signed host callback deletion bypassed live presence validation");
+
+  StepPlan changed = canonical;
+  size_t marker = changed.operations.size();
+  for (size_t i = 0; i < changed.operations.size(); ++i)
+    if (changed.operations[i].kind == OpKind::host_callback) {
+      marker = i;
+      break;
+    }
+  require(marker < changed.operations.size() && !changed.operations[marker].accesses.empty(),
+          "custom rejection fixture has no marker access");
+  changed.operations[marker].accesses[0].mode =
+      changed.operations[marker].accesses[0].mode == AccessMode::read
+          ? AccessMode::write
+          : AccessMode::read;
+  rejected(changed, "re-signed host marker access mutation was accepted");
+
+  changed = canonical;
+  const size_t covered = changed.host_segments[0].operation_index;
+  changed.operations[covered].source_time_offset = 0.125;
+  rejected(changed, "re-signed covered host operation mutation was accepted");
+
+  const std::vector<PolarizationDescriptor> descriptors = f.descriptors->polarizations;
+  f.descriptors->polarizations.erase(
+      std::remove_if(f.descriptors->polarizations.begin(), f.descriptors->polarizations.end(),
+                     [](const PolarizationDescriptor &descriptor) {
+                       return descriptor.kind == SusceptibilityKind::host_custom;
+                     }),
+      f.descriptors->polarizations.end());
+  rejected(canonical, "live custom state without a custom descriptor was accepted");
+  f.descriptors->polarizations = descriptors;
+  f.phasein_time = 1;
+  rejected(canonical, "active material phasing with host callbacks was accepted");
+  f.phasein_time = 0;
+  master_printf("nvidia_timestep: host-custom compile rejections PASS\n");
+}
+
+static void test_host_custom_complex_eh_composition() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  dispersion_sigma_material sigma(false);
+  host_callback_trace cpu_trace, gpu_trace;
+  counted_inherited_lorentzian cpu_e(0.73, 0.06, &cpu_trace);
+  counted_inherited_lorentzian cpu_h(0.91, 0.045, &cpu_trace);
+  counted_inherited_lorentzian gpu_e(0.73, 0.06, &gpu_trace);
+  counted_inherited_lorentzian gpu_h(0.91, 0.045, &gpu_trace);
+  cpu_structure.add_susceptibility(sigma, E_stuff, cpu_e);
+  cpu_structure.add_susceptibility(sigma, H_stuff, cpu_h);
+  gpu_structure.add_susceptibility(sigma, E_stuff, gpu_e);
+  gpu_structure.add_susceptibility(sigma, H_stuff, gpu_h);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_bloch(vec(0.13, 0.07));
+  gpu.use_bloch(vec(0.13, 0.07));
+  cpu.require_component(Ez);
+  cpu.require_component(Hz);
+  gpu.require_component(Ez);
+  gpu.require_component(Hz);
+  gaussian_src_time cpu_e_source(0.31, 0.14), gpu_e_source(0.31, 0.14);
+  gaussian_src_time cpu_h_source(0.27, 0.12), gpu_h_source(0.27, 0.12);
+  cpu.add_point_source(Ez, cpu_e_source, vec(0.31, 0.37), std::complex<double>(0.2, -0.1));
+  gpu.add_point_source(Ez, gpu_e_source, vec(0.31, 0.37), std::complex<double>(0.2, -0.1));
+  cpu.add_point_source(Hz, cpu_h_source, vec(-0.29, 0.23), std::complex<double>(-0.1, 0.07));
+  gpu.add_point_source(Hz, gpu_h_source, vec(-0.29, 0.23), std::complex<double>(-0.1, 0.07));
+  component monitor_component = Ez;
+  dft_fields cpu_monitor =
+      cpu.add_dft_fields(&monitor_component, 1, cpu.v, 0.31, 0.31, 1);
+  dft_fields gpu_monitor =
+      gpu.add_dft_fields(&monitor_component, 1, gpu.v, 0.31, 0.31, 1);
+  flux_vol *cpu_flux =
+      cpu.add_flux_vol(X, volume(vec(0.0, -0.75), vec(0.0, 0.75)));
+  flux_vol *gpu_flux =
+      gpu.add_flux_vol(X, volume(vec(0.0, -0.75), vec(0.0, 0.75)));
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+  initialize_fields(cpu, gpu, false, 0.13);
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  size_t electric_segments = 0, magnetic_segments = 0;
+  for (const HostSegment &segment : plan.host_segments) {
+    electric_segments += segment.ft == E_stuff;
+    magnetic_segments += segment.ft == H_stuff;
+  }
+  require(electric_segments == 2 && magnetic_segments == 2,
+          "complex E+H custom fixture does not contain both host phases");
+  bool dft_update = false, flux_half = false, flux_full = false;
+  for (const Operation &operation : plan.operations) {
+    dft_update = dft_update || operation.kind == OpKind::update_dft;
+    flux_half = flux_half || operation.kind == OpKind::update_flux_half;
+    flux_full = flux_full || operation.kind == OpKind::update_flux;
+  }
+  require(dft_update && flux_half && flux_full,
+          "complex E+H custom fixture omitted DFT/flux composition operations");
+  cpu_trace.events.clear();
+  gpu_trace.events.clear();
+  cpu.advance(100);
+  gpu.advance(100);
+  compare_fields(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  require(std::abs(cpu_flux->flux() - gpu_flux->flux()) <=
+              (sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-12),
+          "complex E+H custom DFT/flux composition changed flux");
+  require(!cpu_trace.events.empty() && cpu_trace.events == gpu_trace.events,
+          "complex E+H custom fallback changed callback order or count");
+  master_printf("nvidia_timestep: host-custom complex E+H composition PASS\n");
+}
+
+static void test_host_custom_precision_rejection(precision_policy_kind policy) {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  inherited_lorentzian custom(0.73, 0.06);
+  s.add_susceptibility(unit_value, E_stuff, custom);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  bool rejected = false;
+  try {
+    f.advance(1);
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  require(rejected && f.t == 0,
+          "non-native host-custom fallback was not rejected before stepping");
+  master_printf("nvidia_timestep: host-custom-%s rejection PASS\n",
+                precision_policy_name(policy));
 }
 
 static void run_gyrotropic_case(const char *name, precision_policy_kind policy, bool real_fields,
@@ -5069,8 +5324,12 @@ int main(int argc, char **argv) {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
     if (host_custom_only) {
-      run_host_custom_fallback_case(policies[p], false);
-      run_host_custom_fallback_case(policies[p], true);
+      if (policies[p] == precision_policy_kind::native) {
+        run_host_custom_fallback_case(policies[p], false);
+        run_host_custom_fallback_case(policies[p], true);
+      }
+      else
+        test_host_custom_precision_rejection(policies[p]);
       continue;
     }
     if (multilevel_only) {
@@ -5248,6 +5507,8 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (host_custom_only) {
+    test_host_custom_complex_eh_composition();
+    test_host_custom_compile_rejections();
     test_host_custom_postdispatch_poison();
     master_printf("nvidia_timestep: PASS\n");
     return 0;

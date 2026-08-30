@@ -619,8 +619,9 @@ struct NvidiaCompiledHostTransfer {
 struct NvidiaCompiledHostSegment {
   HostSegment segment;
   std::vector<HostCallbackDescriptor> callbacks;
-  std::vector<Operation> operations;
+  StepPlan host_plan;
   std::vector<NvidiaCompiledHostTransfer> transfers;
+  std::vector<InternalArrayLayout> resolution_layout;
   size_t staging_bytes;
 };
 
@@ -3528,6 +3529,34 @@ bool has_polarization(const fields &f) {
   return false;
 }
 
+bool has_live_host_custom(const fields &f) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk] || !f.chunks[chunk]->is_mine()) continue;
+    FOR_FIELD_TYPES(ft) for (const polarization_state *p = f.chunks[chunk]->pol[ft]; p;
+                            p = p->next)
+      if (p->s && typeid(*p->s) != typeid(noisy_lorentzian_susceptibility) &&
+          typeid(*p->s) != typeid(gyrotropic_susceptibility) &&
+          typeid(*p->s) != typeid(multilevel_susceptibility) &&
+          typeid(*p->s) != typeid(lorentzian_susceptibility))
+        return true;
+  }
+  return false;
+}
+
+bool has_descriptor_host_custom(const fields &f) {
+  if (!f.descriptors) return false;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+    if (descriptor.kind == SusceptibilityKind::host_custom) return true;
+  return false;
+}
+
+bool has_plan_host_custom(const StepPlan &plan) {
+  bool marker = false;
+  for (const Operation &operation : plan.operations)
+    marker = marker || operation.kind == OpKind::host_callback;
+  return marker || !plan.host_segments.empty() || !plan.host_callbacks.empty();
+}
+
 void set_reason(std::string &why, size_t operation, const char *detail) {
   std::ostringstream message;
   message << "NVIDIA PR2 unsupported operation at index " << operation << ": " << detail;
@@ -3801,7 +3830,18 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA solve_cw does not support host-custom media");
       }
     }
-    if (!plan.host_segments.empty() || !plan.host_callbacks.empty()) {
+    const bool live_host_custom = has_live_host_custom(f_);
+    const bool descriptor_host_custom = has_descriptor_host_custom(f_);
+    const bool plan_host_custom = has_plan_host_custom(plan);
+    if (live_host_custom != descriptor_host_custom ||
+        descriptor_host_custom != plan_host_custom)
+      throw std::invalid_argument(
+          "NVIDIA host-callback live, descriptor, and plan presence differ");
+    if (live_host_custom) {
+      if (options_.precision != precision_policy_kind::native)
+        throw std::invalid_argument("NVIDIA host-custom fallback requires native precision");
+      if (f_.phasein_time > 0)
+        throw std::invalid_argument("NVIDIA host-custom fallback does not support material phasing");
       std::string host_error;
       if (plan.program != StepProgram::ordinary ||
           !validate_host_callback_plan(f_, plan, &host_error))
@@ -4817,17 +4857,22 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           const HostSegment &source = plan.host_segments[op.descriptor_index];
           NvidiaCompiledHostSegment segment = {};
           segment.segment = source;
+          segment.host_plan.program = StepProgram::ordinary;
           segment.staging_bytes = 0;
           for (size_t i = source.callback_index;
-               i < size_t(source.callback_index) + source.callback_count; ++i)
+               i < size_t(source.callback_index) + source.callback_count; ++i) {
             segment.callbacks.push_back(plan.host_callbacks[i]);
+            segment.resolution_layout.resize(
+                std::max(segment.resolution_layout.size(),
+                         plan.host_callbacks[i].published_layout.size()));
+          }
           for (size_t i = source.operation_index;
                i < size_t(source.operation_index) + source.operation_count; ++i) {
             Operation covered = plan.operations[i];
             /* The resident scheduler has already evaluated the marker guard.
                A standalone CPU segment must not evaluate the same guard again. */
             covered.guard = guard_always();
-            segment.operations.push_back(covered);
+            segment.host_plan.operations.push_back(covered);
           }
           for (const BufferAccess &access : op.accesses) {
             if (!is_valid(access.array.id) || access.array.id.value >= state.plan_.arrays.size()) {
@@ -6463,7 +6508,7 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
                                          size_t segment_index) {
   if (segment_index >= executable.host_segments_.size())
     throw std::logic_error("NVIDIA host segment index is out of range");
-  const NvidiaCompiledHostSegment &segment = executable.host_segments_[segment_index];
+  NvidiaCompiledHostSegment &segment = executable.host_segments_[segment_index];
   ++state.host_fallback_statistics_.segment_executions;
 
   /* Resolve pointer-free identities immediately before entering the host
@@ -6472,9 +6517,12 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
   for (const HostCallbackDescriptor &callback : segment.callbacks) {
     ResolvedHostCallback resolved;
     std::string error;
-    if (!resolve_host_callback(f_, callback, resolved, &error))
+    const size_t capacity = segment.resolution_layout.capacity();
+    if (!resolve_host_callback(f_, callback, resolved, segment.resolution_layout, &error))
       throw std::invalid_argument(error.empty() ? "NVIDIA host callback identity is stale"
                                                 : error);
+    if (segment.resolution_layout.capacity() != capacity)
+      ++state.host_fallback_statistics_.steady_capacity_growths;
     ++state.host_fallback_statistics_.callback_resolutions;
   }
 
@@ -6503,15 +6551,11 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
           nvidia::testing::failure_point::host_segment_after_download))
     throw std::runtime_error("injected NVIDIA host-segment post-download failure");
 
-  StepPlan host_plan;
-  host_plan.program = StepProgram::ordinary;
-  host_plan.operations = segment.operations;
-  f_.execute_step_plan(host_plan, 0);
+  f_.execute_step_plan(segment.host_plan, 0);
   if (nvidia::testing::consume_failure_for_testing(
           nvidia::testing::failure_point::host_segment_after_callback))
     throw std::runtime_error("injected NVIDIA host-segment post-callback failure");
 
-  bool uploaded = false;
   for (const NvidiaCompiledHostTransfer &transfer : segment.transfers) {
     if (transfer.mode == AccessMode::read) continue;
     const char *host = static_cast<const char *>(
@@ -6524,11 +6568,6 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
                                         transfer.storage_bytes, *state.transfer_);
     ++state.host_fallback_statistics_.host_to_device_calls;
     state.host_fallback_statistics_.host_to_device_bytes += transfer.storage_bytes;
-    uploaded = true;
-  }
-  if (uploaded) {
-    state.transfer_->synchronize();
-    ++state.host_fallback_statistics_.synchronizations;
   }
   if (nvidia::testing::consume_failure_for_testing(
           nvidia::testing::failure_point::host_segment_after_upload))

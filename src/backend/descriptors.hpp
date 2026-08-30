@@ -306,6 +306,10 @@ inline bool operator!=(const HostCallbackDescriptor &a, const HostCallbackDescri
 HostCallbackDescriptor make_host_callback_descriptor(const PolarizationDescriptor &d);
 bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
                            ResolvedHostCallback &resolved, std::string *error = NULL);
+bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
+                           ResolvedHostCallback &resolved,
+                           std::vector<InternalArrayLayout> &layout_scratch,
+                           std::string *error = NULL);
 
 struct DescriptorSet {
   SourcePlan sources;

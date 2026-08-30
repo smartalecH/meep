@@ -31,11 +31,12 @@ struct NvidiaHostFallbackStatistics {
   size_t host_to_device_calls;
   size_t host_to_device_bytes;
   size_t synchronizations;
+  size_t steady_capacity_growths;
 
   NvidiaHostFallbackStatistics()
       : segment_executions(0), callback_resolutions(0), device_to_host_calls(0),
         device_to_host_bytes(0), host_to_device_calls(0), host_to_device_bytes(0),
-        synchronizations(0) {}
+        synchronizations(0), steady_capacity_growths(0) {}
 };
 
 struct NvidiaCwStatistics {

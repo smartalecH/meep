@@ -4089,6 +4089,37 @@ bool same_host_array_ref(const ArrayRef &a, const ArrayRef &b) {
   return a.id == b.id && a.offset == b.offset && a.elements == b.elements;
 }
 
+bool same_host_operation(const Operation &a, const Operation &b) {
+  if (a.kind != b.kind || a.descriptor_index != b.descriptor_index ||
+      a.descriptor_count != b.descriptor_count ||
+      a.material_refresh_index != b.material_refresh_index ||
+      a.material_refresh_count != b.material_refresh_count ||
+      a.beta_descriptor_index != b.beta_descriptor_index ||
+      a.beta_descriptor_count != b.beta_descriptor_count ||
+      a.cylindrical_m_descriptor_index != b.cylindrical_m_descriptor_index ||
+      a.cylindrical_m_descriptor_count != b.cylindrical_m_descriptor_count ||
+      a.cylindrical_origin_action_index != b.cylindrical_origin_action_index ||
+      a.cylindrical_origin_action_count != b.cylindrical_origin_action_count ||
+      a.polarization_group_index != b.polarization_group_index ||
+      a.polarization_group_count != b.polarization_group_count ||
+      a.polarization_subtraction_index != b.polarization_subtraction_index ||
+      a.polarization_subtraction_count != b.polarization_subtraction_count ||
+      a.magnetic_state_index != b.magnetic_state_index ||
+      a.magnetic_state_count != b.magnetic_state_count ||
+      a.legacy_flux_index != b.legacy_flux_index ||
+      a.legacy_flux_count != b.legacy_flux_count ||
+      a.source_descriptor_index != b.source_descriptor_index ||
+      a.source_descriptor_count != b.source_descriptor_count || a.ft != b.ft ||
+      !same_guard(a.guard, b.guard) || a.source_time_offset != b.source_time_offset ||
+      a.accesses.size() != b.accesses.size())
+    return false;
+  for (size_t i = 0; i < a.accesses.size(); ++i)
+    if (!same_host_array_ref(a.accesses[i].array, b.accesses[i].array) ||
+        a.accesses[i].mode != b.accesses[i].mode)
+      return false;
+  return true;
+}
+
 bool access_covers(const BufferAccess &have, const BufferAccess &need) {
   if (!same_host_array_ref(have.array, need.array)) return false;
   return have.mode == need.mode || have.mode == AccessMode::read_write;
@@ -4422,15 +4453,8 @@ bool validate_host_callback_plan(fields &f, const StepPlan &plan, std::string *e
     for (size_t i = 0; i < plan.operations.size(); ++i) {
       const Operation &a = plan.operations[i];
       const Operation &b = expected.operations[i];
-      if (a.kind != OpKind::host_callback && b.kind != OpKind::host_callback) continue;
-      if (a.kind != b.kind || a.ft != b.ft || !same_guard(a.guard, b.guard) ||
-          a.descriptor_index != b.descriptor_index || a.descriptor_count != b.descriptor_count ||
-          a.accesses.size() != b.accesses.size())
-        throw std::invalid_argument("host callback marker differs from canonical plan");
-      for (size_t ai = 0; ai < a.accesses.size(); ++ai)
-        if (!same_host_array_ref(a.accesses[ai].array, b.accesses[ai].array) ||
-            a.accesses[ai].mode != b.accesses[ai].mode)
-          throw std::invalid_argument("host callback access union differs from canonical plan");
+      if (!same_host_operation(a, b))
+        throw std::invalid_argument("host callback operation schedule differs from canonical plan");
     }
     return true;
   }

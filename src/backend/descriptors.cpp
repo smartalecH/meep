@@ -1239,7 +1239,8 @@ HostCallbackDescriptor make_host_callback_descriptor(const PolarizationDescripto
 }
 
 bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
-                           ResolvedHostCallback &resolved, std::string *error) {
+                           ResolvedHostCallback &resolved,
+                           std::vector<InternalArrayLayout> &layout, std::string *error) {
   resolved = ResolvedHostCallback();
   if (error) error->clear();
   try {
@@ -1258,7 +1259,7 @@ bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
         (state->data != NULL) != descriptor.has_internal_state)
       throw std::invalid_argument("host callback live identity changed");
 
-    std::vector<InternalArrayLayout> layout;
+    layout.clear();
     const bool published = state->s->internal_layout(layout, fc->gv, state->data);
     if (published != descriptor.layout_published || layout.size() != descriptor.published_layout.size())
       throw std::invalid_argument("host callback published layout changed");
@@ -1267,17 +1268,14 @@ bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
     if (published && !f.array_catalog)
       throw std::invalid_argument("host callback published layout has no catalog");
     validate_internal_layout_overlap(layout);
-    std::set<uint32_t> ids;
     for (size_t li = 0; li < layout.size(); ++li) {
       const InternalArrayLayout &live = layout[li];
-      PublishedInternalLayout value;
-      value.name = live.name ? live.name : "";
-      value.element_type = live.element_type;
-      value.offset_elements = live.offset_elements;
-      value.elements = live.elements;
-      value.c = live.c;
-      value.cmp = live.cmp;
-      if (value != descriptor.published_layout[li])
+      const PublishedInternalLayout &published_layout = descriptor.published_layout[li];
+      if (published_layout.name != (live.name ? live.name : "") ||
+          published_layout.element_type != live.element_type ||
+          published_layout.offset_elements != live.offset_elements ||
+          published_layout.elements != live.elements || published_layout.c != live.c ||
+          published_layout.cmp != live.cmp)
         throw std::invalid_argument("host callback published layout row changed");
       void *const address =
           checked_internal_row_address(
@@ -1285,8 +1283,11 @@ bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
               live.elements *
                   (live.element_type == InternalArrayLayout::complex_realnum ? 2 : 1));
       const ArrayRef &ref = descriptor.published_internal_refs[li];
+      bool duplicate = false;
+      for (size_t prior = 0; prior < li; ++prior)
+        duplicate = duplicate || descriptor.published_internal_refs[prior].id == ref.id;
       if (!is_valid(ref.id) || ref.id.value >= f.array_catalog->size() || ref.offset != 0 ||
-          ref.elements != live.elements || !ids.insert(ref.id.value).second)
+          ref.elements != live.elements || duplicate)
         throw std::invalid_argument("host callback internal reference is invalid");
       const StorageKey &key = f.array_catalog->key(ref.id);
       const ArraySpec &spec = f.array_catalog->spec(ref.id);
@@ -1324,6 +1325,13 @@ bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
     if (error) *error = e.what();
     return false;
   }
+}
+
+bool resolve_host_callback(fields &f, const HostCallbackDescriptor &descriptor,
+                           ResolvedHostCallback &resolved, std::string *error) {
+  std::vector<InternalArrayLayout> layout;
+  layout.reserve(descriptor.published_layout.size());
+  return resolve_host_callback(f, descriptor, resolved, layout, error);
 }
 
 void refresh_operation_descriptors(fields &f, bool rebuild_all) {
