@@ -131,6 +131,50 @@ struct DftDescriptor {
   size_t Nomega;
 };
 
+/* --- Legacy instantaneous flux monitors ---------------------------------
+   The live flux_vol list owns only host callbacks and scalar results.  These
+   recipes flatten the same centered-grid E x H integrations into portable
+   chunk-local terms.  No flux_vol pointer or private half-step scalar crosses
+   this boundary. */
+
+struct LegacyFluxTermDescriptor {
+  uint32_t term_ordinal;
+  uint32_t region_ordinal;
+  int sign;
+  int chunk;
+  component e_component;
+  component h_component;
+  ArrayId e_real;
+  ArrayId e_imag;
+  ArrayId h_real;
+  ArrayId h_imag;
+  ivec begin;
+  ivec end;
+  ivec lattice_shift;
+  int symmetry_index;
+  size_t base;
+  size_t counts[3];
+  ptrdiff_t strides[3];
+  ptrdiff_t e_offsets[2];
+  ptrdiff_t h_offsets[2];
+  double phase_real;
+  double phase_imag;
+  double boundary_weights[3][4];
+  double dV0;
+  double dV1;
+};
+
+struct LegacyFluxDescriptor {
+  uint32_t flux_ordinal;
+  direction normal;
+  volume where;
+  uint64_t recipe_signature;
+  std::vector<LegacyFluxTermDescriptor> terms;
+
+  LegacyFluxDescriptor(uint32_t ordinal, direction d, const volume &v)
+      : flux_ordinal(ordinal), normal(d), where(v), recipe_signature(0) {}
+};
+
 /* --- Susceptibilities ----------------------------------------------------- */
 
 enum class SusceptibilityKind { lorentzian, noisy_lorentzian, gyrotropic, multilevel, host_custom };
@@ -186,11 +230,16 @@ struct PolarizationDescriptor {
 struct DescriptorSet {
   SourcePlan sources;
   std::vector<DftDescriptor> dfts;
+  std::vector<LegacyFluxDescriptor> legacy_fluxes;
+  uint64_t legacy_flux_generation;
   std::vector<PolarizationDescriptor> polarizations;
   std::vector<ChunkLoopRegion> regions;
+  DescriptorSet() : legacy_flux_generation(0) {}
   void clear() {
     sources.clear();
     dfts.clear();
+    legacy_fluxes.clear();
+    legacy_flux_generation = 0;
     polarizations.clear();
     regions.clear();
   }
@@ -214,6 +263,10 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
    values are deliberately excluded; decimation_factor and due_scalar_slot
    are descriptor metadata and are included. */
 uint64_t dft_plan_signature(const std::vector<DftDescriptor> &plan);
+void build_legacy_flux_descriptors(fields &f, std::vector<LegacyFluxDescriptor> &out);
+/* Rebuild the owned DescriptorSet recipes and stamp the live list generation.
+   PR7/8 use this at their collective transactional refresh boundary. */
+void refresh_legacy_flux_descriptors(fields &f);
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out);
 
 } // namespace meep

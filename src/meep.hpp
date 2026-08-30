@@ -986,6 +986,7 @@ class fields;
 class fields_chunk;
 class flux_vol;
 class source_descriptor_builder;
+class legacy_flux_descriptor_builder;
 
 // Time-dependence of a current source, intended to be overridden by
 // subclasses.  current() and dipole() are be related by
@@ -2495,6 +2496,7 @@ public:
   flux_vol *next;
 
 private:
+  friend class legacy_flux_descriptor_builder;
   double flux_wrongE() { return f->flux_in_box_wrongH(d, where); }
   fields *f;
   direction d;
