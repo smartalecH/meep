@@ -141,6 +141,8 @@ void fields::execute_step_plan(const StepPlan &plan, int save_synchronized_magne
       case OpKind::unpack_halo:
       case OpKind::exchange_local:
       case OpKind::reduction:
+      /* Metadata only: the referenced ordinary operations remain in the plan
+         and execute exactly once through their existing cases above. */
       case OpKind::host_callback:
       case OpKind::pack_state:
       case OpKind::unpack_state:

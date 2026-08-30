@@ -76,6 +76,31 @@ struct BufferAccess {
   AccessMode mode;
 };
 
+/* A host callback marker does not duplicate the operations that retain the
+   exact legacy CPU semantics.  It names a contiguous following span which a
+   resident backend must execute on the host as one indivisible segment.  PR 6
+   populates the callback identities; PR 2 supplies the host-owned halo plan
+   namespace.  Their spans are declared here so the StepPlan schema is frozen
+   before either live recipe is attached. */
+enum class HostSegmentPhase : uint32_t { constitutive = 0, polarization_and_halo = 1 };
+
+const char *host_segment_phase_name(HostSegmentPhase phase);
+
+struct HostSegment {
+  HostSegmentPhase phase;
+  field_type ft;
+  uint32_t operation_index;
+  uint32_t operation_count;
+  uint32_t callback_index;
+  uint32_t callback_count;
+  /* Logical PR2 host-halo plan span, never a generation-local HostHaloId. */
+  uint32_t host_halo_plan_index;
+  uint32_t host_halo_plan_count;
+};
+
+bool operator==(const HostSegment &a, const HostSegment &b);
+inline bool operator!=(const HostSegment &a, const HostSegment &b) { return !(a == b); }
+
 /* The guard mechanism is recorded in the plan rather than resolved by the
    executor because it determines graph structure in Phase 2: a device_predicate
    keeps a node in the graph, a graph_variant forces a second compiled program,
@@ -695,6 +720,7 @@ struct StepPlan {
   std::vector<double> cylindrical_origin_r;
   std::vector<uint8_t> cylindrical_zero_near_origin;
   std::vector<Operation> operations;
+  std::vector<HostSegment> host_segments;
   std::vector<CurlUpdate> db_updates;
   std::vector<CylindricalRadialPrefix> cylindrical_radial_prefixes;
   std::vector<BfastUpdate> bfast_updates;
@@ -733,6 +759,7 @@ struct StepPlan {
     cylindrical_origin_r.clear();
     cylindrical_zero_near_origin.clear();
     operations.clear();
+    host_segments.clear();
     db_updates.clear();
     cylindrical_radial_prefixes.clear();
     bfast_updates.clear();
@@ -813,6 +840,20 @@ bool validate_cw_state_layout(fields &f, const CwStateLayout &layout,
 
 /* Structural identity used by device executables and tests. */
 uint64_t compute_step_plan_signature(const StepPlan &plan);
+
+/* Construct the marker's canonical access union in first-use order. Equal
+   ArrayRefs are collapsed and read+write is promoted to read_write. Distinct
+   ranges carrying one ArrayId are rejected: host segments transfer complete,
+   unambiguous catalog allocations. */
+std::vector<BufferAccess>
+build_host_segment_access_union(const StepPlan &plan, uint32_t operation_index,
+                                uint32_t operation_count,
+                                const std::vector<BufferAccess> &additional);
+
+/* Structural validation for host_callback markers. This checks only the PR 5
+   operation-span contract. PR 6 additionally validates callback identities
+   and the bounds of callback spans once that vector exists. */
+bool validate_host_segments(const StepPlan &plan, std::string *error = NULL);
 
 /* Recomputed by resident preflight so externally-mutated target topology is
    rejected before phase_material_mix changes current coefficients. */

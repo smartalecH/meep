@@ -50,6 +50,14 @@
 #include "backend/step_plan.hpp"
 #include "meep_internals.hpp"
 
+namespace meep {
+/* Test-only friend: exercise the exact CPU dispatch switch without exposing a
+   public execution API or adding a production callback hook. */
+struct StepPlanTestAccess {
+  static void execute(fields &f, const StepPlan &plan) { f.execute_step_plan(plan, 0); }
+};
+} // namespace meep
+
 using namespace meep;
 
 static int failures = 0;
@@ -83,6 +91,32 @@ public:
   }
 };
 static double magnetic_conductivity(const vec &) { return 0.07; }
+
+class host_segment_counting_lorentzian : public lorentzian_susceptibility {
+public:
+  host_segment_counting_lorentzian(realnum omega_0, realnum gamma)
+      : lorentzian_susceptibility(omega_0, gamma) {}
+  susceptibility *clone() const override { return new host_segment_counting_lorentzian(*this); }
+
+  void subtract_P(field_type ft, realnum *f_minus_p[NUM_FIELD_COMPONENTS][2],
+                  void *data) const override {
+    ++subtract_calls;
+    lorentzian_susceptibility::subtract_P(ft, f_minus_p, data);
+  }
+
+  void update_P(realnum *W[NUM_FIELD_COMPONENTS][2],
+                realnum *W_prev[NUM_FIELD_COMPONENTS][2], realnum dt, const grid_volume &gv,
+                void *data) const override {
+    ++update_calls;
+    lorentzian_susceptibility::update_P(W, W_prev, dt, gv, data);
+  }
+
+  static int subtract_calls;
+  static int update_calls;
+};
+
+int host_segment_counting_lorentzian::subtract_calls = 0;
+int host_segment_counting_lorentzian::update_calls = 0;
 
 static void compare(const char *name, const std::vector<std::string> &got, const char *const *want,
                     size_t nwant) {
@@ -289,6 +323,12 @@ static void test_full_plan() {
   }
 
   const StepPlan p = build_step_plan(f, StepProgram::ordinary);
+  std::string host_error;
+  CHECK(p.host_segments.empty(), "PR5 populated live host segments before PR6");
+  CHECK(validate_host_segments(p, &host_error), "ordinary plan has invalid host segments: %s",
+        host_error.c_str());
+  for (const Operation &op : p.operations)
+    CHECK(op.kind != OpKind::host_callback, "PR5 emitted a live host callback before PR6");
   std::vector<std::string> got;
   format_step_plan(p, got);
   /* Only ranks that actually own a monitor chunk emit update_dft; see the note
@@ -3572,6 +3612,431 @@ static void test_cylindrical_schema_signature() {
         "StepPlan::clear retained cylindrical coordinate state");
 }
 
+static Operation host_test_operation(OpKind kind, field_type ft, Guard guard = guard_always()) {
+  Operation op = {};
+  op.kind = kind;
+  op.ft = ft;
+  op.guard = guard;
+  return op;
+}
+
+static void append_synthetic_host_family(StepPlan &plan, field_type ft,
+                                         Guard guard = guard_always()) {
+  const field_type w_halo = ft == E_stuff ? WE_stuff : WH_stuff;
+  const field_type p_halo = ft == E_stuff ? PE_stuff : PH_stuff;
+
+  Operation constitutive_marker = host_test_operation(OpKind::host_callback, ft, guard);
+  constitutive_marker.descriptor_index = uint32_t(plan.host_segments.size());
+  constitutive_marker.descriptor_count = 1;
+  plan.operations.push_back(constitutive_marker);
+  const uint32_t constitutive_index = uint32_t(plan.operations.size());
+  plan.operations.push_back(host_test_operation(OpKind::update_eh, ft, guard));
+  plan.host_segments.push_back(
+      HostSegment{HostSegmentPhase::constitutive, ft, constitutive_index, 1, 0, 0, 0, 0});
+
+  plan.operations.push_back(host_test_operation(OpKind::transfer_halo, w_halo, guard));
+
+  Operation polarization_marker = host_test_operation(OpKind::host_callback, ft, guard);
+  polarization_marker.descriptor_index = uint32_t(plan.host_segments.size());
+  polarization_marker.descriptor_count = 1;
+  plan.operations.push_back(polarization_marker);
+  const uint32_t polarization_index = uint32_t(plan.operations.size());
+  plan.operations.push_back(host_test_operation(OpKind::update_polarization, ft, guard));
+  plan.operations.push_back(host_test_operation(OpKind::transfer_halo, p_halo, guard));
+  plan.host_segments.push_back(HostSegment{HostSegmentPhase::polarization_and_halo, ft,
+                                           polarization_index, 2, 0, 0, 0, 0});
+
+  plan.operations.push_back(host_test_operation(OpKind::transfer_halo, ft, guard));
+}
+
+static size_t count_host_phase(const StepPlan &plan, field_type ft, HostSegmentPhase phase) {
+  size_t count = 0;
+  for (const HostSegment &segment : plan.host_segments)
+    if (segment.ft == ft && segment.phase == phase) ++count;
+  return count;
+}
+
+static void test_host_segment_topologies() {
+  std::string error;
+  for (int mask = 1; mask <= 3; ++mask) {
+    StepPlan plan;
+    if (mask & 1) append_synthetic_host_family(plan, E_stuff);
+    if (mask & 2) append_synthetic_host_family(plan, H_stuff);
+    CHECK(validate_host_segments(plan, &error), "E/H host topology %d rejected: %s", mask,
+          error.c_str());
+    CHECK(count_host_phase(plan, E_stuff, HostSegmentPhase::constitutive) ==
+              size_t((mask & 1) != 0),
+          "E/H topology %d has the wrong E constitutive count", mask);
+    CHECK(count_host_phase(plan, H_stuff, HostSegmentPhase::polarization_and_halo) ==
+              size_t((mask & 2) != 0),
+          "E/H topology %d has the wrong H polarization count", mask);
+  }
+
+  StepPlan phasing;
+  append_synthetic_host_family(phasing, H_stuff, guard_segment(3));
+  append_synthetic_host_family(phasing, H_stuff, guard_always());
+  CHECK(validate_host_segments(phasing, &error), "repeated guarded H segments rejected: %s",
+        error.c_str());
+  CHECK(count_host_phase(phasing, H_stuff, HostSegmentPhase::constitutive) == 2,
+        "repeated H update_eh occurrences did not produce two host segments");
+
+  const HostSegment &ordinary_h = phasing.host_segments[2];
+  phasing.magnetic_half_step.update_h = ordinary_h.operation_index;
+  phasing.magnetic_half_step.transfer_h = uint32_t(phasing.operations.size() - 1);
+  CHECK(phasing.operations[phasing.magnetic_half_step.update_h].kind == OpKind::update_eh,
+        "magnetic update_h index points at the host marker instead of update_eh");
+  CHECK(phasing.operations[phasing.magnetic_half_step.transfer_h].kind == OpKind::transfer_halo &&
+            phasing.operations[phasing.magnetic_half_step.transfer_h].ft == H_stuff,
+        "magnetic transfer_h index was displaced by host markers");
+}
+
+static void test_host_segment_access_union() {
+  StepPlan plan;
+  Operation first = host_test_operation(OpKind::update_polarization, E_stuff);
+  first.accesses.push_back(BufferAccess{ArrayRef{ArrayId{7}, 0, 64}, AccessMode::read});
+  first.accesses.push_back(BufferAccess{ArrayRef{ArrayId{8}, 0, 32}, AccessMode::write});
+  plan.operations.push_back(first);
+  Operation second = host_test_operation(OpKind::transfer_halo, PE_stuff);
+  second.accesses.push_back(BufferAccess{ArrayRef{ArrayId{7}, 0, 64}, AccessMode::write});
+  plan.operations.push_back(second);
+  std::vector<BufferAccess> additional;
+  additional.push_back(BufferAccess{ArrayRef{ArrayId{9}, 4, 12}, AccessMode::read_write});
+  additional.push_back(BufferAccess{ArrayRef{ArrayId{8}, 0, 32}, AccessMode::read});
+
+  const std::vector<BufferAccess> result =
+      build_host_segment_access_union(plan, 0, 2, additional);
+  CHECK(result.size() == 3, "host access union has %zu rows instead of 3", result.size());
+  if (result.size() == 3) {
+    CHECK(result[0].array.id == ArrayId{7} && result[0].mode == AccessMode::read_write,
+          "host access union did not promote read/write alias 7");
+    CHECK(result[1].array.id == ArrayId{8} && result[1].mode == AccessMode::read_write,
+          "host access union did not promote write/read alias 8");
+    CHECK(result[2].array.id == ArrayId{9} && result[2].mode == AccessMode::read_write,
+          "host access union did not preserve deterministic first-use order");
+  }
+
+  bool rejected = false;
+  try {
+    std::vector<BufferAccess> conflicting;
+    conflicting.push_back(BufferAccess{ArrayRef{ArrayId{7}, 1, 63}, AccessMode::read});
+    build_host_segment_access_union(plan, 0, 2, conflicting);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "one ArrayId with conflicting host ranges was accepted");
+
+  rejected = false;
+  try { build_host_segment_access_union(plan, UINT32_MAX, 2, additional); }
+  catch (const std::out_of_range &) { rejected = true; }
+  CHECK(rejected, "out-of-range host access operation span was accepted");
+}
+
+static void test_cpu_host_marker_is_noop() {
+  grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, one, no_pml());
+  s.add_susceptibility(one, E_stuff, host_segment_counting_lorentzian(0.7, 0.08));
+  fields f(&s);
+  f.use_real_fields();
+  gaussian_src_time src(0.3, 0.1);
+  f.add_point_source(Ez, src, vec(0.0, 0.0));
+  f.advance(1); // realize polarization storage and connections
+
+  StepPlan plain;
+  plain.operations.push_back(host_test_operation(OpKind::update_eh, E_stuff));
+  plain.operations.push_back(host_test_operation(OpKind::update_polarization, E_stuff));
+  plain.operations.push_back(host_test_operation(OpKind::transfer_halo, PE_stuff));
+
+  StepPlan marked;
+  append_synthetic_host_family(marked, E_stuff);
+  /* Remove the W and final E boundaries so the two test plans differ only by
+     the two no-op markers around the same update_eh/update_polarization/PE work. */
+  marked.operations.erase(marked.operations.begin() + 2);
+  marked.operations.pop_back();
+  marked.host_segments[1].operation_index = 3;
+  marked.operations[2].descriptor_index = 1;
+  std::string error;
+  CHECK(validate_host_segments(marked, &error), "CPU marker test plan is invalid: %s",
+        error.c_str());
+
+  host_segment_counting_lorentzian::subtract_calls = 0;
+  host_segment_counting_lorentzian::update_calls = 0;
+  StepPlanTestAccess::execute(f, plain);
+  const int plain_subtract = host_segment_counting_lorentzian::subtract_calls;
+  const int plain_update = host_segment_counting_lorentzian::update_calls;
+
+  host_segment_counting_lorentzian::subtract_calls = 0;
+  host_segment_counting_lorentzian::update_calls = 0;
+  StepPlanTestAccess::execute(f, marked);
+  CHECK(host_segment_counting_lorentzian::subtract_calls == plain_subtract,
+        "CPU host marker duplicated/omitted subtract_P (%d != %d)",
+        host_segment_counting_lorentzian::subtract_calls, plain_subtract);
+  CHECK(host_segment_counting_lorentzian::update_calls == plain_update,
+        "CPU host marker duplicated/omitted update_P (%d != %d)",
+        host_segment_counting_lorentzian::update_calls, plain_update);
+  CHECK(plain_subtract > 0 && plain_update > 0, "CPU callback-count oracle was vacuous");
+}
+
+static void test_host_segment_schema() {
+  StepPlan plan;
+
+  Operation constitutive_marker =
+      host_test_operation(OpKind::host_callback, E_stuff, guard_segment(7));
+  constitutive_marker.descriptor_index = 0;
+  constitutive_marker.descriptor_count = 1;
+  constitutive_marker.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{11}, 0, 64}, AccessMode::read_write});
+  constitutive_marker.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{12}, 0, 64}, AccessMode::read_write});
+  plan.operations.push_back(constitutive_marker);
+
+  Operation update_eh = host_test_operation(OpKind::update_eh, E_stuff, guard_segment(7));
+  update_eh.accesses.push_back(BufferAccess{ArrayRef{ArrayId{11}, 0, 64}, AccessMode::read});
+  plan.operations.push_back(update_eh);
+
+  Operation polarization_marker =
+      host_test_operation(OpKind::host_callback, H_stuff, guard_always());
+  polarization_marker.descriptor_index = 1;
+  polarization_marker.descriptor_count = 1;
+  polarization_marker.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{21}, 0, 96}, AccessMode::read_write});
+  polarization_marker.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{22}, 4, 32}, AccessMode::read_write});
+  plan.operations.push_back(polarization_marker);
+
+  Operation update_polarization =
+      host_test_operation(OpKind::update_polarization, H_stuff, guard_always());
+  update_polarization.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{21}, 0, 96}, AccessMode::write});
+  plan.operations.push_back(update_polarization);
+  Operation transfer_ph = host_test_operation(OpKind::transfer_halo, PH_stuff, guard_always());
+  transfer_ph.accesses.push_back(
+      BufferAccess{ArrayRef{ArrayId{22}, 4, 32}, AccessMode::read});
+  plan.operations.push_back(transfer_ph);
+
+  const HostSegment constitutive = {HostSegmentPhase::constitutive, E_stuff, 1, 1, 3, 2, 0, 0};
+  const HostSegment polarization = {
+      HostSegmentPhase::polarization_and_halo, H_stuff, 3, 2, 5, 4, 9, 3};
+  plan.host_segments.push_back(constitutive);
+  plan.host_segments.push_back(polarization);
+
+  std::string error;
+  CHECK(validate_host_segments(plan, &error), "valid host segments were rejected: %s",
+        error.c_str());
+  CHECK(constitutive == plan.host_segments[0], "identical host segments compare unequal");
+  CHECK(constitutive != polarization, "different host segments compare equal");
+#define CHECK_HOST_INEQUALITY(expr, message)                                                       \
+  do {                                                                                             \
+    HostSegment changed = constitutive;                                                            \
+    expr;                                                                                          \
+    CHECK(changed != constitutive, message);                                                       \
+  } while (0)
+  CHECK_HOST_INEQUALITY(changed.phase = HostSegmentPhase::polarization_and_halo,
+                        "host segment equality ignored phase");
+  CHECK_HOST_INEQUALITY(changed.ft = H_stuff, "host segment equality ignored field type");
+  CHECK_HOST_INEQUALITY(++changed.operation_index,
+                        "host segment equality ignored operation index");
+  CHECK_HOST_INEQUALITY(++changed.operation_count,
+                        "host segment equality ignored operation count");
+  CHECK_HOST_INEQUALITY(++changed.callback_index,
+                        "host segment equality ignored callback index");
+  CHECK_HOST_INEQUALITY(++changed.callback_count,
+                        "host segment equality ignored callback count");
+  CHECK_HOST_INEQUALITY(++changed.host_halo_plan_index,
+                        "host segment equality ignored host halo index");
+  CHECK_HOST_INEQUALITY(++changed.host_halo_plan_count,
+                        "host segment equality ignored host halo count");
+#undef CHECK_HOST_INEQUALITY
+  CHECK(!strcmp(host_segment_phase_name(HostSegmentPhase::constitutive), "constitutive"),
+        "constitutive phase has the wrong name");
+  CHECK(!strcmp(host_segment_phase_name(HostSegmentPhase::polarization_and_halo),
+                "polarization_and_halo"),
+        "polarization phase has the wrong name");
+
+  std::vector<std::string> formatted;
+  format_step_plan(plan, formatted);
+  CHECK(formatted.size() == plan.operations.size(), "host plan formatting lost operations");
+  if (formatted.size() == plan.operations.size()) {
+    CHECK(formatted[0] ==
+              "host_callback(E,constitutive,ops=1+1,callbacks=3+2,halos=0+0)",
+          "constitutive host marker formatting is incomplete: %s", formatted[0].c_str());
+    CHECK(formatted[2] ==
+              "host_callback(H,polarization_and_halo,ops=3+2,callbacks=5+4,halos=9+3)",
+          "polarization host marker formatting is incomplete: %s", formatted[2].c_str());
+  }
+
+  const uint64_t signature = compute_step_plan_signature(plan);
+#define CHECK_HOST_SIGNATURE(expr, message)                                                        \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
+  } while (0)
+  CHECK_HOST_SIGNATURE(changed.host_segments[0].phase =
+                           HostSegmentPhase::polarization_and_halo,
+                       "signature ignored host segment phase");
+  CHECK_HOST_SIGNATURE(changed.host_segments[0].ft = H_stuff,
+                       "signature ignored host segment field type");
+  CHECK_HOST_SIGNATURE(++changed.host_segments[0].operation_index,
+                       "signature ignored host operation span start");
+  CHECK_HOST_SIGNATURE(++changed.host_segments[0].operation_count,
+                       "signature ignored host operation span count");
+  CHECK_HOST_SIGNATURE(++changed.host_segments[0].callback_index,
+                       "signature ignored host callback span start");
+  CHECK_HOST_SIGNATURE(++changed.host_segments[0].callback_count,
+                       "signature ignored host callback span count");
+  CHECK_HOST_SIGNATURE(++changed.host_segments[1].host_halo_plan_index,
+                       "signature ignored host halo span start");
+  CHECK_HOST_SIGNATURE(++changed.host_segments[1].host_halo_plan_count,
+                       "signature ignored host halo span count");
+  CHECK_HOST_SIGNATURE(++changed.operations[0].guard.scalar_slot,
+                       "signature ignored host marker guard");
+  CHECK_HOST_SIGNATURE(changed.operations[0].accesses[0].mode = AccessMode::write,
+                       "signature ignored host marker access mode");
+#undef CHECK_HOST_SIGNATURE
+
+  auto rejected = [&](StepPlan candidate, const char *message) {
+    std::string why;
+    CHECK(!validate_host_segments(candidate, &why), message);
+    CHECK(!why.empty(), "invalid host segment produced no diagnostic");
+  };
+
+  {
+    StepPlan bad = plan;
+    bad.operations[0].descriptor_count = 0;
+    rejected(bad, "host marker with an empty segment span was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].descriptor_index = 2;
+    rejected(bad, "host marker with an out-of-range segment was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].polarization_group_count = 1;
+    rejected(bad, "host marker with an unrelated payload was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[0].phase = HostSegmentPhase(99);
+    rejected(bad, "host segment with an invalid phase was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[0].ft = D_stuff;
+    rejected(bad, "host segment with a non-E/H field type was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].ft = H_stuff;
+    rejected(bad, "host callback marker with the wrong field type was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    ++bad.host_segments[0].operation_index;
+    rejected(bad, "host segment detached from its marker was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[0].operation_index = 0;
+    rejected(bad, "self-covering host segment was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[0].operation_count = 2;
+    rejected(bad, "constitutive host segment with the wrong length was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[0].host_halo_plan_count = 1;
+    rejected(bad, "constitutive host segment with a halo span was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[0].callback_index = UINT32_MAX;
+    bad.host_segments[0].callback_count = 1;
+    rejected(bad, "overflowing callback span was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments[1].host_halo_plan_index = UINT32_MAX;
+    bad.host_segments[1].host_halo_plan_count = 1;
+    rejected(bad, "overflowing host halo span was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[1].kind = OpKind::update_db;
+    rejected(bad, "constitutive segment covering the wrong operation was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[4].ft = PE_stuff;
+    rejected(bad, "polarization segment covering the wrong halo was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[3].kind = OpKind::update_eh;
+    rejected(bad, "polarization segment covering the wrong first operation was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    std::swap(bad.operations[3], bad.operations[4]);
+    rejected(bad, "reordered polarization/halo segment was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[1].kind = OpKind::host_callback;
+    bad.operations[1].descriptor_index = 1;
+    bad.operations[1].descriptor_count = 1;
+    rejected(bad, "nested host callback marker was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[3].guard = guard_segment(1);
+    rejected(bad, "host segment with inconsistent guards was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].accesses.erase(bad.operations[0].accesses.begin());
+    rejected(bad, "host segment with an incomplete access union was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].accesses[0].mode = AccessMode::write;
+    rejected(bad, "write-only host access was accepted for a covered read");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].accesses.push_back(bad.operations[0].accesses[0]);
+    rejected(bad, "duplicate host segment ArrayId was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].accesses[0].array.id = invalid_array();
+    rejected(bad, "invalid host segment ArrayId was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[0].accesses[0].array.elements = 0;
+    rejected(bad, "empty host segment access was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.operations[2].descriptor_index = 0;
+    rejected(bad, "host segment referenced by two markers was accepted");
+  }
+  {
+    StepPlan bad = plan;
+    bad.host_segments.push_back(constitutive);
+    rejected(bad, "unreferenced host segment was accepted");
+  }
+
+  plan.clear();
+  CHECK(plan.host_segments.empty(), "StepPlan::clear retained host segments");
+  plan.clear();
+  CHECK(plan.host_segments.empty(), "second StepPlan::clear retained host segments");
+  CHECK(validate_host_segments(plan, &error), "empty host segment plan was rejected: %s",
+        error.c_str());
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -3593,6 +4058,10 @@ int main(int argc, char **argv) {
   test_beta_schema_signature();
   test_bfast_schema_signature();
   test_cylindrical_schema_signature();
+  test_host_segment_topologies();
+  test_host_segment_access_union();
+  test_cpu_host_marker_is_noop();
+  test_host_segment_schema();
 
   if (failures) {
     master_printf("step_plan: %d FAILURE(S)\n", failures);

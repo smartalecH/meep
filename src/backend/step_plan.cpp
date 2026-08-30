@@ -62,6 +62,14 @@ const char *op_kind_name(OpKind k) {
   return "?";
 }
 
+const char *host_segment_phase_name(HostSegmentPhase phase) {
+  switch (phase) {
+    case HostSegmentPhase::constitutive: return "constitutive";
+    case HostSegmentPhase::polarization_and_halo: return "polarization_and_halo";
+  }
+  return "?";
+}
+
 static const char *ft_name(field_type ft) {
   switch (ft) {
     case E_stuff: return "E";
@@ -1218,6 +1226,16 @@ public:
         sig ^= uint64_t(access.array.elements) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
         sig ^= uint64_t(access.mode) + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
       }
+    }
+    for (const HostSegment &segment : plan.host_segments) {
+      mix(sig, uint64_t(segment.phase));
+      mix(sig, uint64_t(segment.ft));
+      mix(sig, uint64_t(segment.operation_index));
+      mix(sig, uint64_t(segment.operation_count));
+      mix(sig, uint64_t(segment.callback_index));
+      mix(sig, uint64_t(segment.callback_count));
+      mix(sig, uint64_t(segment.host_halo_plan_index));
+      mix(sig, uint64_t(segment.host_halo_plan_count));
     }
     for (const CurlUpdate &d : plan.db_updates)
       hash_curl(sig, d);
@@ -2499,6 +2517,175 @@ uint64_t compute_step_plan_signature(const StepPlan &plan) {
   return StepPlanBuilder::signature_for(plan);
 }
 
+bool operator==(const HostSegment &a, const HostSegment &b) {
+  return a.phase == b.phase && a.ft == b.ft && a.operation_index == b.operation_index &&
+         a.operation_count == b.operation_count && a.callback_index == b.callback_index &&
+         a.callback_count == b.callback_count &&
+         a.host_halo_plan_index == b.host_halo_plan_index &&
+         a.host_halo_plan_count == b.host_halo_plan_count;
+}
+
+namespace {
+
+bool same_guard(const Guard &a, const Guard &b) {
+  return a.kind == b.kind && a.scalar_slot == b.scalar_slot &&
+         a.variant_index == b.variant_index;
+}
+
+bool same_host_array_ref(const ArrayRef &a, const ArrayRef &b) {
+  return a.id == b.id && a.offset == b.offset && a.elements == b.elements;
+}
+
+bool access_covers(const BufferAccess &have, const BufferAccess &need) {
+  if (!same_host_array_ref(have.array, need.array)) return false;
+  return have.mode == need.mode || have.mode == AccessMode::read_write;
+}
+
+bool checked_u32_span(uint32_t index, uint32_t count) {
+  return uint64_t(index) + uint64_t(count) <= uint64_t(UINT32_MAX);
+}
+
+bool host_segment_failure(std::string *error, const std::string &message) {
+  if (error) *error = message;
+  return false;
+}
+
+} // namespace
+
+std::vector<BufferAccess>
+build_host_segment_access_union(const StepPlan &plan, uint32_t operation_index,
+                                uint32_t operation_count,
+                                const std::vector<BufferAccess> &additional) {
+  if (uint64_t(operation_index) + uint64_t(operation_count) > plan.operations.size())
+    throw std::out_of_range("host segment access span is out of range");
+
+  std::vector<BufferAccess> result;
+  auto merge = [&](const BufferAccess &candidate) {
+    if (!is_valid(candidate.array.id) || !candidate.array.elements)
+      throw std::invalid_argument("host segment access is invalid or empty");
+    if (candidate.mode != AccessMode::read && candidate.mode != AccessMode::write &&
+        candidate.mode != AccessMode::read_write)
+      throw std::invalid_argument("host segment access mode is invalid");
+    for (BufferAccess &existing : result) {
+      if (existing.array.id != candidate.array.id) continue;
+      if (!same_host_array_ref(existing.array, candidate.array))
+        throw std::invalid_argument("host segment gives one ArrayId multiple ranges");
+      if (existing.mode != candidate.mode) existing.mode = AccessMode::read_write;
+      return;
+    }
+    result.push_back(candidate);
+  };
+
+  for (uint32_t i = 0; i < operation_count; ++i)
+    for (const BufferAccess &access : plan.operations[size_t(operation_index) + i].accesses)
+      merge(access);
+  for (const BufferAccess &access : additional)
+    merge(access);
+  return result;
+}
+
+bool validate_host_segments(const StepPlan &plan, std::string *error) {
+  if (error) error->clear();
+  std::vector<uint32_t> segment_references(plan.host_segments.size(), 0);
+  std::vector<uint8_t> covered_operations(plan.operations.size(), 0);
+
+  for (size_t marker_index = 0; marker_index < plan.operations.size(); ++marker_index) {
+    const Operation &marker = plan.operations[marker_index];
+    if (marker.kind != OpKind::host_callback) continue;
+    if (marker.descriptor_count != 1 || marker.descriptor_index >= plan.host_segments.size())
+      return host_segment_failure(error, "host callback marker has an invalid segment span");
+    if (marker.material_refresh_index || marker.material_refresh_count ||
+        marker.beta_descriptor_index || marker.beta_descriptor_count ||
+        marker.cylindrical_m_descriptor_index || marker.cylindrical_m_descriptor_count ||
+        marker.cylindrical_origin_action_index || marker.cylindrical_origin_action_count ||
+        marker.polarization_group_index || marker.polarization_group_count ||
+        marker.polarization_subtraction_index || marker.polarization_subtraction_count ||
+        marker.magnetic_state_index || marker.magnetic_state_count || marker.legacy_flux_index ||
+        marker.legacy_flux_count || marker.source_time_offset != 0.0)
+      return host_segment_failure(error, "host callback marker has unrelated payload");
+
+    const HostSegment &segment = plan.host_segments[marker.descriptor_index];
+    if (++segment_references[marker.descriptor_index] != 1)
+      return host_segment_failure(error, "host segment is referenced by multiple markers");
+    if (segment.ft != E_stuff && segment.ft != H_stuff)
+      return host_segment_failure(error, "host segment has an invalid field type");
+    if (marker.ft != segment.ft)
+      return host_segment_failure(error, "host callback marker field type differs from segment");
+    if (!checked_u32_span(segment.callback_index, segment.callback_count) ||
+        !checked_u32_span(segment.host_halo_plan_index, segment.host_halo_plan_count))
+      return host_segment_failure(error, "host segment subordinate span overflows uint32_t");
+    if (segment.operation_index != marker_index + 1)
+      return host_segment_failure(error, "host segment does not begin immediately after marker");
+    if (uint64_t(segment.operation_index) + uint64_t(segment.operation_count) >
+        plan.operations.size())
+      return host_segment_failure(error, "host segment operation span is out of range");
+
+    const uint32_t expected_count =
+        segment.phase == HostSegmentPhase::constitutive
+            ? 1
+            : segment.phase == HostSegmentPhase::polarization_and_halo ? 2 : 0;
+    if (!expected_count)
+      return host_segment_failure(error, "host segment has an invalid phase");
+    if (segment.operation_count != expected_count)
+      return host_segment_failure(error, "host segment has the wrong operation count");
+    if (segment.phase == HostSegmentPhase::constitutive && segment.host_halo_plan_count)
+      return host_segment_failure(error, "constitutive host segment has a halo span");
+
+    for (size_t i = 0; i < marker.accesses.size(); ++i) {
+      if (!is_valid(marker.accesses[i].array.id))
+        return host_segment_failure(error, "host segment has an invalid access ArrayId");
+      if (marker.accesses[i].array.elements == 0)
+        return host_segment_failure(error, "host segment has an empty access range");
+      if (marker.accesses[i].mode != AccessMode::read &&
+          marker.accesses[i].mode != AccessMode::write &&
+          marker.accesses[i].mode != AccessMode::read_write)
+        return host_segment_failure(error, "host segment has an invalid access mode");
+      for (size_t j = 0; j < i; ++j)
+        if (marker.accesses[j].array.id == marker.accesses[i].array.id)
+          return host_segment_failure(error,
+                                      "host segment access union contains a duplicate ArrayId");
+    }
+
+    for (uint32_t i = 0; i < segment.operation_count; ++i) {
+      const size_t covered_index = size_t(segment.operation_index) + i;
+      const Operation &covered = plan.operations[covered_index];
+      if (covered_operations[covered_index]++)
+        return host_segment_failure(error, "host segment operation spans overlap");
+      if (!same_guard(marker.guard, covered.guard))
+        return host_segment_failure(error, "host segment guard differs from covered operation");
+      for (const BufferAccess &need : covered.accesses) {
+        bool found = false;
+        for (const BufferAccess &have : marker.accesses)
+          if (access_covers(have, need)) {
+            found = true;
+            break;
+          }
+        if (!found)
+          return host_segment_failure(error, "host segment access union omits a covered access");
+      }
+    }
+
+    const Operation &first = plan.operations[segment.operation_index];
+    if (segment.phase == HostSegmentPhase::constitutive) {
+      if (first.kind != OpKind::update_eh || first.ft != segment.ft)
+        return host_segment_failure(error, "constitutive host segment covers the wrong operation");
+    }
+    else {
+      const Operation &second = plan.operations[segment.operation_index + 1];
+      const field_type expected_halo = segment.ft == E_stuff ? PE_stuff : PH_stuff;
+      if (first.kind != OpKind::update_polarization || first.ft != segment.ft ||
+          second.kind != OpKind::transfer_halo || second.ft != expected_halo)
+        return host_segment_failure(error,
+                                    "polarization host segment covers the wrong operation sequence");
+    }
+  }
+
+  for (uint32_t references : segment_references)
+    if (references != 1)
+      return host_segment_failure(error, "host segment has no marker");
+  return true;
+}
+
 /* Transcribed from fields::step_once. Read the two side by side.
  *
  * step_boundaries() begins with zero_metal for every owned chunk and then does
@@ -2622,9 +2809,18 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
 
 void format_step_plan(const StepPlan &p, std::vector<std::string> &out) {
   out.clear();
-  char buf[128];
+  char buf[256];
   for (const Operation &op : p.operations) {
-    if (op.ft == field_type(NUM_FIELD_TYPES))
+    if (op.kind == OpKind::host_callback && op.descriptor_count == 1 &&
+        op.descriptor_index < p.host_segments.size()) {
+      const HostSegment &segment = p.host_segments[op.descriptor_index];
+      snprintf(buf, sizeof buf, "%s(%s,%s,ops=%u+%u,callbacks=%u+%u,halos=%u+%u)",
+               op_kind_name(op.kind), ft_name(op.ft), host_segment_phase_name(segment.phase),
+               segment.operation_index, segment.operation_count, segment.callback_index,
+               segment.callback_count, segment.host_halo_plan_index,
+               segment.host_halo_plan_count);
+    }
+    else if (op.ft == field_type(NUM_FIELD_TYPES))
       snprintf(buf, sizeof buf, "%s", op_kind_name(op.kind));
     else
       snprintf(buf, sizeof buf, "%s(%s)", op_kind_name(op.kind), ft_name(op.ft));
