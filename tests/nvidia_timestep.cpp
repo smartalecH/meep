@@ -1322,6 +1322,362 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
   master_printf("nvidia_timestep: %s/%s PASS\n", name, precision_policy_name(policy));
 }
 
+static void run_legacy_flux_case(const char *name, precision_policy_kind policy,
+                                 bool complex_fields) {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  if (complex_fields) {
+    const vec bloch(0.17, 0.11);
+    cpu.use_bloch(bloch);
+    gpu.use_bloch(bloch);
+  }
+  else {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
+  for (size_t i = 0; i < sizeof(components) / sizeof(components[0]); ++i) {
+    cpu.require_component(components[i]);
+    gpu.require_component(components[i]);
+  }
+  cpu.advance(1);
+  cpu.t = 0;
+  flux_vol *cpu_x = cpu.add_flux_vol(X, volume(vec(0.0, -0.75), vec(0.0, 0.75)));
+  flux_vol *gpu_x = gpu.add_flux_vol(X, volume(vec(0.0, -0.75), vec(0.0, 0.75)));
+  flux_vol *cpu_y = cpu.add_flux_vol(Y, volume(vec(-1.0, 0.0), vec(1.0, 0.0)));
+  flux_vol *gpu_y = gpu.add_flux_vol(Y, volume(vec(-1.0, 0.0), vec(1.0, 0.0)));
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.41);
+
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 2e-5 : 2e-12;
+  for (int step = 0; step < 2; ++step) {
+    cpu.advance(1);
+    nvidia::testing::reset_transfer_accounting();
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    gpu.advance(1);
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    const nvidia::testing::transfer_accounting transfers =
+        nvidia::testing::current_transfer_accounting();
+    if (!step) {
+      const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+      require(plan.legacy_flux_updates.size() == 2 && !plan.legacy_flux_terms.empty(),
+              "NVIDIA legacy flux plan lacks ordered monitor terms after refresh");
+    }
+    require(std::fabs(cpu_x->flux() - gpu_x->flux()) <=
+                    tolerance * (1.0 + std::fabs(cpu_x->flux())) &&
+                std::fabs(cpu_y->flux() - gpu_y->flux()) <=
+                    tolerance * (1.0 + std::fabs(cpu_y->flux())),
+            "NVIDIA legacy flux scalar differs from CPU");
+    require(transfers.device_to_host_calls == 1 &&
+                transfers.device_to_host_bytes == 2 * sizeof(double),
+            "NVIDIA legacy flux did not publish with one final scalar transfer");
+    if (step)
+      require(before.device_bytes_current == after.device_bytes_current &&
+                  before.pinned_bytes_current == after.pinned_bytes_current,
+              "NVIDIA legacy flux allocated storage during steady execution");
+  }
+  master_printf("nvidia_timestep: flux-%s/%s PASS\n", name,
+                precision_policy_name(policy));
+}
+
+static void run_legacy_flux_symmetry_case(precision_policy_kind policy) {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  const symmetry sym = -mirror(Y, gv);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), sym, 2);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), sym, 2);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  const vec bloch(0.17, 0.0);
+  cpu.use_bloch(bloch);
+  gpu.use_bloch(bloch);
+  const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
+  for (size_t i = 0; i < sizeof(components) / sizeof(components[0]); ++i) {
+    cpu.require_component(components[i]);
+    gpu.require_component(components[i]);
+  }
+  cpu.advance(1);
+  cpu.t = 0;
+  flux_vol *cpu_flux =
+      cpu.add_flux_vol(X, volume(vec(0.0, -0.9), vec(0.0, 0.9)));
+  flux_vol *gpu_flux =
+      gpu.add_flux_vol(X, volume(vec(0.0, -0.9), vec(0.0, 0.9)));
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.29);
+  cpu.advance(1);
+  gpu.advance(1);
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 3e-12;
+  require(std::fabs(cpu_flux->flux() - gpu_flux->flux()) <=
+              tolerance * (1.0 + std::fabs(cpu_flux->flux())),
+          "NVIDIA symmetry-transformed legacy flux differs from CPU");
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  bool transformed = false;
+  for (const LegacyFluxTerm &term : plan.legacy_flux_terms)
+    transformed |= term.symmetry_index != 0 || term.lattice_shift != ivec(0);
+  require(transformed, "legacy flux symmetry fixture produced no transformed term");
+  master_printf("nvidia_timestep: flux-symmetry/%s PASS\n",
+                precision_policy_name(policy));
+}
+
+static void run_legacy_flux_material_case(precision_policy_kind policy, bool anisotropic,
+                                          bool conductivity) {
+  const grid_volume gv = vol3d(2.0, 2.0, 2.0, 5.0);
+  const boundary_region boundaries = pml(0.4, X) + pml(0.4, Y);
+  linear_anisotropic_material material(true);
+  std::unique_ptr<structure> cpu_structure, gpu_structure;
+  if (anisotropic) {
+    cpu_structure.reset(new structure(gv, material, boundaries, identity(), 2));
+    gpu_structure.reset(new structure(gv, material, boundaries, identity(), 2));
+  }
+  else {
+    cpu_structure.reset(new structure(gv, isotropic_eps, boundaries, identity(), 2));
+    gpu_structure.reset(new structure(gv, isotropic_eps, boundaries, identity(), 2));
+  }
+  if (conductivity) {
+    set_uniform_conductivity(*cpu_structure);
+    set_uniform_conductivity(*gpu_structure);
+  }
+  fields cpu(cpu_structure.get());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(gpu_structure.get(), options);
+  if (anisotropic) {
+    const vec bloch(0.11, 0.07, 0.05);
+    cpu.use_bloch(bloch);
+    gpu.use_bloch(bloch);
+  }
+  else {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  cpu.require_component(Ez);
+  gpu.require_component(Ez);
+  gaussian_src_time cpu_source(0.31, 0.14), gpu_source(0.31, 0.14);
+  const std::complex<double> amplitude =
+      anisotropic ? std::complex<double>(0.23, -0.11) : std::complex<double>(0.23, 0.0);
+  cpu.add_point_source(Ez, cpu_source, vec(0.21, -0.17, 0.13), amplitude);
+  gpu.add_point_source(Ez, gpu_source, vec(0.21, -0.17, 0.13), amplitude);
+  cpu.advance(1);
+  cpu.t = 0;
+  flux_vol *cpu_flux = cpu.add_flux_vol(
+      Z, volume(vec(-0.75, -0.75, 0.0), vec(0.75, 0.75, 0.0)));
+  flux_vol *gpu_flux = gpu.add_flux_vol(
+      Z, volume(vec(-0.75, -0.75, 0.0), vec(0.75, 0.75, 0.0)));
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_live_fields_by_key(cpu, gpu, narrowed, 0.013);
+  cpu.advance(1);
+  gpu.advance(1);
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 1e-4 : 4e-12;
+  require(std::fabs(cpu_flux->flux() - gpu_flux->flux()) <=
+              tolerance * (1.0 + std::fabs(cpu_flux->flux())),
+          "NVIDIA PML/conductive material legacy flux differs from CPU");
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  bool saw_split_h = false, saw_conductivity = false, saw_anisotropy = false;
+  for (const CurlUpdate &update : plan.db_updates) {
+    saw_split_h |= (update.region.variant_key & curl_has_pml_aux) != 0;
+    saw_conductivity |= (update.region.variant_key & curl_has_conductivity) != 0;
+  }
+  for (const ConstitutiveUpdate &update : plan.eh_updates)
+    saw_anisotropy |= (update.region.variant_key & constitutive_one_offdiagonal) != 0 ||
+                      (update.region.variant_key & constitutive_two_offdiagonals) != 0;
+  require(saw_split_h && saw_conductivity == conductivity && saw_anisotropy == anisotropic,
+          "legacy flux material fixture lacks its requested PML/material composition");
+  master_printf("nvidia_timestep: flux-material-%s/%s PASS\n",
+                anisotropic ? "anisotropic-pml" : "pml-conductive",
+                precision_policy_name(policy));
+}
+
+static void test_legacy_flux_missing_components() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  flux_vol *flux = gpu.add_flux_vol(Z, volume(vec(-0.5, 0.0), vec(0.5, 0.0)));
+  gpu.init_backend();
+  gpu.advance(1);
+  require(flux->flux() == 0.0,
+          "NVIDIA legacy flux did not treat absent field components as zero");
+  master_printf("nvidia_timestep: flux missing-components PASS\n");
+}
+
+static void run_cylindrical_flux_case(precision_policy_kind policy) {
+  grid_volume gv = volcyl(2.5, 3.0, 6.0);
+  gv.shift_origin(R, 8);
+  structure cpu_structure(gv, isotropic_eps, pml(0.35), identity(), 2);
+  structure gpu_structure(gv, isotropic_eps, pml(0.35), identity(), 2);
+  fields cpu(&cpu_structure, 1.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options, 1.0);
+  require_cylindrical_components(cpu);
+  require_cylindrical_components(gpu);
+  cpu.advance(1);
+  cpu.t = 0;
+  flux_vol *cpu_r =
+      cpu.add_flux_vol(R, volume(veccyl(1.25, -1.0), veccyl(1.25, 1.0)));
+  flux_vol *gpu_r =
+      gpu.add_flux_vol(R, volume(veccyl(1.25, -1.0), veccyl(1.25, 1.0)));
+  flux_vol *cpu_p =
+      cpu.add_flux_vol(P, volume(veccyl(0.5, -1.0), veccyl(2.0, 1.0)));
+  flux_vol *gpu_p =
+      gpu.add_flux_vol(P, volume(veccyl(0.5, -1.0), veccyl(2.0, 1.0)));
+  flux_vol *cpu_z = cpu.add_flux_vol(Z, volume(veccyl(0.5, 0.0), veccyl(2.0, 0.0)));
+  flux_vol *gpu_z = gpu.add_flux_vol(Z, volume(veccyl(0.5, 0.0), veccyl(2.0, 0.0)));
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.17);
+  cpu.advance(1);
+  gpu.advance(1);
+  const double tolerance = (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 3e-12;
+  require(std::fabs(cpu_r->flux() - gpu_r->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_r->flux())) &&
+              std::fabs(cpu_p->flux() - gpu_p->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_p->flux())) &&
+              std::fabs(cpu_z->flux() - gpu_z->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_z->flux())),
+          "NVIDIA cylindrical R/P/Z legacy flux differs from CPU");
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  bool saw_radial_volume = false;
+  for (const LegacyFluxTerm &term : plan.legacy_flux_terms)
+    saw_radial_volume |= term.dV1 != 0.0;
+  require(saw_radial_volume,
+          "NVIDIA cylindrical legacy flux did not exercise radial volume weighting");
+  master_printf("nvidia_timestep: flux-cylindrical-rpz/%s PASS\n",
+                precision_policy_name(policy));
+}
+
+static void test_legacy_flux_add_remove() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
+  for (size_t i = 0; i < sizeof(components) / sizeof(components[0]); ++i) {
+    cpu.require_component(components[i]);
+    gpu.require_component(components[i]);
+  }
+  cpu.advance(1);
+  cpu.t = 0;
+  gpu.init_backend();
+  initialize_fields(cpu, gpu, false, 0.23);
+  cpu.advance(1);
+  gpu.advance(1);
+  BackendState *const live_state = gpu.backend_state;
+  const double tolerance = sizeof(realnum) == sizeof(float) ? 8e-5 : 2e-12;
+
+  flux_vol *cpu_first = cpu.add_flux_vol(Z, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
+  flux_vol *gpu_first = gpu.add_flux_vol(Z, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
+  Executable *old_executable = gpu.executable;
+  cpu.advance(1);
+  gpu.advance(1);
+  require(gpu.backend_state == live_state && gpu.executable != old_executable &&
+              std::fabs(cpu_first->flux() - gpu_first->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_first->flux())),
+          "NVIDIA live legacy flux addition did not recompile and publish");
+
+  flux_vol *cpu_second = cpu.add_flux_vol(X, volume(vec(0.0, -0.75), vec(0.0, 0.75)));
+  flux_vol *gpu_second = gpu.add_flux_vol(X, volume(vec(0.0, -0.75), vec(0.0, 0.75)));
+  old_executable = gpu.executable;
+  cpu.advance(1);
+  gpu.advance(1);
+  require(gpu.backend_state == live_state && gpu.executable != old_executable &&
+              std::fabs(cpu_first->flux() - gpu_first->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_first->flux())) &&
+              std::fabs(cpu_second->flux() - gpu_second->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_second->flux())),
+          "NVIDIA second legacy flux addition changed list ordering or publication");
+
+  old_executable = gpu.executable;
+  cpu.remove_fluxes();
+  gpu.remove_fluxes();
+  nvidia::testing::reset_transfer_accounting();
+  cpu.advance(1);
+  gpu.advance(1);
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(gpu.backend_state == live_state && gpu.executable != old_executable &&
+              transfers.device_to_host_calls == 0,
+          "NVIDIA legacy flux removal did not replace code without scalar transfer");
+
+  flux_vol *cpu_again =
+      cpu.add_flux_vol(Y, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
+  flux_vol *gpu_again =
+      gpu.add_flux_vol(Y, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
+  old_executable = gpu.executable;
+  cpu.advance(1);
+  gpu.advance(1);
+  require(gpu.backend_state == live_state && gpu.executable != old_executable &&
+              std::fabs(cpu_again->flux() - gpu_again->flux()) <=
+                  tolerance * (1.0 + std::fabs(cpu_again->flux())) &&
+              std::fabs(cpu_again->flux()) > std::numeric_limits<realnum>::epsilon() &&
+              std::fabs(gpu_again->flux()) > std::numeric_limits<realnum>::epsilon(),
+          "NVIDIA legacy flux add-after-remove did not recompile or publish");
+  master_printf("nvidia_timestep: flux add/remove/add PASS\n");
+}
+
+static void test_legacy_flux_postlaunch_poison() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ex);
+  gpu.require_component(Ey);
+  gpu.require_component(Hx);
+  gpu.require_component(Hy);
+  flux_vol *flux = gpu.add_flux_vol(Z, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
+  gpu.init_backend();
+  gpu.advance(1);
+  const double published = flux->flux();
+
+  nvidia::testing::fail_next(nvidia::testing::failure_point::device_to_host_copy);
+  bool failed = false;
+  try {
+    gpu.advance(1);
+  }
+  catch (const std::runtime_error &error) {
+    failed = std::string(error.what()).find("device-to-host") != std::string::npos;
+  }
+  nvidia::testing::clear_failure();
+  require(failed && gpu.backend->is_poisoned() && flux->flux() == published,
+          "failed NVIDIA legacy flux publication did not poison or changed public scalar");
+  bool rejected = false;
+  try {
+    gpu.advance(1);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
+  require(rejected, "poisoned NVIDIA legacy flux backend accepted a later advance");
+  master_printf("nvidia_timestep: flux postlaunch poison PASS\n");
+}
+
 static void run_magnetic_sync_case(const char *name, precision_policy_kind policy,
                                    bool real_fields, bool use_bfast) {
   const grid_volume gv = vol2d(3.0, 2.0, 8.0);
@@ -1818,6 +2174,98 @@ static void expect_compile_rejected(fields &gpu, StepPlan plan, const char *expe
   }
   delete unexpected;
   require(rejected, "malformed descriptor was not rejected as expected");
+}
+
+static void expect_stale_compile_rejected(fields &gpu, const StepPlan &plan) {
+  Executable *unexpected = NULL;
+  bool rejected = false;
+  try {
+    unexpected = gpu.backend->compile(plan, *gpu.backend_state);
+  }
+  catch (const std::runtime_error &error) {
+    rejected = std::string(error.what()).find("stale StepPlan signature") != std::string::npos;
+  }
+  delete unexpected;
+  require(rejected, "stale legacy flux plan signature was accepted");
+}
+
+static void test_legacy_flux_compile_rejections() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::mixed;
+  fields gpu(&s, options);
+  const vec bloch(0.13, -0.09);
+  gpu.use_bloch(bloch);
+  const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
+  for (size_t i = 0; i < sizeof(components) / sizeof(components[0]); ++i)
+    gpu.require_component(components[i]);
+  gpu.add_flux_vol(Z, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
+  gpu.init_backend();
+  gpu.advance(1);
+  const StepPlan baseline = build_step_plan(gpu, StepProgram::ordinary);
+  require(baseline.legacy_flux_updates.size() == 1 &&
+              baseline.legacy_flux_terms.size() >= 2,
+          "legacy flux rejection fixture lacks canonical descriptors");
+  size_t half_marker = baseline.operations.size(), final_marker = baseline.operations.size();
+  for (size_t i = 0; i < baseline.operations.size(); ++i) {
+    if (baseline.operations[i].kind == OpKind::update_flux_half) half_marker = i;
+    if (baseline.operations[i].kind == OpKind::update_flux) final_marker = i;
+  }
+  require(half_marker < baseline.operations.size() && final_marker < baseline.operations.size() &&
+              !baseline.operations[half_marker].accesses.empty() &&
+              !baseline.operations[final_marker].accesses.empty(),
+          "legacy flux rejection fixture lacks marker accesses");
+
+  StepPlan malformed = baseline;
+  malformed.legacy_flux_terms[0].sign = -malformed.legacy_flux_terms[0].sign;
+  expect_stale_compile_rejected(gpu, malformed);
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+
+  malformed = baseline;
+  ++malformed.legacy_flux_updates[0].flux_ordinal;
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  ++malformed.legacy_flux_updates[0].term_index;
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  malformed.legacy_flux_updates[0].term_count =
+      uint32_t(malformed.legacy_flux_terms.size() + 1);
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  ++malformed.legacy_flux_terms[0].term_ordinal;
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  ++malformed.legacy_flux_terms[0].e_real.value;
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  malformed.legacy_flux_terms[0].e_offsets[0] =
+      std::numeric_limits<ptrdiff_t>::max();
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  malformed.legacy_flux_terms[0].phase_real =
+      std::numeric_limits<double>::quiet_NaN();
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+  malformed = baseline;
+  malformed.legacy_flux_terms[0].boundary_weights[0][0] =
+      std::numeric_limits<double>::infinity();
+  expect_compile_rejected(gpu, malformed, "legacy flux descriptors are non-canonical");
+
+  malformed = baseline;
+  ++malformed.operations[half_marker].legacy_flux_count;
+  expect_compile_rejected(gpu, malformed, "legacy flux marker span is incomplete");
+  malformed = baseline;
+  malformed.operations[final_marker].accesses.pop_back();
+  expect_compile_rejected(gpu, malformed, "legacy flux marker identity or accesses are stale");
+  malformed = baseline;
+  ++malformed.operations[half_marker].accesses[0].array.offset;
+  expect_compile_rejected(gpu, malformed, "legacy flux marker identity or accesses are stale");
+
+  Executable *valid = gpu.backend->compile(baseline, *gpu.backend_state);
+  require(valid != NULL, "valid legacy flux plan did not compile after rejection checks");
+  delete valid;
+  master_printf("nvidia_timestep: flux compile rejections PASS\n");
 }
 
 static void test_material_compile_rejections() {
@@ -2861,6 +3309,7 @@ int main(int argc, char **argv) {
   const bool cylindrical_only = getenv("MEEP_NVIDIA_TIMESTEP_CYLINDRICAL_ONLY") != NULL;
   const bool magnetic_only = getenv("MEEP_NVIDIA_TIMESTEP_MAGNETIC_ONLY") != NULL;
   const bool material_only = getenv("MEEP_NVIDIA_TIMESTEP_MATERIAL_ONLY") != NULL;
+  const bool flux_only = getenv("MEEP_NVIDIA_TIMESTEP_FLUX_ONLY") != NULL;
   const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
   if (getenv("MEEP_NVIDIA_COEFFICIENTS_ONLY")) {
@@ -2912,6 +3361,15 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (flux_only) {
+      run_legacy_flux_case("real-two-monitor", policies[p], false);
+      run_legacy_flux_case("complex-bloch-two-monitor", policies[p], true);
+      run_legacy_flux_symmetry_case(policies[p]);
+      run_legacy_flux_material_case(policies[p], false, true);
+      run_legacy_flux_material_case(policies[p], true, false);
+      run_cylindrical_flux_case(policies[p]);
+      continue;
+    }
     if (material_only) {
       run_material_phase_case("real-target-conductivity", policies[p], true, false);
       run_material_phase_case("complex-current-conductivity", policies[p], false, true);
@@ -2994,7 +3452,8 @@ int main(int argc, char **argv) {
       run_bfast_case("d2-beta-composed", gv2, policies[p], false, positive_k, false,
                      false, 2, &bloch2, 0.17);
     }
-    if (gyro_only || beta_only || bfast_only || magnetic_only || material_only) continue;
+    if (gyro_only || beta_only || bfast_only || magnetic_only || material_only || flux_only)
+      continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
     run_dispersion_case("complex-lorentz-pml-phase", policies[p], false, false, false, false,
@@ -3065,18 +3524,24 @@ int main(int argc, char **argv) {
     test_material_cpu_setup_to_nvidia();
     test_material_compile_rejections();
   }
+  if (flux_only) {
+    test_legacy_flux_missing_components();
+    test_legacy_flux_add_remove();
+    test_legacy_flux_postlaunch_poison();
+    test_legacy_flux_compile_rejections();
+  }
   set_finite_check_mode(FiniteCheckMode::off);
   if (cylindrical_only && !cylindrical_case) {
     test_nvidia_cylindrical_change_m(precision_policy_kind::native);
     test_cylindrical_compile_rejections();
   }
-  else if (!material_only) {
+  else if (!material_only && !flux_only) {
     if (!beta_only && !bfast_only) test_gyrotropic_compile_rejections();
     if (!gyro_only && !bfast_only) test_beta_compile_rejections();
     if (!gyro_only && !beta_only) test_bfast_compile_rejections();
   }
   if (!gyro_only && !beta_only && !bfast_only && !cylindrical_only && !magnetic_only &&
-      !material_only) {
+      !material_only && !flux_only) {
     test_compile_allocation_retry();
     test_rejections();
     test_nonlinear_compile_rejections();
