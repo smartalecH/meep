@@ -40,6 +40,7 @@
 #include <string.h>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include <meep.hpp>
@@ -72,6 +73,7 @@ static int failures = 0;
 static double one(const vec &) { return 1.0; }
 static double zero(const vec &) { return 0.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+static double magnetic_conductivity(const vec &) { return 0.07; }
 
 class multitile_anisotropic_material : public material_function {
 public:
@@ -85,7 +87,6 @@ public:
       if (other != d) row[other] = offdiagonal[d][other];
   }
 };
-static double magnetic_conductivity(const vec &) { return 0.07; }
 
 class inherited_noisy_lorentzian : public noisy_lorentzian_susceptibility {
 public:
@@ -93,6 +94,45 @@ public:
       : noisy_lorentzian_susceptibility(amplitude, omega, gamma) {}
   virtual susceptibility *clone() const { return new inherited_noisy_lorentzian(*this); }
 };
+
+class inherited_multilevel : public multilevel_susceptibility {
+public:
+  inherited_multilevel(int L, int T, const realnum *Gamma, const realnum *N0,
+                       const realnum *alpha, const realnum *omega, const realnum *gamma,
+                       const realnum *sigmat)
+      : multilevel_susceptibility(L, T, Gamma, N0, alpha, omega, gamma, sigmat) {}
+  virtual susceptibility *clone() const { return new inherited_multilevel(*this); }
+};
+
+static void add_live_multilevel_states(structure &s) {
+  const realnum e_gamma[] = {realnum(0.02), 0, 0, 0, realnum(0.03), 0, 0, 0,
+                             realnum(0.04)};
+  const realnum e_n0[] = {realnum(0.7), realnum(0.2), realnum(0.1)};
+  const realnum e_alpha[] = {realnum(-0.2), realnum(0.3), realnum(0.4), realnum(-0.5),
+                             realnum(-0.6), realnum(0.7)};
+  const realnum e_omega[] = {realnum(0.73), realnum(0.91)};
+  const realnum e_damping[] = {realnum(0.06), realnum(0.08)};
+  const realnum e_sigmat[] = {1, 1, 1, 1, 1, 2, 2, 2, 2, 2};
+  multilevel_susceptibility electric(3, 2, e_gamma, e_n0, e_alpha, e_omega, e_damping,
+                                     e_sigmat);
+  multilevel_susceptibility electric_repeat(3, 2, e_gamma, e_n0, e_alpha, e_omega,
+                                            e_damping, e_sigmat);
+  inherited_multilevel derived(3, 2, e_gamma, e_n0, e_alpha, e_omega, e_damping, e_sigmat);
+  lorentzian_susceptibility ordinary(realnum(0.81), realnum(0.025));
+  const realnum h_gamma[] = {realnum(0.01), realnum(0.005), 0, realnum(0.025)};
+  const realnum h_n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum h_alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum h_omega[] = {realnum(0.63)};
+  const realnum h_damping[] = {realnum(0.04)};
+  const realnum h_sigmat[] = {3, 3, 3, 3, 3};
+  multilevel_susceptibility magnetic(2, 1, h_gamma, h_n0, h_alpha, h_omega, h_damping,
+                                     h_sigmat);
+  s.add_susceptibility(one, E_stuff, electric);
+  s.add_susceptibility(one, E_stuff, ordinary);
+  s.add_susceptibility(one, E_stuff, derived);
+  s.add_susceptibility(one, E_stuff, electric_repeat);
+  s.add_susceptibility(one, H_stuff, magnetic);
+}
 
 class anisotropic_noisy_material : public material_function {
 public:
@@ -113,6 +153,27 @@ public:
     else if (d == Y)
       row[int(X)] = 0.25;
   }
+};
+
+class multilevel_offdiagonal_material : public material_function {
+public:
+  explicit multilevel_offdiagonal_material(int cross_terms) : cross_terms_(cross_terms) {}
+  virtual void eff_chi1inv_row(component c, double row[3], const volume &,
+                               double = DEFAULT_SUBPIXEL_TOL,
+                               int = DEFAULT_SUBPIXEL_MAXEVAL) {
+    row[0] = row[1] = row[2] = 0.0;
+    row[int(component_direction(c))] = 1.0;
+  }
+  virtual void sigma_row(component c, double row[3], const vec &) {
+    row[0] = row[1] = row[2] = 0.0;
+    const direction d = component_direction(c);
+    row[int(d)] = 1.0;
+    if (d == X && cross_terms_ > 0) row[int(Y)] = 0.25;
+    if (d == X && cross_terms_ > 1) row[int(Z)] = 0.125;
+  }
+
+private:
+  int cross_terms_;
 };
 
 class cw_custom_source : public continuous_src_time {
@@ -3504,7 +3565,380 @@ static void test_multilevel_polarization_group_schedule() {
   CHECK(or_to_all(exercised), "no rank had enough catalog rows for multilevel schedule coverage");
 }
 
-static void test_multilevel_previous_w_copy_once() {
+static void test_live_multilevel_plan(bool complex_fields) {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  add_live_multilevel_states(s);
+  fields f(&s);
+  if (complex_fields)
+    f.use_bloch(vec(0.07, -0.11));
+  else
+    f.use_real_fields();
+  FOR_COMPONENTS(c)
+  if (gv.has_field(c)) f.require_component(c);
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.11, 0.13));
+  f.add_point_source(Hz, source, vec(-0.17, 0.09));
+  f.advance(2);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t local_descriptors = 0, local_groups = 0, local_population_rows = 0;
+  size_t local_transition_rows = 0, local_subtractions = 0;
+  size_t local_owned_chunks = 0;
+  std::set<std::tuple<int, int> > electric_state_indices;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine()) ++local_owned_chunks;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind != SusceptibilityKind::multilevel) continue;
+    ++local_descriptors;
+    if (descriptor.ft == E_stuff)
+      electric_state_indices.insert(std::make_tuple(descriptor.chunk, descriptor.state_index));
+    const PolarizationUpdateGroup *group = NULL;
+    const Operation *group_op = NULL;
+    for (const PolarizationUpdateGroup &candidate : plan.polarization_groups)
+      if (candidate.kind == PolarizationGroupKind::multilevel &&
+          candidate.chunk == descriptor.chunk && candidate.ft == descriptor.ft &&
+          candidate.state_index == descriptor.state_index) {
+        CHECK(!group, "live multilevel descriptor has duplicate action groups");
+        group = &candidate;
+      }
+    CHECK(group, "live multilevel descriptor has no action group");
+    if (!group) continue;
+    ++local_groups;
+    CHECK(group->population_count == 1 &&
+              size_t(group->population_index) < plan.multilevel_population_updates.size() &&
+              group->transition_count == descriptor.multilevel_states.size(),
+          "live multilevel group spans are incomplete");
+    if (size_t(group->population_index) >= plan.multilevel_population_updates.size()) continue;
+    const MultilevelPopulationUpdate &population =
+        plan.multilevel_population_updates[group->population_index];
+    for (const Operation &candidate : plan.operations)
+      if (candidate.kind == OpKind::update_polarization && candidate.ft == descriptor.ft &&
+          size_t(candidate.polarization_group_index) <=
+              size_t(group - &plan.polarization_groups[0]) &&
+          size_t(group - &plan.polarization_groups[0]) <
+              size_t(candidate.polarization_group_index) + candidate.polarization_group_count)
+        group_op = &candidate;
+    ++local_population_rows;
+    CHECK(population.ft == descriptor.ft && population.region.chunk == descriptor.chunk &&
+              population.state_index == descriptor.state_index &&
+              population.levels == descriptor.multilevel.levels &&
+              population.transitions == descriptor.multilevel.transitions &&
+              population.gamma_inv == descriptor.multilevel_gamma_inv &&
+              population.populations == descriptor.multilevel_populations &&
+              population.scratch_elements_per_point == descriptor.multilevel.levels,
+          "live multilevel population action differs from its descriptor");
+    CHECK(group_op, "live multilevel group is outside its update_polarization operation");
+    if (group_op) {
+      const BufferAccess *gamma_access = find_access(*group_op, population.gamma_inv);
+      const BufferAccess *population_access = find_access(*group_op, population.populations);
+      CHECK(gamma_access && gamma_access->mode == AccessMode::read && population_access &&
+                population_access->mode == AccessMode::read_write,
+            "live multilevel scalar access modes are incomplete");
+    }
+    size_t action_row = group->transition_index;
+    for (size_t transition = 0; transition < descriptor.multilevel.transitions; ++transition)
+      for (const MultilevelStateArrays &state : descriptor.multilevel_states) {
+        if (state.transition_index != int(transition)) continue;
+        CHECK(action_row < plan.multilevel_transition_updates.size(),
+              "live multilevel transition span is out of range");
+        if (action_row >= plan.multilevel_transition_updates.size()) continue;
+        const size_t term_index =
+            population.term_index + (action_row - group->transition_index);
+        CHECK(term_index < plan.multilevel_population_terms.size(),
+              "live multilevel population-term span is out of range");
+        if (term_index >= plan.multilevel_population_terms.size()) continue;
+        const MultilevelTransitionUpdate &update = plan.multilevel_transition_updates[action_row];
+        const MultilevelPopulationTerm &term = plan.multilevel_population_terms[term_index];
+        CHECK(update.ft == descriptor.ft && update.state_index == descriptor.state_index &&
+                  update.transition_index == int(transition) && update.region.c == state.c &&
+                  update.region.cmp == state.cmp && update.p == state.p &&
+                  update.p_prev == state.p_prev && update.populations == population.populations &&
+                  term.transition_index == int(transition) && term.c == state.c &&
+                  term.cmp == state.cmp && term.p == state.p && term.p_prev == state.p_prev,
+              "live multilevel transition/term order differs from descriptor order");
+        ptrdiff_t yee1, yee2, cent1, cent2;
+        f.chunks[descriptor.chunk]->gv.yee2cent_offsets(state.c, yee1, yee2);
+        f.chunks[descriptor.chunk]->gv.cent2yee_offsets(state.c, cent1, cent2);
+        CHECK(term.centered_offsets[0] == yee1 && term.centered_offsets[1] == yee2 &&
+                  update.population_offsets[0] == cent1 &&
+                  update.population_offsets[1] == cent2,
+              "live multilevel action has incorrect centering offsets");
+        int positive = -1, negative = -1;
+        for (size_t level = 0; level < descriptor.multilevel.levels; ++level) {
+          const double a = descriptor.multilevel.alpha
+              [level * descriptor.multilevel.transitions + transition];
+          if (a > 0) positive = int(level);
+          if (a < 0) negative = int(level);
+        }
+        CHECK(update.positive_level == positive && update.negative_level == negative &&
+                  update.omega == descriptor.multilevel.omega[transition] &&
+                  update.gamma == descriptor.multilevel.transition_gamma[transition] &&
+                  update.dt == f.chunks[descriptor.chunk]->dt,
+              "live multilevel transition changed last-sign or scalar parameters");
+        for (int coefficient = 0; coefficient < 5; ++coefficient)
+          CHECK(update.sigmat[coefficient] ==
+                    descriptor.multilevel.sigmat[5 * transition + coefficient],
+                "live multilevel transition changed sigmat[%d]", coefficient);
+        if (group_op) {
+          const BufferAccess *w_access = find_access(*group_op, term.w);
+          const BufferAccess *w_prev_access = find_access(*group_op, term.w_prev);
+          const BufferAccess *p_access = find_access(*group_op, term.p);
+          const BufferAccess *p_prev_access = find_access(*group_op, term.p_prev);
+          const BufferAccess *sigma_access = find_access(*group_op, update.diagonal_sigma);
+          CHECK(w_access && w_access->mode == AccessMode::read && w_prev_access &&
+                    w_prev_access->mode == AccessMode::read && p_access &&
+                    p_access->mode == AccessMode::read_write && p_prev_access &&
+                    p_prev_access->mode == AccessMode::read_write && sigma_access &&
+                    sigma_access->mode == AccessMode::read,
+                "live multilevel transition access modes are incomplete");
+        }
+        ++action_row;
+        ++local_transition_rows;
+      }
+  }
+
+  for (const Operation &op : plan.operations)
+    if (op.kind == OpKind::update_eh)
+      for (size_t i = op.polarization_subtraction_index;
+           i < size_t(op.polarization_subtraction_index) + op.polarization_subtraction_count; ++i)
+        if (i < plan.polarization_subtractions.size() &&
+            plan.polarization_subtractions[i].transition_index >= 0)
+          ++local_subtractions;
+  FOR_FIELD_TYPES(ft) {
+    if (ft != E_stuff && ft != H_stuff) continue;
+    std::vector<PolarizationSubtraction> expected;
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+      if (descriptor.kind != SusceptibilityKind::multilevel || descriptor.ft != ft) continue;
+      for (size_t transition = 0; transition < descriptor.multilevel.transitions; ++transition)
+        for (const MultilevelStateArrays &state : descriptor.multilevel_states) {
+          if (state.transition_index != int(transition)) continue;
+          const component target_component =
+              field_type_component(ft == E_stuff ? D_stuff : B_stuff, state.c);
+          const ArrayId target = f.array_catalog->find(
+              {descriptor.chunk, int(array_kind::f_minus_p), int(target_component), state.cmp, 0});
+          if (!is_valid(target)) continue;
+          PolarizationSubtraction row = {};
+          row.chunk = descriptor.chunk;
+          row.c = state.c;
+          row.cmp = state.cmp;
+          row.state_index = descriptor.state_index;
+          row.transition_index = int(transition);
+          row.target = target;
+          row.p = state.p;
+          row.elements = state.elements;
+          expected.push_back(row);
+        }
+    }
+    std::vector<PolarizationSubtraction> actual;
+    for (const Operation &op : plan.operations)
+      if (op.kind == OpKind::update_eh && op.ft == ft)
+        for (size_t i = op.polarization_subtraction_index;
+             i < size_t(op.polarization_subtraction_index) + op.polarization_subtraction_count;
+             ++i)
+          if (i < plan.polarization_subtractions.size() &&
+              plan.polarization_subtractions[i].transition_index >= 0)
+            actual.push_back(plan.polarization_subtractions[i]);
+    CHECK(actual == expected,
+          "live multilevel subtraction rows differ from exact transition-major order");
+  }
+  CHECK(local_descriptors == local_groups && local_descriptors == local_population_rows,
+        "live multilevel descriptors/groups/population actions are not one-to-one");
+  CHECK(local_descriptors == 3 * local_owned_chunks,
+        "live multilevel fixture did not emit two E and one H state per owned chunk");
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine())
+      CHECK(electric_state_indices.count(std::make_tuple(chunk, 0)) &&
+                electric_state_indices.count(std::make_tuple(chunk, 3)),
+            "live multilevel state_index was filtered instead of following linked-list order");
+  CHECK(local_transition_rows == local_subtractions,
+        "live multilevel transition/subtraction row counts differ");
+  CHECK(sum_to_all(local_descriptors) > 0 && sum_to_all(local_transition_rows) > 0,
+        "live multilevel fixture emitted no work");
+
+  bool checked_gamma_authority = false;
+  for (const PolarizationDescriptor &candidate : f.descriptors->polarizations) {
+    if (candidate.kind != SusceptibilityKind::multilevel) continue;
+    const int chunk = candidate.chunk;
+    const field_type ft = candidate.ft;
+    const int state_index = candidate.state_index;
+    const ArrayId gamma_id = candidate.multilevel_gamma_inv;
+    const ArrayId population_id = candidate.multilevel_populations;
+    realnum *gamma = f.array_catalog->resolve<realnum>(gamma_id);
+    realnum *populations = f.array_catalog->resolve<realnum>(population_id);
+    const realnum original = gamma[0];
+    const realnum original_population = populations[0];
+    const realnum changed = original + realnum(0.125);
+    const realnum changed_population = original_population + realnum(0.0625);
+    gamma[0] = changed;
+    populations[0] = changed_population;
+    build_polarization_descriptors(f, f.descriptors->polarizations);
+    const PolarizationDescriptor *refreshed = NULL;
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (descriptor.kind == SusceptibilityKind::multilevel && descriptor.chunk == chunk &&
+          descriptor.ft == ft && descriptor.state_index == state_index)
+        refreshed = &descriptor;
+    CHECK(refreshed && refreshed->multilevel_gamma_inv == gamma_id &&
+              refreshed->multilevel_populations == population_id &&
+              f.array_catalog->resolve<realnum>(gamma_id)[0] == changed &&
+              f.array_catalog->resolve<realnum>(population_id)[0] == changed_population,
+          "descriptor refresh recomputed or rebound authoritative multilevel storage");
+    const StepPlan authoritative = build_step_plan(f, StepProgram::ordinary);
+    bool action_kept_gamma = false;
+    for (const MultilevelPopulationUpdate &population :
+         authoritative.multilevel_population_updates)
+      action_kept_gamma =
+          action_kept_gamma || (population.region.chunk == chunk && population.ft == ft &&
+                                population.state_index == state_index &&
+                                population.gamma_inv == gamma_id &&
+                                population.populations == population_id);
+    CHECK(action_kept_gamma,
+          "live multilevel action did not retain authoritative GammaInv identity");
+    gamma[0] = original;
+    populations[0] = original_population;
+    build_polarization_descriptors(f, f.descriptors->polarizations);
+    checked_gamma_authority = true;
+    break;
+  }
+  CHECK(checked_gamma_authority || !local_owned_chunks,
+        "owning rank did not exercise authoritative GammaInv refresh");
+
+  size_t descriptor_index = f.descriptors->polarizations.size();
+  for (size_t i = 0; i < f.descriptors->polarizations.size(); ++i)
+    if (f.descriptors->polarizations[i].kind == SusceptibilityKind::multilevel) {
+      descriptor_index = i;
+      break;
+    }
+  if (descriptor_index < f.descriptors->polarizations.size()) {
+    PolarizationDescriptor &descriptor = f.descriptors->polarizations[descriptor_index];
+    const PolarizationDescriptor saved = descriptor;
+    auto plan_rejected = [&]() {
+      try { (void)build_step_plan(f, StepProgram::ordinary); }
+      catch (const std::exception &) { return true; }
+      return false;
+    };
+    auto expect_rejected = [&](const char *message) {
+      CHECK(plan_rejected(), "%s", message);
+      descriptor = saved;
+    };
+    descriptor.multilevel.alpha.pop_back();
+    expect_rejected("truncated multilevel alpha was accepted");
+    descriptor.multilevel.gamma_matrix.pop_back();
+    expect_rejected("truncated multilevel Gamma was accepted");
+    descriptor.multilevel.initial_populations.pop_back();
+    expect_rejected("truncated multilevel N0 was accepted");
+    descriptor.multilevel.omega.pop_back();
+    expect_rejected("truncated multilevel omega was accepted");
+    descriptor.multilevel.transition_gamma.pop_back();
+    expect_rejected("truncated multilevel transition gamma was accepted");
+    descriptor.multilevel.sigmat.pop_back();
+    expect_rejected("truncated multilevel sigmat was accepted");
+    descriptor.multilevel.gamma_matrix[0] = std::numeric_limits<double>::quiet_NaN();
+    expect_rejected("nonfinite multilevel coefficient was accepted");
+    for (size_t level = 0; level < descriptor.multilevel.levels; ++level)
+      descriptor.multilevel.alpha[level * descriptor.multilevel.transitions] = 1.0;
+    expect_rejected("multilevel alpha without a negative level was accepted");
+    descriptor.required_w ^= 1;
+    expect_rejected("multilevel required-W mutation was accepted");
+    descriptor.required_w_prev ^= 1;
+    expect_rejected("multilevel required-W-prev mutation was accepted");
+    if (!descriptor.multilevel_states.empty()) {
+      descriptor.multilevel_states[0].p = invalid_array();
+      expect_rejected("invalid multilevel P ArrayId was accepted");
+      descriptor.multilevel_states[0].p = ArrayId{uint32_t(f.array_catalog->size())};
+      expect_rejected("out-of-range multilevel P ArrayId was accepted");
+      descriptor.multilevel_states[0].p_prev = invalid_array();
+      expect_rejected("invalid multilevel P_prev ArrayId was accepted");
+      descriptor.multilevel_states[0].p_prev = descriptor.multilevel_states[0].p;
+      expect_rejected("aliased multilevel P/P_prev ArrayIds were accepted");
+      descriptor.multilevel_states[0].c = Centered;
+      expect_rejected("invalid multilevel row component was accepted");
+      descriptor.multilevel_states[0].cmp = 2;
+      expect_rejected("invalid multilevel row cmp was accepted");
+      descriptor.multilevel_states[0].transition_index =
+          int(descriptor.multilevel.transitions);
+      expect_rejected("invalid multilevel transition ordinal was accepted");
+      --descriptor.multilevel_states[0].elements;
+      expect_rejected("invalid multilevel row extent was accepted");
+
+      ArraySpec &spec =
+          const_cast<ArraySpec &>(f.array_catalog->spec(saved.multilevel_states[0].p));
+      const ArraySpec original_spec = spec;
+      spec.role = array_role::scratch;
+      CHECK(plan_rejected(), "multilevel P with the wrong role was accepted");
+      spec = original_spec;
+      spec.element_type = ElementType::float64;
+      CHECK(plan_rejected(), "multilevel P with the wrong element type was accepted");
+      spec = original_spec;
+      spec.storage = spec.storage == Precision::f32 ? Precision::f64 : Precision::f32;
+      CHECK(plan_rejected(), "multilevel P with the wrong storage precision was accepted");
+      spec = original_spec;
+      ++spec.elements;
+      CHECK(plan_rejected(), "multilevel P with the wrong catalog extent was accepted");
+      spec = original_spec;
+      ++spec.alignment;
+      CHECK(plan_rejected(), "multilevel P with the wrong alignment was accepted");
+      spec = original_spec;
+      spec.alias_of = saved.multilevel_states[0].p_prev;
+      CHECK(plan_rejected(), "aliased multilevel catalog storage was accepted");
+      spec = original_spec;
+
+      StorageKey &key =
+          const_cast<StorageKey &>(f.array_catalog->key(saved.multilevel_states[0].p));
+      const StorageKey original_key = key;
+      ++key.aux;
+      CHECK(plan_rejected(), "multilevel P with the wrong StorageKey was accepted");
+      key = original_key;
+
+      const MultilevelStateArrays &live = saved.multilevel_states[0];
+      ArrayId w = f.array_catalog->find(
+          {saved.chunk, int(array_kind::f_w), int(live.c), live.cmp, 0});
+      if (!is_valid(w))
+        w = f.array_catalog->find(
+            {saved.chunk, int(array_kind::f), int(live.c), live.cmp, 0});
+      const ArrayId w_prev = f.array_catalog->find(
+          {saved.chunk, int(array_kind::f_w_prev), int(live.c), live.cmp, 0});
+      const int sigma_aux = saved.state_index * NUM_FIELD_TYPES + int(saved.ft);
+      const ArrayId sigma = f.array_catalog->find(
+          {saved.chunk, int(array_kind::sigma), int(live.c),
+           int(component_direction(live.c)), uint64_t(sigma_aux)});
+      const ArrayId bindings[] = {w, w_prev, sigma};
+      const char *binding_names[] = {"W", "W_prev", "sigma"};
+      for (size_t binding = 0; binding < 3; ++binding) {
+        CHECK(is_valid(bindings[binding]), "live multilevel fixture lacks %s binding",
+              binding_names[binding]);
+        if (!is_valid(bindings[binding])) continue;
+        StorageKey &binding_key =
+            const_cast<StorageKey &>(f.array_catalog->key(bindings[binding]));
+        const StorageKey original_binding_key = binding_key;
+        ++binding_key.aux;
+        CHECK(plan_rejected(), "multilevel %s binding mutation was accepted",
+              binding_names[binding]);
+        binding_key = original_binding_key;
+      }
+    }
+    descriptor.multilevel_gamma_inv = invalid_array();
+    expect_rejected("invalid multilevel GammaInv ArrayId was accepted");
+    descriptor.multilevel_populations = invalid_array();
+    expect_rejected("invalid multilevel population ArrayId was accepted");
+    descriptor.multilevel_populations = descriptor.multilevel_gamma_inv;
+    expect_rejected("aliased multilevel scalar ArrayIds were accepted");
+    {
+      realnum *gamma = f.array_catalog->resolve<realnum>(saved.multilevel_gamma_inv);
+      const realnum original = gamma[0];
+      gamma[0] = std::numeric_limits<realnum>::infinity();
+      CHECK(plan_rejected(), "nonfinite authoritative GammaInv was accepted");
+      gamma[0] = original;
+    }
+    if (descriptor.multilevel_states.size() > descriptor.multilevel.transitions) {
+      std::swap(descriptor.multilevel_states[0],
+                descriptor.multilevel_states[descriptor.multilevel.transitions]);
+      expect_rejected("reordered multilevel state rows were accepted");
+    }
+  }
+}
+
+static void test_live_zero_row_multilevel_plan() {
   const realnum gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
   const realnum n0[] = {realnum(0.8), realnum(0.2)};
   const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
@@ -3512,46 +3946,181 @@ static void test_multilevel_previous_w_copy_once() {
   const realnum damping[] = {realnum(0.04)};
   const realnum sigmat[] = {1, 1, 1, 1, 1};
   multilevel_susceptibility multilevel(2, 1, gamma, n0, alpha, omega, damping, sigmat);
-  grid_volume gv = vol2d(3.0, 3.0, 8.0);
-  multitile_anisotropic_material material;
-  structure s(gv, material, pml(0.45, X) + pml(0.45, Y), identity(), 1);
-  s.add_susceptibility(one, E_stuff, multilevel);
-  fields f(&s, 0, 0, true, 0, 4);
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml(), identity(), 1);
+  s.add_susceptibility(zero, E_stuff, multilevel);
+  fields f(&s);
   f.use_real_fields();
+  f.require_component(Ez);
+  f.advance(2);
+
+  size_t descriptors = 0, groups = 0;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+    if (descriptor.kind == SusceptibilityKind::multilevel) {
+      ++descriptors;
+      CHECK(descriptor.has_internal_state && descriptor.multilevel_states.empty() &&
+                descriptor.required_w == 0 && descriptor.required_w_prev == 0 &&
+                descriptor.needs_halo,
+            "zero-row multilevel descriptor lost its population-only contract");
+    }
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  for (const PolarizationUpdateGroup &group : plan.polarization_groups)
+    if (group.kind == PolarizationGroupKind::multilevel) {
+      ++groups;
+      CHECK(group.population_count == 1 && group.transition_count == 0 &&
+                size_t(group.population_index) < plan.multilevel_population_updates.size(),
+            "zero-row multilevel group did not retain exactly one population action");
+      if (size_t(group.population_index) < plan.multilevel_population_updates.size()) {
+        const MultilevelPopulationUpdate &population =
+            plan.multilevel_population_updates[group.population_index];
+        CHECK(population.active_component_cmps == 0 && population.term_count == 0,
+              "zero-row multilevel population action retained transition work");
+      }
+    }
+  CHECK(descriptors == groups && (descriptors > 0 || count_processors() > 1),
+        "zero-row multilevel descriptor/group counts differ");
+  CHECK(or_to_all(groups > 0), "zero-row multilevel fixture emitted no population group");
+}
+
+static void realize_multilevel_without_update(fields &f, field_type ft) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    fields_chunk &fc = *f.chunks[chunk];
+    if (!fc.is_mine()) continue;
+    prepare_update_eh(fc, ft, false, *f.storage_plan);
+    for (polarization_state *state = fc.pol[ft]; state; state = state->next)
+      if (!state->data) {
+        state->data = state->s->new_internal_data(fc.f, fc.gv);
+        if (state->data) state->s->init_internal_data(fc.f, fc.dt, fc.gv, state->data);
+      }
+  }
+  build_storage_catalog(f, *f.array_catalog, *f.storage_plan);
+  build_polarization_descriptors(f, f.descriptors->polarizations);
+}
+
+static void test_live_multilevel_offdiagonal_rejected(int cross_terms) {
+  const realnum gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum omega[] = {realnum(0.63)};
+  const realnum damping[] = {realnum(0.04)};
+  const realnum sigmat[] = {1, 1, 1, 1, 1};
+  multilevel_offdiagonal_material material(cross_terms);
+  multilevel_susceptibility multilevel(2, 1, gamma, n0, alpha, omega, damping, sigmat);
+  grid_volume gv = vol3d(2.0, 2.0, 2.0, 6.0);
+  structure s(gv, material, no_pml(), identity(), 1);
+  s.add_susceptibility(material, E_stuff, multilevel);
+  fields f(&s);
   f.require_component(Ex);
   f.require_component(Ey);
   f.require_component(Ez);
-  f.advance(1);
-  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  realize_multilevel_without_update(f, E_stuff);
+  bool has_multilevel = false;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+    has_multilevel = has_multilevel || descriptor.kind == SusceptibilityKind::multilevel;
+  bool rejected = false;
+  try { (void)build_step_plan(f, StepProgram::ordinary); }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected || !has_multilevel,
+        "%d-offdiagonal multilevel susceptibility was accepted on an owning rank", cross_terms);
+  CHECK(or_to_all(rejected), "%d-offdiagonal fixture exercised no rejection", cross_terms);
+}
 
-  std::map<uint32_t, size_t> copy_counts;
-  std::map<std::tuple<int, int, int>, size_t> tile_counts;
-  bool local_multitile = false;
-  for (const ConstitutiveUpdate &update : plan.eh_updates) {
-    const bool copy =
-        (update.region.variant_key & constitutive_copy_w_previous) != 0;
-    CHECK(copy == is_valid(update.previous_w),
-          "constitutive previous-W operand and copy bit disagree");
-    if (copy) ++copy_counts[update.previous_w.value];
-    const std::tuple<int, int, int> identity(update.region.chunk, int(update.region.c),
-                                             update.region.cmp);
-    local_multitile = local_multitile || ++tile_counts[identity] > 1;
-  }
-  bool owns_previous = false;
-  if (f.array_catalog)
-    for (size_t i = 0; i < f.array_catalog->size(); ++i) {
-      const ArrayId id{uint32_t(i)};
-      const StorageKey &key = f.array_catalog->key(id);
-      if (key.kind != int(array_kind::f_w_prev)) continue;
-      owns_previous = true;
-      CHECK(copy_counts[id.value] == 1,
-            "f_w_prev ArrayId %u is copied %zu times instead of once", id.value,
-            copy_counts[id.value]);
+static void test_multilevel_plan_after_field_growth() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  add_live_multilevel_states(s);
+  fields f(&s);
+  f.use_real_fields();
+  f.require_component(Ez);
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.11, 0.13));
+  f.advance(2);
+
+  typedef std::tuple<int, int, int, int, int, StorageKey, StorageKey> StableRow;
+  std::vector<StableRow> before_rows;
+  std::unordered_map<StorageKey, ArrayId, StorageKeyHash> before_ids;
+  std::map<std::tuple<int, int, int>, uint64_t> before_masks;
+  const size_t before_catalog_size = f.array_catalog->size();
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::multilevel) continue;
+    before_masks[std::make_tuple(d.chunk, int(d.ft), d.state_index)] = d.required_w;
+    for (const MultilevelStateArrays &state : d.multilevel_states) {
+      before_rows.push_back(std::make_tuple(d.chunk, int(d.ft), d.state_index, int(state.c),
+                                           state.cmp * 16 + state.transition_index,
+                                           f.array_catalog->key(state.p),
+                                           f.array_catalog->key(state.p_prev)));
+      before_ids[f.array_catalog->key(state.p)] = state.p;
+      before_ids[f.array_catalog->key(state.p_prev)] = state.p_prev;
     }
-  CHECK(or_to_all(owns_previous),
-        "multilevel previous-W fixture produced no owned previous-W storage");
-  CHECK(or_to_all(local_multitile),
-        "multilevel previous-W copy fixture did not produce multiple constitutive tiles");
+  }
+  const StepPlan before_plan = build_step_plan(f, StepProgram::ordinary);
+  const size_t before_actions = before_plan.multilevel_transition_updates.size();
+
+  f.require_component(Hz);
+  f.advance(1);
+  std::vector<StableRow> after_rows;
+  bool saw_live_superset = false;
+  bool saw_rebound_id = false;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::multilevel) continue;
+    CHECK(before_masks[std::make_tuple(d.chunk, int(d.ft), d.state_index)] == d.required_w &&
+              d.required_w_prev == d.required_w,
+          "field growth changed the authoritative multilevel W masks");
+    uint64_t current_needs = 0;
+    polarization_state *state = f.chunks[d.chunk]->pol[d.ft];
+    for (int i = 0; state && i < d.state_index; ++i)
+      state = state->next;
+    if (state)
+      FOR_COMPONENTS(c) DOCMP2 if (state->s->needs_P(c, cmp, f.chunks[d.chunk]->f)) {
+        current_needs |= uint64_t(1) << (2 * int(c) + cmp);
+      }
+    saw_live_superset = saw_live_superset || bool(current_needs & ~d.required_w);
+    for (const MultilevelStateArrays &row : d.multilevel_states) {
+      after_rows.push_back(std::make_tuple(d.chunk, int(d.ft), d.state_index, int(row.c),
+                                          row.cmp * 16 + row.transition_index,
+                                          f.array_catalog->key(row.p),
+                                          f.array_catalog->key(row.p_prev)));
+      saw_rebound_id = saw_rebound_id || before_ids[f.array_catalog->key(row.p)] != row.p ||
+                       before_ids[f.array_catalog->key(row.p_prev)] != row.p_prev;
+    }
+  }
+  const StepPlan after_plan = build_step_plan(f, StepProgram::ordinary);
+  CHECK(before_rows == after_rows,
+        "field growth changed multilevel descriptor row identity or semantic order");
+  CHECK(before_actions == after_plan.multilevel_transition_updates.size(),
+        "field growth synthesized new multilevel transition actions");
+  bool actions_bind_current = true;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::multilevel) continue;
+    bool population_matched = false;
+    for (const MultilevelPopulationUpdate &population :
+         after_plan.multilevel_population_updates)
+      population_matched =
+          population_matched ||
+          (population.region.chunk == d.chunk && population.ft == d.ft &&
+           population.state_index == d.state_index &&
+           population.gamma_inv == d.multilevel_gamma_inv &&
+           population.populations == d.multilevel_populations);
+    actions_bind_current = actions_bind_current && population_matched;
+    for (const MultilevelStateArrays &row : d.multilevel_states) {
+      bool matched = false;
+      for (const MultilevelTransitionUpdate &action : after_plan.multilevel_transition_updates)
+        matched = matched || (action.region.chunk == d.chunk && action.ft == d.ft &&
+                              action.state_index == d.state_index &&
+                              action.transition_index == row.transition_index &&
+                              action.region.c == row.c && action.region.cmp == row.cmp &&
+                              action.p == row.p && action.p_prev == row.p_prev);
+      actions_bind_current = actions_bind_current && matched;
+    }
+  }
+  CHECK(actions_bind_current,
+        "field-growth plan retained stale multilevel ArrayIds after catalog rebuild");
+  CHECK(f.array_catalog->size() > before_catalog_size || !before_ids.size(),
+        "field-growth fixture did not grow the canonical catalog");
+  CHECK(or_to_all(saw_rebound_id),
+        "field-growth fixture did not exercise a multilevel ArrayId rebinding");
+  CHECK(or_to_all(saw_live_superset),
+        "field-growth fixture did not exercise a needs_P superset");
 }
 
 static void test_live_noisy_polarization_plan(bool complex_fields) {
@@ -4021,6 +4590,56 @@ static void test_live_noisy_without_primary_w() {
   CHECK(or_to_all(hidden_primary_rows > 0),
         "missing-W fixture found no primary field row to hide");
   CHECK(or_to_all(exercised), "missing-W fixture found no noisy state row");
+}
+
+static void test_multilevel_previous_w_copy_once() {
+  const realnum gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum omega[] = {realnum(0.63)};
+  const realnum damping[] = {realnum(0.04)};
+  const realnum sigmat[] = {1, 1, 1, 1, 1};
+  multilevel_susceptibility multilevel(2, 1, gamma, n0, alpha, omega, damping, sigmat);
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  multitile_anisotropic_material material;
+  structure s(gv, material, pml(0.45, X) + pml(0.45, Y), identity(), 1);
+  s.add_susceptibility(one, E_stuff, multilevel);
+  fields f(&s, 0, 0, true, 0, 4);
+  f.use_real_fields();
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.advance(1);
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+
+  std::map<uint32_t, size_t> copy_counts;
+  std::map<std::tuple<int, int, int>, size_t> tile_counts;
+  bool local_multitile = false;
+  for (const ConstitutiveUpdate &update : plan.eh_updates) {
+    const bool copy =
+        (update.region.variant_key & constitutive_copy_w_previous) != 0;
+    CHECK(copy == is_valid(update.previous_w),
+          "constitutive previous-W operand and copy bit disagree");
+    if (copy) ++copy_counts[update.previous_w.value];
+    const std::tuple<int, int, int> identity(update.region.chunk, int(update.region.c),
+                                             update.region.cmp);
+    local_multitile = local_multitile || ++tile_counts[identity] > 1;
+  }
+  bool owns_previous = false;
+  if (f.array_catalog)
+    for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+      const ArrayId id{uint32_t(i)};
+      const StorageKey &key = f.array_catalog->key(id);
+      if (key.kind != int(array_kind::f_w_prev)) continue;
+      owns_previous = true;
+      CHECK(copy_counts[id.value] == 1,
+            "f_w_prev ArrayId %u is copied %zu times instead of once", id.value,
+            copy_counts[id.value]);
+    }
+  CHECK(or_to_all(owns_previous),
+        "multilevel previous-W fixture produced no owned previous-W storage");
+  CHECK(or_to_all(local_multitile),
+        "multilevel previous-W copy fixture did not produce multiple constitutive tiles");
 }
 
 static void test_legacy_flux_schema_signature() {
@@ -4610,6 +5229,12 @@ int main(int argc, char **argv) {
   test_polarization_schema_signature();
   test_noisy_polarization_group_schedule();
   test_multilevel_polarization_group_schedule();
+  test_live_multilevel_plan(false);
+  test_live_multilevel_plan(true);
+  test_live_zero_row_multilevel_plan();
+  test_live_multilevel_offdiagonal_rejected(1);
+  test_live_multilevel_offdiagonal_rejected(2);
+  test_multilevel_plan_after_field_growth();
   test_multilevel_previous_w_copy_once();
   test_live_noisy_polarization_plan(false);
   test_live_noisy_polarization_plan(true);

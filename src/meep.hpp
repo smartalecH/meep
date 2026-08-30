@@ -425,6 +425,7 @@ public:
   virtual bool needs_W_prev() const { return true; }
 
 protected:
+  friend class susceptibility_descriptor_builder;
   int L;           // number of atom levels
   int T;           // number of optical transitions
   realnum *Gamma;  // LxL matrix of relaxation rates Gamma[i*L+j] from i -> j

@@ -211,17 +211,43 @@ struct GyrotropicStateArrays {
   size_t elements;
 };
 
+struct MultilevelParameters {
+  uint32_t levels;
+  uint32_t transitions;
+  std::vector<double> gamma_matrix;
+  std::vector<double> initial_populations;
+  std::vector<double> alpha;
+  std::vector<double> omega;
+  std::vector<double> transition_gamma;
+  std::vector<double> sigmat;
+};
+
+struct MultilevelStateArrays {
+  int transition_index;
+  component c;
+  int cmp;
+  ArrayId p;
+  ArrayId p_prev;
+  size_t elements;
+};
+
 struct PolarizationDescriptor {
   SusceptibilityKind kind;
   int chunk;
   field_type ft;
   int state_index;
+  bool has_internal_state;
   LorentzianParameters lorentzian;
   double noise_amplitude;
   uint32_t noise_algorithm_version;
   std::vector<LorentzianStateArrays> lorentzian_states;
   GyrotropicParameters gyrotropic;
   std::vector<GyrotropicStateArrays> gyrotropic_states;
+  MultilevelParameters multilevel;
+  ArrayId multilevel_gamma_inv;
+  ArrayId multilevel_populations;
+  size_t multilevel_population_points;
+  std::vector<MultilevelStateArrays> multilevel_states;
   std::vector<InternalArrayLayout> internal_arrays;
   size_t per_thread_scratch_elements;
   uint64_t required_w;      // bit per (component, cmp)

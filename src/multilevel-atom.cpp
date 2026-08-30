@@ -317,6 +317,7 @@ bool multilevel_susceptibility::internal_layout(std::vector<InternalArrayLayout>
 int multilevel_susceptibility::num_cinternal_notowned_needed(component c,
                                                              void *P_internal_data) const {
   multilevel_data *d = (multilevel_data *)P_internal_data;
+  if (!d) return 0;
   return d->P[c][0] ? T : 0;
 }
 

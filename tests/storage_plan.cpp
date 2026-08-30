@@ -243,14 +243,17 @@ static void test_polarization_halo_remap() {
     ++polarization_arrays;
     CHECK(key.kind == int(array_kind::polarization_internal),
           "polarization array has the wrong storage kind");
-    CHECK(key.aux == polarization_storage_aux(key.aux / 1024, size_t(key.aux % 1024)),
+    CHECK(key.aux == polarization_storage_aux(polarization_storage_field_type(key.aux),
+                                              polarization_storage_state_index(key.aux),
+                                              polarization_storage_layout_ordinal(key.aux)),
           "polarization storage key is not stable");
   }
   CHECK(or_to_all(polarization_arrays > 0), "no polarization arrays were catalogued");
 
   bool rejected_ordinal = false;
   try {
-    (void)polarization_storage_aux(0, 1024);
+    (void)polarization_storage_aux(E_stuff, 0,
+                                   size_t(std::numeric_limits<uint32_t>::max()) + 1);
   }
   catch (const std::overflow_error &) { rejected_ordinal = true; }
   CHECK(rejected_ordinal, "polarization storage key accepted an overflowing ordinal");
