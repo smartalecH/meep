@@ -1117,16 +1117,37 @@ void fields::init_backend() {
     execution_options opts;
     select_backend(opts);
   }
-  if (or_to_all(backend->is_poisoned()))
+
+  /* One collective carries the health, lifecycle, and legacy-flux presence
+     facts needed below.  Keeping them in this existing init-entry reduction
+     avoids adding steady-state collectives to CPU advance(). */
+  const DirtyMask relevant = dirty_source_plan | dirty_monitor_plan | dirty_storage |
+                             dirty_regions | dirty_initialization | dirty_classification |
+                             dirty_executable | dirty_flux_plan;
+  const size_t poison_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 1);
+  const size_t flux_present_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 2);
+  size_t local_status = size_t(dirty_mask & relevant);
+  if (backend->is_poisoned()) local_status |= poison_bit;
+  if (fluxes || (descriptors && !descriptors->legacy_fluxes.empty()))
+    local_status |= flux_present_bit;
+  size_t global_status = 0;
+  bw_or_to_all(&local_status, &global_status, 1);
+  if (global_status & poison_bit)
     throw std::runtime_error("fields::init_backend: resident backend is poisoned");
+  const bool any_flux = (global_status & flux_present_bit) != 0;
+
   if (!backend->requires_full_storage_preparation()) {
     /* Most CPU execution keeps its historical lazy storage preparation.
        Legacy flux is the exception: its pointer-free recipes need final
        catalog ArrayIds before the first StepPlan is built, so a cold CPU flux
        step completes storage here. Once storage is current, value-only plan
        mutations refresh without another preparation pass. */
-    const bool refresh_flux_after_cpu_rebuild = fluxes && is_dirty(*this, dirty_storage);
+    if (global_status & size_t(dirty_flux_plan))
+      dirty_mask |= dirty_flux_plan | dirty_regions | dirty_executable;
+    if (any_flux && (global_status & size_t(dirty_storage))) dirty_mask |= dirty_storage;
+    const bool refresh_flux_after_cpu_rebuild = any_flux && is_dirty(*this, dirty_storage);
     if (refresh_flux_after_cpu_rebuild) {
+      dirty_mask |= dirty_storage;
       prepare_storage();
       dirty_mask |= dirty_flux_plan | dirty_regions | dirty_executable;
     }
@@ -1137,15 +1158,7 @@ void fields::init_backend() {
     return;
   }
 
-  /* Resident lifecycle decisions guard collective preparation. Reconcile the
-     relevant causes before any rank branches into classification or rebuild. */
-  const DirtyMask relevant = dirty_source_plan | dirty_monitor_plan | dirty_storage |
-                             dirty_regions | dirty_initialization | dirty_classification |
-                             dirty_executable;
-  const size_t local_dirty = size_t(dirty_mask & relevant);
-  size_t global_dirty = 0;
-  bw_or_to_all(&local_dirty, &global_dirty, 1);
-  dirty_mask |= DirtyMask(global_dirty);
+  dirty_mask |= DirtyMask(global_status & size_t(relevant));
 
   /* A phase may have been configured while the CPU backend was still lazy and
      only then moved to a resident backend.  Before that backend freezes its
