@@ -228,10 +228,17 @@ enum class failure_point {
   device_restore,
   pinned_allocate,
   pinned_free,
-  host_to_device_copy
+  host_to_device_copy,
+  cw_pack,
+  cw_timestep,
+  cw_reduction,
+  cw_scalar_copy,
+  cw_unpack,
+  cw_breakdown
 };
 void fail_next(failure_point point);
 void clear_failure();
+bool consume_failure_for_testing(failure_point point);
 transfer_accounting current_transfer_accounting();
 void reset_transfer_accounting();
 } // namespace testing
