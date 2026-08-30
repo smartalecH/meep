@@ -339,6 +339,7 @@ public:
   virtual int get_num_params() { return 5; }
 
 protected:
+  friend class susceptibility_descriptor_builder;
   realnum noise_amp;
 };
 

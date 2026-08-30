@@ -35,6 +35,7 @@
 #include <limits>
 #include <map>
 #include <math.h>
+#include <set>
 #include <stdio.h>
 #include <string.h>
 #include <string>
@@ -43,6 +44,7 @@
 
 #include <meep.hpp>
 
+#include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/prepare.hpp"
 #include "backend/random_state.hpp"
@@ -68,6 +70,7 @@ static int failures = 0;
   } while (0)
 
 static double one(const vec &) { return 1.0; }
+static double zero(const vec &) { return 0.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 
 class multitile_anisotropic_material : public material_function {
@@ -83,6 +86,34 @@ public:
   }
 };
 static double magnetic_conductivity(const vec &) { return 0.07; }
+
+class inherited_noisy_lorentzian : public noisy_lorentzian_susceptibility {
+public:
+  inherited_noisy_lorentzian(realnum amplitude, realnum omega, realnum gamma)
+      : noisy_lorentzian_susceptibility(amplitude, omega, gamma) {}
+  virtual susceptibility *clone() const { return new inherited_noisy_lorentzian(*this); }
+};
+
+class anisotropic_noisy_material : public material_function {
+public:
+  virtual void eff_chi1inv_row(component c, double row[3], const volume &,
+                               double = DEFAULT_SUBPIXEL_TOL,
+                               int = DEFAULT_SUBPIXEL_MAXEVAL) {
+    row[0] = row[1] = row[2] = 0.0;
+    row[int(component_direction(c))] = 1.0;
+  }
+  virtual void sigma_row(component c, double row[3], const vec &) {
+    row[0] = row[1] = row[2] = 0.0;
+    const direction d = component_direction(c);
+    row[int(d)] = 1.0;
+    if (d == X) {
+      row[int(Y)] = 0.25;
+      row[int(Z)] = 0.125;
+    }
+    else if (d == Y)
+      row[int(X)] = 0.25;
+  }
+};
 
 class cw_custom_source : public continuous_src_time {
 public:
@@ -588,7 +619,7 @@ static void test_empty_plan() {
   structure s(gv, one, no_pml());
   fields f(&s);
   f.require_component(Ez);
-  f.advance(1);
+  f.advance(2);
   const StepPlan p = build_step_plan(f, StepProgram::ordinary);
   std::vector<std::string> got;
   format_step_plan(p, got);
@@ -2208,6 +2239,22 @@ static void test_noisy_polarization_group_schedule() {
                            std::vector<PolarizationUpdate>(),
                            "mixed Lorentz/gyrotropic recurrence group was accepted");
 
+    StepPlan wrong_ft_plan;
+    Operation wrong_ft_op = {};
+    wrong_ft_op.kind = OpKind::update_polarization;
+    wrong_ft_op.ft = H_stuff;
+    wrong_ft_op.guard = guard_always();
+    rejected = false;
+    try {
+      append_polarization_update_group(f, wrong_ft_plan, wrong_ft_op,
+                                       std::vector<PolarizationUpdate>{a0},
+                                       std::vector<PolarizationUpdate>());
+    }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected && wrong_ft_plan.polarization_updates.empty() &&
+              wrong_ft_op.descriptor_count == 0 && wrong_ft_op.accesses.empty(),
+          "polarization group with mismatched operation field family was accepted");
+
     PolarizationUpdate gyrotropic = a0;
     gyrotropic.kind = PolarizationUpdateKind::gyrotropic;
     expect_group_rejection(std::vector<PolarizationUpdate>{gyrotropic},
@@ -3507,6 +3554,475 @@ static void test_multilevel_previous_w_copy_once() {
         "multilevel previous-W copy fixture did not produce multiple constitutive tiles");
 }
 
+static void test_live_noisy_polarization_plan(bool complex_fields) {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  noisy_lorentzian_susceptibility electric(0.03125, 1.25, 0.075, false);
+  noisy_lorentzian_susceptibility electric_repeat(0.03125, 1.25, 0.075, false);
+  noisy_lorentzian_susceptibility magnetic_drude(0.0625, 0.8, 0.125, true);
+  noisy_lorentzian_susceptibility zero_state(0.125, 0.6, 0.05, false);
+  lorentzian_susceptibility ordinary(1.4, 0.09, false);
+  inherited_noisy_lorentzian derived(0.09375, 0.7, 0.05);
+  s.add_susceptibility(one, E_stuff, electric);
+  s.add_susceptibility(one, E_stuff, ordinary);
+  s.add_susceptibility(one, E_stuff, derived);
+  s.add_susceptibility(one, E_stuff, electric_repeat);
+  s.add_susceptibility(zero, E_stuff, zero_state);
+  s.add_susceptibility(one, H_stuff, magnetic_drude);
+  fields f(&s);
+  if (complex_fields)
+    f.use_bloch(vec(0.07, 0.11));
+  else
+    f.use_real_fields();
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.11, 0.13));
+  f.add_point_source(Hz, source, vec(-0.17, 0.09));
+  f.advance(2);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  size_t noisy_groups = 0, electric_groups = 0, electric_rows = 0, magnetic_rows = 0;
+  size_t subtraction_rows = 0, custom_descriptors = 0, zero_noisy_descriptors = 0;
+  size_t local_noisy_descriptors = 0, local_noisy_actions = 0;
+  bool saw_state_above_zero = false, saw_cmp0 = false, saw_cmp1 = false;
+  bool owns_chunk = false;
+  std::vector<size_t> expected_groups(size_t(f.num_chunks), 0);
+  std::vector<size_t> observed_groups(size_t(f.num_chunks), 0);
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+    if (descriptor.kind == SusceptibilityKind::noisy_lorentzian &&
+        !descriptor.lorentzian_states.empty()) {
+      ++expected_groups[size_t(descriptor.chunk)];
+      ++local_noisy_descriptors;
+    }
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+    if (descriptor.kind == SusceptibilityKind::host_custom &&
+        descriptor.ft == E_stuff) {
+      ++custom_descriptors;
+      for (const PolarizationUpdate &update : plan.polarization_updates)
+        CHECK(update.region.chunk != descriptor.chunk || update.ft != descriptor.ft ||
+                  update.state_index != descriptor.state_index,
+              "derived noisy subclass leaked into the portable polarization plan");
+    }
+  for (const Operation &op : plan.operations) {
+    if (op.kind != OpKind::update_polarization) continue;
+    const size_t end = size_t(op.descriptor_index) + size_t(op.descriptor_count);
+    CHECK(end <= plan.polarization_updates.size(),
+          "live noisy polarization span exceeds its descriptor table");
+    size_t cursor = op.descriptor_index;
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+      if (descriptor.ft != op.ft ||
+          (descriptor.kind != SusceptibilityKind::lorentzian &&
+           descriptor.kind != SusceptibilityKind::noisy_lorentzian))
+        continue;
+      const bool noisy = descriptor.kind == SusceptibilityKind::noisy_lorentzian;
+      if (noisy) {
+        ++noisy_groups;
+        if (descriptor.ft == E_stuff) ++electric_groups;
+        if (!descriptor.lorentzian_states.empty())
+          ++observed_groups[size_t(descriptor.chunk)];
+      }
+      saw_state_above_zero = saw_state_above_zero || descriptor.state_index > 0;
+      const size_t group_begin = cursor;
+      bool saw_noise = false;
+      std::set<std::pair<int, int> > recurrence_pairs, noise_pairs;
+      while (cursor < end) {
+        const PolarizationUpdate &update = plan.polarization_updates[cursor];
+        if (update.region.chunk != descriptor.chunk || update.ft != descriptor.ft ||
+            update.state_index != descriptor.state_index)
+          break;
+        CHECK(update.ft == op.ft, "live polarization row lost its E/H field family");
+        saw_cmp0 = saw_cmp0 || update.region.cmp == 0;
+        saw_cmp1 = saw_cmp1 || update.region.cmp == 1;
+        const std::pair<int, int> key(int(update.region.c), update.region.cmp);
+        if (update.kind == PolarizationUpdateKind::noisy_add) {
+          ++local_noisy_actions;
+          CHECK(noisy, "ordinary Lorentz descriptor emitted a noisy-add row");
+          saw_noise = true;
+          noise_pairs.insert(key);
+          CHECK(is_valid(update.p) && is_valid(update.diagonal_sigma) &&
+                    !is_valid(update.p_prev) && !is_valid(update.primary_w) &&
+                    !is_valid(update.offdiagonal_sigma1) && !is_valid(update.offdiagonal_sigma2),
+                "live noisy-add row retained recurrence-only operands");
+          CHECK(update.noise_amplitude == descriptor.noise_amplitude &&
+                    update.noise_algorithm_version == counter_random_algorithm_version &&
+                    update.omega_0 == descriptor.lorentzian.omega_0 &&
+                    update.gamma == descriptor.lorentzian.gamma,
+                "live noisy-add row lost descriptor coefficients");
+          const BufferAccess *p_access = find_access(op, update.p);
+          const BufferAccess *sigma_access = find_access(op, update.diagonal_sigma);
+          CHECK(p_access && p_access->mode == AccessMode::read_write,
+                "live noisy-add P access is not read-write");
+          CHECK(sigma_access && sigma_access->mode == AccessMode::read,
+                "live noisy-add diagonal sigma access is not exactly read-only");
+        }
+        else {
+          CHECK(!saw_noise, "live noisy group interleaved recurrence after noise");
+          CHECK(update.kind == PolarizationUpdateKind::lorentzian,
+                "live noisy descriptor did not reuse the Lorentz recurrence action");
+          CHECK(update.noise_amplitude == 0.0 && update.noise_algorithm_version == 0,
+                "live recurrence row retained noise-only metadata");
+          CHECK(bool(update.region.variant_key & polarization_drude) == descriptor.lorentzian.drude,
+                "live noisy recurrence lost its Lorentz/Drude mode");
+          recurrence_pairs.insert(key);
+        }
+        if (op.ft == E_stuff)
+          ++electric_rows;
+        else if (op.ft == H_stuff)
+          ++magnetic_rows;
+        ++cursor;
+      }
+      if (descriptor.lorentzian_states.empty()) {
+        ++zero_noisy_descriptors;
+        CHECK(cursor == group_begin,
+              "zero-row noisy descriptor contributed a polarization action");
+      }
+      else {
+        CHECK(cursor > group_begin, "live Lorentz descriptor produced no contiguous group");
+        CHECK(saw_noise == noisy, "live Lorentz/noisy group has the wrong action kinds");
+        if (noisy)
+          CHECK(recurrence_pairs == noise_pairs,
+                "live noisy descriptor recurrence/noise component sets differ");
+        else
+          CHECK(noise_pairs.empty(), "ordinary Lorentz group retained noisy rows");
+      }
+    }
+    CHECK(cursor == end, "live polarization span contains an unexpected descriptor group");
+  }
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine())
+      CHECK(observed_groups[size_t(chunk)] == expected_groups[size_t(chunk)],
+            "owned chunk %d has %zu noisy groups, expected %zu", chunk,
+            observed_groups[size_t(chunk)], expected_groups[size_t(chunk)]);
+
+  for (const PolarizationSubtraction &subtraction : plan.polarization_subtractions) {
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+      if (descriptor.kind != SusceptibilityKind::noisy_lorentzian ||
+          descriptor.chunk != subtraction.chunk || descriptor.ft == field_type(NUM_FIELD_TYPES) ||
+          descriptor.state_index != subtraction.state_index)
+        continue;
+      for (const LorentzianStateArrays &state : descriptor.lorentzian_states)
+        if (state.p == subtraction.p) ++subtraction_rows;
+    }
+  }
+  const bool global_e = or_to_all(electric_rows > 0);
+  const bool global_h = or_to_all(magnetic_rows > 0);
+  const bool global_state_above_zero = or_to_all(saw_state_above_zero);
+  const bool global_cmp0 = or_to_all(saw_cmp0);
+  const bool global_cmp1 = or_to_all(saw_cmp1);
+  CHECK(global_e && global_h, "live noisy plan did not cover both electric and magnetic rows");
+  CHECK(or_to_all(noisy_groups > 0), "live noisy plan produced no descriptor groups");
+  CHECK(or_to_all(electric_groups >= 2),
+        "live noisy plan did not retain multiple identical electric susceptibilities");
+  CHECK(global_state_above_zero, "live noisy plan did not retain a nonzero state ordinal");
+  CHECK(global_cmp0 && global_cmp1 == complex_fields,
+        "live noisy plan cmp coverage does not match real/complex mode");
+  CHECK(or_to_all(custom_descriptors > 0),
+        "derived noisy subclass was not retained as a host-custom descriptor");
+  CHECK(or_to_all(zero_noisy_descriptors > 0),
+        "zero-sigma noisy descriptor did not remain a zero-row contribution");
+  CHECK(or_to_all(subtraction_rows > 0),
+        "live noisy Lorentz rows were omitted from polarization subtraction");
+  if (!owns_chunk)
+    CHECK(local_noisy_descriptors == 0 && local_noisy_actions == 0,
+          "idle rank retained local noisy descriptors or actions");
+
+  bool mutated_signature = false, mutated_frequency = false, mutated_version = false;
+  bool rejected_version = false, rejected_state = false;
+  bool rejected_alias = false;
+  for (PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind != SusceptibilityKind::noisy_lorentzian ||
+        descriptor.lorentzian_states.empty())
+      continue;
+    const double amplitude = descriptor.noise_amplitude;
+    descriptor.noise_amplitude += 0.015625;
+    const StepPlan changed = build_step_plan(f, StepProgram::ordinary);
+    mutated_signature = changed.signature != plan.signature;
+    descriptor.noise_amplitude = amplitude;
+
+    const double omega_0 = descriptor.lorentzian.omega_0;
+    descriptor.lorentzian.omega_0 += 0.03125;
+    mutated_frequency = build_step_plan(f, StepProgram::ordinary).signature != plan.signature;
+    descriptor.lorentzian.omega_0 = omega_0;
+
+    const uint32_t version = descriptor.noise_algorithm_version;
+    ++descriptor.noise_algorithm_version;
+    mutated_version = build_step_plan(f, StepProgram::ordinary).signature != plan.signature;
+    descriptor.noise_algorithm_version = 0;
+    try { (void)build_step_plan(f, StepProgram::ordinary); }
+    catch (const std::invalid_argument &) { rejected_version = true; }
+    descriptor.noise_algorithm_version = version;
+
+    if (!descriptor.lorentzian_states.empty()) {
+      const ArrayId p = descriptor.lorentzian_states[0].p;
+      descriptor.lorentzian_states[0].p = invalid_array();
+      try { (void)build_step_plan(f, StepProgram::ordinary); }
+      catch (const std::invalid_argument &) { rejected_state = true; }
+      descriptor.lorentzian_states[0].p = p;
+
+      const ArrayId p_prev = descriptor.lorentzian_states[0].p_prev;
+      descriptor.lorentzian_states[0].p_prev = p;
+      try { (void)build_step_plan(f, StepProgram::ordinary); }
+      catch (const std::invalid_argument &) { rejected_alias = true; }
+      descriptor.lorentzian_states[0].p_prev = p_prev;
+    }
+    break;
+  }
+  CHECK(or_to_all(mutated_signature), "noise amplitude mutation did not change plan signature");
+  CHECK(or_to_all(mutated_frequency), "noisy frequency mutation did not change plan signature");
+  CHECK(or_to_all(mutated_version), "noise algorithm mutation did not change plan signature");
+  CHECK(or_to_all(rejected_version), "invalid noise algorithm version was accepted");
+  CHECK(or_to_all(rejected_state), "missing noisy P state was accepted");
+  CHECK(or_to_all(rejected_alias), "aliased noisy P/P_prev state was accepted");
+}
+
+static void test_live_noisy_offdiagonal_plan() {
+  grid_volume gv = vol3d(2.0, 2.0, 2.0, 6.0);
+  anisotropic_noisy_material material;
+  structure s(gv, material, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+  s.add_susceptibility(material, E_stuff, noisy);
+  fields f(&s);
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.advance(2);
+
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  typedef std::tuple<int, int, int, int> RowKey;
+  std::set<RowKey> expected_recurrences, expected_noise;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind != SusceptibilityKind::noisy_lorentzian) continue;
+    for (const LorentzianStateArrays &state : descriptor.lorentzian_states) {
+      const direction d = component_direction(state.c);
+      const int sigma_aux = descriptor.state_index * NUM_FIELD_TYPES + int(descriptor.ft);
+      ArrayId primary = f.array_catalog->find(
+          {descriptor.chunk, int(array_kind::f_w), int(state.c), state.cmp, 0});
+      if (!is_valid(primary))
+        primary = f.array_catalog->find(
+            {descriptor.chunk, int(array_kind::f), int(state.c), state.cmp, 0});
+      const ArrayId diagonal = f.array_catalog->find(
+          {descriptor.chunk, int(array_kind::sigma), int(state.c), int(d), sigma_aux});
+      const RowKey key(descriptor.chunk, descriptor.state_index, int(state.c), state.cmp);
+      if (is_valid(primary) && is_valid(diagonal)) expected_recurrences.insert(key);
+      if (is_valid(state.p) && is_valid(diagonal)) expected_noise.insert(key);
+    }
+  }
+
+  bool saw_zero = false, saw_one = false, saw_two = false;
+  std::set<RowKey> actual_recurrences, actual_noise;
+  for (const Operation &op : plan.operations) {
+    if (op.kind != OpKind::update_polarization || op.ft != E_stuff) continue;
+    const size_t end = size_t(op.descriptor_index) + size_t(op.descriptor_count);
+    for (size_t i = op.descriptor_index; i < end; ++i) {
+      const PolarizationUpdate &update = plan.polarization_updates[i];
+      const RowKey key(update.region.chunk, update.state_index, int(update.region.c),
+                       update.region.cmp);
+      if (update.kind == PolarizationUpdateKind::noisy_add) {
+        actual_noise.insert(key);
+        CHECK(update.region.variant_key == 0 && !is_valid(update.cross_w1) &&
+                  !is_valid(update.cross_w2) && !is_valid(update.offdiagonal_sigma1) &&
+                  !is_valid(update.offdiagonal_sigma2),
+              "noise-only action retained offdiagonal recurrence state");
+        continue;
+      }
+      const unsigned offdiagonals =
+          unsigned(bool(update.region.variant_key & polarization_one_offdiagonal)) +
+          unsigned(bool(update.region.variant_key & polarization_two_offdiagonals));
+      actual_recurrences.insert(key);
+      saw_zero = saw_zero || offdiagonals == 0;
+      saw_one = saw_one || offdiagonals == 1;
+      saw_two = saw_two || offdiagonals == 2;
+      if (offdiagonals == 0)
+        CHECK(!is_valid(update.cross_w1) && !is_valid(update.cross_w2) &&
+                  !is_valid(update.offdiagonal_sigma1) &&
+                  !is_valid(update.offdiagonal_sigma2),
+              "diagonal recurrence retained cross-field operands");
+      if (offdiagonals >= 1) {
+        CHECK(is_valid(update.cross_w1) && is_valid(update.offdiagonal_sigma1),
+              "one-offdiagonal recurrence lacks its W/sigma operands");
+        const BufferAccess *w1 = find_access(op, update.cross_w1);
+        const BufferAccess *sigma1 = find_access(op, update.offdiagonal_sigma1);
+        CHECK(w1 && w1->mode == AccessMode::read && sigma1 &&
+                  sigma1->mode == AccessMode::read,
+              "one-offdiagonal recurrence has incorrect read accesses");
+      }
+      if (offdiagonals == 2) {
+        CHECK(is_valid(update.cross_w2) && is_valid(update.offdiagonal_sigma2),
+              "two-offdiagonal recurrence lacks its second W/sigma operands");
+        const BufferAccess *w2 = find_access(op, update.cross_w2);
+        const BufferAccess *sigma2 = find_access(op, update.offdiagonal_sigma2);
+        CHECK(w2 && w2->mode == AccessMode::read && sigma2 &&
+                  sigma2->mode == AccessMode::read,
+              "two-offdiagonal recurrence has incorrect second read accesses");
+      }
+    }
+  }
+  CHECK(actual_recurrences == expected_recurrences,
+        "live noisy recurrence component/cmp rows differ from descriptor state");
+  CHECK(actual_noise == expected_noise,
+        "live noisy-add component/cmp rows differ from descriptor state");
+  CHECK(or_to_all(saw_zero), "live noisy plan did not exercise a zero-offdiagonal recurrence");
+  CHECK(or_to_all(saw_one), "live noisy plan did not exercise a one-offdiagonal recurrence");
+  CHECK(or_to_all(saw_two), "live noisy plan did not exercise a two-offdiagonal recurrence");
+}
+
+static void test_noisy_plan_after_field_growth() {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+  s.add_susceptibility(one, E_stuff, noisy);
+  fields f(&s);
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.13, 0.11));
+  f.advance(1);
+  const StepPlan before = build_step_plan(f, StepProgram::ordinary);
+  struct StateBinding {
+    StorageKey key;
+    void *address;
+  };
+  std::vector<StateBinding> before_bindings;
+  size_t before_rows = 0;
+  bool owns_chunk = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind != SusceptibilityKind::noisy_lorentzian) continue;
+    for (const LorentzianStateArrays &state : descriptor.lorentzian_states) {
+      ++before_rows;
+      const ArrayId ids[2] = {state.p, state.p_prev};
+      for (int i = 0; i < 2; ++i) {
+        CHECK(is_valid(ids[i]) && ids[i].value < f.array_catalog->size(),
+              "pre-growth noisy state has an invalid ArrayId");
+        if (!is_valid(ids[i]) || ids[i].value >= f.array_catalog->size()) continue;
+        before_bindings.push_back(
+            StateBinding{f.array_catalog->key(ids[i]), f.array_catalog->resolve_untyped(ids[i])});
+      }
+    }
+  }
+
+  f.require_component(Ex);
+  f.advance(1);
+  const StepPlan after = build_step_plan(f, StepProgram::ordinary);
+  bool checked = false;
+  size_t after_rows = 0, local_noisy_actions = 0;
+  for (const StateBinding &binding : before_bindings) {
+    const ArrayId rebound = f.array_catalog->find(binding.key);
+    CHECK(is_valid(rebound) && rebound.value < f.array_catalog->size(),
+          "field growth dropped an existing noisy state key");
+    if (is_valid(rebound) && rebound.value < f.array_catalog->size())
+      CHECK(f.array_catalog->resolve_untyped(rebound) == binding.address,
+            "field growth rebound an existing noisy state to a new address");
+  }
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind != SusceptibilityKind::noisy_lorentzian) continue;
+    for (const LorentzianStateArrays &state : descriptor.lorentzian_states) {
+      ++after_rows;
+      CHECK(is_valid(state.p) && state.p.value < f.array_catalog->size() &&
+                is_valid(state.p_prev) && state.p_prev.value < f.array_catalog->size(),
+            "field-growth noisy descriptor retained an invalid current ArrayId");
+      if (!is_valid(state.p) || state.p.value >= f.array_catalog->size()) continue;
+      CHECK(f.array_catalog->resolve_untyped(state.p) != NULL,
+            "field-growth noisy descriptor P ArrayId does not resolve in the rebuilt catalog");
+      bool plan_uses_current_p = false;
+      for (const PolarizationUpdate &update : after.polarization_updates)
+        if (update.region.chunk == descriptor.chunk && update.ft == descriptor.ft &&
+            update.state_index == descriptor.state_index && update.region.c == state.c &&
+            update.region.cmp == state.cmp && update.p == state.p)
+          plan_uses_current_p = true;
+      CHECK(plan_uses_current_p,
+            "field-growth StepPlan does not use the refreshed noisy P ArrayId");
+      checked = true;
+    }
+  }
+  for (const PolarizationUpdate &update : after.polarization_updates)
+    if (update.kind == PolarizationUpdateKind::noisy_add) ++local_noisy_actions;
+  CHECK(or_to_all(checked), "field-growth fixture checked no noisy descriptor rows");
+  CHECK(after_rows >= before_rows,
+        "field growth removed noisy descriptor rows on an owning rank");
+  CHECK(after_rows > before_rows || !owns_chunk,
+        "field growth did not add a noisy state row on an owning rank");
+  if (!owns_chunk)
+    CHECK(before_rows == 0 && after_rows == 0 && local_noisy_actions == 0,
+          "idle rank retained noisy descriptor rows or actions across field growth");
+  CHECK(or_to_all(after.signature != before.signature),
+        "field-layout growth did not rebuild the noisy StepPlan signature");
+}
+
+static void test_live_noisy_without_primary_w() {
+  grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  anisotropic_noisy_material material;
+  structure s(gv, material, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+  s.add_susceptibility(material, E_stuff, noisy);
+  fields f(&s);
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.11, 0.13));
+  f.advance(2);
+
+  const CpuArrayCatalog saved = *f.array_catalog;
+  CpuArrayCatalog without_primary_w;
+  size_t hidden_primary_rows = 0;
+  for (size_t i = 0; i < saved.size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    StorageKey key = saved.key(id);
+    if ((key.kind == int(array_kind::f) || key.kind == int(array_kind::f_w)) &&
+        key.component_ == int(Ex) && key.cmp == 0) {
+      key.aux = -1000 - int(hidden_primary_rows++);
+    }
+    const ArraySpec &spec = saved.spec(id);
+    without_primary_w.register_array(key, saved.resolve_untyped(id), spec.elements, spec.role,
+                                     spec.element_type);
+  }
+  for (size_t i = 0; i < saved.size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    if (is_valid(saved.spec(id).alias_of))
+      without_primary_w.set_alias(id, saved.spec(id).alias_of);
+  }
+  *f.array_catalog = without_primary_w;
+
+  bool built = true;
+  StepPlan missing_w_plan;
+  try { missing_w_plan = build_step_plan(f, StepProgram::ordinary); }
+  catch (const std::invalid_argument &) { built = false; }
+
+  bool exercised = false;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    if (descriptor.kind != SusceptibilityKind::noisy_lorentzian ||
+        descriptor.lorentzian_states.empty())
+      continue;
+    for (const LorentzianStateArrays &state : descriptor.lorentzian_states) {
+      if (state.c != Ex || state.cmp != 0) continue;
+      const ArrayId primary_w = f.array_catalog->find(
+          {descriptor.chunk, int(array_kind::f_w), int(state.c), state.cmp, 0});
+      const ArrayId primary_f = f.array_catalog->find(
+          {descriptor.chunk, int(array_kind::f), int(state.c), state.cmp, 0});
+      const ArrayId sigma = f.array_catalog->find(
+          {descriptor.chunk, int(array_kind::sigma), int(state.c), int(X),
+           descriptor.state_index * NUM_FIELD_TYPES + int(descriptor.ft)});
+      CHECK(!is_valid(primary_w) && !is_valid(primary_f) && is_valid(state.p) && is_valid(sigma),
+            "catalog seam did not retain P+diagonal sigma while hiding primary W");
+      bool recurrence_found = false, noise_found = false;
+      for (const PolarizationUpdate &update : missing_w_plan.polarization_updates) {
+        if (update.region.chunk != descriptor.chunk || update.ft != descriptor.ft ||
+            update.state_index != descriptor.state_index || update.region.c != state.c ||
+            update.region.cmp != state.cmp)
+          continue;
+        recurrence_found = recurrence_found || update.kind == PolarizationUpdateKind::lorentzian;
+        noise_found = noise_found || update.kind == PolarizationUpdateKind::noisy_add;
+      }
+      CHECK(!recurrence_found && noise_found,
+            "missing-W noisy row did not retain exactly its noise-only action");
+      exercised = true;
+    }
+  }
+  *f.array_catalog = saved;
+  CHECK(built, "missing-W noisy plan construction was rejected");
+  CHECK(or_to_all(hidden_primary_rows > 0),
+        "missing-W fixture found no primary field row to hide");
+  CHECK(or_to_all(exercised), "missing-W fixture found no noisy state row");
+}
+
 static void test_legacy_flux_schema_signature() {
   StepPlan plan;
   Operation op = {};
@@ -4095,6 +4611,11 @@ int main(int argc, char **argv) {
   test_noisy_polarization_group_schedule();
   test_multilevel_polarization_group_schedule();
   test_multilevel_previous_w_copy_once();
+  test_live_noisy_polarization_plan(false);
+  test_live_noisy_polarization_plan(true);
+  test_live_noisy_offdiagonal_plan();
+  test_noisy_plan_after_field_growth();
+  test_live_noisy_without_primary_w();
   test_legacy_flux_schema_signature();
   test_live_legacy_flux_spans();
   test_beta_schema_signature();

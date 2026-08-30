@@ -17,6 +17,7 @@
 
 #include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/random_state.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -61,6 +62,10 @@ public:
     p.gamma = s.gamma;
     p.drude = s.no_omega_0_denominator;
     return p;
+  }
+
+  static double noise_amplitude(const noisy_lorentzian_susceptibility &s) {
+    return s.noise_amp;
   }
 
   static GyrotropicParameters gyrotropic_parameters(const gyrotropic_susceptibility &s) {
@@ -757,6 +762,8 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         d.state_index = si;
         d.kind = classify_susceptibility(p->s);
         d.lorentzian = LorentzianParameters{0.0, 0.0, false};
+        d.noise_amplitude = 0.0;
+        d.noise_algorithm_version = 0;
         d.gyrotropic = GyrotropicParameters{};
         d.per_thread_scratch_elements = 0;
         d.required_w = 0;
@@ -769,10 +776,17 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         if (!p->s->internal_layout(d.internal_arrays, fc.gv, p->data))
           d.kind = SusceptibilityKind::host_custom;
 
-        if (d.kind == SusceptibilityKind::lorentzian) {
+        if (d.kind == SusceptibilityKind::lorentzian ||
+            d.kind == SusceptibilityKind::noisy_lorentzian) {
           const lorentzian_susceptibility &lorentz =
               static_cast<const lorentzian_susceptibility &>(*p->s);
           d.lorentzian = susceptibility_descriptor_builder::lorentzian_parameters(lorentz);
+          if (d.kind == SusceptibilityKind::noisy_lorentzian) {
+            const noisy_lorentzian_susceptibility &noisy =
+                static_cast<const noisy_lorentzian_susceptibility &>(*p->s);
+            d.noise_amplitude = susceptibility_descriptor_builder::noise_amplitude(noisy);
+            d.noise_algorithm_version = counter_random_algorithm_version;
+          }
           build_lorentzian_state_arrays(f, fc, p, d);
         }
         else if (d.kind == SusceptibilityKind::gyrotropic) {
@@ -786,6 +800,7 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
           /* Exact built-in Lorentzian descriptors bind the state arrays that
              exist, rather than a later grow-only field-layout snapshot. */
           if (d.kind != SusceptibilityKind::lorentzian &&
+              d.kind != SusceptibilityKind::noisy_lorentzian &&
               d.kind != SusceptibilityKind::gyrotropic) {
             DOCMP2 {
               if (p->s->needs_P(c, cmp, fc.f))
