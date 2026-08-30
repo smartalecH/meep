@@ -169,6 +169,168 @@ void add_access(fields &f, Operation &op, ArrayId id, AccessMode mode) {
   op.accesses.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
 }
 
+namespace {
+
+bool same_polarization_group(const PolarizationUpdate &a, const PolarizationUpdate &b) {
+  return a.region.chunk == b.region.chunk && a.ft == b.ft && a.state_index == b.state_index;
+}
+
+bool same_polarization_region(const UpdateRegion &a, const UpdateRegion &b) {
+  if (a.chunk != b.chunk || a.c != b.c || a.cmp != b.cmp || !(a.begin == b.begin) ||
+      !(a.end == b.end) || a.base != b.base)
+    return false;
+  for (int axis = 0; axis < 3; ++axis)
+    if (a.counts[axis] != b.counts[axis] || a.strides[axis] != b.strides[axis]) return false;
+  return true;
+}
+
+bool ordered_polarization_rows(const std::vector<PolarizationUpdate> &rows) {
+  for (size_t i = 1; i < rows.size(); ++i) {
+    const PolarizationUpdate &previous = rows[i - 1];
+    const PolarizationUpdate &current = rows[i];
+    if (int(previous.region.c) > int(current.region.c) ||
+        (previous.region.c == current.region.c && previous.region.cmp >= current.region.cmp))
+      return false;
+  }
+  return true;
+}
+
+bool canonical_noisy_add(const PolarizationUpdate &d) {
+  if (d.kind != PolarizationUpdateKind::noisy_add || !is_valid(d.p) ||
+      !is_valid(d.diagonal_sigma) || is_valid(d.p_prev) || is_valid(d.p_cross1) ||
+      is_valid(d.p_prev_cross1) || is_valid(d.p_cross2) || is_valid(d.p_prev_cross2) ||
+      is_valid(d.primary_w) || is_valid(d.cross_w1) || is_valid(d.cross_w2) ||
+      is_valid(d.offdiagonal_sigma1) || is_valid(d.offdiagonal_sigma2) ||
+      d.primary_stride != 0 || d.cross_stride1 != 0 || d.cross_stride2 != 0 || d.alpha != 0.0 ||
+      d.gyro_model != GYROTROPIC_LORENTZIAN || d.region.variant_key != 0 ||
+      d.noise_algorithm_version == 0)
+    return false;
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      if (d.gyro_tensor[i][j] != 0.0) return false;
+  return true;
+}
+
+void add_polarization_recurrence_accesses(fields &f, Operation &op,
+                                          const PolarizationUpdate &update) {
+  add_access(f, op, update.p, AccessMode::read_write);
+  add_access(f, op, update.p_prev, AccessMode::read_write);
+  add_access(f, op, update.p_cross1, AccessMode::read_write);
+  add_access(f, op, update.p_prev_cross1, AccessMode::read_write);
+  add_access(f, op, update.p_cross2, AccessMode::read_write);
+  add_access(f, op, update.p_prev_cross2, AccessMode::read_write);
+  add_access(f, op, update.primary_w, AccessMode::read);
+  add_access(f, op, update.cross_w1, AccessMode::read);
+  add_access(f, op, update.cross_w2, AccessMode::read);
+  add_access(f, op, update.diagonal_sigma, AccessMode::read);
+  add_access(f, op, update.offdiagonal_sigma1, AccessMode::read);
+  add_access(f, op, update.offdiagonal_sigma2, AccessMode::read);
+}
+
+} // namespace
+
+void append_polarization_update_group_impl(fields &f, StepPlan &plan, Operation &op,
+                                           const std::vector<PolarizationUpdate> &recurrences,
+                                           const std::vector<PolarizationUpdate> &noise_additions) {
+  if (op.kind != OpKind::update_polarization)
+    throw std::invalid_argument("polarization group requires an update_polarization operation");
+  if (op.descriptor_index > plan.polarization_updates.size() ||
+      op.descriptor_count != plan.polarization_updates.size() - op.descriptor_index)
+    throw std::invalid_argument("polarization group is not appended to its operation span");
+  if (recurrences.empty() && noise_additions.empty()) return;
+
+  const PolarizationUpdate &identity =
+      recurrences.empty() ? noise_additions.front() : recurrences.front();
+  if (identity.ft != op.ft)
+    throw std::invalid_argument("polarization group field family differs from its operation");
+  for (const PolarizationUpdate &previous : plan.polarization_updates)
+    if (same_polarization_group(identity, previous))
+      throw std::invalid_argument("polarization group identity is not contiguous");
+  PolarizationUpdateKind recurrence_kind = PolarizationUpdateKind::lorentzian;
+  if (!recurrences.empty()) recurrence_kind = recurrences.front().kind;
+  for (const PolarizationUpdate &update : recurrences) {
+    if ((update.kind != PolarizationUpdateKind::lorentzian &&
+         update.kind != PolarizationUpdateKind::gyrotropic) ||
+        update.kind != recurrence_kind ||
+        update.noise_amplitude != 0.0 || update.noise_algorithm_version != 0 ||
+        !same_polarization_group(identity, update))
+      throw std::invalid_argument("malformed polarization recurrence group");
+  }
+  if (!noise_additions.empty() && !recurrences.empty() &&
+      recurrence_kind != PolarizationUpdateKind::lorentzian)
+    throw std::invalid_argument("noise additions require a Lorentz-family recurrence");
+  for (const PolarizationUpdate &update : noise_additions) {
+    if (!canonical_noisy_add(update) || !same_polarization_group(identity, update))
+      throw std::invalid_argument("malformed noisy polarization addition group");
+  }
+  if (!noise_additions.empty()) {
+    const PolarizationUpdate &coefficients = noise_additions.front();
+    for (const PolarizationUpdate &recurrence : recurrences) {
+      bool matched = false;
+      for (const PolarizationUpdate &noise : noise_additions)
+        matched = matched || (recurrence.region.c == noise.region.c &&
+                              recurrence.region.cmp == noise.region.cmp);
+      if (!matched)
+        throw std::invalid_argument("noisy polarization recurrence is missing its noise row");
+    }
+    for (const PolarizationUpdate &noise : noise_additions) {
+      if (noise.omega_0 != coefficients.omega_0 || noise.gamma != coefficients.gamma ||
+          noise.dt != coefficients.dt || noise.noise_amplitude != coefficients.noise_amplitude ||
+          noise.noise_algorithm_version != coefficients.noise_algorithm_version)
+        throw std::invalid_argument("noisy polarization group has inconsistent coefficients");
+      for (const PolarizationUpdate &recurrence : recurrences) {
+        if (recurrence.region.c != noise.region.c || recurrence.region.cmp != noise.region.cmp)
+          continue;
+        if (!same_polarization_region(recurrence.region, noise.region) || recurrence.p != noise.p ||
+            recurrence.diagonal_sigma != noise.diagonal_sigma ||
+            recurrence.omega_0 != noise.omega_0 || recurrence.gamma != noise.gamma ||
+            recurrence.dt != noise.dt)
+          throw std::invalid_argument("noisy addition differs from its recurrence row");
+      }
+    }
+  }
+  if (!ordered_polarization_rows(recurrences) || !ordered_polarization_rows(noise_additions))
+    throw std::invalid_argument("polarization group rows are not in component/cmp order");
+
+  for (const PolarizationUpdate &update : recurrences) {
+    plan.polarization_updates.push_back(update);
+    add_polarization_recurrence_accesses(f, op, update);
+  }
+  for (const PolarizationUpdate &update : noise_additions) {
+    plan.polarization_updates.push_back(update);
+    add_access(f, op, update.p, AccessMode::read_write);
+    add_access(f, op, update.diagonal_sigma, AccessMode::read);
+  }
+  op.descriptor_count = uint32_t(plan.polarization_updates.size()) - op.descriptor_index;
+}
+
+bool polarization_updates_equal(const PolarizationUpdate &a, const PolarizationUpdate &b) {
+  if (a.kind != b.kind || a.region.chunk != b.region.chunk || a.region.c != b.region.c ||
+      a.region.cmp != b.region.cmp || !(a.region.begin == b.region.begin) ||
+      !(a.region.end == b.region.end) || a.region.base != b.region.base ||
+      a.region.variant_key != b.region.variant_key || a.ft != b.ft ||
+      a.state_index != b.state_index || a.p != b.p || a.p_prev != b.p_prev ||
+      a.p_cross1 != b.p_cross1 || a.p_prev_cross1 != b.p_prev_cross1 ||
+      a.p_cross2 != b.p_cross2 || a.p_prev_cross2 != b.p_prev_cross2 ||
+      a.primary_w != b.primary_w || a.cross_w1 != b.cross_w1 || a.cross_w2 != b.cross_w2 ||
+      a.diagonal_sigma != b.diagonal_sigma || a.offdiagonal_sigma1 != b.offdiagonal_sigma1 ||
+      a.offdiagonal_sigma2 != b.offdiagonal_sigma2 ||
+      a.primary_stride != b.primary_stride || a.cross_stride1 != b.cross_stride1 ||
+      a.cross_stride2 != b.cross_stride2 || a.omega_0 != b.omega_0 || a.gamma != b.gamma ||
+      a.alpha != b.alpha || a.gyro_model != b.gyro_model || a.dt != b.dt ||
+      a.noise_amplitude != b.noise_amplitude ||
+      a.noise_algorithm_version != b.noise_algorithm_version)
+    return false;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (a.region.counts[axis] != b.region.counts[axis] ||
+        a.region.strides[axis] != b.region.strides[axis])
+      return false;
+    for (int cross = 0; cross < 3; ++cross)
+      if (a.gyro_tensor[axis][cross] != b.gyro_tensor[axis][cross]) return false;
+  }
+  return true;
+}
+
 size_t checked_product(size_t a, size_t b, const char *what) {
   if (a && b > std::numeric_limits<size_t>::max() / a) throw std::overflow_error(what);
   return a * b;
@@ -852,6 +1014,7 @@ private:
   static void hash_polarization(uint64_t &sig, const PolarizationUpdate &d) {
     mix(sig, uint64_t(d.kind));
     hash_region(sig, d.region);
+    mix(sig, uint64_t(d.ft));
     mix(sig, uint64_t(d.state_index));
     hash_id(sig, d.p);
     hash_id(sig, d.p_prev);
@@ -876,6 +1039,8 @@ private:
         mix_double(sig, d.gyro_tensor[i][j]);
     mix(sig, uint64_t(d.gyro_model));
     mix_double(sig, d.dt);
+    mix_double(sig, d.noise_amplitude);
+    mix(sig, uint64_t(d.noise_algorithm_version));
   }
   static void hash_polarization_subtraction(uint64_t &sig, const PolarizationSubtraction &d) {
     mix(sig, uint64_t(d.chunk));
@@ -1543,6 +1708,16 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
 }
 
 } // namespace
+
+void append_polarization_update_group(fields &f, StepPlan &plan, Operation &op,
+                                      const std::vector<PolarizationUpdate> &recurrences,
+                                      const std::vector<PolarizationUpdate> &noise_additions) {
+  append_polarization_update_group_impl(f, plan, op, recurrences, noise_additions);
+}
+
+bool operator==(const PolarizationUpdate &a, const PolarizationUpdate &b) {
+  return polarization_updates_equal(a, b);
+}
 
 bool operator==(const CwStateRow &a, const CwStateRow &b) {
   return a.chunk == b.chunk && a.traversal_component == b.traversal_component &&

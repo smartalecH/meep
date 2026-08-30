@@ -339,11 +339,12 @@ enum PolarizationVariant : uint32_t {
   polarization_drude = 1u << 2
 };
 
-enum class PolarizationUpdateKind : uint32_t { lorentzian = 0, gyrotropic = 1 };
+enum class PolarizationUpdateKind : uint32_t { lorentzian = 0, gyrotropic = 1, noisy_add = 2 };
 
 struct PolarizationUpdate {
   PolarizationUpdateKind kind;
   UpdateRegion region;
+  field_type ft;
   int state_index;
   ArrayId p;
   ArrayId p_prev;
@@ -366,7 +367,14 @@ struct PolarizationUpdate {
   double gyro_tensor[3][3];
   gyrotropy_model gyro_model;
   double dt;
+  double noise_amplitude;
+  uint32_t noise_algorithm_version;
 };
+
+bool operator==(const PolarizationUpdate &a, const PolarizationUpdate &b);
+inline bool operator!=(const PolarizationUpdate &a, const PolarizationUpdate &b) {
+  return !(a == b);
+}
 
 struct PolarizationSubtraction {
   int chunk;
@@ -663,6 +671,14 @@ struct StepPlan {
     signature = 0;
   }
 };
+
+/* Append one susceptibility's portable polarization actions as a single
+   contiguous group. Deterministic recurrence rows always precede every noise
+   row. PR6 supplies live descriptor rows; PR5 owns only this ordering and
+   access contract. */
+void append_polarization_update_group(fields &f, StepPlan &plan, Operation &op,
+                                      const std::vector<PolarizationUpdate> &recurrences,
+                                      const std::vector<PolarizationUpdate> &noise_additions);
 
 /* A direct transcription of the order in src/step.cpp. It omits empty work and
    NEVER reorders what remains. It is not a scheduler that infers Maxwell's
