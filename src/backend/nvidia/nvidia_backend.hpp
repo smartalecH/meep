@@ -178,6 +178,11 @@ public:
   void synchronize_magnetic_fields(Executable &executable, BackendState &state) override;
   void restore_magnetic_fields(Executable &executable, BackendState &state) override;
 
+  bool supports_host_custom_fallback() const override { return true; }
+  void preflight_host_custom_fallback(Executable &executable, BackendState &state) override;
+  void validate_host_custom_rebuild() override;
+  void validate_host_custom_plan(const StepPlan &plan, BackendState &state) override;
+
   bool supports_cw(const CwSolveRequest &request, std::string &why) const override;
   Executable *preflight_cw(const CwSolveRequest &request, const StepPlan &step_plan,
                            const CwPlan &cw_plan, Executable *cached,
@@ -207,7 +212,7 @@ private:
   NvidiaExecutable &checked_executable(Executable &executable,
                                        const NvidiaBackendState &state) const;
   void execute_host_segment(NvidiaExecutable &executable, NvidiaBackendState &state,
-                            size_t segment_index);
+                            size_t operation_index, size_t segment_index);
   void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
   fields &f_;
   execution_options options_;

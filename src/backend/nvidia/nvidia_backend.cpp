@@ -3574,6 +3574,51 @@ NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int se
 
 NvidiaBackend::~NvidiaBackend() {}
 
+void NvidiaBackend::validate_host_custom_rebuild() {
+  if (options_.precision != precision_policy_kind::native)
+    throw std::invalid_argument("NVIDIA host-custom fallback requires native precision");
+  if (f_.phasein_time > 0)
+    throw std::invalid_argument("NVIDIA host-custom fallback does not support material phasing");
+}
+
+void NvidiaBackend::validate_host_custom_plan(const StepPlan &plan, BackendState &raw_state) {
+  (void)checked_state(raw_state);
+  validate_host_custom_rebuild();
+  if (plan.program != StepProgram::ordinary || !has_plan_host_custom(plan))
+    throw std::invalid_argument("NVIDIA host-custom fallback requires an ordinary host-segment plan");
+}
+
+void NvidiaBackend::preflight_host_custom_fallback(Executable &raw_executable,
+                                                   BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  NvidiaExecutable &executable = checked_executable(raw_executable, state);
+  if (!state.initialized_ || state.transfer_failed_)
+    throw std::logic_error("NVIDIA host-custom fallback state is unavailable");
+  if (executable.program_ != StepProgram::ordinary ||
+      executable.storage_fingerprint_ != state.fingerprint_)
+    throw std::logic_error("NVIDIA host-custom fallback executable is stale");
+  if (!f_.step_plans[0] || f_.step_plans[0]->signature != executable.signature_ ||
+      compute_step_plan_signature(*f_.step_plans[0]) != executable.signature_)
+    throw std::logic_error("NVIDIA host-custom fallback plan signature is stale");
+
+  const StepPlan &plan = *f_.step_plans[0];
+  if (plan.host_segments.size() != executable.host_segments_.size() ||
+      plan.host_segments.empty())
+    throw std::logic_error("NVIDIA host-custom fallback segment schedule changed");
+  for (size_t si = 0; si < executable.host_segments_.size(); ++si) {
+    const NvidiaCompiledHostSegment &compiled = executable.host_segments_[si];
+    const HostSegment &segment = plan.host_segments[si];
+    if (compiled.segment != segment ||
+        size_t(segment.callback_index) + segment.callback_count > plan.host_callbacks.size() ||
+        compiled.callbacks.size() != segment.callback_count ||
+        state.staging_.size() < compiled.staging_bytes)
+      throw std::logic_error("NVIDIA host-custom fallback segment identity changed");
+    for (size_t ci = 0; ci < compiled.callbacks.size(); ++ci)
+      if (compiled.callbacks[ci] != plan.host_callbacks[size_t(segment.callback_index) + ci])
+        throw std::logic_error("NVIDIA host-custom fallback callback identity changed");
+  }
+}
+
 BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
   std::unique_ptr<NvidiaBackendState> state;
   std::string local_error;
@@ -6220,7 +6265,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         if (op.guard.kind == GuardKind::segment_boundary && !segment_guard) continue;
         switch (op.kind) {
           case OpKind::host_callback:
-            execute_host_segment(executable, state, op.host_segment_index);
+            execute_host_segment(executable, state, oi, op.host_segment_index);
             oi = checked_add(oi, executable.host_segments_[op.host_segment_index]
                                      .segment.operation_count,
                              "skipping NVIDIA host-segment operations");
@@ -6509,10 +6554,13 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
 
 void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
                                          NvidiaBackendState &state,
-                                         size_t segment_index) {
+                                         size_t operation_index, size_t segment_index) {
   if (segment_index >= executable.host_segments_.size())
     throw std::logic_error("NVIDIA host segment index is out of range");
+  if (operation_index > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("NVIDIA host segment operation index overflow");
   NvidiaCompiledHostSegment &segment = executable.host_segments_[segment_index];
+  HostCustomFallbackSession session(*this, uint32_t(operation_index), segment.segment);
   ++state.host_fallback_statistics_.segment_executions;
 
   /* Resolve pointer-free identities immediately before entering the host
@@ -6536,6 +6584,7 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
     state.arenas_->copy_to_host_async(staging + transfer.staging_offset,
                                       transfer.array.id.value, transfer.storage_offset,
                                       transfer.storage_bytes, *state.transfer_);
+    session.record_download(transfer.storage_bytes);
     ++state.host_fallback_statistics_.device_to_host_calls;
     state.host_fallback_statistics_.device_to_host_bytes += transfer.storage_bytes;
   }
@@ -6555,6 +6604,11 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
           nvidia::testing::failure_point::host_segment_after_download))
     throw std::runtime_error("injected NVIDIA host-segment post-download failure");
 
+  size_t callback_count = 0;
+  for (const HostCallbackDescriptor &callback : segment.callbacks)
+    if (segment.segment.phase != HostSegmentPhase::constitutive || callback.has_internal_state)
+      ++callback_count;
+  session.enter_callback(callback_count);
   f_.execute_step_plan(segment.host_plan, 0);
   if (nvidia::testing::consume_failure_for_testing(
           nvidia::testing::failure_point::host_segment_after_callback))
@@ -6570,12 +6624,14 @@ void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
     state.arenas_->copy_from_host_async(transfer.array.id.value, transfer.storage_offset,
                                         staging + transfer.staging_offset,
                                         transfer.storage_bytes, *state.transfer_);
+    session.record_upload(transfer.storage_bytes);
     ++state.host_fallback_statistics_.host_to_device_calls;
     state.host_fallback_statistics_.host_to_device_bytes += transfer.storage_bytes;
   }
   if (nvidia::testing::consume_failure_for_testing(
           nvidia::testing::failure_point::host_segment_after_upload))
     throw std::runtime_error("injected NVIDIA host-segment post-upload failure");
+  session.complete();
 }
 
 void NvidiaBackend::read(ArrayRef ref, void *host_buffer, size_t bytes) {

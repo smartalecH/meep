@@ -3233,6 +3233,16 @@ static void run_dispersion_case(const char *name, precision_policy_kind policy, 
                 precision_policy_name(policy));
 }
 
+static execution_options host_custom_nvidia_options(
+    precision_policy_kind policy = precision_policy_kind::native) {
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  return options;
+}
+
 static void run_host_custom_fallback_case(precision_policy_kind policy, bool magnetic) {
   const grid_volume gv = vol2d(2.4, 2.0, 8.0);
   const boundary_region boundary = magnetic ? no_pml() : pml(0.35, X);
@@ -3264,9 +3274,7 @@ static void run_host_custom_fallback_case(precision_policy_kind policy, bool mag
   }
 
   fields cpu(&cpu_structure);
-  execution_options options;
-  options.backend = backend_kind::nvidia;
-  options.precision = policy;
+  execution_options options = host_custom_nvidia_options(policy);
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -3403,8 +3411,7 @@ static void test_host_custom_postdispatch_poison() {
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
     inherited_lorentzian custom(0.73, 0.06);
     s.add_susceptibility(unit_value, E_stuff, custom);
-    execution_options options;
-    options.backend = backend_kind::nvidia;
+    execution_options options = host_custom_nvidia_options();
     fields f(&s, options);
     f.use_real_fields();
     f.require_component(Ez);
@@ -3429,8 +3436,7 @@ static void test_host_custom_compile_rejections() {
   structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   inherited_lorentzian custom(0.73, 0.06);
   s.add_susceptibility(unit_value, E_stuff, custom);
-  execution_options options;
-  options.backend = backend_kind::nvidia;
+  execution_options options = host_custom_nvidia_options();
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ez);
@@ -3509,8 +3515,7 @@ static void test_host_custom_complex_eh_composition() {
   gpu_structure.add_susceptibility(sigma, E_stuff, gpu_e);
   gpu_structure.add_susceptibility(sigma, H_stuff, gpu_h);
   fields cpu(&cpu_structure);
-  execution_options options;
-  options.backend = backend_kind::nvidia;
+  execution_options options = host_custom_nvidia_options();
   fields gpu(&gpu_structure, options);
   cpu.use_bloch(vec(0.13, 0.07));
   gpu.use_bloch(vec(0.13, 0.07));
@@ -3599,9 +3604,7 @@ static void test_host_custom_precision_rejection(precision_policy_kind policy) {
   structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   inherited_lorentzian custom(0.73, 0.06);
   s.add_susceptibility(unit_value, E_stuff, custom);
-  execution_options options;
-  options.backend = backend_kind::nvidia;
-  options.precision = policy;
+  execution_options options = host_custom_nvidia_options(policy);
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ez);
