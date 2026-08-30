@@ -152,7 +152,7 @@ static void test_changed_hash_invalidates_executable() {
   CHECK(f.prepared_classification_hash != 0, "classification did not publish a hash");
   clear_dirty(f, dirty_executable);
   ++f.prepared_classification_hash;
-  f.classify_and_finalize();
+  backend_classify_and_finalize(f);
   CHECK(is_dirty(f, dirty_executable),
         "a changed classification hash did not invalidate the executable");
 }
