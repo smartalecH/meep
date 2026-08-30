@@ -290,6 +290,7 @@ StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
 bool backend_try_refresh_legacy_flux(fields &f, const char *site);
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
+void backend_set_legacy_flux_descriptor_failure_for_testing(int rank, int flux_ordinal);
 
 /* Preserve resident-authoritative values and retire the old backend objects
    before a host-side field-layout mutation can delete or replace their
