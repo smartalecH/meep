@@ -65,6 +65,11 @@ void fields::advance(int n) {
 }
 
 void fields::ensure_backend_executable() {
+  /* A legacy flux add/remove keeps storage stable but changes collective
+     region recipes and both flux-marker access sets. Stage descriptors, both
+     plans, and the replacement executable as one resident transaction. */
+  if (backend_try_refresh_legacy_flux(*this, "fields::advance legacy flux refresh")) return;
+
   /* step_plan_for clears dirty_executable, so remember whether the compiled
      backend artifact was stale before asking it to rebuild the data plan. */
   const bool local_recompile = !executable || is_dirty(*this, dirty_executable);

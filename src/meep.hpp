@@ -1001,6 +1001,7 @@ struct BackendEpochSnapshot;
 class flux_vol;
 class source_descriptor_builder;
 class legacy_flux_descriptor_builder;
+void backend_publish_legacy_flux(fields &, const double *, size_t, const char *);
 
 // Time-dependence of a current source, intended to be overridden by
 // subclasses.  current() and dipole() are be related by
@@ -2489,6 +2490,7 @@ private:
   friend bool backend_try_synchronize_magnetic_fields(fields &, const char *);
   friend bool backend_try_restore_magnetic_fields(fields &, const char *);
   friend bool backend_try_solve_cw(fields &, const CwSolveRequest &, CwSolveResult &);
+  friend bool backend_try_refresh_legacy_flux(fields &, const char *);
   friend class PreparedBackendEpoch;
   friend struct BackendEpochSnapshot;
   int synchronized_magnetic_fields; // count number of nested synchs
@@ -2619,6 +2621,7 @@ public:
 
 private:
   friend class legacy_flux_descriptor_builder;
+  friend void backend_publish_legacy_flux(fields &, const double *, size_t, const char *);
   double flux_wrongE() { return f->flux_in_box_wrongH(d, where); }
   fields *f;
   direction d;
