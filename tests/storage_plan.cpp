@@ -30,6 +30,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
+#include <set>
+#include <typeinfo>
 #include <vector>
 
 #include <meep.hpp>
@@ -154,6 +157,193 @@ static void test_polarization_halo_remap() {
     polarization_refs += refs.size();
   }
   CHECK(or_to_all(polarization_refs > 0), "no polarization halo references were remapped");
+}
+
+static void test_noisy_lorentzian_storage(bool complex_fields) {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  noisy_lorentzian_susceptibility electric(0.02, 1.1, 0.05, false);
+  noisy_lorentzian_susceptibility magnetic_drude(0.03, 0.9, 0.07, true);
+  s.add_susceptibility(unit_sigma, E_stuff, electric);
+  s.add_susceptibility(unit_sigma, H_stuff, magnetic_drude);
+
+  fields f(&s);
+  if (complex_fields)
+    f.use_bloch(vec(0.07, -0.11));
+  else
+    f.use_real_fields();
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.13, 0.11));
+  f.add_point_source(Hz, source, vec(-0.17, 0.09));
+  set_random_seed(20260830UL);
+  f.advance(2);
+
+  size_t expected_internal_rows = 0;
+  size_t catalogued_internal_rows = 0;
+  size_t scratch_rows = 0;
+  size_t noisy_states = 0;
+  size_t owned_chunks = 0;
+  size_t pe_refs = 0, ph_refs = 0;
+  bool saw_e = false, saw_h = false, saw_cmp0 = false, saw_cmp1 = false;
+  std::set<uint32_t> noisy_ids;
+  std::set<const void *> noisy_addresses;
+
+  for (size_t id_value = 0; id_value < f.array_catalog->size(); ++id_value) {
+    const ArrayId id{uint32_t(id_value)};
+    const StorageKey &key = f.array_catalog->key(id);
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (key.kind == int(array_kind::polarization_internal)) ++catalogued_internal_rows;
+    if (spec.role == array_role::scratch) ++scratch_rows;
+  }
+
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
+    ++owned_chunks;
+    fields_chunk &fc = *f.chunks[chunk];
+    size_t chunk_e_states = 0, chunk_h_states = 0;
+    FOR_FIELD_TYPES(ft) {
+      int state_index = 0;
+      for (polarization_state *state = fc.pol[ft]; state; state = state->next, ++state_index) {
+        if (typeid(*state->s) != typeid(noisy_lorentzian_susceptibility)) continue;
+        ++noisy_states;
+        if (ft == E_stuff) {
+          ++chunk_e_states;
+          saw_e = true;
+        }
+        if (ft == H_stuff) {
+          ++chunk_h_states;
+          saw_h = true;
+        }
+        std::vector<InternalArrayLayout> layout;
+        CHECK(state->s->internal_layout(layout, fc.gv, state->data),
+              "noisy susceptibility did not publish its inherited Lorentz layout");
+        std::set<std::pair<int, int> > expected_pairs;
+        FOR_COMPONENTS(c) DOCMP2 {
+          if (state->s->needs_P(c, cmp, fc.f))
+            expected_pairs.insert(std::make_pair(int(c), cmp));
+        }
+        const size_t live_rows = 2 * expected_pairs.size();
+        CHECK(layout.size() == live_rows,
+              "noisy Lorentz layout has %zu rows, expected 2*needs_P = %zu", layout.size(),
+              live_rows);
+        expected_internal_rows += live_rows;
+        realnum *base = static_cast<realnum *>(state->data);
+        std::map<std::pair<int, int>, std::vector<ArrayId> > pairs;
+        std::set<std::pair<int, int> > actual_pairs;
+        for (size_t li = 0; li < layout.size(); ++li) {
+          const InternalArrayLayout &entry = layout[li];
+          const int aux = state_index * 1024 + int(li);
+          const ArrayId id = f.array_catalog->find(
+              StorageKey{chunk, int(array_kind::polarization_internal), int(entry.c), entry.cmp,
+                         aux});
+          CHECK(is_valid(id), "noisy internal row %zu has no canonical ArrayId", li);
+          if (!is_valid(id)) continue;
+          const ArraySpec &spec = f.array_catalog->spec(id);
+          CHECK(spec.role == array_role::polarization,
+                "noisy internal row %zu has non-polarization role", li);
+          CHECK(spec.element_type == ElementType::realnum_value && spec.elements == entry.elements,
+                "noisy internal row %zu has incompatible type/extent", li);
+          CHECK(entry.elements == size_t(fc.gv.ntot()),
+                "noisy internal row %zu has %zu elements, expected chunk ntot %zu", li,
+                entry.elements, size_t(fc.gv.ntot()));
+          CHECK(!is_valid(spec.alias_of), "noisy internal row %zu unexpectedly aliases", li);
+          realnum *const address = f.array_catalog->resolve<realnum>(id);
+          CHECK(address == base + entry.offset_elements,
+                "noisy internal row %zu resolves to the wrong address", li);
+          CHECK(noisy_ids.insert(id.value).second,
+                "noisy internal ArrayId %u is reused by another row", unsigned(id.value));
+          CHECK(noisy_addresses.insert(address).second,
+                "noisy internal address is reused by another row");
+          CHECK(!strcmp(entry.name, (li & 1) ? "P_prev" : "P"),
+                "noisy internal row %zu has unexpected name %s", li, entry.name);
+          const std::pair<int, int> pair_key = std::make_pair(int(entry.c), entry.cmp);
+          pairs[pair_key].push_back(id);
+          actual_pairs.insert(pair_key);
+        }
+        CHECK(actual_pairs == expected_pairs,
+              "noisy layout component/cmp key set differs from live needs_P set");
+        for (const auto &pair : pairs) {
+          saw_cmp0 = saw_cmp0 || pair.first.second == 0;
+          saw_cmp1 = saw_cmp1 || pair.first.second == 1;
+          CHECK(pair.second.size() == 2,
+                "noisy component/cmp has %zu internal rows instead of P/P_prev",
+                pair.second.size());
+          if (pair.second.size() == 2)
+            CHECK(f.array_catalog->resolve_untyped(pair.second[0]) !=
+                      f.array_catalog->resolve_untyped(pair.second[1]),
+                  "noisy P and P_prev arrays alias");
+        }
+      }
+    }
+    CHECK(chunk_e_states == 1 && chunk_h_states == 1,
+          "owned chunk %d has %zu noisy E and %zu noisy H states, expected one each", chunk,
+          chunk_e_states, chunk_h_states);
+  }
+
+  for (const HaloPlan &source_plan : f.halos->plans) {
+    if (source_plan.ft != PE_stuff && source_plan.ft != PH_stuff) continue;
+    HaloPlan canonical;
+    std::string why;
+    CHECK(remap_halo_plan(source_plan, f.halos->arrays, *f.array_catalog, f.is_real ? 1 : 2,
+                          canonical, why),
+          "noisy polarization halo did not remap: %s", why.c_str());
+    std::vector<ElementRef> source_refs, canonical_refs;
+    expand_gather(source_plan, source_refs);
+    expand_gather(canonical, canonical_refs);
+    CHECK(source_refs.size() == canonical_refs.size(),
+          "noisy polarization gather changed size during canonical remap");
+    for (size_t j = 0; j < source_refs.size() && j < canonical_refs.size(); ++j) {
+      const ElementRef &from = source_refs[j], &to = canonical_refs[j];
+      const bool valid_id = to.array.value < f.array_catalog->size();
+      CHECK(valid_id, "noisy polarization gather has an invalid canonical ArrayId");
+      if (!valid_id) continue;
+      CHECK(f.halos->arrays.base(from.array) + from.index ==
+                f.array_catalog->resolve<realnum>(to.array) + to.index,
+            "noisy polarization gather address differs after canonical remap");
+      CHECK(f.array_catalog->key(to.array).kind == int(array_kind::polarization_internal),
+            "noisy polarization gather references a non-polarization array");
+    }
+    const size_t gather_refs = canonical_refs.size();
+    expand_scatter(source_plan, source_refs);
+    expand_scatter(canonical, canonical_refs);
+    CHECK(source_refs.size() == canonical_refs.size(),
+          "noisy polarization scatter changed size during canonical remap");
+    for (size_t j = 0; j < source_refs.size() && j < canonical_refs.size(); ++j) {
+      const ElementRef &from = source_refs[j], &to = canonical_refs[j];
+      const bool valid_id = to.array.value < f.array_catalog->size();
+      CHECK(valid_id, "noisy polarization scatter has an invalid canonical ArrayId");
+      if (!valid_id) continue;
+      CHECK(f.halos->arrays.base(from.array) + from.index ==
+                f.array_catalog->resolve<realnum>(to.array) + to.index,
+            "noisy polarization scatter address differs after canonical remap");
+      CHECK(f.array_catalog->key(to.array).kind == int(array_kind::polarization_internal),
+            "noisy polarization scatter references a non-polarization array");
+    }
+    const size_t total_refs = gather_refs + canonical_refs.size();
+    if (source_plan.ft == PE_stuff)
+      pe_refs += total_refs;
+    else
+      ph_refs += total_refs;
+  }
+
+  CHECK(catalogued_internal_rows == expected_internal_rows,
+        "noisy fixture catalogued %zu polarization rows, expected exactly %zu",
+        catalogued_internal_rows, expected_internal_rows);
+  CHECK(scratch_rows == 0,
+        "noisy Lorentz storage introduced %zu scratch/RNG rows", scratch_rows);
+  CHECK(noisy_states == 2 * owned_chunks,
+        "owned chunks contain %zu noisy states, expected %zu", noisy_states, 2 * owned_chunks);
+  const bool global_saw_e = or_to_all(saw_e);
+  const bool global_saw_h = or_to_all(saw_h);
+  const bool global_saw_cmp0 = or_to_all(saw_cmp0);
+  const bool global_saw_cmp1 = or_to_all(saw_cmp1);
+  CHECK(global_saw_e && global_saw_h,
+        "noisy fixture did not instantiate both electric Lorentz and magnetic Drude states");
+  CHECK(global_saw_cmp0, "no noisy cmp0 polarization row was catalogued");
+  CHECK(global_saw_cmp1 == complex_fields,
+        "noisy cmp1 coverage does not match real/complex fixture mode");
+  CHECK(or_to_all(pe_refs > 0), "no noisy electric polarization halo was remapped");
+  CHECK(or_to_all(ph_refs > 0), "no noisy magnetic polarization halo was remapped");
 }
 
 /* ------------------------------------------------------------------ */
@@ -496,6 +686,8 @@ int main(int argc, char **argv) {
   test_mid_run_source();
   test_mid_run_susceptibility();
   test_polarization_halo_remap();
+  test_noisy_lorentzian_storage(false);
+  test_noisy_lorentzian_storage(true);
   test_material_phase_storage_union();
   test_material_coefficient_storage();
 
