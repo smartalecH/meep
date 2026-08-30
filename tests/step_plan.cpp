@@ -33,10 +33,12 @@
 #include <algorithm>
 #include <exception>
 #include <limits>
+#include <map>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include <meep.hpp>
@@ -67,6 +69,19 @@ static int failures = 0;
 
 static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+
+class multitile_anisotropic_material : public material_function {
+public:
+  void eff_chi1inv_row(component c, double row[3], const volume &, double, int) override {
+    row[0] = row[1] = row[2] = 0.0;
+    const int d = component_index(c);
+    row[d] = 0.5 + 0.05 * d;
+    static const double offdiagonal[3][3] = {
+        {0.0, 0.03, -0.02}, {0.03, 0.0, 0.04}, {-0.02, 0.04, 0.0}};
+    for (int other = 0; other < 3; ++other)
+      if (other != d) row[other] = offdiagonal[d][other];
+  }
+};
 static double magnetic_conductivity(const vec &) { return 0.07; }
 
 static void compare(const char *name, const std::vector<std::string> &got, const char *const *want,
@@ -1403,6 +1418,7 @@ static void test_polarization_schema_signature() {
   subtraction.c = Ez;
   subtraction.cmp = 1;
   subtraction.state_index = 4;
+  subtraction.transition_index = 3;
   subtraction.target = ArrayId{7};
   subtraction.p = update.p;
   subtraction.elements = 101;
@@ -1416,7 +1432,9 @@ static void test_polarization_schema_signature() {
             plan.operations[0].cylindrical_m_descriptor_index == 0 &&
             plan.operations[0].cylindrical_m_descriptor_count == 0 &&
             plan.operations[0].cylindrical_origin_action_index == 0 &&
-            plan.operations[0].cylindrical_origin_action_count == 0,
+            plan.operations[0].cylindrical_origin_action_count == 0 &&
+            plan.operations[0].polarization_group_index == 0 &&
+            plan.operations[0].polarization_group_count == 0,
         "new operation spans are not zero-initialized");
 
 #define CHECK_SIGNATURE_FIELD(expr, message)                                                       \
@@ -1427,6 +1445,8 @@ static void test_polarization_schema_signature() {
   } while (0)
   CHECK_SIGNATURE_FIELD(++changed.operations[0].polarization_subtraction_count,
                         "signature ignored polarization subtraction span");
+  CHECK_SIGNATURE_FIELD(++changed.operations[0].polarization_group_count,
+                        "signature ignored polarization group span");
   CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].region.begin.set_direction(
                             X, changed.polarization_updates[0].region.begin.in_direction(X) + 2),
                         "signature ignored polarization region begin");
@@ -1456,6 +1476,8 @@ static void test_polarization_schema_signature() {
                         "signature ignored noise algorithm version");
   CHECK_SIGNATURE_FIELD(++changed.polarization_subtractions[0].elements,
                         "signature ignored polarization subtraction size");
+  CHECK_SIGNATURE_FIELD(++changed.polarization_subtractions[0].transition_index,
+                        "signature ignored polarization subtraction transition");
 #undef CHECK_SIGNATURE_FIELD
 
   const PolarizationUpdate copy = update;
@@ -1471,10 +1493,18 @@ static void test_polarization_schema_signature() {
   CHECK(changed_update != update, "noise algorithm version did not affect equality");
 
   plan.clear();
-  CHECK(plan.polarization_updates.empty() && plan.polarization_subtractions.empty(),
+  CHECK(plan.polarization_groups.empty() && plan.polarization_updates.empty() &&
+            plan.polarization_subtractions.empty() &&
+            plan.multilevel_population_updates.empty() &&
+            plan.multilevel_population_terms.empty() &&
+            plan.multilevel_transition_updates.empty() && plan.multilevel_coefficients.empty(),
         "StepPlan::clear retained polarization state");
   plan.clear();
-  CHECK(plan.polarization_updates.empty() && plan.polarization_subtractions.empty(),
+  CHECK(plan.polarization_groups.empty() && plan.polarization_updates.empty() &&
+            plan.polarization_subtractions.empty() &&
+            plan.multilevel_population_updates.empty() &&
+            plan.multilevel_population_terms.empty() &&
+            plan.multilevel_transition_updates.empty() && plan.multilevel_coefficients.empty(),
         "StepPlan::clear is not idempotent for polarization state");
 }
 
@@ -1565,7 +1595,9 @@ static void test_noisy_polarization_group_schedule() {
     op.descriptor_count = 0;
     append_polarization_update_group(f, plan, op, std::vector<PolarizationUpdate>(),
                                      std::vector<PolarizationUpdate>());
-    CHECK(plan.polarization_updates.empty() && op.descriptor_count == 0 && op.accesses.empty(),
+    CHECK(plan.polarization_groups.empty() && plan.polarization_updates.empty() &&
+              op.descriptor_count == 0 && op.polarization_group_count == 0 &&
+              op.accesses.empty(),
           "empty polarization group changed the plan");
 
     const PolarizationUpdate a0 = recurrence(0, Ex, 0, 0);
@@ -1591,6 +1623,15 @@ static void test_noisy_polarization_group_schedule() {
 
     CHECK(op.descriptor_index == 0 && op.descriptor_count == plan.polarization_updates.size(),
           "noisy polarization operation span does not cover every grouped action");
+    CHECK(op.polarization_group_index == 0 &&
+              op.polarization_group_count == plan.polarization_groups.size() &&
+              plan.polarization_groups.size() == 3,
+          "noisy polarization operation does not span three susceptibility groups");
+    const int expected_group_states[] = {0, 1, 2};
+    for (size_t i = 0; i < plan.polarization_groups.size(); ++i)
+      CHECK(plan.polarization_groups[i].kind == PolarizationGroupKind::recurrence &&
+                plan.polarization_groups[i].state_index == expected_group_states[i],
+            "noisy polarization group schedule differs at state %zu", i);
     CHECK(plan.polarization_updates.size() == 8,
           "noisy polarization schedule has %zu actions, expected 8",
           plan.polarization_updates.size());
@@ -1752,12 +1793,1263 @@ static void test_noisy_polarization_group_schedule() {
       append_polarization_update_group(f, plan, op, a_recurrences, a_noise);
     }
     catch (const std::invalid_argument &) { rejected = true; }
-    CHECK(rejected && plan.polarization_updates.size() == before_reappearance,
+    CHECK(rejected && plan.polarization_updates.size() == before_reappearance &&
+              plan.polarization_groups.size() == 3,
           "noncontiguous repeated polarization identity was accepted");
   }
   CHECK(exercised || !owns_chunk,
         "an owning rank lacked enough catalog rows for noisy schedule coverage");
   CHECK(or_to_all(exercised), "no rank had enough catalog rows for noisy schedule coverage");
+}
+
+static void test_multilevel_polarization_group_schedule() {
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  fields f(&s);
+  FOR_COMPONENTS(c)
+  if (gv.has_field(c)) f.require_component(c);
+  gaussian_src_time source(0.2, 0.1);
+  f.add_point_source(Ez, source, vec(0.0, 0.0));
+  f.advance(1);
+
+  bool owns_chunk = false;
+  int owned_chunk = -1;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine()) {
+      owns_chunk = true;
+      if (owned_chunk < 0) owned_chunk = chunk;
+    }
+  /* This is a synthetic schema test, so provision enough distinct local
+     catalog rows instead of depending on how the physical field arrays are
+     distributed across MPI owners.  The backing storage remains live for the
+     duration of every append/resolve check below. */
+  std::vector<realnum> synthetic_storage(27 * 64);
+  if (owns_chunk && f.array_catalog) {
+    size_t unaliased = 0;
+    for (size_t i = 0; i < f.array_catalog->size(); ++i)
+      if (!is_valid(f.array_catalog->spec(ArrayId{uint32_t(i)}).alias_of)) ++unaliased;
+    size_t synthetic = 0;
+    while (unaliased < 27) {
+      const StorageKey key{owned_chunk, int(array_kind::dft), -1, -1,
+                           UINT64_C(0xf000000000000000) + synthetic};
+      ++synthetic;
+      if (f.array_catalog->contains(key)) continue;
+      f.array_catalog->register_array(key, synthetic_storage.data() + 64 * (synthetic - 1), 64,
+                                      array_role::polarization, ElementType::realnum_value);
+      ++unaliased;
+    }
+  }
+  std::vector<ArrayId> ids;
+  if (f.array_catalog)
+    for (size_t i = 0; i < f.array_catalog->size() && ids.size() < 27; ++i)
+      if (!is_valid(f.array_catalog->spec(ArrayId{uint32_t(i)}).alias_of))
+        ids.push_back(ArrayId{uint32_t(i)});
+
+  bool exercised = false;
+  if (ids.size() >= 27) {
+    exercised = true;
+    const ArraySpec &alias_target_spec = f.array_catalog->spec(ids[0]);
+    const StorageKey alias_key{owned_chunk, int(array_kind::dft), -1, -1,
+                               UINT64_C(0xefffffffffffffff)};
+    const ArrayId alias_of_first = f.array_catalog->register_array(
+        alias_key, f.array_catalog->resolve_untyped(ids[0]), alias_target_spec.elements,
+        alias_target_spec.role, alias_target_spec.element_type);
+    f.array_catalog->set_alias(alias_of_first, ids[0]);
+    auto region = [&](component c, int cmp) {
+      UpdateRegion r = {};
+      r.chunk = owned_chunk;
+      r.c = c;
+      r.cmp = cmp;
+      r.begin = ivec(0, 0, 0);
+      r.end = ivec(2, 2, 0);
+      r.base = 0;
+      r.counts[0] = r.counts[1] = 2;
+      r.counts[2] = 1;
+      r.strides[0] = 1;
+      r.strides[1] = 4;
+      r.strides[2] = 0;
+      r.variant_key = 0;
+      return r;
+    };
+    auto recurrence = [&](int state, component c, size_t base) {
+      PolarizationUpdate update = {};
+      update.kind = PolarizationUpdateKind::lorentzian;
+      update.region = region(c, 0);
+      update.ft = E_stuff;
+      update.state_index = state;
+      update.p = ids[base];
+      update.p_prev = ids[base + 1];
+      update.p_cross1 = update.p_prev_cross1 = invalid_array();
+      update.p_cross2 = update.p_prev_cross2 = invalid_array();
+      update.primary_w = ids[2];
+      update.cross_w1 = update.cross_w2 = invalid_array();
+      update.diagonal_sigma = ids[6];
+      update.offdiagonal_sigma1 = update.offdiagonal_sigma2 = invalid_array();
+      update.omega_0 = 0.31;
+      update.gamma = 0.07;
+      update.gyro_model = GYROTROPIC_LORENTZIAN;
+      update.dt = 0.0125;
+      return update;
+    };
+
+    MultilevelPopulationUpdate population = {};
+    population.region = region(Centered, -1);
+    population.ft = E_stuff;
+    population.state_index = 1;
+    population.levels = 3;
+    population.transitions = 2;
+    population.active_component_cmps = 2;
+    population.gamma_inv = ids[0];
+    population.populations = ids[1];
+    population.scratch_elements_per_point = 3;
+    population.dt = 0.0125;
+
+    std::vector<MultilevelPopulationTerm> terms;
+    std::vector<MultilevelTransitionUpdate> transitions;
+    const component components[] = {Ex, Ey};
+    size_t state_id = 8;
+    for (int t = 0; t < 2; ++t)
+      for (int ci = 0; ci < 2; ++ci) {
+        MultilevelPopulationTerm term = {};
+        term.transition_index = t;
+        term.c = components[ci];
+        term.cmp = 0;
+        term.w = ids[2 + 2 * ci];
+        term.w_prev = ids[3 + 2 * ci];
+        term.p = ids[state_id++];
+        term.p_prev = ids[state_id++];
+        term.centered_offsets[0] = 1 + ci;
+        term.centered_offsets[1] = 5 + ci;
+        terms.push_back(term);
+
+        MultilevelTransitionUpdate transition = {};
+        transition.region = region(term.c, term.cmp);
+        transition.ft = E_stuff;
+        transition.state_index = 1;
+        transition.transition_index = t;
+        transition.p = term.p;
+        transition.p_prev = term.p_prev;
+        transition.w = term.w;
+        transition.diagonal_sigma = ids[6 + ci];
+        transition.populations = population.populations;
+        transition.population_offsets[0] = -term.centered_offsets[0];
+        transition.population_offsets[1] = -term.centered_offsets[1];
+        transition.population_stride = 3;
+        transition.positive_level = t == 0 ? 1 : 2;
+        transition.negative_level = t == 0 ? 2 : 1;
+        transition.omega = 0.4 + 0.1 * t;
+        transition.gamma = 0.03 + 0.01 * t;
+        for (int coefficient = 0; coefficient < 5; ++coefficient)
+          transition.sigmat[coefficient] = 1.0 + 0.125 * coefficient + t;
+        transition.dt = population.dt;
+        transitions.push_back(transition);
+      }
+    const std::vector<double> gamma_matrix{0.01, 0.02, 0.03, 0.04, 0.05,
+                                            0.06, 0.07, 0.08, 0.09};
+    /* level-major; both transitions have duplicate signs, so the expected
+       positive/negative indices pin the CPU's last-sign-wins scan. */
+    const std::vector<double> alpha{-0.2, 0.3, 0.4, -0.5, -0.6, 0.7};
+
+    StepPlan plan;
+    Operation op = {};
+    op.kind = OpKind::update_polarization;
+    op.ft = E_stuff;
+    op.guard = guard_always();
+    const PolarizationUpdate before = recurrence(0, Ex, 16);
+    PolarizationUpdate before_noise = {};
+    before_noise.kind = PolarizationUpdateKind::noisy_add;
+    before_noise.region = before.region;
+    before_noise.ft = before.ft;
+    before_noise.state_index = before.state_index;
+    before_noise.p = before.p;
+    before_noise.p_prev = before_noise.p_cross1 = before_noise.p_prev_cross1 = invalid_array();
+    before_noise.p_cross2 = before_noise.p_prev_cross2 = invalid_array();
+    before_noise.primary_w = before_noise.cross_w1 = before_noise.cross_w2 = invalid_array();
+    before_noise.diagonal_sigma = before.diagonal_sigma;
+    before_noise.offdiagonal_sigma1 = before_noise.offdiagonal_sigma2 = invalid_array();
+    before_noise.omega_0 = before.omega_0;
+    before_noise.gamma = before.gamma;
+    before_noise.gyro_model = GYROTROPIC_LORENTZIAN;
+    before_noise.dt = before.dt;
+    before_noise.noise_amplitude = 0.125;
+    before_noise.noise_algorithm_version = counter_random_algorithm_version;
+    append_polarization_update_group(f, plan, op, std::vector<PolarizationUpdate>{before},
+                                     std::vector<PolarizationUpdate>{before_noise});
+    append_multilevel_update_group(f, plan, op, population, terms, transitions, gamma_matrix,
+                                   alpha);
+    const PolarizationUpdate after = recurrence(2, Ey, 18);
+    append_polarization_update_group(f, plan, op, std::vector<PolarizationUpdate>{after},
+                                     std::vector<PolarizationUpdate>());
+
+    Operation hop = {};
+    hop.kind = OpKind::update_polarization;
+    hop.ft = H_stuff;
+    hop.guard = guard_always();
+    hop.descriptor_index = uint32_t(plan.polarization_updates.size());
+    hop.polarization_group_index = uint32_t(plan.polarization_groups.size());
+    MultilevelPopulationUpdate h_population = {};
+    h_population.region = region(Centered, -1);
+    h_population.ft = H_stuff;
+    h_population.state_index = 0;
+    h_population.levels = 2;
+    h_population.transitions = 1;
+    h_population.active_component_cmps = 1;
+    h_population.gamma_inv = ids[20];
+    h_population.populations = ids[21];
+    h_population.scratch_elements_per_point = 2;
+    h_population.dt = 0.0125;
+    MultilevelPopulationTerm h_term = {};
+    h_term.transition_index = 0;
+    h_term.c = Hx;
+    h_term.cmp = 0;
+    h_term.w = ids[22];
+    h_term.w_prev = ids[23];
+    h_term.p = ids[24];
+    h_term.p_prev = ids[25];
+    h_term.centered_offsets[0] = 2;
+    h_term.centered_offsets[1] = 6;
+    MultilevelTransitionUpdate h_transition = {};
+    h_transition.region = region(Hx, 0);
+    h_transition.ft = H_stuff;
+    h_transition.state_index = 0;
+    h_transition.transition_index = 0;
+    h_transition.p = h_term.p;
+    h_transition.p_prev = h_term.p_prev;
+    h_transition.w = h_term.w;
+    h_transition.diagonal_sigma = ids[26];
+    h_transition.populations = h_population.populations;
+    h_transition.population_offsets[0] = -h_term.centered_offsets[0];
+    h_transition.population_offsets[1] = -h_term.centered_offsets[1];
+    h_transition.population_stride = 2;
+    h_transition.positive_level = 1;
+    h_transition.negative_level = 0;
+    h_transition.omega = 0.71;
+    h_transition.gamma = 0.09;
+    for (int coefficient = 0; coefficient < 5; ++coefficient)
+      h_transition.sigmat[coefficient] = 2.0 + 0.25 * coefficient;
+    h_transition.dt = h_population.dt;
+    append_multilevel_update_group(f, plan, hop, h_population,
+                                   std::vector<MultilevelPopulationTerm>{h_term},
+                                   std::vector<MultilevelTransitionUpdate>{h_transition},
+                                   std::vector<double>{0.02, 0.0, 0.0, 0.03},
+                                   std::vector<double>{-0.4, 0.5});
+
+    CHECK(plan.polarization_groups.size() == 4 && op.polarization_group_index == 0 &&
+              op.polarization_group_count == 3,
+          "electric polarization operation does not contain exactly three ordered groups");
+    CHECK(hop.polarization_group_index == 3 && hop.polarization_group_count == 1,
+          "magnetic polarization operation does not contain exactly one group");
+    const PolarizationGroupKind expected_kinds[] = {
+        PolarizationGroupKind::recurrence, PolarizationGroupKind::multilevel,
+        PolarizationGroupKind::recurrence, PolarizationGroupKind::multilevel};
+    const int expected_states[] = {0, 1, 2, 0};
+    const field_type expected_families[] = {E_stuff, E_stuff, E_stuff, H_stuff};
+    for (size_t i = 0; i < plan.polarization_groups.size(); ++i)
+      CHECK(plan.polarization_groups[i].kind == expected_kinds[i] &&
+                plan.polarization_groups[i].state_index == expected_states[i] &&
+                plan.polarization_groups[i].ft == expected_families[i],
+            "mixed polarization group order differs at %zu", i);
+    CHECK(plan.polarization_groups[0].recurrence_count == 1 &&
+              plan.polarization_groups[0].noise_count == 1,
+          "noisy group before the multilevel state lost recurrence/noise ordering");
+    CHECK(plan.multilevel_population_updates.size() == 2 &&
+              plan.multilevel_population_terms.size() == terms.size() + 1 &&
+              plan.multilevel_transition_updates.size() == transitions.size() + 1 &&
+              plan.multilevel_coefficients.size() == gamma_matrix.size() + alpha.size() + 6,
+          "multilevel group did not publish its exact action spans");
+    for (size_t i = 0; i < terms.size(); ++i) {
+      CHECK(plan.multilevel_population_terms[i] == terms[i],
+            "electric multilevel population term differs at %zu", i);
+      CHECK(plan.multilevel_transition_updates[i] == transitions[i],
+            "electric multilevel transition differs at %zu", i);
+    }
+    CHECK(plan.multilevel_population_terms.back() == h_term &&
+              plan.multilevel_transition_updates.back() == h_transition,
+          "nonempty L2/T1 magnetic schema differs from its source rows");
+    const MultilevelPopulationUpdate &published = plan.multilevel_population_updates[0];
+    CHECK(published.gamma_index == 0 && published.gamma_count == gamma_matrix.size() &&
+              published.alpha_index == gamma_matrix.size() &&
+              published.alpha_count == alpha.size() && published.term_index == 0 &&
+              published.term_count == terms.size(),
+          "multilevel coefficient/term spans are incorrect");
+    const MultilevelPopulationUpdate &published_h = plan.multilevel_population_updates[1];
+    CHECK(published_h.gamma_index == gamma_matrix.size() + alpha.size() &&
+              published_h.gamma_count == 4 && published_h.alpha_index ==
+                                                     gamma_matrix.size() + alpha.size() + 4 &&
+              published_h.alpha_count == 2 && published_h.term_index == terms.size() &&
+              published_h.term_count == 1,
+          "nonempty L2/T1 coefficient/term spans are incorrect");
+    for (size_t i = 0; i < gamma_matrix.size(); ++i)
+      CHECK(plan.multilevel_coefficients[i] == gamma_matrix[i],
+            "multilevel Gamma coefficient order differs at %zu", i);
+    for (size_t i = 0; i < alpha.size(); ++i)
+      CHECK(plan.multilevel_coefficients[gamma_matrix.size() + i] == alpha[i],
+            "multilevel alpha coefficient order differs at %zu", i);
+
+    std::vector<BufferAccess> expected_accesses;
+    auto expect_access = [&](ArrayId id, AccessMode mode) {
+      merge_expected_access(expected_accesses,
+                            BufferAccess{ArrayRef{id, 0, f.array_catalog->spec(id).elements}, mode});
+    };
+    for (const PolarizationUpdate *ordinary : {&before, &after}) {
+      expect_access(ordinary->p, AccessMode::read_write);
+      expect_access(ordinary->p_prev, AccessMode::read_write);
+      expect_access(ordinary->primary_w, AccessMode::read);
+      expect_access(ordinary->diagonal_sigma, AccessMode::read);
+    }
+    expect_access(population.gamma_inv, AccessMode::read);
+    expect_access(population.populations, AccessMode::read_write);
+    for (size_t i = 0; i < terms.size(); ++i) {
+      expect_access(terms[i].w, AccessMode::read);
+      expect_access(terms[i].w_prev, AccessMode::read);
+      expect_access(terms[i].p, AccessMode::read_write);
+      expect_access(terms[i].p_prev, AccessMode::read_write);
+      expect_access(transitions[i].diagonal_sigma, AccessMode::read);
+    }
+    CHECK(op.accesses.size() == expected_accesses.size(),
+          "multilevel operation has %zu accesses, expected exact union of %zu",
+          op.accesses.size(), expected_accesses.size());
+    for (const BufferAccess &want : expected_accesses) {
+      const BufferAccess *got = find_access(op, want.array.id);
+      CHECK(got && same_access(*got, want),
+            "multilevel operation has an incorrect access for ArrayId %u", want.array.id.value);
+    }
+    std::vector<BufferAccess> expected_h_accesses;
+    auto expect_h_access = [&](ArrayId id, AccessMode mode) {
+      merge_expected_access(expected_h_accesses,
+                            BufferAccess{ArrayRef{id, 0, f.array_catalog->spec(id).elements}, mode});
+    };
+    expect_h_access(h_population.gamma_inv, AccessMode::read);
+    expect_h_access(h_population.populations, AccessMode::read_write);
+    expect_h_access(h_term.w, AccessMode::read);
+    expect_h_access(h_term.w_prev, AccessMode::read);
+    expect_h_access(h_term.p, AccessMode::read_write);
+    expect_h_access(h_term.p_prev, AccessMode::read_write);
+    expect_h_access(h_transition.diagonal_sigma, AccessMode::read);
+    CHECK(hop.accesses.size() == expected_h_accesses.size(),
+          "L2/T1 magnetic operation has %zu accesses instead of exact union of %zu",
+          hop.accesses.size(), expected_h_accesses.size());
+    for (const BufferAccess &want : expected_h_accesses) {
+      const BufferAccess *got = find_access(hop, want.array.id);
+      CHECK(got && same_access(*got, want),
+            "L2/T1 magnetic operation has an incorrect access for ArrayId %u",
+            want.array.id.value);
+    }
+    const BufferAccess *h_gamma_access = find_access(hop, h_population.gamma_inv);
+    const BufferAccess *h_population_access = find_access(hop, h_population.populations);
+    CHECK(h_gamma_access && h_gamma_access->mode == AccessMode::read && h_population_access &&
+              h_population_access->mode == AccessMode::read_write,
+          "L2/T1 magnetic scalar accesses are incorrect");
+
+    for (const MultilevelPopulationTerm &term : terms) {
+      PolarizationSubtraction subtraction = {};
+      subtraction.chunk = owned_chunk;
+      subtraction.c = term.c;
+      subtraction.cmp = term.cmp;
+      subtraction.state_index = 1;
+      subtraction.transition_index = term.transition_index;
+      subtraction.target = term.w;
+      subtraction.p = term.p;
+      subtraction.elements = 17;
+      plan.polarization_subtractions.push_back(subtraction);
+    }
+    op.polarization_subtraction_index = 0;
+    op.polarization_subtraction_count = uint32_t(terms.size());
+    PolarizationSubtraction h_subtraction = {};
+    h_subtraction.chunk = owned_chunk;
+    h_subtraction.c = h_term.c;
+    h_subtraction.cmp = h_term.cmp;
+    h_subtraction.state_index = h_population.state_index;
+    h_subtraction.transition_index = h_term.transition_index;
+    h_subtraction.target = h_term.w;
+    h_subtraction.p = h_term.p;
+    h_subtraction.elements = 19;
+    hop.polarization_subtraction_index = uint32_t(plan.polarization_subtractions.size());
+    plan.polarization_subtractions.push_back(h_subtraction);
+    hop.polarization_subtraction_count = 1;
+    CHECK(plan.polarization_subtractions.size() == terms.size() + 1,
+          "multilevel subtraction schedule has the wrong row count");
+    for (size_t i = 0; i < terms.size(); ++i)
+      CHECK(plan.polarization_subtractions[i].transition_index == terms[i].transition_index &&
+                plan.polarization_subtractions[i].c == terms[i].c &&
+                plan.polarization_subtractions[i].cmp == terms[i].cmp,
+            "multilevel subtraction order differs from transition-major term %zu", i);
+    CHECK(plan.polarization_subtractions.back() == h_subtraction,
+          "L2/T1 magnetic subtraction row differs from its transition");
+    plan.operations.push_back(op);
+    plan.operations.push_back(hop);
+    CHECK(plan.operations.size() == 2 && plan.operations[0].ft == E_stuff &&
+              plan.operations[1].ft == H_stuff,
+          "multilevel schedule did not retain exactly one operation per field family");
+    plan.signature = compute_step_plan_signature(plan);
+    const uint64_t signature = plan.signature;
+
+#define CHECK_MULTILEVEL_SIGNATURE(expr, message)                                                  \
+  do {                                                                                             \
+    StepPlan changed = plan;                                                                       \
+    expr;                                                                                          \
+    CHECK(compute_step_plan_signature(changed) != signature, message);                             \
+  } while (0)
+    CHECK_MULTILEVEL_SIGNATURE(++changed.operations[0].polarization_group_count,
+                               "signature ignored multilevel group operation span");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.operations[0].polarization_group_index,
+                               "signature ignored multilevel group operation index");
+    CHECK_MULTILEVEL_SIGNATURE(
+        changed.polarization_groups[1].kind = PolarizationGroupKind::recurrence,
+        "signature ignored multilevel group kind");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].chunk,
+                               "signature ignored multilevel group chunk");
+    CHECK_MULTILEVEL_SIGNATURE(changed.polarization_groups[1].ft = H_stuff,
+                               "signature ignored multilevel group field family");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].state_index,
+                               "signature ignored multilevel group identity");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].recurrence_index,
+                               "signature ignored multilevel group recurrence index");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].recurrence_count,
+                               "signature ignored multilevel group recurrence count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].noise_count,
+                               "signature ignored multilevel group noise count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].population_index,
+                               "signature ignored multilevel group population span");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].population_count,
+                               "signature ignored multilevel group population count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].transition_index,
+                               "signature ignored multilevel group transition index");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_groups[1].transition_count,
+                               "signature ignored multilevel group transition span");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].levels,
+                               "signature ignored multilevel level count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].transitions,
+                               "signature ignored multilevel transition count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].active_component_cmps,
+                               "signature ignored multilevel active component count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].gamma_index,
+                               "signature ignored multilevel coefficient span");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].gamma_count,
+                               "signature ignored multilevel Gamma count");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].alpha_index,
+                               "signature ignored multilevel alpha index");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].term_count,
+                               "signature ignored multilevel term span");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].term_index,
+                               "signature ignored multilevel term index");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].gamma_inv.value,
+                               "signature ignored multilevel GammaInv ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].region.base,
+                               "signature ignored multilevel population region");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].region.chunk,
+                               "signature ignored multilevel population chunk");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_population_updates[0].region.c = Ex,
+                               "signature ignored multilevel population component");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].region.cmp,
+                               "signature ignored multilevel population complex lane");
+    CHECK_MULTILEVEL_SIGNATURE(
+        changed.multilevel_population_updates[0].region.begin = ivec(2, 0, 0),
+        "signature ignored multilevel population region begin");
+    CHECK_MULTILEVEL_SIGNATURE(
+        changed.multilevel_population_updates[0].region.end = ivec(4, 2, 0),
+        "signature ignored multilevel population region end");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].region.counts[0],
+                               "signature ignored multilevel population count geometry");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].region.strides[0],
+                               "signature ignored multilevel population stride geometry");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].region.variant_key,
+                               "signature ignored multilevel population variant");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_population_updates[0].ft = H_stuff,
+                               "signature ignored multilevel population field family");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].state_index,
+                               "signature ignored multilevel population state");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].populations.value,
+                               "signature ignored multilevel population ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_updates[0].alpha_count,
+                               "signature ignored multilevel alpha span");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_population_updates[0].dt += 0.01,
+                               "signature ignored multilevel population timestep");
+    CHECK_MULTILEVEL_SIGNATURE(
+        ++changed.multilevel_population_updates[0].scratch_elements_per_point,
+        "signature ignored multilevel scratch size");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].transition_index,
+                               "signature ignored multilevel term transition");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_population_terms[0].c = Ey,
+                               "signature ignored multilevel term component");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].w.value,
+                               "signature ignored multilevel term field ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].w_prev.value,
+                               "signature ignored multilevel previous-field ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].p.value,
+                               "signature ignored multilevel term ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].p_prev.value,
+                               "signature ignored multilevel previous-P ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].cmp,
+                               "signature ignored multilevel term complex lane");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].centered_offsets[0],
+                               "signature ignored multilevel term offset");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_population_terms[0].centered_offsets[1],
+                               "signature ignored second multilevel term offset");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].positive_level,
+                               "signature ignored multilevel transition level");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].negative_level,
+                               "signature ignored multilevel negative level");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].transition_index,
+                               "signature ignored multilevel transition ordinal");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].region.chunk,
+                               "signature ignored multilevel transition chunk");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_transition_updates[0].region.c = Ez,
+                               "signature ignored multilevel transition component");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].region.cmp,
+                               "signature ignored multilevel transition complex lane");
+    CHECK_MULTILEVEL_SIGNATURE(
+        changed.multilevel_transition_updates[0].region.begin = ivec(2, 0, 0),
+        "signature ignored multilevel transition region begin");
+    CHECK_MULTILEVEL_SIGNATURE(
+        changed.multilevel_transition_updates[0].region.end = ivec(4, 2, 0),
+        "signature ignored multilevel transition region end");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].region.base,
+                               "signature ignored multilevel transition base");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].region.counts[0],
+                               "signature ignored multilevel transition count geometry");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].region.strides[0],
+                               "signature ignored multilevel transition stride geometry");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].region.variant_key,
+                               "signature ignored multilevel transition variant");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_transition_updates[0].ft = H_stuff,
+                               "signature ignored multilevel transition field family");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].state_index,
+                               "signature ignored multilevel transition state");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].diagonal_sigma.value,
+                               "signature ignored multilevel transition sigma ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].p.value,
+                               "signature ignored multilevel transition P ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].p_prev.value,
+                               "signature ignored multilevel transition previous-P ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].w.value,
+                               "signature ignored multilevel transition field ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].populations.value,
+                               "signature ignored multilevel transition populations ArrayId");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].population_stride,
+                               "signature ignored multilevel population stride");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.multilevel_transition_updates[0].population_offsets[0],
+                               "signature ignored multilevel transition population offset");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_transition_updates[0].omega += 0.01,
+                               "signature ignored multilevel transition coefficient");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_transition_updates[0].gamma += 0.01,
+                               "signature ignored multilevel transition damping");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_transition_updates[0].sigmat[3] += 0.01,
+                               "signature ignored multilevel sigmat coefficient");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_transition_updates[0].dt += 0.01,
+                               "signature ignored multilevel transition timestep");
+    CHECK_MULTILEVEL_SIGNATURE(changed.multilevel_coefficients[0] += 0.01,
+                               "signature ignored multilevel coefficient payload");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].transition_index,
+                               "signature ignored multilevel subtraction transition order");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].chunk,
+                               "signature ignored multilevel subtraction chunk");
+    CHECK_MULTILEVEL_SIGNATURE(changed.polarization_subtractions[1].c = Ez,
+                               "signature ignored multilevel subtraction component");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].cmp,
+                               "signature ignored multilevel subtraction complex lane");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].state_index,
+                               "signature ignored multilevel subtraction state");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].target.value,
+                               "signature ignored multilevel subtraction target");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].p.value,
+                               "signature ignored multilevel subtraction P");
+    CHECK_MULTILEVEL_SIGNATURE(++changed.polarization_subtractions[1].elements,
+                               "signature ignored multilevel subtraction extent");
+#undef CHECK_MULTILEVEL_SIGNATURE
+
+#define CHECK_TERM_EQUALITY(expr, message)                                                         \
+  do {                                                                                             \
+    MultilevelPopulationTerm changed_term = terms[0];                                              \
+    expr;                                                                                          \
+    CHECK(changed_term != terms[0], message);                                                      \
+  } while (0)
+    CHECK_TERM_EQUALITY(++changed_term.transition_index,
+                        "multilevel term equality ignored transition ordinal");
+    CHECK_TERM_EQUALITY(changed_term.c = Ey,
+                        "multilevel term equality ignored component");
+    CHECK_TERM_EQUALITY(++changed_term.cmp, "multilevel term equality ignored complex lane");
+    CHECK_TERM_EQUALITY(++changed_term.w.value, "multilevel term equality ignored W");
+    CHECK_TERM_EQUALITY(++changed_term.w_prev.value,
+                        "multilevel term equality ignored W_prev");
+    CHECK_TERM_EQUALITY(++changed_term.p.value, "multilevel term equality ignored P");
+    CHECK_TERM_EQUALITY(++changed_term.p_prev.value,
+                        "multilevel term equality ignored P_prev");
+    CHECK_TERM_EQUALITY(++changed_term.centered_offsets[0],
+                        "multilevel term equality ignored first offset");
+    CHECK_TERM_EQUALITY(++changed_term.centered_offsets[1],
+                        "multilevel term equality ignored second offset");
+#undef CHECK_TERM_EQUALITY
+
+#define CHECK_POPULATION_EQUALITY(expr, message)                                                   \
+  do {                                                                                             \
+    MultilevelPopulationUpdate changed_population = published;                                    \
+    expr;                                                                                          \
+    CHECK(changed_population != published, message);                                              \
+  } while (0)
+    CHECK_POPULATION_EQUALITY(++changed_population.region.chunk,
+                              "multilevel population equality ignored chunk");
+    CHECK_POPULATION_EQUALITY(changed_population.region.c = Ex,
+                              "multilevel population equality ignored component");
+    CHECK_POPULATION_EQUALITY(++changed_population.region.cmp,
+                              "multilevel population equality ignored complex lane");
+    CHECK_POPULATION_EQUALITY(changed_population.region.begin = ivec(2, 0, 0),
+                              "multilevel population equality ignored begin");
+    CHECK_POPULATION_EQUALITY(changed_population.region.end = ivec(4, 2, 0),
+                              "multilevel population equality ignored end");
+    CHECK_POPULATION_EQUALITY(++changed_population.region.base,
+                              "multilevel population equality ignored base");
+    CHECK_POPULATION_EQUALITY(++changed_population.region.counts[0],
+                              "multilevel population equality ignored count geometry");
+    CHECK_POPULATION_EQUALITY(++changed_population.region.strides[0],
+                              "multilevel population equality ignored stride geometry");
+    CHECK_POPULATION_EQUALITY(++changed_population.region.variant_key,
+                              "multilevel population equality ignored region variant");
+    CHECK_POPULATION_EQUALITY(changed_population.ft = H_stuff,
+                              "multilevel population equality ignored field family");
+    CHECK_POPULATION_EQUALITY(++changed_population.state_index,
+                              "multilevel population equality ignored state");
+    CHECK_POPULATION_EQUALITY(++changed_population.levels,
+                              "multilevel population equality ignored levels");
+    CHECK_POPULATION_EQUALITY(++changed_population.transitions,
+                              "multilevel population equality ignored transitions");
+    CHECK_POPULATION_EQUALITY(++changed_population.active_component_cmps,
+                              "multilevel population equality ignored active component count");
+    CHECK_POPULATION_EQUALITY(++changed_population.gamma_inv.value,
+                              "multilevel population equality ignored GammaInv");
+    CHECK_POPULATION_EQUALITY(++changed_population.populations.value,
+                              "multilevel population equality ignored populations");
+    CHECK_POPULATION_EQUALITY(++changed_population.gamma_index,
+                              "multilevel population equality ignored Gamma index");
+    CHECK_POPULATION_EQUALITY(++changed_population.gamma_count,
+                              "multilevel population equality ignored Gamma count");
+    CHECK_POPULATION_EQUALITY(++changed_population.alpha_index,
+                              "multilevel population equality ignored alpha index");
+    CHECK_POPULATION_EQUALITY(++changed_population.alpha_count,
+                              "multilevel population equality ignored alpha count");
+    CHECK_POPULATION_EQUALITY(++changed_population.term_index,
+                              "multilevel population equality ignored term index");
+    CHECK_POPULATION_EQUALITY(++changed_population.term_count,
+                              "multilevel population equality ignored term count");
+    CHECK_POPULATION_EQUALITY(++changed_population.scratch_elements_per_point,
+                              "multilevel population equality ignored scratch elements");
+    CHECK_POPULATION_EQUALITY(changed_population.dt += 0.01,
+                              "multilevel population equality ignored timestep");
+#undef CHECK_POPULATION_EQUALITY
+
+#define CHECK_TRANSITION_EQUALITY(expr, message)                                                   \
+  do {                                                                                             \
+    MultilevelTransitionUpdate changed_transition = transitions[0];                               \
+    expr;                                                                                          \
+    CHECK(changed_transition != transitions[0], message);                                         \
+  } while (0)
+    CHECK_TRANSITION_EQUALITY(++changed_transition.region.chunk,
+                              "multilevel transition equality ignored chunk");
+    CHECK_TRANSITION_EQUALITY(changed_transition.region.c = Ez,
+                              "multilevel transition equality ignored component");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.region.cmp,
+                              "multilevel transition equality ignored complex lane");
+    CHECK_TRANSITION_EQUALITY(changed_transition.region.begin = ivec(2, 0, 0),
+                              "multilevel transition equality ignored begin");
+    CHECK_TRANSITION_EQUALITY(changed_transition.region.end = ivec(4, 2, 0),
+                              "multilevel transition equality ignored end");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.region.base,
+                              "multilevel transition equality ignored base");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.region.counts[0],
+                              "multilevel transition equality ignored count geometry");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.region.strides[0],
+                              "multilevel transition equality ignored stride geometry");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.region.variant_key,
+                              "multilevel transition equality ignored variant");
+    CHECK_TRANSITION_EQUALITY(changed_transition.ft = H_stuff,
+                              "multilevel transition equality ignored field family");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.state_index,
+                              "multilevel transition equality ignored state");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.transition_index,
+                              "multilevel transition equality ignored transition ordinal");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.p.value,
+                              "multilevel transition equality ignored P");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.p_prev.value,
+                              "multilevel transition equality ignored P_prev");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.w.value,
+                              "multilevel transition equality ignored W");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.diagonal_sigma.value,
+                              "multilevel transition equality ignored sigma");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.populations.value,
+                              "multilevel transition equality ignored populations");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.population_offsets[0],
+                              "multilevel transition equality ignored first offset");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.population_offsets[1],
+                              "multilevel transition equality ignored second offset");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.population_stride,
+                              "multilevel transition equality ignored population stride");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.positive_level,
+                              "multilevel transition equality ignored positive level");
+    CHECK_TRANSITION_EQUALITY(++changed_transition.negative_level,
+                              "multilevel transition equality ignored negative level");
+    CHECK_TRANSITION_EQUALITY(changed_transition.omega += 0.01,
+                              "multilevel transition equality ignored omega");
+    CHECK_TRANSITION_EQUALITY(changed_transition.gamma += 0.01,
+                              "multilevel transition equality ignored gamma");
+    CHECK_TRANSITION_EQUALITY(changed_transition.sigmat[4] += 0.01,
+                              "multilevel transition equality ignored sigmat");
+    CHECK_TRANSITION_EQUALITY(changed_transition.dt += 0.01,
+                              "multilevel transition equality ignored timestep");
+#undef CHECK_TRANSITION_EQUALITY
+#define CHECK_GROUP_EQUALITY(expr, message)                                                        \
+  do {                                                                                             \
+    PolarizationUpdateGroup changed_group = plan.polarization_groups[1];                           \
+    expr;                                                                                          \
+    CHECK(changed_group != plan.polarization_groups[1], message);                                  \
+  } while (0)
+    CHECK_GROUP_EQUALITY(changed_group.kind = PolarizationGroupKind::recurrence,
+                         "polarization group equality ignored kind");
+    CHECK_GROUP_EQUALITY(++changed_group.chunk, "polarization group equality ignored chunk");
+    CHECK_GROUP_EQUALITY(changed_group.ft = H_stuff,
+                         "polarization group equality ignored field family");
+    CHECK_GROUP_EQUALITY(++changed_group.state_index,
+                         "polarization group equality ignored state");
+    CHECK_GROUP_EQUALITY(++changed_group.recurrence_index,
+                         "polarization group equality ignored recurrence index");
+    CHECK_GROUP_EQUALITY(++changed_group.recurrence_count,
+                         "polarization group equality ignored recurrence count");
+    CHECK_GROUP_EQUALITY(++changed_group.noise_count,
+                         "polarization group equality ignored noise count");
+    CHECK_GROUP_EQUALITY(++changed_group.population_index,
+                         "polarization group equality ignored population index");
+    CHECK_GROUP_EQUALITY(++changed_group.population_count,
+                         "polarization group equality ignored population count");
+    CHECK_GROUP_EQUALITY(++changed_group.transition_index,
+                         "polarization group equality ignored transition index");
+    CHECK_GROUP_EQUALITY(++changed_group.transition_count,
+                         "polarization group equality ignored transition count");
+#undef CHECK_GROUP_EQUALITY
+#define CHECK_SUBTRACTION_EQUALITY(expr, message)                                                  \
+  do {                                                                                             \
+    PolarizationSubtraction changed_subtraction = plan.polarization_subtractions[0];               \
+    expr;                                                                                          \
+    CHECK(changed_subtraction != plan.polarization_subtractions[0], message);                      \
+  } while (0)
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.chunk,
+                               "polarization subtraction equality ignored chunk");
+    CHECK_SUBTRACTION_EQUALITY(changed_subtraction.c = Ez,
+                               "polarization subtraction equality ignored component");
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.cmp,
+                               "polarization subtraction equality ignored complex lane");
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.state_index,
+                               "polarization subtraction equality ignored state");
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.transition_index,
+                               "polarization subtraction equality ignored transition order");
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.target.value,
+                               "polarization subtraction equality ignored target");
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.p.value,
+                               "polarization subtraction equality ignored P");
+    CHECK_SUBTRACTION_EQUALITY(++changed_subtraction.elements,
+                               "polarization subtraction equality ignored extent");
+#undef CHECK_SUBTRACTION_EQUALITY
+
+    auto expect_rejection = [&](const MultilevelPopulationUpdate &candidate_population,
+                                const std::vector<MultilevelPopulationTerm> &candidate_terms,
+                                const std::vector<MultilevelTransitionUpdate> &candidate_transitions,
+                                const std::vector<double> &candidate_gamma,
+                                const std::vector<double> &candidate_alpha,
+                                const char *message) {
+      StepPlan rejected_plan;
+      Operation rejected_op = {};
+      rejected_op.kind = OpKind::update_polarization;
+      rejected_op.ft = E_stuff;
+      rejected_op.guard = guard_always();
+      bool rejected = false;
+      try {
+        append_multilevel_update_group(f, rejected_plan, rejected_op, candidate_population,
+                                       candidate_terms, candidate_transitions, candidate_gamma,
+                                       candidate_alpha);
+      }
+      catch (const std::exception &) { rejected = true; }
+      CHECK(rejected && rejected_plan.polarization_groups.empty() &&
+                rejected_plan.multilevel_population_updates.empty() &&
+                rejected_plan.multilevel_population_terms.empty() &&
+                rejected_plan.multilevel_transition_updates.empty() &&
+                rejected_plan.multilevel_coefficients.empty() && rejected_op.accesses.empty(),
+            "%s", message);
+    };
+
+    std::vector<MultilevelPopulationTerm> malformed_terms = terms;
+    std::swap(malformed_terms[1], malformed_terms[2]);
+    expect_rejection(population, malformed_terms, transitions, gamma_matrix, alpha,
+                     "reordered multilevel population terms were accepted");
+    std::vector<MultilevelTransitionUpdate> malformed_transitions = transitions;
+    malformed_transitions.pop_back();
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "missing multilevel transition row was accepted");
+    malformed_terms = terms;
+    malformed_terms[0].p_prev = malformed_terms[0].p;
+    expect_rejection(population, malformed_terms, transitions, gamma_matrix, alpha,
+                     "aliased multilevel P/P_prev was accepted");
+    malformed_terms = terms;
+    malformed_terms[0].p = invalid_array();
+    expect_rejection(population, malformed_terms, transitions, gamma_matrix, alpha,
+                     "invalid multilevel ArrayId was accepted");
+    MultilevelPopulationUpdate malformed_population = population;
+    malformed_population.scratch_elements_per_point = 2;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "incorrect multilevel scratch requirement was accepted");
+    std::vector<double> malformed_gamma = gamma_matrix;
+    malformed_gamma.pop_back();
+    expect_rejection(population, terms, transitions, malformed_gamma, alpha,
+                     "incorrect multilevel Gamma extent was accepted");
+    std::vector<double> malformed_alpha = alpha;
+    malformed_alpha[0] = std::numeric_limits<double>::quiet_NaN();
+    expect_rejection(population, terms, transitions, gamma_matrix, malformed_alpha,
+                     "nonfinite multilevel alpha was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[0].dt += 0.01;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "inconsistent multilevel transition dt was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[2].w = ids[26];
+    malformed_transitions[2].w = ids[26];
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "transition-dependent multilevel W binding was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    ++malformed_terms[2].centered_offsets[0];
+    malformed_transitions[2].population_offsets[0] =
+        -malformed_terms[2].centered_offsets[0];
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "transition-dependent multilevel centering offset was accepted");
+    malformed_transitions = transitions;
+    ++malformed_transitions[2].region.base;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "transition-dependent multilevel Yee region was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[2].diagonal_sigma = ids[26];
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "transition-dependent multilevel sigma binding was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[1].omega += 0.01;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "component-dependent multilevel omega was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[1].gamma += 0.01;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "component-dependent multilevel gamma was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[1].sigmat[4] += 0.01;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "component-dependent multilevel sigmat was accepted");
+    malformed_population = population;
+    malformed_population.ft = D_stuff;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "non-E/H multilevel population family was accepted");
+    malformed_population = population;
+    malformed_population.region.chunk = f.num_chunks;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "out-of-range multilevel chunk identity was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[0].centered_offsets[0] = std::numeric_limits<ptrdiff_t>::min();
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "PTRDIFF_MIN multilevel offset reached unchecked negation");
+    malformed_population = population;
+    malformed_population.region.counts[0] = std::numeric_limits<size_t>::max();
+    malformed_population.region.strides[0] = 2;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "overflowing multilevel region count/stride product was accepted");
+    malformed_population = population;
+    malformed_population.region.base = std::numeric_limits<size_t>::max();
+    malformed_population.region.counts[0] = 2;
+    malformed_population.region.strides[0] = 1;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "overflowing multilevel region base was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[0].region.strides[0] = -1;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "negative multilevel region stride was accepted");
+
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[1] = malformed_terms[0];
+    malformed_transitions[1] = malformed_transitions[0];
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "duplicate multilevel transition row was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms.push_back(terms.back());
+    malformed_transitions.push_back(transitions.back());
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "extra multilevel transition row was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms.pop_back();
+    malformed_transitions.pop_back();
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "incomplete multilevel transition row set was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    std::swap(malformed_terms[0], malformed_terms[1]);
+    std::swap(malformed_transitions[0], malformed_transitions[1]);
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "paired but reordered multilevel rows were accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[2].c = Ez;
+    malformed_transitions[2].region.c = Ez;
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "mismatched multilevel transition row set was accepted");
+
+    malformed_alpha = alpha;
+    malformed_alpha[0] = 0.2;
+    malformed_alpha[2] = 0.4;
+    malformed_alpha[4] = 0.6;
+    expect_rejection(population, terms, transitions, gamma_matrix, malformed_alpha,
+                     "multilevel alpha without a negative level was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[0].positive_level = 0;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition ignored last-sign-wins level selection");
+    malformed_transitions = transitions;
+    ++malformed_transitions[0].population_offsets[0];
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel population/transition offset mismatch was accepted");
+
+    malformed_population = population;
+    malformed_population.populations = malformed_population.gamma_inv;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "aliased multilevel GammaInv/populations was accepted");
+    malformed_population = population;
+    malformed_population.gamma_inv = alias_of_first;
+    expect_rejection(malformed_population, terms, transitions, gamma_matrix, alpha,
+                     "noncanonical alias ArrayId was accepted as multilevel GammaInv");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[1].p = malformed_terms[0].p;
+    malformed_transitions[1].p = malformed_terms[0].p;
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "cross-row multilevel P alias was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[0].p = population.populations;
+    malformed_transitions[0].p = population.populations;
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel P aliasing population storage was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_transitions[0].diagonal_sigma = malformed_terms[1].p;
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel sigma aliasing writable P was accepted");
+    malformed_terms = terms;
+    malformed_transitions = transitions;
+    malformed_terms[0].w = malformed_terms[1].p;
+    malformed_transitions[0].w = malformed_terms[1].p;
+    expect_rejection(population, malformed_terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel field aliasing writable P was accepted");
+
+    malformed_transitions = transitions;
+    malformed_transitions[0].ft = H_stuff;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition with wrong field family was accepted");
+    malformed_transitions = transitions;
+    ++malformed_transitions[0].region.chunk;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition with wrong chunk was accepted");
+    malformed_transitions = transitions;
+    ++malformed_transitions[0].state_index;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition with wrong state was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[0].region.c = Ez;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition with wrong component was accepted");
+    malformed_transitions = transitions;
+    malformed_transitions[0].region.cmp = 1;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition with wrong complex lane was accepted");
+    malformed_transitions = transitions;
+    ++malformed_transitions[0].transition_index;
+    expect_rejection(population, terms, malformed_transitions, gamma_matrix, alpha,
+                     "multilevel transition with wrong transition ordinal was accepted");
+
+    StepPlan bad_span_plan;
+    Operation bad_span_op = {};
+    bad_span_op.kind = OpKind::update_polarization;
+    bad_span_op.ft = E_stuff;
+    bad_span_op.polarization_group_index = std::numeric_limits<uint32_t>::max();
+    bool bad_span_rejected = false;
+    try {
+      append_multilevel_update_group(f, bad_span_plan, bad_span_op, population, terms,
+                                     transitions, gamma_matrix, alpha);
+    }
+    catch (const std::exception &) { bad_span_rejected = true; }
+    CHECK(bad_span_rejected && bad_span_plan.polarization_groups.empty() &&
+              bad_span_plan.multilevel_population_updates.empty() && bad_span_op.accesses.empty(),
+          "out-of-range multilevel group span was accepted or mutated the plan");
+    bad_span_plan.clear();
+    bad_span_op = {};
+    bad_span_op.kind = OpKind::update_polarization;
+    bad_span_op.ft = E_stuff;
+    bad_span_op.descriptor_count = 1;
+    bad_span_rejected = false;
+    try {
+      append_multilevel_update_group(f, bad_span_plan, bad_span_op, population, terms,
+                                     transitions, gamma_matrix, alpha);
+    }
+    catch (const std::exception &) { bad_span_rejected = true; }
+    CHECK(bad_span_rejected && bad_span_plan.polarization_groups.empty() &&
+              bad_span_plan.multilevel_population_updates.empty() && bad_span_op.accesses.empty(),
+          "corrupt multilevel descriptor span was accepted or mutated the plan");
+
+    StepPlan invalid_family_plan;
+    Operation invalid_family_op = {};
+    invalid_family_op.kind = OpKind::update_polarization;
+    invalid_family_op.ft = D_stuff;
+    MultilevelPopulationUpdate invalid_family_population = population;
+    invalid_family_population.ft = D_stuff;
+    invalid_family_population.state_index = 7;
+    invalid_family_population.levels = 2;
+    invalid_family_population.transitions = 1;
+    invalid_family_population.active_component_cmps = 0;
+    invalid_family_population.scratch_elements_per_point = 2;
+    bool invalid_family_rejected = false;
+    try {
+      append_multilevel_update_group(f, invalid_family_plan, invalid_family_op,
+                                     invalid_family_population,
+                                     std::vector<MultilevelPopulationTerm>(),
+                                     std::vector<MultilevelTransitionUpdate>(),
+                                     std::vector<double>{1, 0, 0, 1},
+                                     std::vector<double>{-1, 1});
+    }
+    catch (const std::exception &) { invalid_family_rejected = true; }
+    CHECK(invalid_family_rejected && invalid_family_plan.polarization_groups.empty() &&
+              invalid_family_op.accesses.empty(),
+          "non-E/H multilevel operation family was accepted or partially published");
+
+    const size_t groups_before = plan.polarization_groups.size();
+    const size_t updates_before = plan.polarization_updates.size();
+    bool repeated_rejected = false;
+    try {
+      append_polarization_update_group(f, plan, op, std::vector<PolarizationUpdate>{before},
+                                       std::vector<PolarizationUpdate>());
+    }
+    catch (const std::invalid_argument &) { repeated_rejected = true; }
+    CHECK(repeated_rejected && plan.polarization_groups.size() == groups_before &&
+              plan.polarization_updates.size() == updates_before,
+          "noncontiguous cross-kind group identity was accepted");
+
+    StepPlan decreasing_plan;
+    Operation decreasing_op = {};
+    decreasing_op.kind = OpKind::update_polarization;
+    decreasing_op.ft = E_stuff;
+    append_polarization_update_group(f, decreasing_plan, decreasing_op,
+                                     std::vector<PolarizationUpdate>{after},
+                                     std::vector<PolarizationUpdate>());
+    const size_t decreasing_accesses = decreasing_op.accesses.size();
+    bool decreasing_rejected = false;
+    try {
+      PolarizationUpdate state_one = recurrence(1, Ex, 16);
+      append_polarization_update_group(f, decreasing_plan, decreasing_op,
+                                       std::vector<PolarizationUpdate>{state_one},
+                                       std::vector<PolarizationUpdate>());
+    }
+    catch (const std::invalid_argument &) { decreasing_rejected = true; }
+    CHECK(decreasing_rejected && decreasing_plan.polarization_groups.size() == 1 &&
+              decreasing_plan.polarization_updates.size() == 1 &&
+              decreasing_op.accesses.size() == decreasing_accesses,
+          "unique but decreasing polarization state order was accepted or mutated the plan");
+
+    StepPlan protected_plan;
+    Operation protected_op = {};
+    protected_op.kind = OpKind::update_polarization;
+    protected_op.ft = E_stuff;
+    MultilevelPopulationUpdate protected_population = population;
+    protected_population.state_index = 0;
+    std::vector<MultilevelTransitionUpdate> protected_transitions = transitions;
+    for (MultilevelTransitionUpdate &transition : protected_transitions)
+      transition.state_index = 0;
+    append_multilevel_update_group(f, protected_plan, protected_op, protected_population, terms,
+                                   protected_transitions, gamma_matrix, alpha);
+    const size_t protected_accesses = protected_op.accesses.size();
+    const size_t protected_updates = protected_plan.polarization_updates.size();
+    PolarizationUpdate aliased_recurrence = recurrence(1, Ex, 16);
+    aliased_recurrence.p = protected_population.gamma_inv;
+    bool protected_rejected = false;
+    try {
+      append_polarization_update_group(f, protected_plan, protected_op,
+                                       std::vector<PolarizationUpdate>{aliased_recurrence},
+                                       std::vector<PolarizationUpdate>());
+    }
+    catch (const std::invalid_argument &) { protected_rejected = true; }
+    const BufferAccess *protected_gamma =
+        find_access(protected_op, protected_population.gamma_inv);
+    CHECK(protected_rejected && protected_plan.polarization_groups.size() == 1 &&
+              protected_plan.polarization_updates.size() == protected_updates &&
+              protected_op.accesses.size() == protected_accesses && protected_gamma &&
+              protected_gamma->mode == AccessMode::read,
+          "later recurrence reused GammaInv or mutated its read-only access");
+    PolarizationUpdate indirect_alias = recurrence(1, Ex, 16);
+    indirect_alias.p = alias_of_first;
+    protected_rejected = false;
+    try {
+      append_polarization_update_group(f, protected_plan, protected_op,
+                                       std::vector<PolarizationUpdate>{indirect_alias},
+                                       std::vector<PolarizationUpdate>());
+    }
+    catch (const std::invalid_argument &) { protected_rejected = true; }
+    protected_gamma = find_access(protected_op, protected_population.gamma_inv);
+    CHECK(protected_rejected && protected_plan.polarization_groups.size() == 1 &&
+              protected_plan.polarization_updates.size() == protected_updates &&
+              protected_op.accesses.size() == protected_accesses && protected_gamma &&
+              protected_gamma->mode == AccessMode::read,
+          "later recurrence reused an alias of GammaInv or mutated the plan");
+    PolarizationUpdate aliased_noise = before_noise;
+    aliased_noise.state_index = 1;
+    aliased_noise.p = protected_population.gamma_inv;
+    protected_rejected = false;
+    try {
+      append_polarization_update_group(f, protected_plan, protected_op,
+                                       std::vector<PolarizationUpdate>(),
+                                       std::vector<PolarizationUpdate>{aliased_noise});
+    }
+    catch (const std::invalid_argument &) { protected_rejected = true; }
+    protected_gamma = find_access(protected_op, protected_population.gamma_inv);
+    CHECK(protected_rejected && protected_plan.polarization_groups.size() == 1 &&
+              protected_plan.polarization_updates.size() == protected_updates &&
+              protected_op.accesses.size() == protected_accesses && protected_gamma &&
+              protected_gamma->mode == AccessMode::read,
+          "later noise action reused GammaInv or mutated the plan");
+
+    Operation protected_hop = {};
+    protected_hop.kind = OpKind::update_polarization;
+    protected_hop.ft = H_stuff;
+    protected_hop.descriptor_index = uint32_t(protected_plan.polarization_updates.size());
+    protected_hop.polarization_group_index = uint32_t(protected_plan.polarization_groups.size());
+    MultilevelPopulationUpdate aliased_h_population = h_population;
+    aliased_h_population.gamma_inv = terms[0].p;
+    bool cross_operation_rejected = false;
+    try {
+      append_multilevel_update_group(
+          f, protected_plan, protected_hop, aliased_h_population,
+          std::vector<MultilevelPopulationTerm>{h_term},
+          std::vector<MultilevelTransitionUpdate>{h_transition},
+          std::vector<double>{0.02, 0.0, 0.0, 0.03}, std::vector<double>{-0.4, 0.5});
+    }
+    catch (const std::invalid_argument &) { cross_operation_rejected = true; }
+    CHECK(cross_operation_rejected && protected_plan.polarization_groups.size() == 1 &&
+              protected_plan.multilevel_population_updates.size() == 1 &&
+              protected_hop.accesses.empty(),
+          "later multilevel operation aliased earlier state storage or partially published");
+
+    StepPlan ordinary_first_plan;
+    Operation ordinary_first_op = {};
+    ordinary_first_op.kind = OpKind::update_polarization;
+    ordinary_first_op.ft = E_stuff;
+    append_polarization_update_group(f, ordinary_first_plan, ordinary_first_op,
+                                     std::vector<PolarizationUpdate>{before},
+                                     std::vector<PolarizationUpdate>{before_noise});
+    std::vector<MultilevelPopulationTerm> aliases_ordinary_terms = terms;
+    std::vector<MultilevelTransitionUpdate> aliases_ordinary_transitions = transitions;
+    aliases_ordinary_terms[0].p = before.p;
+    aliases_ordinary_transitions[0].p = before.p;
+    const size_t ordinary_first_accesses = ordinary_first_op.accesses.size();
+    bool ordinary_first_rejected = false;
+    try {
+      append_multilevel_update_group(f, ordinary_first_plan, ordinary_first_op, population,
+                                     aliases_ordinary_terms, aliases_ordinary_transitions,
+                                     gamma_matrix, alpha);
+    }
+    catch (const std::invalid_argument &) { ordinary_first_rejected = true; }
+    CHECK(ordinary_first_rejected && ordinary_first_plan.polarization_groups.size() == 1 &&
+              ordinary_first_plan.multilevel_population_updates.empty() &&
+              ordinary_first_op.accesses.size() == ordinary_first_accesses,
+          "multilevel state reused earlier recurrence storage or partially published");
+
+    StepPlan zero_row_plan;
+    Operation zero_row_op = {};
+    zero_row_op.kind = OpKind::update_polarization;
+    zero_row_op.ft = E_stuff;
+    MultilevelPopulationUpdate zero_row = population;
+    zero_row.state_index = 7;
+    zero_row.levels = 2;
+    zero_row.transitions = 1;
+    zero_row.active_component_cmps = 0;
+    zero_row.scratch_elements_per_point = 2;
+    append_multilevel_update_group(f, zero_row_plan, zero_row_op, zero_row,
+                                   std::vector<MultilevelPopulationTerm>(),
+                                   std::vector<MultilevelTransitionUpdate>(),
+                                   std::vector<double>{1, 0, 0, 1},
+                                   std::vector<double>{-1, 1});
+    CHECK(zero_row_plan.polarization_groups.size() == 1 &&
+              zero_row_plan.multilevel_population_updates.size() == 1 &&
+              zero_row_plan.multilevel_population_terms.empty() &&
+              zero_row_plan.multilevel_transition_updates.empty() &&
+              zero_row_op.accesses.size() == 2,
+          "zero-row multilevel state did not retain its population action");
+
+    plan.clear();
+    CHECK(plan.polarization_groups.empty() && plan.multilevel_population_updates.empty() &&
+              plan.multilevel_population_terms.empty() &&
+              plan.multilevel_transition_updates.empty() && plan.multilevel_coefficients.empty(),
+          "StepPlan::clear retained multilevel schedule state");
+    plan.clear();
+    CHECK(plan.polarization_groups.empty() && plan.multilevel_population_updates.empty() &&
+              plan.multilevel_population_terms.empty() &&
+              plan.multilevel_transition_updates.empty() && plan.multilevel_coefficients.empty(),
+          "StepPlan::clear is not idempotent for multilevel schedule state");
+  }
+  CHECK(exercised || !owns_chunk,
+        "an owning rank lacked enough catalog rows for multilevel schedule coverage");
+  CHECK(or_to_all(exercised), "no rank had enough catalog rows for multilevel schedule coverage");
+}
+
+static void test_multilevel_previous_w_copy_once() {
+  const realnum gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum omega[] = {realnum(0.63)};
+  const realnum damping[] = {realnum(0.04)};
+  const realnum sigmat[] = {1, 1, 1, 1, 1};
+  multilevel_susceptibility multilevel(2, 1, gamma, n0, alpha, omega, damping, sigmat);
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  multitile_anisotropic_material material;
+  structure s(gv, material, pml(0.45, X) + pml(0.45, Y), identity(), 1);
+  s.add_susceptibility(one, E_stuff, multilevel);
+  fields f(&s, 0, 0, true, 0, 4);
+  f.use_real_fields();
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Ez);
+  f.advance(1);
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+
+  std::map<uint32_t, size_t> copy_counts;
+  std::map<std::tuple<int, int, int>, size_t> tile_counts;
+  bool local_multitile = false;
+  for (const ConstitutiveUpdate &update : plan.eh_updates) {
+    const bool copy =
+        (update.region.variant_key & constitutive_copy_w_previous) != 0;
+    CHECK(copy == is_valid(update.previous_w),
+          "constitutive previous-W operand and copy bit disagree");
+    if (copy) ++copy_counts[update.previous_w.value];
+    const std::tuple<int, int, int> identity(update.region.chunk, int(update.region.c),
+                                             update.region.cmp);
+    local_multitile = local_multitile || ++tile_counts[identity] > 1;
+  }
+  bool owns_previous = false;
+  if (f.array_catalog)
+    for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+      const ArrayId id{uint32_t(i)};
+      const StorageKey &key = f.array_catalog->key(id);
+      if (key.kind != int(array_kind::f_w_prev)) continue;
+      owns_previous = true;
+      CHECK(copy_counts[id.value] == 1,
+            "f_w_prev ArrayId %u is copied %zu times instead of once", id.value,
+            copy_counts[id.value]);
+    }
+  CHECK(or_to_all(owns_previous),
+        "multilevel previous-W fixture produced no owned previous-W storage");
+  CHECK(or_to_all(local_multitile),
+        "multilevel previous-W copy fixture did not produce multiple constitutive tiles");
 }
 
 static void test_legacy_flux_schema_signature() {
@@ -2294,6 +3586,8 @@ int main(int argc, char **argv) {
   test_magnetic_schema_signature();
   test_polarization_schema_signature();
   test_noisy_polarization_group_schedule();
+  test_multilevel_polarization_group_schedule();
+  test_multilevel_previous_w_copy_once();
   test_legacy_flux_schema_signature();
   test_live_legacy_flux_spans();
   test_beta_schema_signature();

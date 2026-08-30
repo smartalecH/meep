@@ -19,7 +19,9 @@
 #include <string.h>
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 #include "backend/step_plan.hpp"
@@ -75,6 +77,8 @@ static const char *ft_name(field_type ft) {
 }
 
 namespace {
+
+ArrayId canonical_array(const CpuArrayCatalog &catalog, ArrayId id);
 
 void target_fingerprint_mix(uint64_t &sig, uint64_t value) {
   sig ^= value + 0x9e3779b97f4a7c15ull + (sig << 6) + (sig >> 2);
@@ -175,6 +179,17 @@ bool same_polarization_group(const PolarizationUpdate &a, const PolarizationUpda
   return a.region.chunk == b.region.chunk && a.ft == b.ft && a.state_index == b.state_index;
 }
 
+bool same_polarization_group_identity(const PolarizationUpdateGroup &group, int chunk,
+                                      field_type ft, int state_index) {
+  return group.chunk == chunk && group.ft == ft && group.state_index == state_index;
+}
+
+bool ordered_polarization_group_identity(const PolarizationUpdateGroup &previous, int chunk,
+                                         field_type ft, int state_index) {
+  return previous.ft == ft &&
+         (previous.chunk < chunk || (previous.chunk == chunk && previous.state_index < state_index));
+}
+
 bool same_polarization_region(const UpdateRegion &a, const UpdateRegion &b) {
   if (a.chunk != b.chunk || a.c != b.c || a.cmp != b.cmp || !(a.begin == b.begin) ||
       !(a.end == b.end) || a.base != b.base)
@@ -182,6 +197,10 @@ bool same_polarization_region(const UpdateRegion &a, const UpdateRegion &b) {
   for (int axis = 0; axis < 3; ++axis)
     if (a.counts[axis] != b.counts[axis] || a.strides[axis] != b.strides[axis]) return false;
   return true;
+}
+
+bool same_multilevel_region(const UpdateRegion &a, const UpdateRegion &b) {
+  return same_polarization_region(a, b) && a.variant_key == b.variant_key;
 }
 
 bool ordered_polarization_rows(const std::vector<PolarizationUpdate> &rows) {
@@ -211,6 +230,21 @@ bool canonical_noisy_add(const PolarizationUpdate &d) {
   return true;
 }
 
+bool polarization_update_aliases(const fields &f, const PolarizationUpdate &d, ArrayId id) {
+  if (!f.array_catalog || !is_valid(id)) return false;
+  const ArrayId protected_id = canonical_array(*f.array_catalog, id);
+  const ArrayId candidates[] = {d.p,          d.p_prev,       d.p_cross1,
+                                d.p_prev_cross1, d.p_cross2,    d.p_prev_cross2,
+                                d.primary_w,  d.cross_w1,     d.cross_w2,
+                                d.diagonal_sigma, d.offdiagonal_sigma1,
+                                d.offdiagonal_sigma2};
+  for (ArrayId candidate : candidates)
+    if (is_valid(candidate) &&
+        canonical_array(*f.array_catalog, candidate) == protected_id)
+      return true;
+  return false;
+}
+
 void add_polarization_recurrence_accesses(fields &f, Operation &op,
                                           const PolarizationUpdate &update) {
   add_access(f, op, update.p, AccessMode::read_write);
@@ -237,17 +271,47 @@ void append_polarization_update_group_impl(fields &f, StepPlan &plan, Operation 
   if (op.descriptor_index > plan.polarization_updates.size() ||
       op.descriptor_count != plan.polarization_updates.size() - op.descriptor_index)
     throw std::invalid_argument("polarization group is not appended to its operation span");
+  if (op.polarization_group_index > plan.polarization_groups.size() ||
+      op.polarization_group_count !=
+          plan.polarization_groups.size() - op.polarization_group_index)
+    throw std::invalid_argument("polarization group schedule is not appended to its operation");
   if (recurrences.empty() && noise_additions.empty()) return;
 
   const PolarizationUpdate &identity =
       recurrences.empty() ? noise_additions.front() : recurrences.front();
   if (identity.ft != op.ft)
     throw std::invalid_argument("polarization group field family differs from its operation");
-  for (const PolarizationUpdate &previous : plan.polarization_updates)
-    if (same_polarization_group(identity, previous))
+  for (const PolarizationUpdateGroup &previous : plan.polarization_groups)
+    if (same_polarization_group_identity(previous, identity.region.chunk, identity.ft,
+                                         identity.state_index))
       throw std::invalid_argument("polarization group identity is not contiguous");
+  if (op.polarization_group_count &&
+      !ordered_polarization_group_identity(plan.polarization_groups.back(), identity.region.chunk,
+                                           identity.ft, identity.state_index))
+    throw std::invalid_argument("polarization groups are not in live state order");
+  for (const MultilevelPopulationUpdate &population : plan.multilevel_population_updates)
+    for (const PolarizationUpdate &update : recurrences)
+      if (polarization_update_aliases(f, update, population.gamma_inv) ||
+          polarization_update_aliases(f, update, population.populations))
+        throw std::invalid_argument("polarization recurrence aliases multilevel scalar storage");
+  for (const MultilevelPopulationUpdate &population : plan.multilevel_population_updates)
+    for (const PolarizationUpdate &update : noise_additions)
+      if (polarization_update_aliases(f, update, population.gamma_inv) ||
+          polarization_update_aliases(f, update, population.populations))
+        throw std::invalid_argument("polarization noise aliases multilevel scalar storage");
+  for (const MultilevelPopulationTerm &term : plan.multilevel_population_terms) {
+    for (const PolarizationUpdate &update : recurrences)
+      if (polarization_update_aliases(f, update, term.p) ||
+          polarization_update_aliases(f, update, term.p_prev))
+        throw std::invalid_argument("polarization recurrence aliases multilevel state storage");
+    for (const PolarizationUpdate &update : noise_additions)
+      if (polarization_update_aliases(f, update, term.p) ||
+          polarization_update_aliases(f, update, term.p_prev))
+        throw std::invalid_argument("polarization noise aliases multilevel state storage");
+  }
   PolarizationUpdateKind recurrence_kind = PolarizationUpdateKind::lorentzian;
   if (!recurrences.empty()) recurrence_kind = recurrences.front().kind;
+  const uint32_t recurrence_index = uint32_t(plan.polarization_updates.size());
   for (const PolarizationUpdate &update : recurrences) {
     if ((update.kind != PolarizationUpdateKind::lorentzian &&
          update.kind != PolarizationUpdateKind::gyrotropic) ||
@@ -291,6 +355,12 @@ void append_polarization_update_group_impl(fields &f, StepPlan &plan, Operation 
   }
   if (!ordered_polarization_rows(recurrences) || !ordered_polarization_rows(noise_additions))
     throw std::invalid_argument("polarization group rows are not in component/cmp order");
+  const size_t update_count = recurrences.size() + noise_additions.size();
+  if (update_count < recurrences.size() ||
+      update_count > std::numeric_limits<uint32_t>::max() ||
+      plan.polarization_updates.size() > std::numeric_limits<uint32_t>::max() - update_count ||
+      plan.polarization_groups.size() >= std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("polarization group span overflow");
 
   for (const PolarizationUpdate &update : recurrences) {
     plan.polarization_updates.push_back(update);
@@ -302,6 +372,330 @@ void append_polarization_update_group_impl(fields &f, StepPlan &plan, Operation 
     add_access(f, op, update.diagonal_sigma, AccessMode::read);
   }
   op.descriptor_count = uint32_t(plan.polarization_updates.size()) - op.descriptor_index;
+  plan.polarization_groups.push_back(
+      PolarizationUpdateGroup{PolarizationGroupKind::recurrence,
+                              identity.region.chunk,
+                              identity.ft,
+                              identity.state_index,
+                              recurrence_index,
+                              uint32_t(recurrences.size()),
+                              uint32_t(noise_additions.size()),
+                              0,
+                              0,
+                              0,
+                              0});
+  op.polarization_group_count =
+      uint32_t(plan.polarization_groups.size()) - op.polarization_group_index;
+  for (const MultilevelPopulationUpdate &population : plan.multilevel_population_updates)
+    for (const BufferAccess &access : op.accesses)
+      if (access.array.id == population.gamma_inv && access.mode != AccessMode::read)
+        throw std::logic_error("multilevel GammaInv access is not read-only");
+}
+
+bool valid_catalog_array(const fields &f, ArrayId id) {
+  return f.array_catalog && is_valid(id) && id.value < f.array_catalog->size() &&
+         !is_valid(f.array_catalog->spec(id).alias_of) &&
+         f.array_catalog->resolve_untyped(id) != NULL && f.array_catalog->spec(id).elements != 0;
+}
+
+void validate_multilevel_region_arithmetic(const UpdateRegion &region) {
+  size_t last = region.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!region.counts[axis] || region.strides[axis] < 0)
+      throw std::invalid_argument("malformed multilevel update region");
+    const size_t stride = size_t(region.strides[axis]);
+    const size_t count_minus_one = region.counts[axis] - 1;
+    if (count_minus_one && stride > std::numeric_limits<size_t>::max() / count_minus_one)
+      throw std::overflow_error("multilevel update region stride overflow");
+    const size_t tail = count_minus_one * stride;
+    if (tail > std::numeric_limits<size_t>::max() - last)
+      throw std::overflow_error("multilevel update region base overflow");
+    last += tail;
+  }
+}
+
+bool ordered_multilevel_key(int previous_transition, component previous_component,
+                            int previous_cmp, int transition, component c, int cmp) {
+  return previous_transition < transition ||
+         (previous_transition == transition &&
+          (int(previous_component) < int(c) ||
+           (previous_component == c && previous_cmp < cmp)));
+}
+
+void append_multilevel_update_group_impl(
+    fields &f, StepPlan &plan, Operation &op, const MultilevelPopulationUpdate &input_population,
+    const std::vector<MultilevelPopulationTerm> &terms,
+    const std::vector<MultilevelTransitionUpdate> &transitions,
+    const std::vector<double> &gamma_matrix, const std::vector<double> &alpha) {
+  if (op.kind != OpKind::update_polarization)
+    throw std::invalid_argument("multilevel group requires an update_polarization operation");
+  if (op.descriptor_index > plan.polarization_updates.size() ||
+      op.descriptor_count != plan.polarization_updates.size() - op.descriptor_index)
+    throw std::invalid_argument("multilevel group is not appended to its descriptor span");
+  if (op.polarization_group_index > plan.polarization_groups.size() ||
+      op.polarization_group_count !=
+          plan.polarization_groups.size() - op.polarization_group_index)
+    throw std::invalid_argument("multilevel group is not appended to its operation span");
+  if ((input_population.ft != E_stuff && input_population.ft != H_stuff) ||
+      input_population.ft != op.ft || input_population.levels == 0 ||
+      input_population.transitions == 0 || input_population.region.c != Centered ||
+      input_population.region.cmp != -1 || input_population.region.chunk < 0 ||
+      input_population.region.chunk >= f.num_chunks ||
+      input_population.state_index < 0 || input_population.scratch_elements_per_point !=
+                                                input_population.levels ||
+      !std::isfinite(input_population.dt) || input_population.dt <= 0.0 ||
+      !valid_catalog_array(f, input_population.gamma_inv) ||
+      !valid_catalog_array(f, input_population.populations) ||
+      input_population.gamma_inv == input_population.populations)
+    throw std::invalid_argument("malformed multilevel population update");
+  validate_multilevel_region_arithmetic(input_population.region);
+
+  const size_t levels = input_population.levels;
+  const size_t transition_count = input_population.transitions;
+  if (levels > std::numeric_limits<size_t>::max() / levels ||
+      levels > std::numeric_limits<size_t>::max() / transition_count ||
+      gamma_matrix.size() != levels * levels || alpha.size() != levels * transition_count)
+    throw std::invalid_argument("multilevel coefficient extent mismatch");
+  for (double value : gamma_matrix)
+    if (!std::isfinite(value)) throw std::invalid_argument("nonfinite multilevel Gamma value");
+  for (double value : alpha)
+    if (!std::isfinite(value)) throw std::invalid_argument("nonfinite multilevel alpha value");
+  std::vector<int> positive_level(transition_count, -1);
+  std::vector<int> negative_level(transition_count, -1);
+  for (size_t level = 0; level < levels; ++level)
+    for (size_t transition = 0; transition < transition_count; ++transition) {
+      const double value = alpha[level * transition_count + transition];
+      if (value > 0.0) positive_level[transition] = int(level);
+      if (value < 0.0) negative_level[transition] = int(level);
+    }
+  for (size_t transition = 0; transition < transition_count; ++transition)
+    if (positive_level[transition] < 0 || negative_level[transition] < 0)
+      throw std::invalid_argument("multilevel alpha lacks a positive or negative level");
+  if (terms.size() != transitions.size())
+    throw std::invalid_argument("multilevel population/transition row count mismatch");
+
+  for (const PolarizationUpdateGroup &previous : plan.polarization_groups)
+    if (same_polarization_group_identity(previous, input_population.region.chunk,
+                                         input_population.ft, input_population.state_index))
+      throw std::invalid_argument("multilevel group identity is not contiguous");
+  if (op.polarization_group_count &&
+      !ordered_polarization_group_identity(plan.polarization_groups.back(),
+                                           input_population.region.chunk, input_population.ft,
+                                           input_population.state_index))
+    throw std::invalid_argument("polarization groups are not in live state order");
+  for (const BufferAccess &access : op.accesses)
+    if (access.array.id == input_population.gamma_inv ||
+        access.array.id == input_population.populations)
+      throw std::invalid_argument("multilevel scalar storage is reused by an earlier group");
+
+  if (input_population.active_component_cmps >
+          std::numeric_limits<size_t>::max() / transition_count ||
+      terms.size() != transition_count * input_population.active_component_cmps)
+    throw std::invalid_argument("multilevel active-row count mismatch");
+  std::set<uint32_t> mutable_state_arrays;
+  mutable_state_arrays.insert(input_population.populations.value);
+  std::set<uint32_t> read_only_dynamic_arrays;
+  read_only_dynamic_arrays.insert(input_population.gamma_inv.value);
+
+  std::set<uint32_t> prior_state_arrays;
+  std::set<uint32_t> prior_dynamic_arrays;
+  for (const PolarizationUpdate &update : plan.polarization_updates) {
+    const ArrayId state_ids[] = {update.p,       update.p_prev,       update.p_cross1,
+                                 update.p_prev_cross1, update.p_cross2, update.p_prev_cross2};
+    for (ArrayId id : state_ids)
+      if (is_valid(id)) {
+        const uint32_t canonical = canonical_array(*f.array_catalog, id).value;
+        prior_state_arrays.insert(canonical);
+        prior_dynamic_arrays.insert(canonical);
+      }
+    const ArrayId read_ids[] = {update.primary_w, update.cross_w1, update.cross_w2,
+                                update.diagonal_sigma, update.offdiagonal_sigma1,
+                                update.offdiagonal_sigma2};
+    for (ArrayId id : read_ids)
+      if (is_valid(id))
+        prior_dynamic_arrays.insert(canonical_array(*f.array_catalog, id).value);
+  }
+  for (const MultilevelPopulationUpdate &population : plan.multilevel_population_updates) {
+    prior_state_arrays.insert(population.gamma_inv.value);
+    prior_state_arrays.insert(population.populations.value);
+    prior_dynamic_arrays.insert(population.gamma_inv.value);
+    prior_dynamic_arrays.insert(population.populations.value);
+  }
+  for (const MultilevelPopulationTerm &term : plan.multilevel_population_terms) {
+    prior_state_arrays.insert(term.p.value);
+    prior_state_arrays.insert(term.p_prev.value);
+    prior_dynamic_arrays.insert(term.p.value);
+    prior_dynamic_arrays.insert(term.p_prev.value);
+    prior_dynamic_arrays.insert(term.w.value);
+    prior_dynamic_arrays.insert(term.w_prev.value);
+  }
+  for (const MultilevelTransitionUpdate &transition : plan.multilevel_transition_updates)
+    prior_dynamic_arrays.insert(transition.diagonal_sigma.value);
+
+  for (size_t i = 0; i < terms.size(); ++i) {
+    const MultilevelPopulationTerm &term = terms[i];
+    const MultilevelTransitionUpdate &transition = transitions[i];
+    if (term.transition_index < 0 || size_t(term.transition_index) >= transition_count ||
+        term.c == Centered || type(term.c) != input_population.ft || term.cmp < 0 || term.cmp > 1 ||
+        !valid_catalog_array(f, term.w) || !valid_catalog_array(f, term.w_prev) ||
+        !valid_catalog_array(f, term.p) || !valid_catalog_array(f, term.p_prev) ||
+        term.p == term.p_prev || term.w == term.w_prev)
+      throw std::invalid_argument("malformed multilevel population term");
+    if (!mutable_state_arrays.insert(term.p.value).second ||
+        !mutable_state_arrays.insert(term.p_prev.value).second)
+      throw std::invalid_argument("multilevel transition state arrays are aliased");
+    read_only_dynamic_arrays.insert(term.w.value);
+    read_only_dynamic_arrays.insert(term.w_prev.value);
+    read_only_dynamic_arrays.insert(transition.diagonal_sigma.value);
+    if (term.p == input_population.gamma_inv || term.p_prev == input_population.gamma_inv ||
+        term.w == input_population.gamma_inv || term.w_prev == input_population.gamma_inv ||
+        term.p == input_population.populations || term.p_prev == input_population.populations ||
+        term.w == input_population.populations || term.w_prev == input_population.populations)
+      throw std::invalid_argument("multilevel scalar storage aliases a term array");
+    if (i && !ordered_multilevel_key(terms[i - 1].transition_index, terms[i - 1].c,
+                                     terms[i - 1].cmp, term.transition_index, term.c, term.cmp))
+      throw std::invalid_argument("multilevel population terms are not transition-major");
+    if (transition.ft != input_population.ft ||
+        transition.region.chunk != input_population.region.chunk ||
+        transition.state_index != input_population.state_index ||
+        transition.transition_index != term.transition_index || transition.region.c != term.c ||
+        transition.region.cmp != term.cmp || transition.p != term.p ||
+        transition.p_prev != term.p_prev || transition.w != term.w ||
+        transition.populations != input_population.populations ||
+        term.centered_offsets[0] == std::numeric_limits<ptrdiff_t>::min() ||
+        term.centered_offsets[1] == std::numeric_limits<ptrdiff_t>::min() ||
+        transition.population_offsets[0] != -term.centered_offsets[0] ||
+        transition.population_offsets[1] != -term.centered_offsets[1] ||
+        transition.population_stride != input_population.levels ||
+        transition.positive_level != positive_level[size_t(term.transition_index)] ||
+        transition.negative_level != negative_level[size_t(term.transition_index)] ||
+        transition.positive_level == transition.negative_level ||
+        !valid_catalog_array(f, transition.p) ||
+        !valid_catalog_array(f, transition.p_prev) || !valid_catalog_array(f, transition.w) ||
+        !valid_catalog_array(f, transition.diagonal_sigma) ||
+        !valid_catalog_array(f, transition.populations) || !std::isfinite(transition.omega) ||
+        !std::isfinite(transition.gamma) || !std::isfinite(transition.dt) ||
+        transition.dt != input_population.dt)
+      throw std::invalid_argument("multilevel transition differs from its population term");
+    validate_multilevel_region_arithmetic(transition.region);
+    if (transition.diagonal_sigma == input_population.gamma_inv ||
+        transition.diagonal_sigma == input_population.populations)
+      throw std::invalid_argument("multilevel scalar storage aliases diagonal sigma");
+    for (double value : transition.sigmat)
+      if (!std::isfinite(value))
+        throw std::invalid_argument("nonfinite multilevel transition coefficient");
+  }
+  for (uint32_t id : mutable_state_arrays)
+    if (read_only_dynamic_arrays.count(id))
+      throw std::invalid_argument("multilevel writable storage aliases a read-only array");
+  std::set<uint32_t> new_state_arrays = mutable_state_arrays;
+  new_state_arrays.insert(input_population.gamma_inv.value);
+  for (uint32_t id : new_state_arrays)
+    if (prior_dynamic_arrays.count(id))
+      throw std::invalid_argument("multilevel state storage aliases an earlier group");
+  for (uint32_t id : read_only_dynamic_arrays)
+    if (prior_state_arrays.count(id))
+      throw std::invalid_argument("multilevel read-only storage aliases earlier state");
+  if (!terms.empty()) {
+    size_t rows_per_transition = 0;
+    while (rows_per_transition < terms.size() && terms[rows_per_transition].transition_index == 0)
+      ++rows_per_transition;
+    if (!rows_per_transition || terms.size() != rows_per_transition * transition_count)
+      throw std::invalid_argument("multilevel transition rows are incomplete");
+    for (size_t row = 0; row < rows_per_transition; ++row)
+      if (terms[row].cmp == 1 &&
+          (row == 0 || terms[row - 1].c != terms[row].c || terms[row - 1].cmp != 0))
+        throw std::invalid_argument("multilevel imaginary row lacks its real row");
+    for (size_t transition = 0; transition < transition_count; ++transition) {
+      const MultilevelTransitionUpdate &coefficient_reference =
+          transitions[transition * rows_per_transition];
+      for (size_t row = 0; row < rows_per_transition; ++row) {
+        const MultilevelPopulationTerm &actual = terms[transition * rows_per_transition + row];
+        const MultilevelPopulationTerm &expected = terms[row];
+        const MultilevelTransitionUpdate &actual_transition =
+            transitions[transition * rows_per_transition + row];
+        const MultilevelTransitionUpdate &expected_transition = transitions[row];
+        if (actual.transition_index != int(transition) || actual.c != expected.c ||
+            actual.cmp != expected.cmp || actual.w != expected.w ||
+            actual.w_prev != expected.w_prev ||
+            actual.centered_offsets[0] != expected.centered_offsets[0] ||
+            actual.centered_offsets[1] != expected.centered_offsets[1] ||
+            !same_multilevel_region(actual_transition.region, expected_transition.region) ||
+            actual_transition.diagonal_sigma != expected_transition.diagonal_sigma)
+          throw std::invalid_argument("multilevel transition row sets differ");
+        if (actual_transition.omega != coefficient_reference.omega ||
+            actual_transition.gamma != coefficient_reference.gamma)
+          throw std::invalid_argument("multilevel transition coefficients differ by row");
+        for (int coefficient = 0; coefficient < 5; ++coefficient)
+          if (actual_transition.sigmat[coefficient] !=
+              coefficient_reference.sigmat[coefficient])
+            throw std::invalid_argument("multilevel transition coefficients differ by row");
+      }
+    }
+  }
+
+  const size_t u32_max = std::numeric_limits<uint32_t>::max();
+  if (terms.size() > u32_max || transitions.size() > u32_max || gamma_matrix.size() > u32_max ||
+      alpha.size() > u32_max || plan.multilevel_population_updates.size() >= u32_max ||
+      plan.multilevel_population_terms.size() > u32_max - terms.size() ||
+      plan.multilevel_transition_updates.size() > u32_max - transitions.size() ||
+      plan.multilevel_coefficients.size() > u32_max - gamma_matrix.size() ||
+      plan.multilevel_coefficients.size() + gamma_matrix.size() > u32_max - alpha.size() ||
+      plan.polarization_groups.size() >= u32_max)
+    throw std::overflow_error("multilevel action span overflow");
+
+  MultilevelPopulationUpdate population = input_population;
+  population.gamma_index = uint32_t(plan.multilevel_coefficients.size());
+  population.gamma_count = uint32_t(gamma_matrix.size());
+  population.alpha_index = population.gamma_index + population.gamma_count;
+  population.alpha_count = uint32_t(alpha.size());
+  population.term_index = uint32_t(plan.multilevel_population_terms.size());
+  population.term_count = uint32_t(terms.size());
+  const uint32_t population_index = uint32_t(plan.multilevel_population_updates.size());
+  const uint32_t transition_index = uint32_t(plan.multilevel_transition_updates.size());
+
+  plan.multilevel_coefficients.insert(plan.multilevel_coefficients.end(), gamma_matrix.begin(),
+                                      gamma_matrix.end());
+  plan.multilevel_coefficients.insert(plan.multilevel_coefficients.end(), alpha.begin(),
+                                      alpha.end());
+  plan.multilevel_population_terms.insert(plan.multilevel_population_terms.end(), terms.begin(),
+                                          terms.end());
+  plan.multilevel_transition_updates.insert(plan.multilevel_transition_updates.end(),
+                                            transitions.begin(), transitions.end());
+  plan.multilevel_population_updates.push_back(population);
+  plan.polarization_groups.push_back(
+      PolarizationUpdateGroup{PolarizationGroupKind::multilevel,
+                              population.region.chunk,
+                              population.ft,
+                              population.state_index,
+                              0,
+                              0,
+                              0,
+                              population_index,
+                              1,
+                              transition_index,
+                              uint32_t(transitions.size())});
+
+  add_access(f, op, population.gamma_inv, AccessMode::read);
+  add_access(f, op, population.populations, AccessMode::read_write);
+  for (const MultilevelPopulationTerm &term : terms) {
+    add_access(f, op, term.w, AccessMode::read);
+    add_access(f, op, term.w_prev, AccessMode::read);
+    add_access(f, op, term.p, AccessMode::read);
+    add_access(f, op, term.p_prev, AccessMode::read);
+  }
+  for (const MultilevelTransitionUpdate &transition : transitions) {
+    add_access(f, op, transition.p, AccessMode::read_write);
+    add_access(f, op, transition.p_prev, AccessMode::read_write);
+    add_access(f, op, transition.w, AccessMode::read);
+    add_access(f, op, transition.diagonal_sigma, AccessMode::read);
+    add_access(f, op, transition.populations, AccessMode::read);
+  }
+  op.polarization_group_count =
+      uint32_t(plan.polarization_groups.size()) - op.polarization_group_index;
+  for (const BufferAccess &access : op.accesses)
+    if (access.array.id == population.gamma_inv && access.mode != AccessMode::read)
+      throw std::logic_error("multilevel GammaInv access is not read-only");
 }
 
 bool polarization_updates_equal(const PolarizationUpdate &a, const PolarizationUpdate &b) {
@@ -343,17 +737,17 @@ size_t checked_sum(size_t a, size_t b, const char *what) {
 
 ArrayId canonical_array(const CpuArrayCatalog &catalog, ArrayId id) {
   if (!is_valid(id) || id.value >= catalog.size())
-    throw std::invalid_argument("solve_cw state row names an invalid array");
+    throw std::invalid_argument("portable plan row names an invalid array");
   for (size_t depth = 0; depth <= catalog.size(); ++depth) {
     const ArrayId next = catalog.spec(id).alias_of;
     if (!is_valid(next)) return id;
     if (next.value >= catalog.size())
-      throw std::invalid_argument("solve_cw state row names an invalid alias");
+      throw std::invalid_argument("portable plan row names an invalid alias");
     if (catalog.resolve_untyped(id) != catalog.resolve_untyped(next))
-      throw std::invalid_argument("solve_cw state row contains a stale alias binding");
+      throw std::invalid_argument("portable plan row contains a stale alias binding");
     id = next;
   }
-  throw std::invalid_argument("solve_cw state row contains an alias cycle");
+  throw std::invalid_argument("portable plan row contains an alias cycle");
 }
 
 bool same_region(const UpdateRegion &a, const UpdateRegion &b) {
@@ -595,6 +989,8 @@ public:
     op.cylindrical_m_descriptor_count = 0;
     op.cylindrical_origin_action_index = 0;
     op.cylindrical_origin_action_count = 0;
+    op.polarization_group_index = 0;
+    op.polarization_group_count = 0;
     op.polarization_subtraction_index = 0;
     op.polarization_subtraction_count = 0;
     op.magnetic_state_index = 0;
@@ -802,6 +1198,8 @@ public:
       mix(sig, uint64_t(op.cylindrical_m_descriptor_count));
       mix(sig, uint64_t(op.cylindrical_origin_action_index));
       mix(sig, uint64_t(op.cylindrical_origin_action_count));
+      mix(sig, uint64_t(op.polarization_group_index));
+      mix(sig, uint64_t(op.polarization_group_count));
       sig ^= uint64_t(op.polarization_subtraction_index) + 0x9e3779b97f4a7c15ull + (sig << 6) +
              (sig >> 2);
       sig ^= uint64_t(op.polarization_subtraction_count) + 0x9e3779b97f4a7c15ull + (sig << 6) +
@@ -841,10 +1239,20 @@ public:
     }
     for (const ConstitutiveUpdate &d : plan.eh_updates)
       hash_constitutive(sig, d);
+    for (const PolarizationUpdateGroup &d : plan.polarization_groups)
+      hash_polarization_group(sig, d);
     for (const PolarizationUpdate &d : plan.polarization_updates)
       hash_polarization(sig, d);
     for (const PolarizationSubtraction &d : plan.polarization_subtractions)
       hash_polarization_subtraction(sig, d);
+    for (const MultilevelPopulationUpdate &d : plan.multilevel_population_updates)
+      hash_multilevel_population(sig, d);
+    for (const MultilevelPopulationTerm &d : plan.multilevel_population_terms)
+      hash_multilevel_term(sig, d);
+    for (const MultilevelTransitionUpdate &d : plan.multilevel_transition_updates)
+      hash_multilevel_transition(sig, d);
+    for (double coefficient : plan.multilevel_coefficients)
+      mix_double(sig, coefficient);
     for (const LegacyFluxUpdate &d : plan.legacy_flux_updates)
       hash_legacy_flux_update(sig, d);
     for (const LegacyFluxTerm &d : plan.legacy_flux_terms)
@@ -1042,11 +1450,75 @@ private:
     mix_double(sig, d.noise_amplitude);
     mix(sig, uint64_t(d.noise_algorithm_version));
   }
+  static void hash_polarization_group(uint64_t &sig, const PolarizationUpdateGroup &d) {
+    mix(sig, uint64_t(d.kind));
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.ft));
+    mix(sig, uint64_t(d.state_index));
+    mix(sig, uint64_t(d.recurrence_index));
+    mix(sig, uint64_t(d.recurrence_count));
+    mix(sig, uint64_t(d.noise_count));
+    mix(sig, uint64_t(d.population_index));
+    mix(sig, uint64_t(d.population_count));
+    mix(sig, uint64_t(d.transition_index));
+    mix(sig, uint64_t(d.transition_count));
+  }
+  static void hash_multilevel_term(uint64_t &sig, const MultilevelPopulationTerm &d) {
+    mix(sig, uint64_t(d.transition_index));
+    mix(sig, uint64_t(d.c));
+    mix(sig, uint64_t(d.cmp));
+    hash_id(sig, d.w);
+    hash_id(sig, d.w_prev);
+    hash_id(sig, d.p);
+    hash_id(sig, d.p_prev);
+    mix(sig, uint64_t(d.centered_offsets[0]));
+    mix(sig, uint64_t(d.centered_offsets[1]));
+  }
+  static void hash_multilevel_population(uint64_t &sig, const MultilevelPopulationUpdate &d) {
+    hash_region(sig, d.region);
+    mix(sig, uint64_t(d.ft));
+    mix(sig, uint64_t(d.state_index));
+    mix(sig, uint64_t(d.levels));
+    mix(sig, uint64_t(d.transitions));
+    mix(sig, uint64_t(d.active_component_cmps));
+    hash_id(sig, d.gamma_inv);
+    hash_id(sig, d.populations);
+    mix(sig, uint64_t(d.gamma_index));
+    mix(sig, uint64_t(d.gamma_count));
+    mix(sig, uint64_t(d.alpha_index));
+    mix(sig, uint64_t(d.alpha_count));
+    mix(sig, uint64_t(d.term_index));
+    mix(sig, uint64_t(d.term_count));
+    mix(sig, uint64_t(d.scratch_elements_per_point));
+    mix_double(sig, d.dt);
+  }
+  static void hash_multilevel_transition(uint64_t &sig, const MultilevelTransitionUpdate &d) {
+    hash_region(sig, d.region);
+    mix(sig, uint64_t(d.ft));
+    mix(sig, uint64_t(d.state_index));
+    mix(sig, uint64_t(d.transition_index));
+    hash_id(sig, d.p);
+    hash_id(sig, d.p_prev);
+    hash_id(sig, d.w);
+    hash_id(sig, d.diagonal_sigma);
+    hash_id(sig, d.populations);
+    mix(sig, uint64_t(d.population_offsets[0]));
+    mix(sig, uint64_t(d.population_offsets[1]));
+    mix(sig, uint64_t(d.population_stride));
+    mix(sig, uint64_t(d.positive_level));
+    mix(sig, uint64_t(d.negative_level));
+    mix_double(sig, d.omega);
+    mix_double(sig, d.gamma);
+    for (double value : d.sigmat)
+      mix_double(sig, value);
+    mix_double(sig, d.dt);
+  }
   static void hash_polarization_subtraction(uint64_t &sig, const PolarizationSubtraction &d) {
     mix(sig, uint64_t(d.chunk));
     mix(sig, uint64_t(d.c));
     mix(sig, uint64_t(d.cmp));
     mix(sig, uint64_t(d.state_index));
+    mix(sig, uint64_t(d.transition_index));
     hash_id(sig, d.target);
     hash_id(sig, d.p);
     mix(sig, uint64_t(d.elements));
@@ -1633,6 +2105,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
           d.chi3 = find_array(f_, chunk, array_kind::chi3, int(ec), -1, 0);
           d.target_w = find_array(f_, chunk, array_kind::f_w, int(ec), cmp, 0);
           d.previous_w = find_array(f_, chunk, array_kind::f_w_prev, int(ec), cmp, 0);
+          if (tile != 0) d.previous_w = invalid_array();
           d.pml = make_pml_profile(f_, fc, chunk, dsigw, d.region.begin);
           if (is_valid(d.offdiagonal1)) d.region.variant_key |= constitutive_one_offdiagonal;
           if (is_valid(d.offdiagonal2)) d.region.variant_key |= constitutive_two_offdiagonals;
@@ -1641,7 +2114,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
             d.region.variant_key |= constitutive_has_nonlinearity;
           if (is_valid(primary_minus_p) || is_valid(cross1_minus_p) || is_valid(cross2_minus_p))
             d.region.variant_key |= constitutive_has_minus_p;
-          if (tile == 0 && is_valid(d.previous_w))
+          if (is_valid(d.previous_w))
             d.region.variant_key |= constitutive_copy_w_previous;
 
           plan_.eh_updates.push_back(d);
@@ -1715,8 +2188,66 @@ void append_polarization_update_group(fields &f, StepPlan &plan, Operation &op,
   append_polarization_update_group_impl(f, plan, op, recurrences, noise_additions);
 }
 
+void append_multilevel_update_group(fields &f, StepPlan &plan, Operation &op,
+                                    const MultilevelPopulationUpdate &population,
+                                    const std::vector<MultilevelPopulationTerm> &terms,
+                                    const std::vector<MultilevelTransitionUpdate> &transitions,
+                                    const std::vector<double> &gamma_matrix,
+                                    const std::vector<double> &alpha) {
+  append_multilevel_update_group_impl(f, plan, op, population, terms, transitions, gamma_matrix,
+                                      alpha);
+}
+
 bool operator==(const PolarizationUpdate &a, const PolarizationUpdate &b) {
   return polarization_updates_equal(a, b);
+}
+
+bool operator==(const PolarizationSubtraction &a, const PolarizationSubtraction &b) {
+  return a.chunk == b.chunk && a.c == b.c && a.cmp == b.cmp &&
+         a.state_index == b.state_index && a.transition_index == b.transition_index &&
+         a.target == b.target && a.p == b.p && a.elements == b.elements;
+}
+
+bool operator==(const PolarizationUpdateGroup &a, const PolarizationUpdateGroup &b) {
+  return a.kind == b.kind && a.chunk == b.chunk && a.ft == b.ft &&
+         a.state_index == b.state_index && a.recurrence_index == b.recurrence_index &&
+         a.recurrence_count == b.recurrence_count && a.noise_count == b.noise_count &&
+         a.population_index == b.population_index && a.population_count == b.population_count &&
+         a.transition_index == b.transition_index && a.transition_count == b.transition_count;
+}
+
+bool operator==(const MultilevelPopulationTerm &a, const MultilevelPopulationTerm &b) {
+  return a.transition_index == b.transition_index && a.c == b.c && a.cmp == b.cmp &&
+         a.w == b.w && a.w_prev == b.w_prev && a.p == b.p && a.p_prev == b.p_prev &&
+         a.centered_offsets[0] == b.centered_offsets[0] &&
+         a.centered_offsets[1] == b.centered_offsets[1];
+}
+
+bool operator==(const MultilevelPopulationUpdate &a, const MultilevelPopulationUpdate &b) {
+  return same_multilevel_region(a.region, b.region) && a.ft == b.ft &&
+         a.state_index == b.state_index && a.levels == b.levels &&
+         a.transitions == b.transitions &&
+         a.active_component_cmps == b.active_component_cmps && a.gamma_inv == b.gamma_inv &&
+         a.populations == b.populations && a.gamma_index == b.gamma_index &&
+         a.gamma_count == b.gamma_count && a.alpha_index == b.alpha_index &&
+         a.alpha_count == b.alpha_count && a.term_index == b.term_index &&
+         a.term_count == b.term_count &&
+         a.scratch_elements_per_point == b.scratch_elements_per_point && a.dt == b.dt;
+}
+
+bool operator==(const MultilevelTransitionUpdate &a, const MultilevelTransitionUpdate &b) {
+  if (!same_multilevel_region(a.region, b.region) || a.ft != b.ft ||
+      a.state_index != b.state_index || a.transition_index != b.transition_index || a.p != b.p ||
+      a.p_prev != b.p_prev || a.w != b.w || a.diagonal_sigma != b.diagonal_sigma ||
+      a.populations != b.populations || a.population_offsets[0] != b.population_offsets[0] ||
+      a.population_offsets[1] != b.population_offsets[1] ||
+      a.population_stride != b.population_stride || a.positive_level != b.positive_level ||
+      a.negative_level != b.negative_level || a.omega != b.omega || a.gamma != b.gamma ||
+      a.dt != b.dt)
+    return false;
+  for (int i = 0; i < 5; ++i)
+    if (a.sigmat[i] != b.sigmat[i]) return false;
+  return true;
 }
 
 bool operator==(const CwStateRow &a, const CwStateRow &b) {
