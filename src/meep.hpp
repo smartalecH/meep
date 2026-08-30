@@ -2491,6 +2491,7 @@ private:
   friend bool backend_try_restore_magnetic_fields(fields &, const char *);
   friend bool backend_try_solve_cw(fields &, const CwSolveRequest &, CwSolveResult &);
   friend bool backend_try_refresh_legacy_flux(fields &, const char *);
+  friend void backend_refresh_noisy_seed(fields &, const StepPlan &, const char *);
   friend class PreparedBackendEpoch;
   friend struct BackendEpochSnapshot;
   int synchronized_magnetic_fields; // count number of nested synchs
