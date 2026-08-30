@@ -171,7 +171,11 @@ static void check_config(const char *name, structure &s, bool complex_fields, in
   f.advance(steps);
 
   size_t checked_plans = 0;
+  bool owns_chunk = false;
   std::vector<ElementRef> refs;
+
+  for (int i = 0; i < f.num_chunks; ++i)
+    owns_chunk = owns_chunk || f.chunks[i]->is_mine();
 
   FOR_FIELD_TYPES(ft) {
     for (int i = 0; i < f.num_chunks; ++i)
@@ -211,15 +215,17 @@ static void check_config(const char *name, structure &s, bool complex_fields, in
         }
       }
   }
-  CHECK(checked_plans > 0, "%s: no plans were checked", name);
+  CHECK(checked_plans > 0 || !owns_chunk, "%s: an owning rank checked no plans", name);
 
   /* Pack/unpack round trip on a scratch block. CONNECT_COPY is the identity, so
      packing a plan and unpacking it into the same plan's scatter side must
      reproduce the gathered values at the scatter destinations. */
   size_t roundtrips = 0;
+  bool has_eligible_copy = false;
   for (const HaloPlan &p : f.halos->plans) {
     if (p.phase != CONNECT_COPY || !p.block_elements) continue;
     if (!f.chunks[p.chunks.first]->is_mine() || !f.chunks[p.chunks.second]->is_mine()) continue;
+    has_eligible_copy = true;
     std::vector<realnum> block(p.block_offset + p.block_elements, realnum(0));
     f.pack_halo(p, block.data());
     expand_gather(p, refs);
@@ -229,7 +235,8 @@ static void check_config(const char *name, structure &s, bool complex_fields, in
     }
     ++roundtrips;
   }
-  CHECK(roundtrips > 0 || f.num_chunks == 1, "%s: no COPY plan was round-tripped", name);
+  CHECK(roundtrips > 0 || !owns_chunk || !has_eligible_copy,
+        "%s: an eligible local COPY plan was not round-tripped", name);
 
   const CoalesceStats st = coalesce_stats(f.halos->plans);
   master_printf("%s: %zu reals, %.1f%% in %zu slabs, %zu residue\n", name, st.total_elements,
@@ -266,8 +273,9 @@ int main(int argc, char **argv) {
     check_config("3d/4chunks", s, false, 4, vec(0.13, 0.11, 0.07));
   }
 
+  failures = sum_to_all(failures);
   if (failures) {
-    master_printf("halo_plan: %d FAILURE(S)\n", failures);
+    master_printf("halo_plan: %d FAILURE(S) across all ranks\n", failures);
     return 1;
   }
   master_printf("halo_plan: all checks passed\n");
