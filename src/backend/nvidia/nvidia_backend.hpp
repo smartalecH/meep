@@ -28,18 +28,78 @@ struct NvidiaCwStatistics {
   size_t reduction_count;
   size_t scalar_device_to_host_calls;
   size_t scalar_device_to_host_bytes;
+  size_t source_scalar_host_to_device_calls;
+  size_t source_scalar_host_to_device_bytes;
   size_t vector_host_to_device_bytes;
   size_t vector_device_to_host_bytes;
+  size_t setup_scalar_device_to_host_calls;
+  size_t setup_scalar_device_to_host_bytes;
+  size_t setup_source_scalar_host_to_device_calls;
+  size_t setup_source_scalar_host_to_device_bytes;
+  size_t iteration_scalar_device_to_host_calls;
+  size_t iteration_scalar_device_to_host_bytes;
+  size_t iteration_source_scalar_host_to_device_calls;
+  size_t iteration_source_scalar_host_to_device_bytes;
+  size_t final_scalar_device_to_host_calls;
+  size_t final_scalar_device_to_host_bytes;
+  size_t final_source_scalar_host_to_device_calls;
+  size_t final_source_scalar_host_to_device_bytes;
+  size_t diagnostic_device_to_host_calls;
+  size_t diagnostic_device_to_host_bytes;
+  size_t pack_kernel_launches;
+  size_t unpack_kernel_launches;
+  size_t zero_kernel_launches;
+  size_t rhs_source_kernel_launches;
+  size_t reconciliation_kernel_launches;
+  size_t vector_kernel_launches;
+  size_t operator_kernel_launches;
+  size_t reduction_kernel_launches;
+  size_t timestep_kernel_launches;
+  size_t finite_check_kernel_launches;
   size_t final_dft_kernel_launches;
   size_t kernel_launches;
+  size_t setup_kernel_launches;
+  size_t iteration_kernel_launches;
+  size_t final_kernel_launches;
+  size_t iteration_operator_applications;
+  size_t iteration_reduction_count;
+  size_t iteration_pack_kernel_launches;
+  size_t iteration_unpack_kernel_launches;
+  size_t iteration_reconciliation_kernel_launches;
+  size_t iteration_vector_kernel_launches;
+  size_t iteration_operator_kernel_launches;
+  size_t iteration_reduction_kernel_launches;
+  size_t iteration_timestep_kernel_launches;
+  size_t timestep_kernel_launches_per_operator;
+  size_t reconciliation_kernel_launches_per_operator;
   size_t workspace_capacity_bytes;
   size_t workspace_allocations;
   bool valid;
 
   NvidiaCwStatistics()
       : reduction_count(0), scalar_device_to_host_calls(0), scalar_device_to_host_bytes(0),
+        source_scalar_host_to_device_calls(0), source_scalar_host_to_device_bytes(0),
         vector_host_to_device_bytes(0), vector_device_to_host_bytes(0),
-        final_dft_kernel_launches(0), kernel_launches(0), workspace_capacity_bytes(0),
+        setup_scalar_device_to_host_calls(0), setup_scalar_device_to_host_bytes(0),
+        setup_source_scalar_host_to_device_calls(0), setup_source_scalar_host_to_device_bytes(0),
+        iteration_scalar_device_to_host_calls(0), iteration_scalar_device_to_host_bytes(0),
+        iteration_source_scalar_host_to_device_calls(0),
+        iteration_source_scalar_host_to_device_bytes(0), final_scalar_device_to_host_calls(0),
+        final_scalar_device_to_host_bytes(0), final_source_scalar_host_to_device_calls(0),
+        final_source_scalar_host_to_device_bytes(0), diagnostic_device_to_host_calls(0),
+        diagnostic_device_to_host_bytes(0), pack_kernel_launches(0),
+        unpack_kernel_launches(0), zero_kernel_launches(0), rhs_source_kernel_launches(0),
+        reconciliation_kernel_launches(0), vector_kernel_launches(0),
+        operator_kernel_launches(0), reduction_kernel_launches(0), timestep_kernel_launches(0),
+        finite_check_kernel_launches(0),
+        final_dft_kernel_launches(0), kernel_launches(0), setup_kernel_launches(0),
+        iteration_kernel_launches(0), final_kernel_launches(0),
+        iteration_operator_applications(0), iteration_reduction_count(0),
+        iteration_pack_kernel_launches(0), iteration_unpack_kernel_launches(0),
+        iteration_reconciliation_kernel_launches(0), iteration_vector_kernel_launches(0),
+        iteration_operator_kernel_launches(0), iteration_reduction_kernel_launches(0),
+        iteration_timestep_kernel_launches(0), timestep_kernel_launches_per_operator(0),
+        reconciliation_kernel_launches_per_operator(0), workspace_capacity_bytes(0),
         workspace_allocations(0), valid(false) {}
 };
 
