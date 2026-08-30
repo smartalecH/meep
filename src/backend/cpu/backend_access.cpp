@@ -1013,9 +1013,13 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
   }
   backend_reconcile_host_access(local_error, "fields::solve_cw cheap preflight");
 
+  /* Rebuild the complete backend epoch only when storage/topology can change.
+     Source-amplitude mutations deliberately dirty the source plan and both
+     executables, but their indices/components and resident arrays are stable;
+     rebuilding the epoch there would discard the state-owned CW workspace. */
   const DirtyMask structural_dirty =
-      DirtyMask(dirty_source_plan | dirty_monitor_plan | dirty_storage | dirty_regions |
-                dirty_halos | dirty_executable | dirty_classification);
+      DirtyMask(dirty_monitor_plan | dirty_storage | dirty_regions | dirty_halos |
+                dirty_classification);
   const bool stage_epoch = !f.backend_state || !f.executable || (f.dirty_mask & structural_dirty);
   std::unique_ptr<PreparedBackendEpoch> prepared_epoch;
   if (stage_epoch && f.backend_state) {
@@ -1070,6 +1074,14 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
       /* Source promotion and boundary relocation belong to the staged epoch:
          both may rewrite chunk-local source rows and realize new field slots. */
       f.require_source_components();
+      f.init_backend();
+      f.ensure_backend_executable();
+    }
+    else if (f.dirty_mask & DirtyMask(dirty_source_plan | dirty_monitor_plan | dirty_regions |
+                                      dirty_executable)) {
+      /* Non-structural plan changes retain the resident state while replacing
+         the ordinary executable transactionally.  The CW cache key below then
+         replaces its private executable against the refreshed descriptors. */
       f.init_backend();
       f.ensure_backend_executable();
     }
@@ -1149,9 +1161,10 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
 
   local_error.clear();
   try {
-    /* A value-only refresh is deliberately beyond the retryable preflight
-       boundary: canonical plans and both executables remain reusable, but a
-       partially failed device upload cannot be rolled back. */
+    /* Field/material value refreshes are deliberately beyond the retryable
+       preflight boundary: their plans and executables remain reusable, but a
+       partially failed device upload cannot be rolled back. Source amplitudes
+       were refreshed transactionally with their plans/executables above. */
     if (!stage_epoch && is_dirty(f, dirty_initialization)) f.init_backend();
     {
       CwSolveSession session(f, request);

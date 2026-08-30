@@ -738,8 +738,8 @@ static void test_resident_cw_lifecycle() {
             counts.cw_executables_created == 1 && counts.cw_executables_destroyed == 0,
         "first resident solve did not create exactly one private CW executable");
   BackendState *const state = f->backend_state;
-  Executable *const ordinary = f->executable;
-  Executable *const cached_cw = state->cw_executable;
+  Executable *ordinary = f->executable;
+  Executable *cached_cw = state->cw_executable;
   CHECK(cached_cw && cached_cw != ordinary, "ordinary and CW executables are not separately owned");
 
   counts.cw_status = CwSolveStatus::converged;
@@ -752,11 +752,42 @@ static void test_resident_cw_lifecycle() {
             counts.cw_executables_created == 1,
         "unchanged resident solve rebuilt its private executable");
 
-  invalidate(*f, MutationKind::source_values, "CW source-value reuse test");
+  const int ordinary_created_before_values = counts.executables_created;
+  const int ordinary_destroyed_before_values = counts.executables_destroyed;
+  const int cw_created_before_values = counts.cw_executables_created;
+  const int cw_destroyed_before_values = counts.cw_executables_destroyed;
+  Executable *const ordinary_before_values = ordinary;
+  Executable *const cw_before_values = cached_cw;
+  src_vol *mutated_source = NULL;
+  for (int chunk = 0; chunk < f->num_chunks && !mutated_source; ++chunk)
+    FOR_FIELD_TYPES(ft) if (!f->chunks[chunk]->sources[ft].empty()) {
+      mutated_source = &f->chunks[chunk]->sources[ft][0];
+      break;
+    }
+  CHECK(mutated_source && mutated_source->num_points() > 0,
+        "source-value refresh fixture has no mutable amplitude");
+  const std::complex<double> refreshed_amplitude =
+      mutated_source->amplitude_at(0) + std::complex<double>(0.125, -0.0625);
+  mutated_source->set_amplitude(0, refreshed_amplitude);
+  invalidate(*f, MutationKind::source_values, "CW source-value refresh test");
   CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
         "source-value-only resident solve failed");
-  CHECK(f->backend_state->cw_executable == cached_cw && counts.cw_executables_created == 1,
-        "source-value-only refresh rebuilt the private CW executable");
+  ordinary = f->executable;
+  cached_cw = f->backend_state->cw_executable;
+  CHECK(f->backend_state == state && ordinary != ordinary_before_values &&
+            cached_cw != cw_before_values,
+        "source-value-only refresh did not retain state and replace both executables");
+  CHECK(counts.executables_created == ordinary_created_before_values + 1 &&
+            counts.executables_destroyed == ordinary_destroyed_before_values + 1 &&
+            counts.cw_executables_created == cw_created_before_values + 1 &&
+            counts.cw_executables_destroyed == cw_destroyed_before_values + 1,
+        "source-value-only refresh did not replace each executable exactly once");
+  bool descriptor_refreshed = false;
+  for (const SourceDescriptor &source : f->descriptors->sources.sources)
+    for (std::complex<double> amplitude : source.complex_amplitudes)
+      descriptor_refreshed = descriptor_refreshed || amplitude == refreshed_amplitude;
+  CHECK(descriptor_refreshed,
+        "source-value-only refresh did not publish the live amplitude in SourcePlan");
 
   counts.cw_status = CwSolveStatus::breakdown;
   CHECK(!f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2) &&
