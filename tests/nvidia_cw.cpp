@@ -909,14 +909,83 @@ int main(int argc, char **argv) {
   for (const std::complex<realnum> &value : gpu_not_due_values)
     require(value == std::complex<realnum>(), "NVIDIA not-due final DFT monitor was updated");
 
+  const auto first_live_source = [](fields &owner) -> src_vol * {
+    for (int chunk = 0; chunk < owner.num_chunks; ++chunk) {
+      FOR_FIELD_TYPES(ft) {
+        if (!owner.chunks[chunk]->sources[ft].empty())
+          return &owner.chunks[chunk]->sources[ft][0];
+      }
+    }
+    return NULL;
+  };
+  const auto compare_refresh_point = [&](component c, const vec &point, const char *what) {
+    const std::complex<double> expected = cpu.get_field(c, point);
+    const std::complex<double> actual = gpu.get_field(c, point);
+    const double bound = (reduced_storage ? 2e-3 : 1e-5) * (1.0 + std::abs(expected));
+    require(std::abs(actual - expected) <= bound, what);
+  };
+
+  BackendState *const source_value_state = gpu.backend_state;
+  Executable *const source_value_ordinary = gpu.executable;
+  Executable *const source_value_cw = gpu.backend_state->cw_executable;
+  src_vol *const cpu_mutated_source = first_live_source(cpu);
+  src_vol *const gpu_mutated_source = first_live_source(gpu);
+  require(cpu_mutated_source && gpu_mutated_source &&
+              cpu_mutated_source->num_points() == gpu_mutated_source->num_points() &&
+              cpu_mutated_source->num_points() > 0,
+          "source-value refresh fixture has no corresponding live source");
+  const std::complex<double> refreshed_amplitude =
+      cpu_mutated_source->amplitude_at(0) + std::complex<double>(0.125, -0.0625);
+  cpu_mutated_source->set_amplitude(0, refreshed_amplitude);
+  gpu_mutated_source->set_amplitude(0, refreshed_amplitude);
+  invalidate(cpu, MutationKind::source_values, "CPU CW source-value refresh test");
+  invalidate(gpu, MutationKind::source_values, "NVIDIA CW source-value refresh test");
+  require(cpu.solve_cw(tolerance, 1000, std::complex<double>(0.30, 0.0), 2),
+          "CPU source-value refresh solve did not converge");
   require(gpu.solve_cw(tolerance, 1000, std::complex<double>(0.30, 0.0), 2),
-          "repeated resident solve did not converge");
+          "NVIDIA source-value refresh solve did not converge");
   const NvidiaCwStatistics repeat_stats = nvidia_backend->cw_statistics_for_testing();
+  require(gpu.backend_state == source_value_state && gpu.executable != source_value_ordinary &&
+              gpu.backend_state->cw_executable != source_value_cw,
+          "source-value refresh did not retain state and replace both executables");
   require(repeat_stats.valid && repeat_stats.workspace_allocations == 1 &&
               repeat_stats.workspace_capacity_bytes == first_stats.workspace_capacity_bytes &&
               repeat_stats.vector_host_to_device_bytes == 0 &&
               repeat_stats.vector_device_to_host_bytes == 0,
-          "repeated resident solve did not reuse its device workspace");
+          "source-value refresh did not retain its device workspace");
+  bool refreshed_descriptor = false;
+  for (const SourceDescriptor &source : gpu.descriptors->sources.sources)
+    for (std::complex<double> amplitude : source.complex_amplitudes)
+      refreshed_descriptor = refreshed_descriptor || amplitude == refreshed_amplitude;
+  require(refreshed_descriptor,
+          "source-value refresh did not publish the new spatial amplitude");
+  compare_refresh_point(Ez, vec(4.0, 1.5),
+                        "source-value refresh changed NVIDIA Ez parity");
+  compare_refresh_point(Hz, vec(4.0, 1.5),
+                        "source-value refresh changed NVIDIA Hz parity");
+  compare_dft_values(dft_values(cpu, cpu_due, monitor_component),
+                     dft_values(gpu, gpu_due, monitor_component),
+                     reduced_storage ? 2e-3 : 1e-5);
+
+  BackendState *const source_definition_state = gpu.backend_state;
+  Executable *const source_definition_ordinary = gpu.executable;
+  Executable *const source_definition_cw = gpu.backend_state->cw_executable;
+  const vec added_source_point(2.4, 1.3);
+  const std::complex<double> added_source_amplitude(0.03125, -0.015625);
+  cpu.add_point_source(Ez, cpu_e, added_source_point, added_source_amplitude);
+  gpu.add_point_source(Ez, gpu_e, added_source_point, added_source_amplitude);
+  require(cpu.solve_cw(tolerance, 1000, std::complex<double>(0.30, 0.0), 2),
+          "CPU source-definition refresh solve did not converge");
+  require(gpu.solve_cw(tolerance, 1000, std::complex<double>(0.30, 0.0), 2),
+          "NVIDIA source-definition refresh solve did not converge");
+  require(gpu.backend_state != source_definition_state &&
+              gpu.executable != source_definition_ordinary &&
+              gpu.backend_state->cw_executable != source_definition_cw,
+          "source-definition refresh did not replace state and both executables");
+  compare_refresh_point(Ez, vec(4.0, 1.5),
+                        "source-definition refresh changed NVIDIA Ez parity");
+  compare_refresh_point(Hz, vec(4.0, 1.5),
+                        "source-definition refresh changed NVIDIA Hz parity");
 
   const std::complex<double> near = gpu.get_field(Ez, vec(4.0, 1.5));
   const std::complex<double> far = gpu.get_field(Ez, vec(6.0, 1.5));
