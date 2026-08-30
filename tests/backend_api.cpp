@@ -162,6 +162,7 @@ struct lifetime_counts {
   bool fail_rebuild;
   bool fail_create_state;
   bool fail_initialize;
+  bool fail_finalize;
   bool fail_compile;
   bool fail_advance;
   bool corrupt_catalog_after_compile;
@@ -211,7 +212,8 @@ struct lifetime_counts {
         authoritative_value(0), migrate_multilevel_values(false),
         authoritative_population(realnum(0.625)), authoritative_p(realnum(0.375)),
         authoritative_p_prev(realnum(-0.25)), multilevel_migrations(0), fail_rebuild(false),
-        fail_create_state(false), fail_initialize(false), fail_compile(false), fail_advance(false),
+        fail_create_state(false), fail_initialize(false), fail_finalize(false),
+        fail_compile(false), fail_advance(false),
         corrupt_catalog_after_compile(false),
         fail_magnetic_synchronize(false), fail_magnetic_restore(false),
         fail_magnetic_synchronize_dispatch(false), fail_cw_preflight(false),
@@ -296,7 +298,10 @@ public:
     ++counts.classified;
     return classify(f, plan);
   }
-  void finalize_storage(const StoragePlan &, BackendState &) override { ++counts.finalized; }
+  void finalize_storage(const StoragePlan &, BackendState &) override {
+    ++counts.finalized;
+    if (counts.fail_finalize) throw std::runtime_error("injected finalization failure");
+  }
   Executable *compile(const StepPlan &plan, BackendState &) override {
     if (counts.fail_compile) throw std::runtime_error("injected executable compilation failure");
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
@@ -4154,6 +4159,19 @@ static uint64_t custom_counter_value(const HostCustomFallbackStats &stats,
   return 0;
 }
 
+static bool same_host_custom_stats(const HostCustomFallbackStats &a,
+                                   const HostCustomFallbackStats &b) {
+  return a.warnings == b.warnings && a.preflights == b.preflights &&
+         a.sessions == b.sessions && a.callbacks == b.callbacks &&
+         a.completed_sessions == b.completed_sessions &&
+         a.staging_allocations == b.staging_allocations &&
+         a.staging_bytes == b.staging_bytes && a.downloads == b.downloads &&
+         a.download_bytes == b.download_bytes && a.uploads == b.uploads &&
+         a.upload_bytes == b.upload_bytes &&
+         a.retryable_failures == b.retryable_failures &&
+         a.poisoned_failures == b.poisoned_failures;
+}
+
 static void test_resident_host_custom_policy_lifecycle() {
   auto expect_early_rejection = [](const char *label, const execution_options &opts,
                                    bool backend_support, const char *message,
@@ -4948,6 +4966,80 @@ static void test_resident_host_custom_collective_preflight() {
   }
 
   backend_set_host_custom_mpi_override_for_testing(count_processors() > 1);
+
+  /* Policy and its one-shot warning belong to the committed resident epoch,
+     not merely to the early custom capability reconciliation. Exercise both
+     fallible steps after that gate for addition and removal. */
+  for (int injection = 0; injection < 3; ++injection) {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking =
+        new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    const HostCustomFallbackStats entry_stats = tracking->host_custom_fallback_stats();
+    counts.fail_create_state = injection == 0;
+    counts.fail_initialize = injection == 1;
+    counts.fail_finalize = injection == 2;
+    bool failed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(and_to_all(failed) && !tracking->host_custom_fallback_enabled() &&
+              same_host_custom_stats(entry_stats, tracking->host_custom_fallback_stats()) &&
+              !tracking->is_poisoned(),
+          "custom addition rebuild failure %d published policy, warning, stats, or poison",
+          injection);
+    counts.fail_create_state = false;
+    counts.fail_initialize = false;
+    counts.fail_finalize = false;
+    f.advance(1);
+    const bool any_enabled = or_to_all(tracking->host_custom_fallback_enabled());
+    CHECK(f.backend_state->host_custom_preflight_required &&
+              tracking->host_custom_fallback_enabled() ==
+                  f.backend_state->host_custom_local_presence &&
+              any_enabled &&
+              tracking->host_custom_fallback_stats().warnings == 1,
+          "custom addition rebuild failure %d did not publish on retry", injection);
+  }
+
+  for (int injection = 0; injection < 3; ++injection) {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking =
+        new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    const bool entry_enabled = tracking->host_custom_fallback_enabled();
+    const HostCustomFallbackStats entry_stats = tracking->host_custom_fallback_stats();
+    f.remove_susceptibilities();
+    counts.fail_create_state = injection == 0;
+    counts.fail_initialize = injection == 1;
+    counts.fail_finalize = injection == 2;
+    bool failed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(and_to_all(failed) &&
+              tracking->host_custom_fallback_enabled() == entry_enabled &&
+              same_host_custom_stats(entry_stats, tracking->host_custom_fallback_stats()) &&
+              !tracking->is_poisoned(),
+          "custom removal rebuild failure %d replaced the committed policy or stats",
+          injection);
+    counts.fail_create_state = false;
+    counts.fail_initialize = false;
+    counts.fail_finalize = false;
+    f.advance(1);
+    CHECK(!tracking->host_custom_fallback_enabled() &&
+              same_host_custom_stats(entry_stats, tracking->host_custom_fallback_stats()),
+          "custom removal rebuild failure %d did not publish removal on retry", injection);
+  }
+
   {
     structure s(gv, unit_epsilon, no_pml(), identity(), 2);
     add_custom_lifecycle_state(s);
@@ -5064,11 +5156,13 @@ static void test_resident_host_custom_collective_preflight() {
     f.backend = new tracking_backend(f, counts);
     backend_reset_host_custom_collective_count_for_testing();
     f.advance(1);
+    backend_reset_host_custom_presence_scan_count_for_testing();
     f.advance(1);
     CHECK(backend_host_custom_collective_count_for_testing() == 0 &&
+              backend_host_custom_presence_scan_count_for_testing() == 0 &&
               !f.backend_state->host_custom_preflight_required &&
               !f.backend_state->host_custom_plan_validated,
-          "never-custom steady path entered custom collective validation");
+          "never-custom steady path entered custom collective validation or rescanned states");
   }
 }
 

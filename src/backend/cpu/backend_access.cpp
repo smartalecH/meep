@@ -47,9 +47,11 @@ static size_t multilevel_collective_count_for_testing = 0;
 static int host_custom_collective_failure_rank_for_testing = -1;
 static int host_custom_collective_failure_mode_for_testing = 0;
 static size_t host_custom_collective_count_for_testing = 0;
+static size_t host_custom_presence_scan_count_for_testing = 0;
 static bool host_custom_mpi_override_for_testing = false;
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
+  ++host_custom_presence_scan_count_for_testing;
   for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
     if (!f.chunks[chunk]->is_mine()) continue;
     for (field_type ft : {E_stuff, H_stuff})
@@ -133,12 +135,23 @@ void backend_note_host_custom_collective_for_testing() {
   ++host_custom_collective_count_for_testing;
 }
 
+void backend_reset_host_custom_presence_scan_count_for_testing() {
+  host_custom_presence_scan_count_for_testing = 0;
+}
+
+size_t backend_host_custom_presence_scan_count_for_testing() {
+  return host_custom_presence_scan_count_for_testing;
+}
+
 void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
                                        BackendState &state) {
   if (host_custom_collective_failure_rank_for_testing == my_rank() &&
       host_custom_collective_failure_mode_for_testing == 4)
     throw std::runtime_error("injected host custom plan validation failure");
   f.backend->validate_host_custom_plan(plan, state);
+  if (f.backend->is_poisoned())
+    throw std::runtime_error(
+        "host custom plan validation poisoned the resident backend");
 }
 
 namespace {
@@ -2157,12 +2170,22 @@ void fields::init_backend() {
   const size_t multilevel_present_bit =
       size_t(1) << (std::numeric_limits<size_t>::digits - 3);
   const size_t custom_present_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 4);
+  const bool resident_backend = backend->requires_full_storage_preparation();
+  const bool custom_presence_stale =
+      resident_backend &&
+      (!backend_state || !backend_state->host_custom_presence_validated ||
+       is_dirty(*this, dirty_storage));
+  const bool local_custom =
+      resident_backend
+          ? (custom_presence_stale ? has_live_host_custom_susceptibility(*this)
+                                   : backend_state->host_custom_local_presence)
+          : false;
   size_t local_status = size_t(dirty_mask & relevant);
   if (backend->is_poisoned()) local_status |= poison_bit;
   if (fluxes || (descriptors && !descriptors->legacy_fluxes.empty()))
     local_status |= flux_present_bit;
   if (has_local_exact_multilevel(*this)) local_status |= multilevel_present_bit;
-  if (has_live_host_custom_susceptibility(*this)) local_status |= custom_present_bit;
+  if (local_custom) local_status |= custom_present_bit;
   size_t global_status = 0;
   bw_or_to_all(&local_status, &global_status, 1);
   if (global_status & poison_bit) {
@@ -2173,7 +2196,7 @@ void fields::init_backend() {
   const bool any_multilevel = (global_status & multilevel_present_bit) != 0;
   const bool any_custom = (global_status & custom_present_bit) != 0;
 
-  if (!backend->requires_full_storage_preparation()) {
+  if (!resident_backend) {
     /* Most CPU execution keeps its historical lazy storage preparation.
        Legacy flux is the exception: its pointer-free recipes need final
        catalog ArrayIds before the first StepPlan is built, so a cold CPU flux
@@ -2199,13 +2222,13 @@ void fields::init_backend() {
 
   /* Stage custom policy/readiness on every rank before any resident material
      preparation, polarization allocation, descriptor callback, or state
-     creation. Publication happens only after the collective succeeds. PR6
-     extends validate_host_custom_rebuild with exact host-segment identities. */
-  const bool custom_rebuild = !backend_state || is_dirty(*this, dirty_storage);
+     creation. The enabled bit, cached epoch presence, and warning delta stay
+     private until every later fallible rebuild step has succeeded. PR6 extends
+     validate_host_custom_rebuild with exact host-segment identities. */
+  const bool custom_rebuild = !backend_state || is_dirty(*this, dirty_storage) ||
+                              !backend_state->host_custom_presence_validated;
   if (custom_rebuild) {
-    if (!any_custom)
-      backend_publish_host_custom_policy(*this, false, false);
-    else {
+    if (any_custom) {
       std::string custom_error =
           host_custom_policy_error(*this, HostCustomFallbackUse::time_domain, true,
                                    synchronized_magnetic_fields != 0);
@@ -2220,7 +2243,12 @@ void fields::init_backend() {
           else if (host_custom_collective_failure_mode_for_testing == 3)
             throw std::bad_alloc();
         }
-        if (custom_error.empty()) backend->validate_host_custom_rebuild();
+        if (custom_error.empty()) {
+          backend->validate_host_custom_rebuild();
+          if (backend->is_poisoned())
+            custom_error =
+                "host custom rebuild validation poisoned the resident backend";
+        }
       }
       catch (const std::exception &e) {
         custom_error = e.what();
@@ -2230,8 +2258,6 @@ void fields::init_backend() {
       }
       backend_note_host_custom_collective_for_testing();
       backend_reconcile_host_access(custom_error, "fields::init_backend custom fallback");
-      backend_publish_host_custom_policy(*this, has_live_host_custom_susceptibility(*this),
-                                         true);
     }
   }
 
@@ -2388,6 +2414,14 @@ void fields::init_backend() {
   if (preclassification_ordinary) {
     delete step_plans[0];
     step_plans[0] = preclassification_ordinary.release();
+  }
+  if (custom_rebuild) {
+    if (!backend_state)
+      throw std::logic_error("successful resident rebuild has no backend state");
+    backend_state->host_custom_local_presence = local_custom;
+    backend_state->host_custom_presence_validated = true;
+    backend_state->host_custom_preflight_required = any_custom;
+    backend_publish_host_custom_policy(*this, local_custom, any_custom);
   }
 }
 

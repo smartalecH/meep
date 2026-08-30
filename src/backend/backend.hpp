@@ -64,7 +64,8 @@ struct BackendState {
         noisy_stream_count(0), multilevel_preflight_required(false),
         multilevel_plan_validated(false), multilevel_static_validation_required(false),
         multilevel_validated_plan_signature(0), host_custom_preflight_required(false),
-        host_custom_plan_validated(false), host_custom_validated_plan_signature(0),
+        host_custom_plan_validated(false), host_custom_local_presence(false),
+        host_custom_presence_validated(false), host_custom_validated_plan_signature(0),
         noisy_first_stream_tag(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
@@ -96,6 +97,12 @@ struct BackendState {
      host_custom_enabled_ bit stays local to ranks that own callbacks. */
   bool host_custom_preflight_required;
   bool host_custom_plan_validated;
+  /* Exact live-type presence belongs to the installed storage epoch. A clean
+     init reuses this bit instead of walking every polarization linked list;
+     storage rebuilds rescan and publish the replacement only after the whole
+     resident rebuild commits successfully. */
+  bool host_custom_local_presence;
+  bool host_custom_presence_validated;
   uint64_t host_custom_validated_plan_signature;
   uint64_t noisy_first_stream_tag;
 };
@@ -264,7 +271,10 @@ public:
   }
   /* PR8 owns the allocation-free collective boundary. The final PR6 restack
      overrides these adapter points to validate compiled host-segment identity,
-     ranges, and reserved staging without coupling policy code to that schema. */
+     ranges, and reserved staging without coupling policy code to that schema.
+     Both adapters are validation-only: they must not mutate live backend state
+     or poison the backend. Callers nevertheless reject self-poison before
+     publishing staged policy or plan metadata. */
   virtual void validate_host_custom_rebuild() {}
   virtual void validate_host_custom_plan(const StepPlan &, BackendState &) {}
 
@@ -461,6 +471,8 @@ void backend_set_host_custom_mpi_override_for_testing(bool enabled);
 void backend_reset_host_custom_collective_count_for_testing();
 size_t backend_host_custom_collective_count_for_testing();
 void backend_note_host_custom_collective_for_testing();
+void backend_reset_host_custom_presence_scan_count_for_testing();
+size_t backend_host_custom_presence_scan_count_for_testing();
 void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
                                        BackendState &state);
 void backend_set_noisy_preflight_failure_for_testing(int rank, int mode);
