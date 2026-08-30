@@ -3449,8 +3449,8 @@ NvidiaCompiledHalo compile_halo(const HaloPlan &source, const fields &f, NvidiaB
 
   HaloPlan canonical;
   std::string why;
-  if (!remap_halo_plan(source, f.halos->arrays, *f.array_catalog, f.is_real ? 1 : 2, canonical,
-                       why))
+  if (!remap_halo_plan(source, f.halos->arrays, f.halos->host_arrays, *f.array_catalog,
+                       f.is_real ? 1 : 2, canonical, why))
     throw std::logic_error(std::string("cannot remap local halo plan: ") + why);
 
   std::vector<ElementRef> gather_refs, scatter_refs;
@@ -4612,6 +4612,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           for (size_t i = 0; i < f_.halos->plans.size(); ++i) {
             const HaloPlan &halo = f_.halos->plans[i];
             if (halo.ft != op.ft || !halo.block_elements) continue;
+            /* Opaque polarization halos execute as part of the encompassing
+               host-callback segment.  They deliberately have no device-side
+               ArrayId representation to lower here. */
+            if (halo.storage == HaloStorageDisposition::host_owned) continue;
             const NvidiaCompiledHalo lowered =
                 compile_halo(halo, f_, state, buffer_elements, halo_gathers, halo_scatters);
             if (have_halo_precision && lowered.gather.precision != halo_precision)
