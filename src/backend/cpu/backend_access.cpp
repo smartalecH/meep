@@ -1013,14 +1013,25 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
   }
   backend_reconcile_host_access(local_error, "fields::solve_cw cheap preflight");
 
-  /* Rebuild the complete backend epoch only when storage/topology can change.
-     Source-amplitude mutations deliberately dirty the source plan and both
-     executables, but their indices/components and resident arrays are stable;
-     rebuilding the epoch there would discard the state-owned CW workspace. */
+  /* A pure source-amplitude mutation has stable indices, components, storage,
+     and coordinate topology. It can therefore replace the descriptors and
+     both executables transactionally against the existing state, retaining
+     the state-owned CW workspace. Every other executable-invalidating change
+     keeps the conservative full staged-epoch path below. */
+  const DirtyMask source_value_forbidden =
+      DirtyMask(dirty_initialization | dirty_monitor_plan | dirty_storage | dirty_regions |
+                dirty_halos | dirty_classification);
+  const bool source_value_refresh =
+      f.backend_state && f.executable && is_dirty(f, dirty_source_plan) &&
+      is_dirty(f, dirty_executable) && !(f.dirty_mask & source_value_forbidden) &&
+      coordinate_state_matches(f, f.step_plans[0]) &&
+      (!f.step_plans[1] || coordinate_state_matches(f, f.step_plans[1]));
   const DirtyMask structural_dirty =
-      DirtyMask(dirty_monitor_plan | dirty_storage | dirty_regions | dirty_halos |
-                dirty_classification);
-  const bool stage_epoch = !f.backend_state || !f.executable || (f.dirty_mask & structural_dirty);
+      DirtyMask(dirty_source_plan | dirty_monitor_plan | dirty_storage | dirty_regions |
+                dirty_halos | dirty_executable | dirty_classification);
+  const bool stage_epoch = !source_value_refresh &&
+                           (!f.backend_state || !f.executable ||
+                            (f.dirty_mask & structural_dirty));
   std::unique_ptr<PreparedBackendEpoch> prepared_epoch;
   if (stage_epoch && f.backend_state) {
     try {
@@ -1069,27 +1080,39 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
   uint64_t old_cw_step_plan_signature = 0;
   uint64_t old_cw_plan_signature = 0;
   bool captured_cw_cache = false;
+  std::unique_ptr<DescriptorSet> source_value_descriptors;
+  std::unique_ptr<StepPlan> source_value_step_plans[2];
+  Executable *source_value_ordinary = NULL;
+  DescriptorSet *live_descriptors = NULL;
   try {
-    if (stage_epoch) {
+    if (source_value_refresh) {
+      source_value_descriptors.reset(new DescriptorSet(*f.descriptors));
+      build_source_descriptors(f, source_value_descriptors->sources);
+      live_descriptors = f.descriptors;
+      f.descriptors = source_value_descriptors.get();
+      source_value_step_plans[0].reset(new StepPlan(build_step_plan(f, StepProgram::ordinary)));
+      source_value_step_plans[1].reset(new StepPlan(build_step_plan(f, StepProgram::solve_cw)));
+      source_value_ordinary = f.backend->compile(*source_value_step_plans[0], *f.backend_state);
+      if (!source_value_ordinary)
+        throw std::runtime_error("backend returned no source-refresh executable");
+      ordinary_executable = source_value_ordinary;
+      state = f.backend_state;
+      cw_step_plan = source_value_step_plans[1].get();
+    }
+    else {
+      if (stage_epoch) {
       /* Source promotion and boundary relocation belong to the staged epoch:
          both may rewrite chunk-local source rows and realize new field slots. */
-      f.require_source_components();
-      f.init_backend();
-      f.ensure_backend_executable();
+        f.require_source_components();
+        f.init_backend();
+        f.ensure_backend_executable();
+      }
+      ordinary_executable = f.executable;
+      state = f.backend_state;
+      cw_step_plan = &f.step_plan_for(StepProgram::solve_cw);
     }
-    else if (f.dirty_mask & DirtyMask(dirty_source_plan | dirty_monitor_plan | dirty_regions |
-                                      dirty_executable)) {
-      /* Non-structural plan changes retain the resident state while replacing
-         the ordinary executable transactionally.  The CW cache key below then
-         replaces its private executable against the refreshed descriptors. */
-      f.init_backend();
-      f.ensure_backend_executable();
-    }
-    ordinary_executable = f.executable;
-    state = f.backend_state;
     if (!ordinary_executable || !state)
       throw std::logic_error("resident solve_cw has no prepared ordinary backend epoch");
-    cw_step_plan = &f.step_plan_for(StepProgram::solve_cw);
     audit_resident_cw_layout(f, cw_step_plan->cw_state_layout);
     cw_plan = build_cw_plan(f, *cw_step_plan);
     if (cw_plan_corruption_for_testing) cw_plan.signature ^= 1;
@@ -1122,6 +1145,7 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
   catch (...) {
     local_error = "unknown resident solve_cw compiled preflight failure";
   }
+  if (live_descriptors) f.descriptors = live_descriptors;
 
   if (captured_cw_cache && state &&
       (state->cw_executable != old_cw_executable ||
@@ -1144,12 +1168,28 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
       delete rogue_cache_executable;
     if (replacement && replacement != old_cw_executable && replacement != ordinary_executable)
       delete replacement;
+    delete source_value_ordinary;
     prepared_epoch.reset();
     if (local_error.empty())
       throw std::runtime_error("fields::solve_cw compiled preflight failed on another MPI rank");
     throw std::runtime_error(std::string("fields::solve_cw compiled preflight: ") + local_error);
   }
 
+  if (source_value_refresh) {
+    DescriptorSet *old_descriptors = f.descriptors;
+    StepPlan *old_step_plans[2] = {f.step_plans[0], f.step_plans[1]};
+    Executable *old_ordinary = f.executable;
+    f.descriptors = source_value_descriptors.release();
+    f.step_plans[0] = source_value_step_plans[0].release();
+    f.step_plans[1] = source_value_step_plans[1].release();
+    f.executable = source_value_ordinary;
+    source_value_ordinary = NULL;
+    clear_dirty(f, dirty_source_plan | dirty_executable);
+    delete old_ordinary;
+    delete old_step_plans[0];
+    delete old_step_plans[1];
+    delete old_descriptors;
+  }
   if (replacement != old_cw_executable) {
     state->cw_executable = replacement;
     delete old_cw_executable;

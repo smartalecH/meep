@@ -752,10 +752,6 @@ static void test_resident_cw_lifecycle() {
             counts.cw_executables_created == 1,
         "unchanged resident solve rebuilt its private executable");
 
-  const int ordinary_created_before_values = counts.executables_created;
-  const int ordinary_destroyed_before_values = counts.executables_destroyed;
-  const int cw_created_before_values = counts.cw_executables_created;
-  const int cw_destroyed_before_values = counts.cw_executables_destroyed;
   Executable *const ordinary_before_values = ordinary;
   Executable *const cw_before_values = cached_cw;
   src_vol *mutated_source = NULL;
@@ -770,6 +766,50 @@ static void test_resident_cw_lifecycle() {
       mutated_source->amplitude_at(0) + std::complex<double>(0.125, -0.0625);
   mutated_source->set_amplitude(0, refreshed_amplitude);
   invalidate(*f, MutationKind::source_values, "CW source-value refresh test");
+  const BackendEpochSnapshot source_value_entry(*f);
+  DescriptorSet *const source_value_descriptors = f->descriptors;
+  StepPlan *const source_value_ordinary_plan = f->step_plans[0];
+  StepPlan *const source_value_cw_plan = f->step_plans[1];
+  counts.fail_compile = true;
+  bool source_value_compile_failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    source_value_compile_failed = true;
+  }
+  counts.fail_compile = false;
+  CHECK(source_value_compile_failed && source_value_entry.matches(*f) &&
+            mutated_source->amplitude_at(0) == refreshed_amplitude &&
+            f->backend_state == state && f->executable == ordinary_before_values &&
+            f->backend_state->cw_executable == cw_before_values &&
+            f->descriptors == source_value_descriptors &&
+            f->step_plans[0] == source_value_ordinary_plan &&
+            f->step_plans[1] == source_value_cw_plan,
+        "source-value ordinary compile failure partially published the refresh");
+
+  counts.fail_cw_preflight = true;
+  bool source_value_cw_failed = false;
+  try {
+    (void)f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2);
+  }
+  catch (const std::runtime_error &) {
+    source_value_cw_failed = true;
+  }
+  counts.fail_cw_preflight = false;
+  CHECK(source_value_cw_failed && source_value_entry.matches(*f) &&
+            mutated_source->amplitude_at(0) == refreshed_amplitude &&
+            f->backend_state == state && f->executable == ordinary_before_values &&
+            f->backend_state->cw_executable == cw_before_values &&
+            f->descriptors == source_value_descriptors &&
+            f->step_plans[0] == source_value_ordinary_plan &&
+            f->step_plans[1] == source_value_cw_plan,
+        "source-value CW preflight failure partially published the refresh");
+
+  const int ordinary_created_before_success = counts.executables_created;
+  const int ordinary_destroyed_before_success = counts.executables_destroyed;
+  const int cw_created_before_success = counts.cw_executables_created;
+  const int cw_destroyed_before_success = counts.cw_executables_destroyed;
   CHECK(f->solve_cw(1e-6, 20, std::complex<double>(0.3, 0.0), 2),
         "source-value-only resident solve failed");
   ordinary = f->executable;
@@ -777,10 +817,10 @@ static void test_resident_cw_lifecycle() {
   CHECK(f->backend_state == state && ordinary != ordinary_before_values &&
             cached_cw != cw_before_values,
         "source-value-only refresh did not retain state and replace both executables");
-  CHECK(counts.executables_created == ordinary_created_before_values + 1 &&
-            counts.executables_destroyed == ordinary_destroyed_before_values + 1 &&
-            counts.cw_executables_created == cw_created_before_values + 1 &&
-            counts.cw_executables_destroyed == cw_destroyed_before_values + 1,
+  CHECK(counts.executables_created == ordinary_created_before_success + 1 &&
+            counts.executables_destroyed == ordinary_destroyed_before_success + 1 &&
+            counts.cw_executables_created == cw_created_before_success + 1 &&
+            counts.cw_executables_destroyed == cw_destroyed_before_success + 1,
         "source-value-only refresh did not replace each executable exactly once");
   bool descriptor_refreshed = false;
   for (const SourceDescriptor &source : f->descriptors->sources.sources)
