@@ -24,6 +24,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <typeinfo>
 
@@ -76,6 +77,28 @@ public:
     p.model = s.model;
     for (int i = 0; i < 3; ++i)
       for (int j = 0; j < 3; ++j) p.gyro_tensor[i][j] = s.gyro_tensor[i][j];
+    return p;
+  }
+
+  static MultilevelParameters multilevel_parameters(const multilevel_susceptibility &s) {
+    if (s.L <= 0 || s.T <= 0 || !s.Gamma || !s.N0 || !s.alpha || !s.omega || !s.gamma ||
+        !s.sigmat)
+      throw std::runtime_error("invalid multilevel susceptibility parameters");
+    const size_t levels = size_t(s.L);
+    const size_t transitions = size_t(s.T);
+    if (levels > std::numeric_limits<size_t>::max() / levels ||
+        levels > std::numeric_limits<size_t>::max() / transitions ||
+        transitions > std::numeric_limits<size_t>::max() / 5)
+      throw std::overflow_error("multilevel susceptibility parameter extent overflow");
+    MultilevelParameters p = {};
+    p.levels = uint32_t(levels);
+    p.transitions = uint32_t(transitions);
+    p.gamma_matrix.assign(s.Gamma, s.Gamma + levels * levels);
+    p.initial_populations.assign(s.N0, s.N0 + levels);
+    p.alpha.assign(s.alpha, s.alpha + levels * transitions);
+    p.omega.assign(s.omega, s.omega + transitions);
+    p.transition_gamma.assign(s.gamma, s.gamma + transitions);
+    p.sigmat.assign(s.sigmat, s.sigmat + 5 * transitions);
     return p;
   }
 };
@@ -746,6 +769,110 @@ void build_gyrotropic_state_arrays(fields &f, fields_chunk &fc, polarization_sta
   }
 }
 
+void build_multilevel_state_arrays(fields &f, fields_chunk &fc, polarization_state *state,
+                                   PolarizationDescriptor &d) {
+  if (!state->data) return;
+  if (!f.array_catalog)
+    throw std::runtime_error("multilevel descriptor requires a prepared catalog");
+  const size_t levels = d.multilevel.levels;
+  const size_t transitions = d.multilevel.transitions;
+  const size_t ntot = size_t(fc.gv.ntot());
+  if (levels > std::numeric_limits<size_t>::max() / levels ||
+      ntot > std::numeric_limits<size_t>::max() / levels)
+    throw std::overflow_error("multilevel descriptor extent overflow");
+  if (d.internal_arrays.size() < 2 ||
+      (d.internal_arrays.size() - 2) % (2 * transitions) != 0)
+    throw std::runtime_error("multilevel internal layout has an incomplete transition row");
+
+  realnum *const base = static_cast<realnum *>(state->data);
+  std::set<uint32_t> ids;
+  auto resolve = [&](const InternalArrayLayout &entry, size_t ordinal, size_t elements,
+                     const char *name) {
+    if (!entry.name || strcmp(entry.name, name) ||
+        entry.element_type != InternalArrayLayout::realnum_value || entry.elements != elements)
+      throw std::runtime_error("multilevel internal layout row has incompatible metadata");
+    ArrayId id = invalid_array();
+    ptrdiff_t offset = 0;
+    if (!f.array_catalog->locate(base + entry.offset_elements, id, offset) || offset != 0 ||
+        !is_valid(id) || id.value >= f.array_catalog->size() ||
+        !ids.insert(id.value).second)
+      throw std::runtime_error("multilevel internal row lacks a distinct canonical ArrayId");
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    const StorageKey &key = f.array_catalog->key(id);
+    if (is_valid(spec.alias_of) || spec.role != array_role::polarization ||
+        spec.element_type != ElementType::realnum_value || spec.elements != elements ||
+        key.chunk != d.chunk || key.kind != int(array_kind::polarization_internal) ||
+        key.component_ != int(entry.c) || key.cmp != entry.cmp ||
+        key.aux != polarization_storage_aux(d.ft, d.state_index, ordinal))
+      throw std::runtime_error("multilevel state ArrayId has incompatible storage metadata");
+    return id;
+  };
+
+  const InternalArrayLayout &gamma = d.internal_arrays.front();
+  if (gamma.c != Centered || gamma.cmp != -1)
+    throw std::runtime_error("multilevel GammaInv layout identity is invalid");
+  d.multilevel_gamma_inv = resolve(gamma, 0, levels * levels, "GammaInv");
+  const realnum *gamma_inv = f.array_catalog->resolve<realnum>(d.multilevel_gamma_inv);
+  for (size_t i = 0; i < levels * levels; ++i)
+    if (!std::isfinite(double(gamma_inv[i])))
+      throw std::runtime_error("multilevel GammaInv contains a nonfinite value");
+
+  bool seen[NUM_FIELD_COMPONENTS][2] = {};
+  int previous_component = -1;
+  int previous_cmp = -1;
+  size_t expected_offset = gamma.offset_elements + levels * levels;
+  size_t row = 1;
+  while (row + 1 < d.internal_arrays.size()) {
+    const component c = d.internal_arrays[row].c;
+    const int cmp = d.internal_arrays[row].cmp;
+    const int component_index = int(c);
+    if (component_index < 0 || component_index >= NUM_FIELD_COMPONENTS || c == Centered ||
+        type(c) != d.ft || cmp < 0 || cmp > 1 || seen[component_index][cmp] ||
+        component_index < previous_component ||
+        (component_index == previous_component && cmp <= previous_cmp) ||
+        (cmp == 1 && !seen[int(c)][0]))
+      throw std::runtime_error("multilevel transition layout is not component/cmp-major");
+    for (size_t transition = 0; transition < transitions; ++transition) {
+      const InternalArrayLayout &p = d.internal_arrays[row++];
+      const InternalArrayLayout &p_prev = d.internal_arrays[row++];
+      if (p.c != c || p.cmp != cmp || p_prev.c != c || p_prev.cmp != cmp ||
+          p.offset_elements != expected_offset ||
+          p_prev.offset_elements != p.offset_elements + ntot)
+        throw std::runtime_error("multilevel P/P_prev layout order is invalid");
+      MultilevelStateArrays arrays;
+      arrays.transition_index = int(transition);
+      arrays.c = c;
+      arrays.cmp = cmp;
+      arrays.p = resolve(p, row - 2, ntot, "P");
+      arrays.p_prev = resolve(p_prev, row - 1, ntot, "P_prev");
+      arrays.elements = ntot;
+      d.multilevel_states.push_back(arrays);
+      expected_offset += 2 * ntot;
+    }
+    seen[component_index][cmp] = true;
+    previous_component = component_index;
+    previous_cmp = cmp;
+    d.required_w |= polarization_component_bit(c, cmp);
+  }
+
+  const InternalArrayLayout &populations = d.internal_arrays.back();
+  if (populations.c != Centered || populations.cmp != -1 ||
+      populations.offset_elements != expected_offset + levels)
+    throw std::runtime_error("multilevel N layout does not exclude exactly its Ntmp gap");
+  d.multilevel_populations =
+      resolve(populations, d.internal_arrays.size() - 1, ntot * levels, "N");
+  d.multilevel_population_points = ntot;
+
+  FOR_COMPONENTS(c) DOCMP2 {
+    const int rows = state->s->num_cinternal_notowned_needed(c, state->data);
+    const bool expected = rows > 0 &&
+                          state->s->cinternal_notowned_ptr(0, c, cmp, 0, state->data) != NULL;
+    if (seen[int(c)][cmp] != expected)
+      throw std::runtime_error("multilevel state layout omits or invents a live component");
+  }
+  d.per_thread_scratch_elements = levels;
+}
+
 } // namespace
 
 void build_polarization_descriptors(fields &f, std::vector<PolarizationDescriptor> &out) {
@@ -760,11 +887,16 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
         d.chunk = i;
         d.ft = ft;
         d.state_index = si;
+        d.has_internal_state = p->data != NULL;
         d.kind = classify_susceptibility(p->s);
         d.lorentzian = LorentzianParameters{0.0, 0.0, false};
         d.noise_amplitude = 0.0;
         d.noise_algorithm_version = 0;
         d.gyrotropic = GyrotropicParameters{};
+        d.multilevel = MultilevelParameters{};
+        d.multilevel_gamma_inv = invalid_array();
+        d.multilevel_populations = invalid_array();
+        d.multilevel_population_points = 0;
         d.per_thread_scratch_elements = 0;
         d.required_w = 0;
         d.required_w_prev = 0;
@@ -795,13 +927,39 @@ void build_polarization_descriptors(fields &f, std::vector<PolarizationDescripto
           d.gyrotropic = susceptibility_descriptor_builder::gyrotropic_parameters(gyro);
           build_gyrotropic_state_arrays(f, fc, p, d);
         }
+        else if (d.kind == SusceptibilityKind::multilevel) {
+          const multilevel_susceptibility &multilevel =
+              static_cast<const multilevel_susceptibility &>(*p->s);
+          d.multilevel = susceptibility_descriptor_builder::multilevel_parameters(multilevel);
+          const std::vector<double> *vectors[] = {
+              &d.multilevel.gamma_matrix,       &d.multilevel.initial_populations,
+              &d.multilevel.alpha,              &d.multilevel.omega,
+              &d.multilevel.transition_gamma,   &d.multilevel.sigmat};
+          for (const std::vector<double> *values : vectors)
+            for (double value : *values)
+              if (!std::isfinite(value))
+                throw std::runtime_error("multilevel descriptor contains a nonfinite parameter");
+          for (size_t transition = 0; transition < d.multilevel.transitions; ++transition) {
+            bool positive = false, negative = false;
+            for (size_t level = 0; level < d.multilevel.levels; ++level) {
+              const double value =
+                  d.multilevel.alpha[level * d.multilevel.transitions + transition];
+              positive = positive || value > 0.0;
+              negative = negative || value < 0.0;
+            }
+            if (!positive || !negative)
+              throw std::runtime_error("multilevel alpha lacks a positive or negative level");
+          }
+          build_multilevel_state_arrays(f, fc, p, d);
+        }
 
         FOR_COMPONENTS(c) {
           /* Exact built-in Lorentzian descriptors bind the state arrays that
              exist, rather than a later grow-only field-layout snapshot. */
           if (d.kind != SusceptibilityKind::lorentzian &&
               d.kind != SusceptibilityKind::noisy_lorentzian &&
-              d.kind != SusceptibilityKind::gyrotropic) {
+              d.kind != SusceptibilityKind::gyrotropic &&
+              d.kind != SusceptibilityKind::multilevel) {
             DOCMP2 {
               if (p->s->needs_P(c, cmp, fc.f))
                 d.required_w |= polarization_component_bit(c, cmp);

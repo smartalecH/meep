@@ -409,7 +409,7 @@ bool valid_catalog_array(const fields &f, ArrayId id) {
          f.array_catalog->resolve_untyped(id) != NULL && f.array_catalog->spec(id).elements != 0;
 }
 
-void validate_multilevel_region_arithmetic(const UpdateRegion &region) {
+size_t multilevel_region_last(const UpdateRegion &region) {
   size_t last = region.base;
   for (int axis = 0; axis < 3; ++axis) {
     if (!region.counts[axis] || region.strides[axis] < 0)
@@ -423,6 +423,7 @@ void validate_multilevel_region_arithmetic(const UpdateRegion &region) {
       throw std::overflow_error("multilevel update region base overflow");
     last += tail;
   }
+  return last;
 }
 
 bool ordered_multilevel_key(int previous_transition, component previous_component,
@@ -459,7 +460,7 @@ void append_multilevel_update_group_impl(
       !valid_catalog_array(f, input_population.populations) ||
       input_population.gamma_inv == input_population.populations)
     throw std::invalid_argument("malformed multilevel population update");
-  validate_multilevel_region_arithmetic(input_population.region);
+  (void)multilevel_region_last(input_population.region);
 
   const size_t levels = input_population.levels;
   const size_t transition_count = input_population.transitions;
@@ -588,7 +589,7 @@ void append_multilevel_update_group_impl(
         !std::isfinite(transition.gamma) || !std::isfinite(transition.dt) ||
         transition.dt != input_population.dt)
       throw std::invalid_argument("multilevel transition differs from its population term");
-    validate_multilevel_region_arithmetic(transition.region);
+    (void)multilevel_region_last(transition.region);
     if (transition.diagonal_sigma == input_population.gamma_inv ||
         transition.diagonal_sigma == input_population.populations)
       throw std::invalid_argument("multilevel scalar storage aliases diagonal sigma");
@@ -707,6 +708,107 @@ void append_multilevel_update_group_impl(
   for (const BufferAccess &access : op.accesses)
     if (access.array.id == population.gamma_inv && access.mode != AccessMode::read)
       throw std::logic_error("multilevel GammaInv access is not read-only");
+}
+
+void validate_multilevel_descriptor(fields &f, const fields_chunk &fc,
+                                    const PolarizationDescriptor &descriptor) {
+  if (descriptor.kind != SusceptibilityKind::multilevel ||
+      (descriptor.ft != E_stuff && descriptor.ft != H_stuff) || descriptor.chunk < 0 ||
+      descriptor.chunk >= f.num_chunks || descriptor.state_index < 0 ||
+      &fc != f.chunks[descriptor.chunk] || !descriptor.has_internal_state)
+    throw std::invalid_argument("invalid multilevel descriptor identity");
+  const size_t levels = descriptor.multilevel.levels;
+  const size_t transitions = descriptor.multilevel.transitions;
+  const size_t ntot = size_t(fc.gv.ntot());
+  if (!levels || !transitions || levels > std::numeric_limits<size_t>::max() / levels ||
+      levels > std::numeric_limits<size_t>::max() / transitions ||
+      transitions > std::numeric_limits<size_t>::max() / 5 ||
+      descriptor.multilevel.gamma_matrix.size() != levels * levels ||
+      descriptor.multilevel.initial_populations.size() != levels ||
+      descriptor.multilevel.alpha.size() != levels * transitions ||
+      descriptor.multilevel.omega.size() != transitions ||
+      descriptor.multilevel.transition_gamma.size() != transitions ||
+      descriptor.multilevel.sigmat.size() != 5 * transitions ||
+      descriptor.per_thread_scratch_elements != levels ||
+      descriptor.multilevel_population_points != ntot ||
+      !valid_catalog_array(f, descriptor.multilevel_gamma_inv) ||
+      !valid_catalog_array(f, descriptor.multilevel_populations) ||
+      descriptor.multilevel_states.size() % transitions)
+    throw std::invalid_argument("multilevel descriptor has invalid dimensions");
+
+  for (const std::vector<double> *values :
+       {&descriptor.multilevel.gamma_matrix, &descriptor.multilevel.initial_populations,
+        &descriptor.multilevel.alpha, &descriptor.multilevel.omega,
+        &descriptor.multilevel.transition_gamma, &descriptor.multilevel.sigmat})
+    for (double value : *values)
+      if (!std::isfinite(value))
+        throw std::invalid_argument("multilevel descriptor contains a nonfinite coefficient");
+  for (size_t transition = 0; transition < transitions; ++transition) {
+    bool positive = false;
+    bool negative = false;
+    for (size_t level = 0; level < levels; ++level) {
+      const double value = descriptor.multilevel.alpha[level * transitions + transition];
+      positive = positive || value > 0.0;
+      negative = negative || value < 0.0;
+    }
+    if (!positive || !negative)
+      throw std::invalid_argument("multilevel descriptor alpha has incomplete signs");
+  }
+
+  auto validate_storage = [&](ArrayId id, size_t elements, component c, int cmp,
+                              size_t ordinal) {
+    if (!valid_catalog_array(f, id))
+      throw std::invalid_argument("multilevel descriptor has an invalid storage ArrayId");
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    const StorageKey &key = f.array_catalog->key(id);
+    const Precision native_precision =
+        sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+    if (spec.role != array_role::polarization ||
+        spec.element_type != ElementType::realnum_value || spec.storage != native_precision ||
+        spec.alignment != alignof(realnum) || spec.elements != elements ||
+        key.chunk != descriptor.chunk || key.kind != int(array_kind::polarization_internal) ||
+        key.component_ != int(c) || key.cmp != cmp ||
+        key.aux != polarization_storage_aux(descriptor.ft, descriptor.state_index, ordinal))
+      throw std::invalid_argument("multilevel descriptor has incompatible storage identity");
+  };
+  validate_storage(descriptor.multilevel_gamma_inv, levels * levels, Centered, -1, 0);
+  validate_storage(descriptor.multilevel_populations, ntot * levels, Centered, -1,
+                   1 + 2 * descriptor.multilevel_states.size());
+  const realnum *gamma_inv = f.array_catalog->resolve<realnum>(descriptor.multilevel_gamma_inv);
+  for (size_t i = 0; i < levels * levels; ++i)
+    if (!std::isfinite(double(gamma_inv[i])))
+      throw std::invalid_argument("multilevel descriptor has nonfinite GammaInv storage");
+
+  uint64_t expected_w = 0;
+  int previous_component = -1;
+  int previous_cmp = -1;
+  for (size_t i = 0; i < descriptor.multilevel_states.size(); ++i) {
+    const MultilevelStateArrays &state = descriptor.multilevel_states[i];
+    const int component_index = int(state.c);
+    const int expected_transition = int(i % transitions);
+    if (component_index < 0 || component_index >= NUM_FIELD_COMPONENTS ||
+        type(state.c) != descriptor.ft || state.cmp < 0 || state.cmp > 1 ||
+        state.transition_index != expected_transition || state.elements != ntot ||
+        (expected_transition == 0 &&
+         (component_index < previous_component ||
+          (component_index == previous_component && state.cmp <= previous_cmp) ||
+          (state.cmp == 1 &&
+           (component_index != previous_component || previous_cmp != 0)))) ||
+        (expected_transition != 0 &&
+         (state.c != descriptor.multilevel_states[i - 1].c ||
+          state.cmp != descriptor.multilevel_states[i - 1].cmp)))
+      throw std::invalid_argument("multilevel descriptor state rows are out of order");
+    validate_storage(state.p, ntot, state.c, state.cmp, 1 + 2 * i);
+    validate_storage(state.p_prev, ntot, state.c, state.cmp, 2 + 2 * i);
+    if (expected_transition == 0) {
+      expected_w |= uint64_t(1) << (2 * component_index + state.cmp);
+      previous_component = component_index;
+      previous_cmp = state.cmp;
+    }
+  }
+  if (descriptor.required_w != expected_w || descriptor.required_w_prev != expected_w ||
+      !descriptor.needs_halo)
+    throw std::invalid_argument("multilevel descriptor field masks differ from live state");
 }
 
 bool polarization_updates_equal(const PolarizationUpdate &a, const PolarizationUpdate &b) {
@@ -1832,6 +1934,7 @@ void StepPlanBuilder::add_dfts() {
 void StepPlanBuilder::add_polarizations(field_type ft) {
   Operation &op = add(OpKind::update_polarization, ft);
   op.descriptor_index = uint32_t(plan_.polarization_updates.size());
+  op.polarization_group_index = uint32_t(plan_.polarization_groups.size());
   if (!f_.descriptors) return;
 
   for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
@@ -1839,13 +1942,175 @@ void StepPlanBuilder::add_polarizations(field_type ft) {
     if (descriptor.ft != ft ||
         (descriptor.kind != SusceptibilityKind::lorentzian &&
          descriptor.kind != SusceptibilityKind::noisy_lorentzian &&
-         descriptor.kind != SusceptibilityKind::gyrotropic))
+         descriptor.kind != SusceptibilityKind::gyrotropic &&
+         descriptor.kind != SusceptibilityKind::multilevel))
       continue;
     if (descriptor.chunk < 0 || descriptor.chunk >= f_.num_chunks)
       meep::abort("polarization descriptor has invalid chunk");
     fields_chunk &fc = *f_.chunks[descriptor.chunk];
     std::vector<PolarizationUpdate> recurrences;
     std::vector<PolarizationUpdate> noise_additions;
+
+    if (descriptor.kind == SusceptibilityKind::multilevel) {
+      if (!descriptor.has_internal_state) continue;
+      validate_multilevel_descriptor(f_, fc, descriptor);
+      const size_t levels = descriptor.multilevel.levels;
+      const size_t transition_count = descriptor.multilevel.transitions;
+      MultilevelPopulationUpdate population = {};
+      population.region = make_region(fc.gv, descriptor.chunk, Centered, -1,
+                                      fc.gv.little_owned_corner(Centered), fc.gv.big_corner());
+      population.ft = ft;
+      population.state_index = descriptor.state_index;
+      population.levels = uint32_t(levels);
+      population.transitions = uint32_t(transition_count);
+      population.active_component_cmps =
+          uint32_t(descriptor.multilevel_states.size() / transition_count);
+      population.gamma_inv = descriptor.multilevel_gamma_inv;
+      population.populations = descriptor.multilevel_populations;
+      population.scratch_elements_per_point = descriptor.per_thread_scratch_elements;
+      population.dt = fc.dt;
+      const size_t population_last = multilevel_region_last(population.region);
+      const size_t population_last_element =
+          checked_sum(checked_product(population_last, levels,
+                                      "multilevel population index overflow"),
+                      levels, "multilevel population extent overflow");
+      if (population_last_element >
+          f_.array_catalog->spec(population.populations).elements)
+        throw std::invalid_argument("multilevel population region exceeds N storage");
+
+      auto neighbor_range = [&](const UpdateRegion &region, ptrdiff_t o1, ptrdiff_t o2,
+                                size_t elements, const char *what) {
+        if (o1 == std::numeric_limits<ptrdiff_t>::min() ||
+            o2 == std::numeric_limits<ptrdiff_t>::min() ||
+            (o2 > 0 && o1 > std::numeric_limits<ptrdiff_t>::max() - o2) ||
+            (o2 < 0 && o1 < std::numeric_limits<ptrdiff_t>::min() - o2) ||
+            region.base > size_t(std::numeric_limits<ptrdiff_t>::max()) ||
+            multilevel_region_last(region) > size_t(std::numeric_limits<ptrdiff_t>::max()))
+          throw std::overflow_error(what);
+        const ptrdiff_t combined = o1 + o2;
+        if (combined == std::numeric_limits<ptrdiff_t>::min()) throw std::overflow_error(what);
+        const ptrdiff_t low = std::min(ptrdiff_t(0), std::min(o1, std::min(o2, combined)));
+        const ptrdiff_t high = std::max(ptrdiff_t(0), std::max(o1, std::max(o2, combined)));
+        const ptrdiff_t first = ptrdiff_t(region.base);
+        const ptrdiff_t last = ptrdiff_t(multilevel_region_last(region));
+        if (first < -low || high > std::numeric_limits<ptrdiff_t>::max() - last ||
+            size_t(last + high) >= elements)
+          throw std::invalid_argument(what);
+      };
+
+      std::vector<int> positive_level(transition_count, -1);
+      std::vector<int> negative_level(transition_count, -1);
+      for (size_t level = 0; level < levels; ++level)
+        for (size_t transition = 0; transition < transition_count; ++transition) {
+          const double value =
+              descriptor.multilevel.alpha[level * transition_count + transition];
+          if (value > 0.0) positive_level[transition] = int(level);
+          if (value < 0.0) negative_level[transition] = int(level);
+        }
+
+      std::vector<MultilevelPopulationTerm> terms;
+      std::vector<MultilevelTransitionUpdate> transitions;
+      for (size_t transition = 0; transition < transition_count; ++transition)
+        for (const MultilevelStateArrays &state : descriptor.multilevel_states) {
+          if (state.transition_index != int(transition)) continue;
+          const direction d0 = component_direction(state.c);
+          const direction d1 = cycle_direction(fc.gv.dim, d0, 1);
+          const direction d2 = cycle_direction(fc.gv.dim, d0, 2);
+          ArrayId w = find_array(f_, descriptor.chunk, array_kind::f_w, int(state.c), state.cmp, 0);
+          if (!is_valid(w))
+            w = find_array(f_, descriptor.chunk, array_kind::f, int(state.c), state.cmp, 0);
+          const ArrayId w_prev =
+              find_array(f_, descriptor.chunk, array_kind::f_w_prev, int(state.c), state.cmp, 0);
+          const int sigma_aux = descriptor.state_index * NUM_FIELD_TYPES + int(ft);
+          const ArrayId sigma = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                           int(d0), sigma_aux);
+          const ArrayId sigma1 = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                            int(d1), sigma_aux);
+          const ArrayId sigma2 = find_array(f_, descriptor.chunk, array_kind::sigma, int(state.c),
+                                            int(d2), sigma_aux);
+          if (!is_valid(w) || !is_valid(w_prev) || !is_valid(sigma) || is_valid(sigma1) ||
+              is_valid(sigma2))
+            throw std::invalid_argument("multilevel descriptor has unsupported field bindings");
+          auto validate_binding = [&](ArrayId id, array_kind kind, int component_value,
+                                      int cmp_value, uint64_t aux, array_role role) {
+            if (!valid_catalog_array(f_, id))
+              throw std::invalid_argument("multilevel field binding is not canonical");
+            const ArraySpec &spec = f_.array_catalog->spec(id);
+            const StorageKey &key = f_.array_catalog->key(id);
+            const Precision native_precision =
+                sizeof(realnum) == sizeof(float) ? Precision::f32 : Precision::f64;
+            if (spec.role != role || spec.element_type != ElementType::realnum_value ||
+                spec.storage != native_precision || spec.alignment != alignof(realnum) ||
+                spec.elements != size_t(fc.gv.ntot()) || key.chunk != descriptor.chunk ||
+                key.kind != int(kind) || key.component_ != component_value ||
+                key.cmp != cmp_value || key.aux != aux)
+              throw std::invalid_argument("multilevel field binding has incompatible storage");
+          };
+          const array_kind w_kind =
+              f_.array_catalog->key(w).kind == int(array_kind::f_w) ? array_kind::f_w
+                                                                    : array_kind::f;
+          validate_binding(w, w_kind, int(state.c), state.cmp, 0, array_role::field);
+          validate_binding(w_prev, array_kind::f_w_prev, int(state.c), state.cmp, 0,
+                           array_role::field);
+          validate_binding(sigma, array_kind::sigma, int(state.c), int(d0), uint64_t(sigma_aux),
+                           array_role::material);
+
+          MultilevelPopulationTerm term = {};
+          term.transition_index = int(transition);
+          term.c = state.c;
+          term.cmp = state.cmp;
+          term.w = w;
+          term.w_prev = w_prev;
+          term.p = state.p;
+          term.p_prev = state.p_prev;
+          fc.gv.yee2cent_offsets(state.c, term.centered_offsets[0], term.centered_offsets[1]);
+          const ArrayId centered_arrays[] = {w, w_prev, state.p, state.p_prev};
+          for (ArrayId id : centered_arrays)
+            neighbor_range(population.region, term.centered_offsets[0],
+                           term.centered_offsets[1], f_.array_catalog->spec(id).elements,
+                           "multilevel centered-neighbor range exceeds storage");
+          terms.push_back(term);
+
+          MultilevelTransitionUpdate update = {};
+          update.region = make_region(fc.gv, descriptor.chunk, state.c, state.cmp,
+                                      fc.gv.little_owned_corner(state.c), fc.gv.big_corner());
+          update.ft = ft;
+          update.state_index = descriptor.state_index;
+          update.transition_index = int(transition);
+          update.p = state.p;
+          update.p_prev = state.p_prev;
+          update.w = w;
+          update.diagonal_sigma = sigma;
+          update.populations = descriptor.multilevel_populations;
+          fc.gv.cent2yee_offsets(state.c, update.population_offsets[0],
+                                 update.population_offsets[1]);
+          neighbor_range(update.region, 0, 0, f_.array_catalog->spec(state.p).elements,
+                         "multilevel transition P region exceeds storage");
+          neighbor_range(update.region, 0, 0, f_.array_catalog->spec(state.p_prev).elements,
+                         "multilevel transition P_prev region exceeds storage");
+          neighbor_range(update.region, 0, 0, f_.array_catalog->spec(w).elements,
+                         "multilevel transition W region exceeds storage");
+          neighbor_range(update.region, 0, 0, f_.array_catalog->spec(sigma).elements,
+                         "multilevel transition sigma region exceeds storage");
+          neighbor_range(update.region, update.population_offsets[0],
+                         update.population_offsets[1], descriptor.multilevel_population_points,
+                         "multilevel transition population range exceeds storage");
+          update.population_stride = uint32_t(levels);
+          update.positive_level = positive_level[transition];
+          update.negative_level = negative_level[transition];
+          update.omega = descriptor.multilevel.omega[transition];
+          update.gamma = descriptor.multilevel.transition_gamma[transition];
+          for (int coefficient = 0; coefficient < 5; ++coefficient)
+            update.sigmat[coefficient] =
+                descriptor.multilevel.sigmat[5 * transition + coefficient];
+          update.dt = fc.dt;
+          transitions.push_back(update);
+        }
+      append_multilevel_update_group(f_, plan_, op, population, terms, transitions,
+                                     descriptor.multilevel.gamma_matrix,
+                                     descriptor.multilevel.alpha);
+      continue;
+    }
 
     for (size_t si = 0;
          (descriptor.kind == SusceptibilityKind::lorentzian ||
@@ -2449,6 +2714,35 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
     for (size_t di = 0; di < f_.descriptors->polarizations.size(); ++di) {
       const PolarizationDescriptor &descriptor = f_.descriptors->polarizations[di];
       if (descriptor.ft != ft) continue;
+      if (descriptor.kind == SusceptibilityKind::multilevel) {
+        if (!descriptor.has_internal_state) continue;
+        if (descriptor.chunk < 0 || descriptor.chunk >= f_.num_chunks)
+          throw std::invalid_argument("multilevel descriptor has invalid chunk");
+        const fields_chunk &descriptor_chunk = *f_.chunks[descriptor.chunk];
+        validate_multilevel_descriptor(f_, descriptor_chunk, descriptor);
+        for (size_t transition = 0; transition < descriptor.multilevel.transitions;
+             ++transition)
+          for (const MultilevelStateArrays &state : descriptor.multilevel_states) {
+            if (state.transition_index != int(transition)) continue;
+            const component target_component = field_type_component(ft2, state.c);
+            const ArrayId target = find_array(f_, descriptor.chunk, array_kind::f_minus_p,
+                                              int(target_component), state.cmp, 0);
+            if (!is_valid(target)) continue;
+            PolarizationSubtraction subtraction = {};
+            subtraction.chunk = descriptor.chunk;
+            subtraction.c = state.c;
+            subtraction.cmp = state.cmp;
+            subtraction.state_index = descriptor.state_index;
+            subtraction.transition_index = int(transition);
+            subtraction.target = target;
+            subtraction.p = state.p;
+            subtraction.elements = state.elements;
+            plan_.polarization_subtractions.push_back(subtraction);
+            add_access(f_, op, subtraction.target, AccessMode::read_write);
+            add_access(f_, op, subtraction.p, AccessMode::read);
+          }
+        continue;
+      }
       const bool lorentz_family = descriptor.kind == SusceptibilityKind::lorentzian ||
                                   descriptor.kind == SusceptibilityKind::noisy_lorentzian;
       const size_t state_count = lorentz_family
@@ -2479,6 +2773,7 @@ void StepPlanBuilder::add_eh(field_type ft, Guard guard) {
         subtraction.c = state_c;
         subtraction.cmp = state_cmp;
         subtraction.state_index = descriptor.state_index;
+        subtraction.transition_index = -1;
         subtraction.target = target;
         subtraction.p = state_p;
         subtraction.elements = state_elements;

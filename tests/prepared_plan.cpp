@@ -163,8 +163,17 @@ static void check_prepared_updates() {
   lorentzian_susceptibility susceptibility(1.1, 0.05);
   gyrotropic_susceptibility gyro(vec(0.17, -0.23, 0.31), 0.8, 0.03, 0.07,
                                  GYROTROPIC_SATURATED);
+  const realnum ml_gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum ml_n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum ml_alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum ml_omega[] = {realnum(0.63)};
+  const realnum ml_damping[] = {realnum(0.04)};
+  const realnum ml_sigmat[] = {1, 1, 1, 1, 1};
+  multilevel_susceptibility multilevel(2, 1, ml_gamma, ml_n0, ml_alpha, ml_omega,
+                                      ml_damping, ml_sigmat);
   s.add_susceptibility(eps_slab, E_stuff, susceptibility);
   s.add_susceptibility(eps_slab, E_stuff, gyro);
+  s.add_susceptibility(eps_slab, E_stuff, multilevel);
   fields f(&s);
   gaussian_src_time src(0.3, 0.1);
   src.is_integrated = false;
@@ -183,7 +192,7 @@ static void check_prepared_updates() {
   size_t source_evaluations = 0, source_applications = 0;
   size_t dft_operations = 0;
   size_t polarization_operations = 0, polarization_rows = 0, gyrotropic_rows = 0,
-         subtraction_rows = 0;
+         subtraction_rows = 0, multilevel_groups = 0, multilevel_rows = 0;
   for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
     const Operation &op = plan.operations[oi];
     if (op.kind == OpKind::evaluate_source_scalars) {
@@ -274,6 +283,44 @@ static void check_prepared_updates() {
                 "Lorentzian update contains gyrotropic state IDs");
         }
       }
+      const size_t group_end =
+          size_t(op.polarization_group_index) + size_t(op.polarization_group_count);
+      CHECK(group_end <= plan.polarization_groups.size(),
+            "polarization group span is out of range");
+      for (size_t gi = op.polarization_group_index;
+           gi < group_end && gi < plan.polarization_groups.size(); ++gi) {
+        const PolarizationUpdateGroup &group = plan.polarization_groups[gi];
+        if (group.kind != PolarizationGroupKind::multilevel) continue;
+        ++multilevel_groups;
+        CHECK(group.population_count == 1 &&
+                  size_t(group.population_index) < plan.multilevel_population_updates.size(),
+              "prepared multilevel group lacks its population action");
+        if (size_t(group.population_index) >= plan.multilevel_population_updates.size()) continue;
+        const MultilevelPopulationUpdate &population =
+            plan.multilevel_population_updates[group.population_index];
+        CHECK(has_access(op, population.gamma_inv, AccessMode::read) &&
+                  has_access(op, population.populations, AccessMode::read_write),
+              "prepared multilevel population access modes are incomplete");
+        CHECK(size_t(population.term_index) + population.term_count <=
+                  plan.multilevel_population_terms.size() &&
+                  size_t(group.transition_index) + group.transition_count <=
+                  plan.multilevel_transition_updates.size(),
+              "prepared multilevel term/transition spans are out of range");
+        for (size_t j = 0; j < population.term_count; ++j) {
+          const MultilevelPopulationTerm &term =
+              plan.multilevel_population_terms[population.term_index + j];
+          const MultilevelTransitionUpdate &transition =
+              plan.multilevel_transition_updates[group.transition_index + j];
+          CHECK(has_access(op, term.w, AccessMode::read) &&
+                    has_access(op, term.w_prev, AccessMode::read) &&
+                    has_access(op, term.p, AccessMode::read_write) &&
+                    has_access(op, term.p_prev, AccessMode::read_write) &&
+                    has_access(op, transition.diagonal_sigma, AccessMode::read) &&
+                    has_access(op, transition.populations, AccessMode::read_write),
+                "prepared multilevel transition access union is incomplete");
+          ++multilevel_rows;
+        }
+      }
     }
     if (op.kind != OpKind::update_db && op.kind != OpKind::update_eh) continue;
     ++update_ops;
@@ -361,6 +408,8 @@ static void check_prepared_updates() {
         polarization_operations);
   CHECK(or_to_all(polarization_rows > 0), "prepared plan contains no polarization updates");
   CHECK(or_to_all(gyrotropic_rows > 0), "prepared plan contains no gyrotropic updates");
+  CHECK(or_to_all(multilevel_groups > 0 && multilevel_rows > 0),
+        "prepared plan contains no multilevel groups or transition rows");
   CHECK(or_to_all(subtraction_rows > 0), "prepared plan contains no P subtractions");
   check_finite_value_accesses(f, plan);
   CHECK(source_evaluations == 4, "expected four source evaluations, got %zu",

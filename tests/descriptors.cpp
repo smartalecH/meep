@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <set>
 #include <vector>
 
 #include <meep.hpp>
@@ -48,6 +49,7 @@ static int failures = 0;
   } while (0)
 
 static double one(const vec &) { return 1.0; }
+static double unit_sigma(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static bool close(complex<double> a, complex<double> b) {
   return abs(a - b) <= 1e-13 * std::max(1.0, std::max(abs(a), abs(b)));
@@ -92,6 +94,48 @@ public:
     return new inherited_gyrotropic_susceptibility(*this);
   }
 };
+
+class inherited_multilevel_susceptibility : public multilevel_susceptibility {
+public:
+  inherited_multilevel_susceptibility(int L, int T, const realnum *Gamma, const realnum *N0,
+                                      const realnum *alpha, const realnum *omega,
+                                      const realnum *gamma, const realnum *sigmat)
+      : multilevel_susceptibility(L, T, Gamma, N0, alpha, omega, gamma, sigmat) {}
+  virtual susceptibility *clone() const {
+    return new inherited_multilevel_susceptibility(*this);
+  }
+};
+
+static void add_multilevel_descriptor_states(structure &s) {
+  const realnum e_gamma[] = {realnum(0.02), 0, 0, 0, realnum(0.03), 0, 0, 0,
+                             realnum(0.04)};
+  const realnum e_n0[] = {realnum(0.7), realnum(0.2), realnum(0.1)};
+  const realnum e_alpha[] = {realnum(-0.2), realnum(0.3), realnum(0.4), realnum(-0.5),
+                             realnum(-0.6), realnum(0.7)};
+  const realnum e_omega[] = {realnum(0.73), realnum(0.91)};
+  const realnum e_damping[] = {realnum(0.06), realnum(0.08)};
+  const realnum e_sigmat[] = {1, 1, 1, 1, 1, 2, 2, 2, 2, 2};
+  multilevel_susceptibility electric(3, 2, e_gamma, e_n0, e_alpha, e_omega, e_damping,
+                                     e_sigmat);
+  multilevel_susceptibility electric_repeat(3, 2, e_gamma, e_n0, e_alpha, e_omega,
+                                            e_damping, e_sigmat);
+  inherited_multilevel_susceptibility derived(3, 2, e_gamma, e_n0, e_alpha, e_omega,
+                                               e_damping, e_sigmat);
+  lorentzian_susceptibility ordinary(realnum(0.81), realnum(0.025));
+  const realnum h_gamma[] = {realnum(0.01), realnum(0.005), 0, realnum(0.025)};
+  const realnum h_n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum h_alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum h_omega[] = {realnum(0.63)};
+  const realnum h_damping[] = {realnum(0.04)};
+  const realnum h_sigmat[] = {3, 3, 3, 3, 3};
+  multilevel_susceptibility magnetic(2, 1, h_gamma, h_n0, h_alpha, h_omega, h_damping,
+                                     h_sigmat);
+  s.add_susceptibility(unit_sigma, E_stuff, electric);
+  s.add_susceptibility(unit_sigma, E_stuff, ordinary);
+  s.add_susceptibility(unit_sigma, E_stuff, derived);
+  s.add_susceptibility(unit_sigma, E_stuff, electric_repeat);
+  s.add_susceptibility(unit_sigma, H_stuff, magnetic);
+}
 
 class derived_gaussian_source : public gaussian_src_time {
 public:
@@ -1155,6 +1199,170 @@ static void test_gyrotropic_layout_after_field_growth() {
         "field-growth case did not exercise a gyrotropic needs_P superset");
 }
 
+static void test_multilevel_contract(bool complex_fields) {
+  grid_volume gv = vol2d(4.0, 4.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  add_multilevel_descriptor_states(s);
+  fields f(&s);
+  if (complex_fields)
+    f.use_bloch(vec(0.07, -0.11));
+  else
+    f.use_real_fields();
+  FOR_COMPONENTS(c)
+  if (gv.has_field(c)) f.require_component(c);
+  gaussian_src_time source(0.3, 0.1);
+  f.add_point_source(Ez, source, vec(0.11, 0.13));
+  f.add_point_source(Hz, source, vec(-0.17, 0.09));
+  f.advance(2);
+
+  size_t local_owned_chunks = 0;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    if (f.chunks[chunk]->is_mine()) ++local_owned_chunks;
+  size_t local_descriptors = 0;
+  std::set<int> electric_state_indices;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    if (d.kind != SusceptibilityKind::multilevel) continue;
+    ++local_descriptors;
+    if (d.ft == E_stuff) electric_state_indices.insert(d.state_index);
+    const size_t levels = d.multilevel.levels;
+    const size_t transitions = d.multilevel.transitions;
+    CHECK(d.has_internal_state && (d.ft == E_stuff || d.ft == H_stuff),
+          "multilevel descriptor lost exact built-in identity");
+    CHECK(d.multilevel.gamma_matrix.size() == levels * levels &&
+              d.multilevel.initial_populations.size() == levels &&
+              d.multilevel.alpha.size() == levels * transitions &&
+              d.multilevel.omega.size() == transitions &&
+              d.multilevel.transition_gamma.size() == transitions &&
+              d.multilevel.sigmat.size() == 5 * transitions,
+          "multilevel descriptor parameter extents are incomplete");
+    const std::vector<double> expected_gamma =
+        d.ft == E_stuff
+            ? std::vector<double>{double(realnum(0.02)), 0, 0, 0, double(realnum(0.03)), 0, 0, 0,
+                                  double(realnum(0.04))}
+            : std::vector<double>{double(realnum(0.01)), double(realnum(0.005)), 0,
+                                  double(realnum(0.025))};
+    const std::vector<double> expected_n0 =
+        d.ft == E_stuff
+            ? std::vector<double>{double(realnum(0.7)), double(realnum(0.2)),
+                                  double(realnum(0.1))}
+            : std::vector<double>{double(realnum(0.8)), double(realnum(0.2))};
+    const std::vector<double> expected_alpha =
+        d.ft == E_stuff
+            ? std::vector<double>{double(realnum(-0.2)), double(realnum(0.3)),
+                                  double(realnum(0.4)), double(realnum(-0.5)),
+                                  double(realnum(-0.6)), double(realnum(0.7))}
+            : std::vector<double>{double(realnum(-0.4)), double(realnum(0.5))};
+    CHECK(d.multilevel.gamma_matrix == expected_gamma &&
+              d.multilevel.initial_populations == expected_n0 &&
+              d.multilevel.alpha == expected_alpha,
+          "multilevel descriptor changed source-precision recipe values");
+    const std::vector<double> expected_omega =
+        d.ft == E_stuff
+            ? std::vector<double>{double(realnum(0.73)), double(realnum(0.91))}
+            : std::vector<double>{double(realnum(0.63))};
+    const std::vector<double> expected_damping =
+        d.ft == E_stuff
+            ? std::vector<double>{double(realnum(0.06)), double(realnum(0.08))}
+            : std::vector<double>{double(realnum(0.04))};
+    const std::vector<double> expected_sigmat =
+        d.ft == E_stuff ? std::vector<double>{1, 1, 1, 1, 1, 2, 2, 2, 2, 2}
+                        : std::vector<double>{3, 3, 3, 3, 3};
+    CHECK(d.multilevel.omega == expected_omega &&
+              d.multilevel.transition_gamma == expected_damping &&
+              d.multilevel.sigmat == expected_sigmat,
+          "multilevel descriptor changed transition coefficients");
+    CHECK(d.per_thread_scratch_elements == levels && d.multilevel_population_points ==
+                                                        size_t(f.chunks[d.chunk]->gv.ntot()),
+          "multilevel descriptor scratch/population extent is incorrect");
+    const ArrayId scalar_ids[] = {d.multilevel_gamma_inv, d.multilevel_populations};
+    for (ArrayId id : scalar_ids)
+      CHECK(is_valid(id) && id.value < f.array_catalog->size() &&
+                f.array_catalog->spec(id).role == array_role::polarization &&
+                !is_valid(f.array_catalog->spec(id).alias_of),
+            "multilevel scalar ArrayId is invalid or noncanonical");
+    if (is_valid(d.multilevel_gamma_inv)) {
+      const realnum *gamma_inv = f.array_catalog->resolve<realnum>(d.multilevel_gamma_inv);
+      const double dt = f.chunks[d.chunk]->dt;
+      for (size_t row = 0; row < levels; ++row)
+        for (size_t column = 0; column < levels; ++column) {
+          double expected = 0.0;
+          if (d.ft == H_stuff && levels == 2) {
+            const double a = 1.0 + expected_gamma[0] * dt / 2;
+            const double b = expected_gamma[1] * dt / 2;
+            const double diagonal = 1.0 + expected_gamma[3] * dt / 2;
+            if (row == 0 && column == 0) expected = 1.0 / a;
+            if (row == 0 && column == 1) expected = -b / (a * diagonal);
+            if (row == 1 && column == 1) expected = 1.0 / diagonal;
+          }
+          else if (row == column)
+            expected = 1.0 / (1.0 + expected_gamma[row * levels + row] * dt / 2);
+          CHECK(fabs(double(gamma_inv[row * levels + column]) - expected) < 1e-6,
+                "multilevel GammaInv differs at (%zu,%zu)", row, column);
+        }
+    }
+    uint64_t row_mask = 0;
+    int previous_component = -1, previous_cmp = -1;
+    for (size_t i = 0; i < d.multilevel_states.size(); ++i) {
+      const MultilevelStateArrays &state = d.multilevel_states[i];
+      const int expected_transition = int(i % transitions);
+      CHECK(state.transition_index == expected_transition,
+            "multilevel descriptor is not component/cmp-major with transition-minor rows");
+      if (expected_transition == 0) {
+        CHECK(int(state.c) > previous_component ||
+                  (int(state.c) == previous_component && state.cmp > previous_cmp),
+              "multilevel descriptor component/cmp identities are not ordered");
+        previous_component = int(state.c);
+        previous_cmp = state.cmp;
+        row_mask |= uint64_t(1) << (2 * int(state.c) + state.cmp);
+      }
+      const size_t p_ordinal = 1 + 2 * i;
+      CHECK(f.array_catalog->key(state.p).aux ==
+                    polarization_storage_aux(d.ft, d.state_index, p_ordinal) &&
+                f.array_catalog->key(state.p_prev).aux ==
+                    polarization_storage_aux(d.ft, d.state_index, p_ordinal + 1),
+            "multilevel descriptor row has the wrong storage ordinal");
+    }
+    CHECK(d.required_w == row_mask && d.required_w_prev == row_mask,
+          "multilevel descriptor W/W_prev masks differ from authoritative live rows");
+    CHECK(d.needs_halo, "multilevel descriptor lost its W/P halo requirement");
+  }
+  CHECK(local_descriptors == 3 * local_owned_chunks,
+        "multilevel fixture did not emit two E and one H descriptor per owned chunk");
+  CHECK(local_owned_chunks == 0 ||
+            (electric_state_indices.size() == 2 && electric_state_indices.count(0) &&
+             electric_state_indices.count(3)),
+        "multilevel descriptor state_index was filtered instead of following the live list");
+  CHECK(sum_to_all(local_descriptors) > 0,
+        "multilevel fixture emitted no descriptors on any rank");
+}
+
+static void test_derived_multilevel_remains_custom() {
+  const realnum Gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+  const realnum N0[] = {realnum(0.8), realnum(0.2)};
+  const realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum omega[] = {realnum(0.63)};
+  const realnum damping[] = {realnum(0.04)};
+  const realnum sigmat[] = {1, 1, 1, 1, 1};
+  inherited_multilevel_susceptibility derived(2, 1, Gamma, N0, alpha, omega, damping, sigmat);
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  s.add_susceptibility(unit_sigma, E_stuff, derived);
+  fields f(&s);
+  f.require_component(Ez);
+  f.advance(2);
+  size_t custom = 0, multilevel = 0;
+  for (const PolarizationDescriptor &d : f.descriptors->polarizations) {
+    custom += d.kind == SusceptibilityKind::host_custom;
+    multilevel += d.kind == SusceptibilityKind::multilevel;
+  }
+  CHECK(sum_to_all(custom) > 0 && sum_to_all(multilevel) == 0,
+        "derived multilevel susceptibility crossed the exact-type boundary");
+  const StepPlan plan = build_step_plan(f, StepProgram::ordinary);
+  CHECK(plan.multilevel_population_updates.empty() && plan.multilevel_population_terms.empty() &&
+            plan.multilevel_transition_updates.empty(),
+        "derived multilevel susceptibility emitted portable actions");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
@@ -1189,6 +1397,9 @@ int main(int argc, char **argv) {
   test_lorentzian_layout_after_field_growth();
   test_gyrotropic_contract();
   test_gyrotropic_layout_after_field_growth();
+  test_multilevel_contract(false);
+  test_multilevel_contract(true);
+  test_derived_multilevel_remains_custom();
 
   if (failures) {
     master_printf("descriptors: %d FAILURE(S)\n", failures);
