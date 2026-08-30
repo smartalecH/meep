@@ -31,6 +31,14 @@
 
 namespace meep {
 
+static int legacy_flux_descriptor_failure_rank_for_testing = -1;
+static int legacy_flux_descriptor_failure_ordinal_for_testing = -1;
+
+void backend_set_legacy_flux_descriptor_failure_for_testing(int rank, int flux_ordinal) {
+  legacy_flux_descriptor_failure_rank_for_testing = rank;
+  legacy_flux_descriptor_failure_ordinal_for_testing = flux_ordinal;
+}
+
 class source_descriptor_builder {
 public:
   static void parameters(const gaussian_src_time &st, std::vector<double> &out) {
@@ -538,89 +546,125 @@ uint64_t legacy_flux_definition_signature(const fields &f) {
 }
 
 void build_legacy_flux_descriptors(fields &f, std::vector<LegacyFluxDescriptor> &out) {
-  out.clear();
+  std::string local_error;
   if (!f.array_catalog)
-    throw std::runtime_error("legacy flux descriptors require a prepared array catalog");
+    local_error = "legacy flux descriptors require a prepared array catalog";
+  backend_reconcile_host_access(local_error, "legacy flux descriptor catalog preflight");
 
+  size_t local_definition = size_t(legacy_flux_definition_signature(f));
+  size_t reference_definition = local_definition;
+  broadcast(0, &reference_definition, 1);
+  if (local_definition != reference_definition)
+    local_error = "legacy flux definitions differ across MPI ranks";
+  backend_reconcile_host_access(local_error, "legacy flux descriptor definition preflight");
+
+  std::vector<LegacyFluxDescriptor> replacement;
   uint64_t flux_ordinal = 0;
   for (const flux_vol *flux = f.fluxes; flux; flux = flux->next, ++flux_ordinal) {
+    local_error.clear();
     if (flux_ordinal > std::numeric_limits<uint32_t>::max())
-      throw std::overflow_error("legacy flux descriptor index overflow");
+      local_error = "legacy flux descriptor index overflow";
+    backend_reconcile_host_access(local_error, "legacy flux descriptor monitor preflight");
+
     const direction normal = legacy_flux_descriptor_builder::normal(*flux);
     const volume &where = legacy_flux_descriptor_builder::region(*flux);
     component e[2], h[2];
     legacy_flux_components(f.gv.dim, normal, e, h);
-
     LegacyFluxDescriptor descriptor(uint32_t(flux_ordinal), normal, where);
     descriptor.recipe_signature = legacy_flux_recipe_signature(normal, where);
     for (uint32_t term_ordinal = 0; term_ordinal < 2; ++term_ordinal) {
-      /* fields::integrate uses the component grid directly when both operands
-         have the same Yee shift; otherwise it interpolates both to Centered.
-         This matters for cylindrical P flux, whose E/H pairs share a grid. */
-      const component cgrid = f.gv.iyee_shift(e[term_ordinal]) ==
-                                      f.gv.iyee_shift(h[term_ordinal])
-                                  ? e[term_ordinal]
-                                  : Centered;
-      const ChunkLoopPlan regions = prepare_loop_in_chunks(f, where, cgrid);
-      for (size_t region_ordinal = 0; region_ordinal < regions.regions.size(); ++region_ordinal) {
-        if (region_ordinal > std::numeric_limits<uint32_t>::max())
-          throw std::overflow_error("legacy flux region index overflow");
-        const ChunkLoopRegion &region = regions.regions[region_ordinal];
-        if (region.chunk < 0 || region.chunk >= f.num_chunks || !f.chunks[region.chunk] ||
-            !f.chunks[region.chunk]->is_mine())
-          throw std::runtime_error("legacy flux region names a non-owned chunk");
-        fields_chunk &fc = *f.chunks[region.chunk];
+      local_error.clear();
+      try {
+        /* Match fields::integrate exactly: when both operands share a Yee
+           grid, integrate directly on that grid and leave interpolation
+           offsets zero. Otherwise interpolate both operands to Centered. */
+        const component cgrid = f.gv.iyee_shift(e[term_ordinal]) ==
+                                        f.gv.iyee_shift(h[term_ordinal])
+                                    ? e[term_ordinal]
+                                    : Centered;
+        const ChunkLoopPlan regions = prepare_loop_in_chunks(f, where, cgrid);
+        for (size_t region_ordinal = 0; region_ordinal < regions.regions.size(); ++region_ordinal) {
+          if (region_ordinal > std::numeric_limits<uint32_t>::max())
+            throw std::overflow_error("legacy flux region index overflow");
+          const ChunkLoopRegion &region = regions.regions[region_ordinal];
+          if (region.chunk < 0 || region.chunk >= f.num_chunks || !f.chunks[region.chunk] ||
+              !f.chunks[region.chunk]->is_mine())
+            throw std::runtime_error("legacy flux region names a non-owned chunk");
+          fields_chunk &fc = *f.chunks[region.chunk];
 
-        LegacyFluxTermDescriptor term = {};
-        term.term_ordinal = term_ordinal;
-        term.region_ordinal = uint32_t(region_ordinal);
-        term.sign = term_ordinal ? -1 : 1;
-        term.chunk = region.chunk;
-        term.e_component = f.S.transform(e[term_ordinal], -region.symmetry_index);
-        term.h_component = f.S.transform(h[term_ordinal], -region.symmetry_index);
-        term.e_real = legacy_flux_field(f, region.chunk, term.e_component, 0);
-        term.e_imag = legacy_flux_field(f, region.chunk, term.e_component, 1);
-        term.h_real = legacy_flux_field(f, region.chunk, term.h_component, 0);
-        term.h_imag = legacy_flux_field(f, region.chunk, term.h_component, 1);
-        if ((!is_valid(term.e_real) && is_valid(term.e_imag)) ||
-            (!is_valid(term.h_real) && is_valid(term.h_imag)))
-          throw std::runtime_error("legacy flux imaginary field has no real counterpart");
-        term.begin = region.begin;
-        term.end = region.end;
-        term.lattice_shift = region.lattice_shift;
-        term.symmetry_index = region.symmetry_index;
-        for (int axis = 0; axis < 3; ++axis) {
-          const ptrdiff_t span = region.end.yucky_val(axis) - region.begin.yucky_val(axis);
-          if (span < 0 || span % 2)
-            throw std::runtime_error("legacy flux region has an invalid extent");
-          term.counts[axis] = size_t(span / 2 + 1);
+          LegacyFluxTermDescriptor term = {};
+          term.term_ordinal = term_ordinal;
+          term.region_ordinal = uint32_t(region_ordinal);
+          term.sign = term_ordinal ? -1 : 1;
+          term.chunk = region.chunk;
+          term.e_component = f.S.transform(e[term_ordinal], -region.symmetry_index);
+          term.h_component = f.S.transform(h[term_ordinal], -region.symmetry_index);
+          term.e_real = legacy_flux_field(f, region.chunk, term.e_component, 0);
+          term.e_imag = legacy_flux_field(f, region.chunk, term.e_component, 1);
+          term.h_real = legacy_flux_field(f, region.chunk, term.h_component, 0);
+          term.h_imag = legacy_flux_field(f, region.chunk, term.h_component, 1);
+          if ((!is_valid(term.e_real) && is_valid(term.e_imag)) ||
+              (!is_valid(term.h_real) && is_valid(term.h_imag)))
+            throw std::runtime_error("legacy flux imaginary field has no real counterpart");
+          term.begin = region.begin;
+          term.end = region.end;
+          term.lattice_shift = region.lattice_shift;
+          term.symmetry_index = region.symmetry_index;
+          for (int axis = 0; axis < 3; ++axis) {
+            const ptrdiff_t span = region.end.yucky_val(axis) - region.begin.yucky_val(axis);
+            if (span < 0 || span % 2)
+              throw std::runtime_error("legacy flux region has an invalid extent");
+            term.counts[axis] = size_t(span / 2 + 1);
+          }
+          term.base = legacy_flux_base(fc.gv, region.begin, term.counts, term.strides);
+          if (cgrid == Centered) {
+            fc.gv.yee2cent_offsets(term.e_component, term.e_offsets[0], term.e_offsets[1]);
+            fc.gv.yee2cent_offsets(term.h_component, term.h_offsets[0], term.h_offsets[1]);
+          }
+          const std::complex<double> e_phase =
+              region.phase * f.S.phase_shift(term.e_component, region.symmetry_index);
+          const std::complex<double> h_phase =
+              region.phase * f.S.phase_shift(term.h_component, region.symmetry_index);
+          const std::complex<double> product_phase = std::conj(e_phase) * h_phase;
+          term.phase_real = product_phase.real();
+          term.phase_imag = product_phase.imag();
+          for (int axis = 0; axis < 3; ++axis) {
+            const direction d = fc.gv.yucky_direction(axis);
+            term.boundary_weights[axis][0] = region.weights.s0.in_direction(d);
+            term.boundary_weights[axis][1] = region.weights.s1.in_direction(d);
+            term.boundary_weights[axis][2] = region.weights.e0.in_direction(d);
+            term.boundary_weights[axis][3] = region.weights.e1.in_direction(d);
+          }
+          term.dV0 = region.dV0;
+          term.dV1 = region.dV1;
+          descriptor.terms.push_back(term);
         }
-        term.base = legacy_flux_base(fc.gv, region.begin, term.counts, term.strides);
-        if (cgrid == Centered) {
-          fc.gv.yee2cent_offsets(term.e_component, term.e_offsets[0], term.e_offsets[1]);
-          fc.gv.yee2cent_offsets(term.h_component, term.h_offsets[0], term.h_offsets[1]);
-        }
-        const std::complex<double> e_phase =
-            region.phase * f.S.phase_shift(term.e_component, region.symmetry_index);
-        const std::complex<double> h_phase =
-            region.phase * f.S.phase_shift(term.h_component, region.symmetry_index);
-        const std::complex<double> product_phase = std::conj(e_phase) * h_phase;
-        term.phase_real = product_phase.real();
-        term.phase_imag = product_phase.imag();
-        for (int axis = 0; axis < 3; ++axis) {
-          const direction d = fc.gv.yucky_direction(axis);
-          term.boundary_weights[axis][0] = region.weights.s0.in_direction(d);
-          term.boundary_weights[axis][1] = region.weights.s1.in_direction(d);
-          term.boundary_weights[axis][2] = region.weights.e0.in_direction(d);
-          term.boundary_weights[axis][3] = region.weights.e1.in_direction(d);
-        }
-        term.dV0 = region.dV0;
-        term.dV1 = region.dV1;
-        descriptor.terms.push_back(term);
+        if (legacy_flux_descriptor_failure_rank_for_testing == my_rank() &&
+            legacy_flux_descriptor_failure_ordinal_for_testing == int(flux_ordinal) &&
+            term_ordinal == 0)
+          throw std::runtime_error("injected per-monitor legacy flux descriptor failure");
       }
+      catch (const std::exception &e) {
+        local_error = e.what();
+      }
+      catch (...) {
+        local_error = "unknown legacy flux descriptor pair preparation failure";
+      }
+      backend_reconcile_host_access(local_error, "legacy flux descriptor pair preparation");
     }
-    out.push_back(descriptor);
+    local_error.clear();
+    try {
+      replacement.push_back(descriptor);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
+    catch (...) {
+      local_error = "unknown legacy flux descriptor monitor publication failure";
+    }
+    backend_reconcile_host_access(local_error, "legacy flux descriptor monitor publication");
   }
+  out.swap(replacement);
 }
 
 void refresh_legacy_flux_descriptors(fields &f) {

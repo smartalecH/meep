@@ -417,6 +417,7 @@ StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
 bool backend_try_refresh_legacy_flux(fields &f, const char *site);
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
+void backend_set_legacy_flux_descriptor_failure_for_testing(int rank, int flux_ordinal);
 
 /* Exact-type capability gate.  It runs before resident storage preparation and
    is intentionally independent of the PR6 descriptor/host-segment schema. */
