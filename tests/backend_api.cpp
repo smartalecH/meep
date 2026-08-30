@@ -119,6 +119,7 @@ struct lifetime_counts {
   bool mutate_cw_cache_during_preflight;
   bool mutate_after_cw_boundary;
   bool fail_noisy_seed_refresh;
+  bool poison_noisy_seed_refresh;
   bool cw_saw_transient_mode;
   bool cw_final_dft_at_entry_time;
   CwSolveStatus cw_status;
@@ -146,16 +147,21 @@ struct lifetime_counts {
         fail_magnetic_synchronize_dispatch(false), fail_cw_preflight(false),
         fail_cw_dispatch(false), alias_cw_to_ordinary(false),
         mutate_cw_cache_during_preflight(false), mutate_after_cw_boundary(false),
-        fail_noisy_seed_refresh(false),
+        fail_noisy_seed_refresh(false), poison_noisy_seed_refresh(false),
         cw_saw_transient_mode(false),
         cw_final_dft_at_entry_time(false),
         cw_status(CwSolveStatus::converged) {}
 };
 
 struct tracking_state : BackendState {
-  explicit tracking_state(lifetime_counts &counts_) : counts(counts_) { ++counts.states_created; }
+  explicit tracking_state(lifetime_counts &counts_)
+      : counts(counts_), staged_noisy_seed(), noisy_seed_staged(false) {
+    ++counts.states_created;
+  }
   ~tracking_state() override { ++counts.states_destroyed; }
   lifetime_counts &counts;
+  RandomSeedSnapshot staged_noisy_seed;
+  bool noisy_seed_staged;
 };
 
 struct tracking_executable : Executable {
@@ -234,12 +240,24 @@ public:
     if (counts.fail_advance) throw std::runtime_error("injected backend advance failure");
     ++counts.advanced;
   }
-  void refresh_noisy_seed(const RandomSeedSnapshot &candidate, BackendState &) override {
+  void refresh_noisy_seed(const RandomSeedSnapshot &candidate, BackendState &state) override {
     ++counts.noisy_seed_refresh_attempts;
     if (counts.fail_noisy_seed_refresh)
       throw std::runtime_error("injected noisy seed refresh failure");
-    counts.last_noisy_seed = candidate;
+    if (counts.poison_noisy_seed_refresh) poison();
+    tracking_state &tracking = dynamic_cast<tracking_state &>(state);
+    tracking.staged_noisy_seed = candidate;
+    tracking.noisy_seed_staged = true;
+  }
+  void commit_noisy_seed(BackendState &state) noexcept override {
+    tracking_state &tracking = static_cast<tracking_state &>(state);
+    if (!tracking.noisy_seed_staged) return;
+    counts.last_noisy_seed = tracking.staged_noisy_seed;
     ++counts.noisy_seed_refreshes;
+    tracking.noisy_seed_staged = false;
+  }
+  void discard_noisy_seed(BackendState &state) noexcept override {
+    static_cast<tracking_state &>(state).noisy_seed_staged = false;
   }
   bool supports_cw(const CwSolveRequest &, std::string &why) const override {
     if (cw_supported) return true;
@@ -3687,17 +3705,15 @@ static void test_resident_noisy_lazy_default() {
 
   const bool local_noisy = has_local_noisy_actions(f);
   const RandomSeedSnapshot current = random_seed_snapshot();
-  CHECK(local_noisy ? (current.initialized && current.semantic_seed_valid && !current.explicit_seed)
-                    : same_seed_snapshot(current, initial),
-        "resident noisy lazy default changed the wrong rank metadata");
-  CHECK(counts.noisy_seed_refresh_attempts == int(local_noisy) &&
-            counts.noisy_seed_refreshes == int(local_noisy),
-        "resident noisy lazy default refreshed the wrong ranks");
-  CHECK(f.backend_state->random_seed_snapshot_accepted == local_noisy,
-        "resident noisy lazy default published the wrong local acceptance state");
-  if (local_noisy)
-    CHECK(same_seed_snapshot(f.backend_state->accepted_random_seed, current),
-          "resident noisy lazy default accepted the wrong snapshot");
+  CHECK(current.initialized && current.semantic_seed_valid && !current.explicit_seed,
+        "resident noisy lazy default did not initialize participating rank metadata");
+  CHECK(counts.noisy_seed_refresh_attempts == 1 && counts.noisy_seed_refreshes == 1,
+        "resident noisy lazy default did not refresh every participating rank");
+  CHECK(f.backend_state->random_seed_snapshot_accepted &&
+            same_seed_snapshot(f.backend_state->accepted_random_seed, current),
+        "resident noisy lazy default accepted the wrong rank-local snapshot");
+  CHECK(local_noisy || f.step_plans[0]->polarization_updates.empty(),
+        "idle noisy rank installed a local polarization action");
   CHECK(or_to_all(local_noisy), "resident noisy lazy-default fixture had no owning rank");
 }
 
@@ -3721,14 +3737,11 @@ static void test_resident_noisy_seed_lifecycle() {
   const RandomSeedSnapshot first_seed = random_seed_snapshot();
   f.advance(1);
   const bool local_noisy = has_local_noisy_actions(f);
-  CHECK(f.backend_state &&
-            f.backend_state->random_seed_snapshot_accepted == local_noisy &&
-            (!local_noisy ||
-             same_seed_snapshot(f.backend_state->accepted_random_seed, first_seed)),
+  CHECK(f.backend_state && f.backend_state->random_seed_snapshot_accepted &&
+            same_seed_snapshot(f.backend_state->accepted_random_seed, first_seed),
         "first resident noisy advance did not accept the current seed snapshot");
-  CHECK(counts.noisy_seed_refresh_attempts == int(local_noisy) &&
-            counts.noisy_seed_refreshes == int(local_noisy) &&
-            (!local_noisy || same_seed_snapshot(counts.last_noisy_seed, first_seed)),
+  CHECK(counts.noisy_seed_refresh_attempts == 1 && counts.noisy_seed_refreshes == 1 &&
+            same_seed_snapshot(counts.last_noisy_seed, first_seed),
         "first resident noisy advance did not refresh exactly one seed snapshot");
   CHECK(random_int(0, 1000000) == expected_first_draw,
         "resident noisy compile/refresh/advance consumed the host MT stream");
@@ -3742,7 +3755,7 @@ static void test_resident_noisy_seed_lifecycle() {
   const uint64_t plan_signature = ordinary_plan->signature;
   const int entry_t = f.t;
   const BackendEpochSnapshot stable_epoch(f);
-  const int first_local_refreshes = int(local_noisy);
+  const int first_local_refreshes = 1;
 
   set_random_seed(2002);
   const RandomSeedSnapshot second_seed = random_seed_snapshot();
@@ -3754,7 +3767,7 @@ static void test_resident_noisy_seed_lifecycle() {
         "reseed rebuilt or mutated the resident noisy execution epoch");
   CHECK(counts.noisy_seed_refresh_attempts == 2 * first_local_refreshes &&
             counts.noisy_seed_refreshes == 2 * first_local_refreshes &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, second_seed)),
+            same_seed_snapshot(state->accepted_random_seed, second_seed),
         "reseed did not publish exactly one refreshed snapshot");
 
   set_random_seed(3003);
@@ -3767,7 +3780,7 @@ static void test_resident_noisy_seed_lifecycle() {
             f.step_plans[0] != before_flux_plan && f.storage_plan == storage &&
             f.array_catalog == catalog && f.t == entry_t &&
             counts.noisy_seed_refreshes == 3 * first_local_refreshes &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, third_seed)),
+            same_seed_snapshot(state->accepted_random_seed, third_seed),
         "concurrent seed and legacy-flux refresh did not preserve state and publish both updates");
 
   const RandomSeedSnapshot before_restore = state->accepted_random_seed;
@@ -3776,13 +3789,13 @@ static void test_resident_noisy_seed_lifecycle() {
   f.advance(1);
   CHECK(restored_seed.generation != before_restore.generation &&
             counts.noisy_seed_refreshes == 4 * first_local_refreshes &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, restored_seed)),
+            same_seed_snapshot(state->accepted_random_seed, restored_seed),
         "valid seed restore did not refresh the resident noisy snapshot");
   restore_random_seed();
   const RandomSeedSnapshot repeated_restore = random_seed_snapshot();
   f.advance(1);
   CHECK(counts.noisy_seed_refreshes == 5 * first_local_refreshes &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, repeated_restore)),
+            same_seed_snapshot(state->accepted_random_seed, repeated_restore),
         "repeated valid restore did not refresh by generation");
 
   set_random_seed(2002);
@@ -3791,7 +3804,7 @@ static void test_resident_noisy_seed_lifecycle() {
   CHECK(repeated_seed.generation != second_seed.generation &&
             counts.noisy_seed_refresh_attempts == 6 * first_local_refreshes &&
             counts.noisy_seed_refreshes == 6 * first_local_refreshes &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, repeated_seed)),
+            same_seed_snapshot(state->accepted_random_seed, repeated_seed),
         "same-value reseed did not refresh by generation without rebuilding");
 
   set_random_seed(5005);
@@ -3806,12 +3819,11 @@ static void test_resident_noisy_seed_lifecycle() {
   bool failed = false;
   try { f.advance(1); }
   catch (const std::runtime_error &) { failed = true; }
-  CHECK((failed == local_noisy) &&
+  CHECK(failed &&
             counts.noisy_seed_refresh_attempts == 7 * first_local_refreshes &&
             counts.noisy_seed_refreshes == 6 * first_local_refreshes &&
-            counts.advanced == advances_before_failure + int(!local_noisy) &&
-            (!local_noisy ||
-             same_seed_snapshot(state->accepted_random_seed, accepted_before_failure)) &&
+            counts.advanced == advances_before_failure &&
+            same_seed_snapshot(state->accepted_random_seed, accepted_before_failure) &&
             failure_epoch.matches(f) && !f.backend->is_poisoned(),
         "failed noisy seed refresh published state, dispatched, rebuilt, or poisoned");
   CHECK(random_int(0, 1000000) == expected_failure_draw,
@@ -3821,8 +3833,8 @@ static void test_resident_noisy_seed_lifecycle() {
   f.advance(1);
   CHECK(counts.noisy_seed_refresh_attempts == 8 * first_local_refreshes &&
             counts.noisy_seed_refreshes == 7 * first_local_refreshes &&
-            counts.advanced == advances_before_failure + 2 - int(local_noisy) &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, failed_candidate)),
+            counts.advanced == advances_before_failure + 1 &&
+            same_seed_snapshot(state->accepted_random_seed, failed_candidate),
         "retry after noisy seed refresh failure did not publish the pending snapshot exactly once");
   CHECK(random_int(0, 1000000) == expected_retry_draw,
         "noisy seed refresh retry consumed the host MT stream");
@@ -3835,7 +3847,7 @@ static void test_resident_noisy_seed_lifecycle() {
   CHECK(f.backend_state == state && f.executable == executable_before_reset &&
             f.step_plans[0] == plan_before_reset &&
             counts.noisy_seed_refreshes == refreshes_before_reset &&
-            (!local_noisy || same_seed_snapshot(state->accepted_random_seed, failed_candidate)),
+            same_seed_snapshot(state->accepted_random_seed, failed_candidate),
         "field reset rebuilt or reset the accepted noisy seed snapshot");
 
   const int refreshes_before_remove = counts.noisy_seed_refreshes;
@@ -3864,11 +3876,9 @@ static void test_resident_noisy_seed_lifecycle() {
              counts.states_created == states_before_growth + 1 &&
              counts.states_destroyed == destroyed_before_growth + 1),
         "owned catalog growth did not replace resident state exactly once");
-  CHECK(f.backend_state->random_seed_snapshot_accepted == growth_noisy,
-        "catalog/state replacement published the wrong local seed acceptance state");
-  if (growth_noisy)
-    CHECK(same_seed_snapshot(f.backend_state->accepted_random_seed, growth_seed),
-          "catalog/state replacement accepted the wrong noisy seed snapshot");
+  CHECK(f.backend_state->random_seed_snapshot_accepted &&
+            same_seed_snapshot(f.backend_state->accepted_random_seed, growth_seed),
+        "catalog/state replacement accepted the wrong rank-local noisy seed snapshot");
 
   execution_options cpu_options;
   f.select_backend(cpu_options);
@@ -3879,17 +3889,16 @@ static void test_resident_noisy_seed_lifecycle() {
   const int refreshes_before_reselection = counts.noisy_seed_refreshes;
   f.advance(1);
   const bool reselection_noisy = has_local_noisy_actions(f);
-  CHECK(f.backend_state && f.backend_state->random_seed_snapshot_accepted == reselection_noisy &&
-            counts.noisy_seed_refreshes == refreshes_before_reselection + int(reselection_noisy) &&
-            (!reselection_noisy ||
-             same_seed_snapshot(f.backend_state->accepted_random_seed, growth_seed)),
+  CHECK(f.backend_state && f.backend_state->random_seed_snapshot_accepted &&
+            counts.noisy_seed_refreshes == refreshes_before_reselection + 1 &&
+            same_seed_snapshot(f.backend_state->accepted_random_seed, growth_seed),
         "backend reselection did not accept the current noisy seed snapshot");
 
   monitor.remove();
   f.remove_fluxes();
   f.advance(1);
   const int noisy_attempts_before_failure = counts.advance_attempts;
-  counts.fail_advance = true;
+  counts.fail_advance = my_rank() == 0;
   bool dispatch_failed = false;
   try { f.advance(1); }
   catch (const std::runtime_error &) { dispatch_failed = true; }
@@ -3957,6 +3966,433 @@ static void test_resident_noisy_prelaunch_failures() {
     CHECK(f.executable && !f.backend->is_poisoned(),
           "cold noisy compile failure was not retryable");
   }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    s.add_susceptibility(unit_epsilon, E_stuff, noisy);
+    fields f(&s);
+    f.add_point_source(Ez, source, vec(0.0, 0.0));
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    set_random_seed(8108 + my_global_rank());
+    f.advance(1);
+    const RandomSeedSnapshot accepted = f.backend_state->accepted_random_seed;
+    const int dispatches = counts.advance_attempts;
+    set_random_seed(8208 + my_global_rank());
+    counts.poison_noisy_seed_refresh = my_rank() == 0;
+    bool failed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(failed && f.backend->is_poisoned() && counts.advance_attempts == dispatches &&
+              same_seed_snapshot(f.backend_state->accepted_random_seed, accepted),
+          "poisoned noisy seed staging committed or dispatched");
+  }
+}
+
+static void expect_collective_noisy_preflight_failure(fields &f, lifetime_counts &counts,
+                                                      const char *message) {
+  BackendState *const state = f.backend_state;
+  Executable *const executable = f.executable;
+  StepPlan *const plan = f.step_plans[0];
+  StoragePlan *const storage = f.storage_plan;
+  CpuArrayCatalog *const catalog = f.array_catalog;
+  const RandomSeedSnapshot accepted = state->accepted_random_seed;
+  const int entry_t = f.t;
+  const int attempts = counts.noisy_seed_refresh_attempts;
+  const int refreshes = counts.noisy_seed_refreshes;
+  const int dispatches = counts.advance_attempts;
+  bool failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(failed && f.backend_state == state && f.executable == executable &&
+            f.step_plans[0] == plan && f.storage_plan == storage && f.array_catalog == catalog &&
+            f.t == entry_t && counts.noisy_seed_refresh_attempts == attempts &&
+            counts.noisy_seed_refreshes == refreshes && counts.advance_attempts == dispatches &&
+            same_seed_snapshot(state->accepted_random_seed, accepted) && !f.backend->is_poisoned(),
+        message);
+}
+
+static void test_resident_noisy_collective_preflight() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure s(gv, eps_slab, pml(0.5), identity(), 2);
+  noisy_lorentzian_susceptibility noisy0(0.03125, 1.1, 0.05);
+  noisy_lorentzian_susceptibility noisy1(0.0625, 0.9, 0.07);
+  s.add_susceptibility(unit_epsilon, E_stuff, noisy0);
+  s.add_susceptibility(unit_epsilon, E_stuff, noisy1);
+  fields f(&s);
+  add_noisy_fixture(s, f);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+
+  for (int i = 0; i <= my_rank(); ++i) set_random_seed(9000 + my_global_rank());
+  const RandomSeedSnapshot local_seed = random_seed_snapshot();
+  f.advance(1);
+  CHECK(f.backend_state->random_seed_snapshot_accepted &&
+            same_seed_snapshot(f.backend_state->accepted_random_seed, local_seed),
+        "collective noisy preflight rejected valid unequal rank-local seed metadata");
+  CHECK(counts.noisy_seed_refreshes == 1,
+        "collective noisy preflight did not refresh every participating rank");
+  const bool local_noisy = has_local_noisy_actions(f);
+  CHECK(or_to_all(local_noisy), "collective noisy fixture installed no noisy action");
+  CHECK(local_noisy || f.step_plans[0]->polarization_updates.empty(),
+        "idle collective noisy rank installed a local polarization row");
+
+  const int dynamic_modes[] = {1, 2, 3, 5, 7};
+  for (int target = 0; target < count_processors(); ++target) {
+    for (size_t mode_index = 0; mode_index < sizeof(dynamic_modes) / sizeof(dynamic_modes[0]);
+         ++mode_index) {
+      backend_set_noisy_preflight_failure_for_testing(target, dynamic_modes[mode_index]);
+      expect_collective_noisy_preflight_failure(
+          f, counts, "rank-asymmetric noisy metadata failure crossed the dispatch boundary");
+      backend_set_noisy_preflight_failure_for_testing(-1, 0);
+      const int dispatches = counts.advance_attempts;
+      f.advance(1);
+      CHECK(counts.advance_attempts == dispatches + 1 && !f.backend->is_poisoned(),
+            "rank-asymmetric noisy metadata failure was not retryable");
+    }
+    const bool target_has_noisy = or_to_all(my_rank() == target && local_noisy);
+    if (target_has_noisy)
+      for (int mode = 4; mode <= 6; mode += 2) {
+        backend_set_noisy_preflight_failure_for_testing(target, mode);
+        expect_collective_noisy_preflight_failure(
+            f, counts, "rank-asymmetric noisy static failure crossed the dispatch boundary");
+        backend_set_noisy_preflight_failure_for_testing(-1, 0);
+        const int dispatches = counts.advance_attempts;
+        f.advance(1);
+        CHECK(counts.advance_attempts == dispatches + 1 && !f.backend->is_poisoned(),
+              "rank-asymmetric noisy static failure was not retryable");
+      }
+  }
+
+  StepPlan stable_plan = *f.step_plans[0];
+  std::vector<size_t> noise_rows;
+  for (size_t i = 0; i < f.step_plans[0]->polarization_updates.size(); ++i)
+    if (f.step_plans[0]->polarization_updates[i].kind == PolarizationUpdateKind::noisy_add)
+      noise_rows.push_back(i);
+  const bool enough_rows = noise_rows.size() >= 2;
+  CHECK(or_to_all(enough_rows), "collective noisy mutation fixture has fewer than two noise rows");
+  if (my_rank() == 0 && enough_rows) {
+    std::swap(f.step_plans[0]->polarization_updates[noise_rows[0]],
+              f.step_plans[0]->polarization_updates[noise_rows[1]]);
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "re-signed noisy action order mutation crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && enough_rows) {
+    PolarizationUpdate &first = f.step_plans[0]->polarization_updates[noise_rows[0]];
+    PolarizationUpdate &second = f.step_plans[0]->polarization_updates[noise_rows[1]];
+    second.region.chunk = first.region.chunk;
+    second.region.c = first.region.c;
+    second.region.cmp = first.region.cmp;
+    second.ft = first.ft;
+    second.state_index = first.state_index;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "duplicate re-signed noisy stream tuple crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty())
+    f.step_plans[0]->polarization_updates[noise_rows[0]].p =
+        f.step_plans[0]->polarization_updates[noise_rows[0]].diagonal_sigma;
+  expect_collective_noisy_preflight_failure(
+      f, counts, "stale-signature noisy ArrayId mutation crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0)
+    for (PolarizationUpdate &row : f.step_plans[0]->polarization_updates)
+      if (row.kind == PolarizationUpdateKind::noisy_add)
+        row.kind = PolarizationUpdateKind::lorentzian;
+  expect_collective_noisy_preflight_failure(
+      f, counts, "stale-signature removal of all noisy actions crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    PolarizationUpdate &row = f.step_plans[0]->polarization_updates[noise_rows[0]];
+    row.p = row.diagonal_sigma;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "re-signed noisy ArrayId mutation crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    f.step_plans[0]->polarization_updates[noise_rows[0]].region.counts[0] = 0;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "re-signed noisy range mutation crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    UpdateRegion &region = f.step_plans[0]->polarization_updates[noise_rows[0]].region;
+    bool changed = false;
+    for (int axis = 0; axis < 3; ++axis)
+      if (!changed && region.counts[axis] > 1 && region.strides[axis] != 0) {
+        region.strides[axis] = 0;
+        changed = true;
+      }
+    CHECK(changed, "noisy zero-stride mutation found no traversed axis");
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "re-signed noisy zero-stride mutation crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0) {
+    for (Operation &op : f.step_plans[0]->operations)
+      if (op.kind == OpKind::update_polarization && op.descriptor_count) {
+        --op.descriptor_count;
+        if (!op.accesses.empty()) op.accesses.pop_back();
+        break;
+      }
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "re-signed noisy operation span/access mutation crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0) {
+    for (Operation &op : f.step_plans[0]->operations)
+      if (op.kind == OpKind::update_polarization) {
+        op.guard = guard_device(17);
+        op.source_time_offset = 0.25;
+        break;
+      }
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "re-signed noisy operation guard/timing mutation crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    f.step_plans[0]->polarization_updates.erase(
+        f.step_plans[0]->polarization_updates.begin() + noise_rows[0]);
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "missing re-signed noisy action crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    f.step_plans[0]->polarization_updates.push_back(
+        f.step_plans[0]->polarization_updates[noise_rows[0]]);
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "extra duplicate noisy action crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    UpdateRegion &region = f.step_plans[0]->polarization_updates[noise_rows[0]].region;
+    region.counts[0] = std::numeric_limits<size_t>::max();
+    region.counts[1] = 2;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "noisy owned-point extent overflow crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    f.step_plans[0]->polarization_updates[noise_rows[0]].omega_0 =
+        std::numeric_limits<double>::max();
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "overflowing noisy omega coefficient crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    f.step_plans[0]->polarization_updates[noise_rows[0]].gamma = -0.1;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "invalid noisy gamma sqrt domain crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0 && !noise_rows.empty()) {
+    f.step_plans[0]->polarization_updates[noise_rows[0]].dt = 0.0;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "invalid noisy timestep coefficient crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  CpuArrayCatalog *const live_catalog = f.array_catalog;
+  if (my_rank() == 0) {
+    f.array_catalog = NULL;
+    f.step_plans[0]->signature ^= UINT64_C(1);
+  }
+  const int dispatches_before_missing_catalog = counts.advance_attempts;
+  bool missing_catalog_failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { missing_catalog_failed = true; }
+  if (my_rank() == 0) f.array_catalog = live_catalog;
+  *f.step_plans[0] = stable_plan;
+  CHECK(missing_catalog_failed && counts.advance_attempts == dispatches_before_missing_catalog &&
+            !f.backend->is_poisoned(),
+        "rank-asymmetric missing noisy catalog crossed the dispatch boundary");
+
+  DescriptorSet stable_descriptors = *f.descriptors;
+  if (my_rank() == 0) {
+    f.descriptors->polarizations.clear();
+    f.step_plans[0]->polarization_updates.clear();
+    for (Operation &op : f.step_plans[0]->operations)
+      if (op.kind == OpKind::update_polarization) {
+        op.descriptor_index = 0;
+        op.descriptor_count = 0;
+        op.accesses.clear();
+      }
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "missing noisy descriptor and plan rows crossed the dispatch boundary");
+  *f.descriptors = stable_descriptors;
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0) {
+    bool changed = false;
+    for (PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (!changed && descriptor.kind == SusceptibilityKind::noisy_lorentzian) {
+        descriptor.noise_amplitude = std::numeric_limits<double>::infinity();
+        for (PolarizationUpdate &row : f.step_plans[0]->polarization_updates)
+          if (row.kind == PolarizationUpdateKind::noisy_add &&
+              row.region.chunk == descriptor.chunk && row.ft == descriptor.ft &&
+              row.state_index == descriptor.state_index)
+            row.noise_amplitude = descriptor.noise_amplitude;
+        changed = true;
+      }
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  }
+  expect_collective_noisy_preflight_failure(
+      f, counts, "descriptor-consistent nonfinite noisy coefficient crossed dispatch");
+  *f.descriptors = stable_descriptors;
+  *f.step_plans[0] = stable_plan;
+
+  for (int target = 0; target < count_processors(); ++target) {
+    set_random_seed(10000 + 31 * target + my_global_rank());
+    const RandomSeedSnapshot pending = random_seed_snapshot();
+    const RandomSeedSnapshot accepted = f.backend_state->accepted_random_seed;
+    const int dispatches = counts.advance_attempts;
+    const int refresh_attempts = counts.noisy_seed_refresh_attempts;
+    counts.fail_noisy_seed_refresh = my_rank() == target;
+    bool failed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(failed && counts.advance_attempts == dispatches &&
+              counts.noisy_seed_refresh_attempts == refresh_attempts + 1 &&
+              same_seed_snapshot(f.backend_state->accepted_random_seed, accepted) &&
+              !f.backend->is_poisoned(),
+          "rank-asymmetric noisy seed hook failure dispatched or published acceptance");
+    counts.fail_noisy_seed_refresh = false;
+    f.advance(1);
+    CHECK(same_seed_snapshot(f.backend_state->accepted_random_seed, pending) &&
+              counts.advance_attempts == dispatches + 1,
+          "rank-asymmetric noisy seed hook failure was not retryable");
+  }
+
+  const int attempts_before_poison = counts.advance_attempts;
+  counts.fail_advance = my_rank() == 0;
+  bool failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(failed && f.backend->is_poisoned() &&
+            counts.advance_attempts == attempts_before_poison + 1,
+        "rank-asymmetric noisy dispatch failure did not collectively poison");
+  failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(failed && counts.advance_attempts == attempts_before_poison + 1,
+        "collectively poisoned noisy backend accepted another dispatch");
+}
+
+static void test_resident_noisy_zero_row() {
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+  s.add_susceptibility(unit_epsilon, E_stuff, noisy);
+  fields f(&s);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  backend_reset_noisy_collective_count_for_testing();
+  f.advance(1);
+  f.advance(1);
+  CHECK(counts.noisy_seed_refresh_attempts == 0 && counts.noisy_seed_refreshes == 0 &&
+            f.backend_state && !f.backend_state->random_seed_snapshot_accepted &&
+            !f.backend_state->noisy_preflight_required &&
+            backend_noisy_collective_count_for_testing() == 0,
+        "zero-row noisy definition sampled or refreshed RNG metadata");
+}
+
+static void test_resident_noisy_invalid_first_restore() {
+  restore_random_seed();
+  const RandomSeedSnapshot invalid = random_seed_snapshot();
+  CHECK(invalid.initialized && !invalid.semantic_seed_valid,
+        "isolated first restore did not produce invalid semantic metadata");
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+  s.add_susceptibility(unit_epsilon, E_stuff, noisy);
+  fields f(&s);
+  add_noisy_fixture(s, f);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  bool failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(failed && counts.noisy_seed_refresh_attempts == 0 && counts.advance_attempts == 0 &&
+            !f.backend->is_poisoned(),
+        "invalid first restore crossed the noisy seed dispatch boundary");
+  set_random_seed(12345 + my_global_rank());
+  f.advance(1);
+  CHECK(counts.noisy_seed_refreshes == 1 && counts.advance_attempts == 1,
+        "valid seed did not retry after invalid first restore");
+}
+
+static void test_resident_noisy_split_global_rank() {
+  const int groups = count_processors();
+  divide_parallel_processes(groups);
+  CHECK(my_rank() == 0, "one-rank split communicator did not have local rank zero");
+  const uint64_t local_tag = counter_random_stream_tag(
+      counter_random_algorithm_version, uint32_t(my_global_rank()), 0, uint32_t(E_stuff), 0,
+      uint32_t(Ez), 0);
+  const uint64_t rank_zero_tag = counter_random_stream_tag(
+      counter_random_algorithm_version, 0, 0, uint32_t(E_stuff), 0, uint32_t(Ez), 0);
+  CHECK(rank_zero_tag == UINT64_C(0xbef1dcd6d5312d4d),
+        "version-1 noisy FNV stream-tag KAT changed");
+  CHECK(my_global_rank() == 0 || local_tag != rank_zero_tag,
+        "split-communicator noisy stream tag used local rather than global rank");
+
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+    noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+    s.add_susceptibility(unit_epsilon, E_stuff, noisy);
+    fields f(&s);
+    add_noisy_fixture(s, f);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    set_random_seed(777);
+    f.advance(1);
+    CHECK(counts.noisy_seed_refreshes == 1 && counts.advance_attempts == 1,
+          "split-communicator noisy preflight did not accept local rank metadata");
+    const PolarizationUpdate *first = NULL;
+    for (const PolarizationUpdate &update : f.step_plans[0]->polarization_updates)
+      if (!first && update.kind == PolarizationUpdateKind::noisy_add) first = &update;
+    CHECK(first && f.backend_state->noisy_stream_count > 0,
+          "split-communicator noisy preflight recorded no production stream");
+    if (first) {
+      const uint64_t expected = counter_random_stream_tag(
+          first->noise_algorithm_version, uint32_t(my_global_rank()),
+          uint32_t(first->region.chunk), uint32_t(first->ft), uint32_t(first->state_index),
+          uint32_t(first->region.c), uint32_t(first->region.cmp));
+      CHECK(f.backend_state->noisy_first_stream_tag == expected,
+            "production noisy preflight did not use global-rank stream identity");
+    }
+  }
+  end_divide_parallel();
 }
 
 static void test_resident_advance_failure_poison() {
@@ -4926,6 +5362,8 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_BACKEND_API_NOISY_ONLY")) {
     test_resident_noisy_seed_lifecycle();
     test_resident_noisy_prelaunch_failures();
+    test_resident_noisy_collective_preflight();
+    test_resident_noisy_zero_row();
     test_resident_advance_failure_poison();
     if (failures) return 1;
     master_printf("backend_api: noisy checks passed\n");
@@ -4935,6 +5373,18 @@ int main(int argc, char **argv) {
     test_resident_noisy_lazy_default();
     if (failures) return 1;
     master_printf("backend_api: noisy lazy-default checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_NOISY_INVALID_ONLY")) {
+    test_resident_noisy_invalid_first_restore();
+    if (failures) return 1;
+    master_printf("backend_api: noisy invalid-restore checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_NOISY_SPLIT_ONLY")) {
+    test_resident_noisy_split_global_rank();
+    if (failures) return 1;
+    master_printf("backend_api: noisy split-communicator checks passed\n");
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_CW_ONLY")) {
@@ -4980,6 +5430,8 @@ int main(int argc, char **argv) {
   test_resident_polarization_preparation();
   test_resident_noisy_seed_lifecycle();
   test_resident_noisy_prelaunch_failures();
+  test_resident_noisy_collective_preflight();
+  test_resident_noisy_zero_row();
   test_resident_advance_failure_poison();
   test_resident_beta_fingerprint();
   test_resident_bfast_fingerprint();
