@@ -29,9 +29,11 @@ DirtyMask invalidation_closure(MutationKind cause) {
        backend must refresh the authoritative values from the host mutation. */
     case MutationKind::field_values: return dirty_initialization;
 
-    /* Amplitudes changed but the index tables did not, so only the values that
-       get pushed to the backend are stale. */
-    case MutationKind::source_values: return dirty_initialization;
+    /* Spatial amplitudes are part of SourceDescriptor and of the compiled
+       backend source-point buffer.  Their index/component topology is stable,
+       so storage and cached regions remain valid, but both the descriptor plan
+       and every executable that owns a packed copy must be replaced. */
+    case MutationKind::source_values: return dirty_source_plan | dirty_executable;
 
     /* A different set of sources means a different source plan and a different
        emitted operation list. Promotion to storage/halos happens separately,

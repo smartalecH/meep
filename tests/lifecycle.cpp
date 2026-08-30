@@ -57,7 +57,7 @@ static void test_closure_table() {
   };
   const row table[] = {
       {MutationKind::field_values, dirty_initialization},
-      {MutationKind::source_values, dirty_initialization},
+      {MutationKind::source_values, dirty_source_plan | dirty_executable},
       {MutationKind::source_definition, dirty_source_plan | dirty_regions | dirty_executable},
       {MutationKind::monitor_definition,
        dirty_monitor_plan | dirty_regions | dirty_storage | dirty_executable},
@@ -116,8 +116,12 @@ static void test_generations() {
           mutation_kind_name(MutationKind(i)), (unsigned long long)f.mutation_generation[i],
           (unsigned long long)expect);
   }
-  CHECK(is_dirty(f, dirty_initialization), "source_values must dirty initialization");
-  CHECK(!is_dirty(f, dirty_executable), "source_values must not dirty the executable");
+  CHECK(is_dirty(f, dirty_source_plan), "source_values must dirty the source plan");
+  CHECK(is_dirty(f, dirty_executable), "source_values must dirty the executable");
+  CHECK(!is_dirty(f, dirty_initialization),
+        "source_values must not reinitialize resident field storage");
+  CHECK(!is_dirty(f, dirty_storage) && !is_dirty(f, dirty_regions),
+        "source_values must retain storage and cached region topology");
 
   clear_dirty(f, dirty_initialization);
   CHECK(!is_dirty(f, dirty_initialization), "clear_dirty did not clear");
