@@ -241,7 +241,10 @@ enum class failure_point {
   noisy_seed_sync,
   noisy_add,
   multilevel_population,
-  multilevel_transition
+  multilevel_transition,
+  host_segment_after_download,
+  host_segment_after_callback,
+  host_segment_after_upload
 };
 void fail_next(failure_point point);
 void clear_failure();

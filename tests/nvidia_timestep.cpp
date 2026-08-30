@@ -221,6 +221,13 @@ public:
   susceptibility *clone() const override { return new inherited_noisy_lorentzian(*this); }
 };
 
+class inherited_lorentzian : public lorentzian_susceptibility {
+public:
+  inherited_lorentzian(realnum omega, realnum gamma, bool drude = false)
+      : lorentzian_susceptibility(omega, gamma, drude) {}
+  susceptibility *clone() const override { return new inherited_lorentzian(*this); }
+};
+
 class inherited_multilevel : public multilevel_susceptibility {
 public:
   inherited_multilevel(int levels, int transitions, const realnum *Gamma, const realnum *N0,
@@ -3178,6 +3185,160 @@ static void run_dispersion_case(const char *name, precision_policy_kind policy, 
                 precision_policy_name(policy));
 }
 
+static void run_host_custom_fallback_case(precision_policy_kind policy, bool magnetic) {
+  const grid_volume gv = vol2d(2.4, 2.0, 8.0);
+  const boundary_region boundary = magnetic ? no_pml() : pml(0.35, X);
+  structure cpu_structure(gv, isotropic_eps, boundary, identity(), 2);
+  structure gpu_structure(gv, isotropic_eps, boundary, identity(), 2);
+  dispersion_sigma_material sigma(false);
+  const field_type ft = magnetic ? H_stuff : E_stuff;
+  inherited_lorentzian custom(0.73, 0.06);
+  inherited_lorentzian custom_second(0.91, 0.045);
+  lorentzian_susceptibility native(1.17, 0.035);
+  if (magnetic) {
+    cpu_structure.add_susceptibility(sigma, ft, native);
+    cpu_structure.add_susceptibility(sigma, ft, custom_second);
+    cpu_structure.add_susceptibility(sigma, ft, custom);
+    gpu_structure.add_susceptibility(sigma, ft, native);
+    gpu_structure.add_susceptibility(sigma, ft, custom_second);
+    gpu_structure.add_susceptibility(sigma, ft, custom);
+  }
+  else {
+    cpu_structure.add_susceptibility(sigma, ft, custom);
+    cpu_structure.add_susceptibility(sigma, ft, custom_second);
+    cpu_structure.add_susceptibility(sigma, ft, native);
+    gpu_structure.add_susceptibility(sigma, ft, custom);
+    gpu_structure.add_susceptibility(sigma, ft, custom_second);
+    gpu_structure.add_susceptibility(sigma, ft, native);
+  }
+
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  cpu.require_component(magnetic ? Hz : Ez);
+  gpu.require_component(magnetic ? Hz : Ez);
+  gaussian_src_time cpu_source(0.31, 0.14), gpu_source(0.31, 0.14);
+  if (!magnetic) {
+    cpu_source.is_integrated = true;
+    gpu_source.is_integrated = true;
+    cpu.add_point_source(Ez, cpu_source, vec(0.37, 0.41), 0.21);
+    gpu.add_point_source(Ez, gpu_source, vec(0.37, 0.41), 0.21);
+  }
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+  const bool narrowed = policy != precision_policy_kind::native;
+  if (narrowed) round_real_arrays(*cpu.array_catalog);
+  initialize_fields(cpu, gpu, narrowed, 0.19);
+
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend != NULL, "custom fallback fixture did not select NVIDIA");
+  const StepPlan resident_plan = build_step_plan(gpu, StepProgram::ordinary);
+  StoragePlan device_plan = *gpu.storage_plan;
+  apply_precision_policy(device_plan, policy_for(policy));
+  size_t callbacks_per_step = 0;
+  size_t download_calls_per_step = 0, download_bytes_per_step = 0;
+  size_t upload_calls_per_step = 0, upload_bytes_per_step = 0;
+  for (const HostSegment &segment : resident_plan.host_segments)
+    callbacks_per_step += segment.callback_count;
+  for (const Operation &op : resident_plan.operations) {
+    if (op.kind != OpKind::host_callback) continue;
+    for (const BufferAccess &access : op.accesses) {
+      const ArraySpec &spec = device_plan.arrays[access.array.id.value];
+      const size_t bytes = access.array.elements *
+                           storage_element_bytes(spec.element_type, spec.storage);
+      if (access.mode != AccessMode::write) {
+        ++download_calls_per_step;
+        download_bytes_per_step += bytes;
+      }
+      if (access.mode != AccessMode::read) {
+        ++upload_calls_per_step;
+        upload_bytes_per_step += bytes;
+      }
+    }
+  }
+  require(resident_plan.host_segments.size() == 2 && callbacks_per_step != 0,
+          "custom fallback fixture has an unexpected host-segment topology");
+  cpu.advance(1);
+  gpu.advance(1);
+  compare_fields(cpu, gpu,
+                 (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13);
+  const NvidiaHostFallbackStatistics before = backend->host_fallback_statistics_for_testing();
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  cpu.advance(2);
+  gpu.advance(2);
+  compare_fields(cpu, gpu,
+                 (sizeof(realnum) == sizeof(float) || narrowed) ? 8e-5 : 8e-13);
+  const NvidiaHostFallbackStatistics after = backend->host_fallback_statistics_for_testing();
+  require(after.segment_executions - before.segment_executions == 4,
+          "custom fallback did not execute two host segments per timestep");
+  require(after.callback_resolutions - before.callback_resolutions == 2 * callbacks_per_step,
+          "custom fallback did not re-resolve the callback identity per segment");
+  const bool exact_transfers =
+      after.device_to_host_calls - before.device_to_host_calls ==
+                  2 * download_calls_per_step &&
+              after.host_to_device_calls - before.host_to_device_calls ==
+                  2 * upload_calls_per_step &&
+              after.device_to_host_bytes - before.device_to_host_bytes ==
+                  2 * download_bytes_per_step &&
+              after.host_to_device_bytes - before.host_to_device_bytes ==
+                  2 * upload_bytes_per_step &&
+              after.synchronizations - before.synchronizations ==
+                  4 * resident_plan.host_segments.size();
+  if (!exact_transfers)
+    fprintf(stderr,
+            "host fallback accounting got d2h=%zu/%zu bytes=%zu/%zu h2d=%zu/%zu bytes=%zu/%zu "
+            "sync=%zu/%zu\n",
+            after.device_to_host_calls - before.device_to_host_calls,
+            2 * download_calls_per_step,
+            after.device_to_host_bytes - before.device_to_host_bytes,
+            2 * download_bytes_per_step,
+            after.host_to_device_calls - before.host_to_device_calls,
+            2 * upload_calls_per_step,
+            after.host_to_device_bytes - before.host_to_device_bytes,
+            2 * upload_bytes_per_step,
+            after.synchronizations - before.synchronizations,
+            4 * resident_plan.host_segments.size());
+  require(exact_transfers,
+          "custom fallback transfer accounting differs from the declared compact union");
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  require(memory_before.device_bytes_current == memory_after.device_bytes_current &&
+              memory_before.pinned_bytes_current == memory_after.pinned_bytes_current,
+          "custom fallback allocated device or pinned storage during steady execution");
+  master_printf("nvidia_timestep: host-custom-%s/%s PASS\n", magnetic ? "H" : "E",
+                precision_policy_name(policy));
+}
+
+static void test_host_custom_postdispatch_poison() {
+  const grid_volume gv = vol2d(2.0, 2.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  inherited_lorentzian custom(0.73, 0.06);
+  s.add_susceptibility(unit_value, E_stuff, custom);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.advance(1);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::host_segment_after_callback);
+  bool failed = false;
+  try { f.advance(1); }
+  catch (const std::exception &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && f.backend->is_poisoned(),
+          "custom fallback post-callback failure did not poison the resident backend");
+  failed = false;
+  try { f.advance(1); }
+  catch (const std::exception &) { failed = true; }
+  require(failed, "poisoned custom fallback backend accepted another advance");
+  master_printf("nvidia_timestep: host-custom postdispatch poison PASS\n");
+}
+
 static void run_gyrotropic_case(const char *name, precision_policy_kind policy, bool real_fields,
                                 gyrotropy_model model, bool magnetic, bool use_pml,
                                 const vec *bloch, bool negate_symmetry,
@@ -4829,6 +4990,7 @@ int main(int argc, char **argv) {
   const bool flux_only = getenv("MEEP_NVIDIA_TIMESTEP_FLUX_ONLY") != NULL;
   const bool noisy_only = getenv("MEEP_NVIDIA_TIMESTEP_NOISY_ONLY") != NULL;
   const bool multilevel_only = getenv("MEEP_NVIDIA_TIMESTEP_MULTILEVEL_ONLY") != NULL;
+  const bool host_custom_only = getenv("MEEP_NVIDIA_TIMESTEP_HOST_CUSTOM_ONLY") != NULL;
   const char *cylindrical_case = getenv("MEEP_NVIDIA_CYLINDRICAL_CASE");
   test_polarization_coefficient_rounding();
   test_polarization_storage_key_encoding();
@@ -4906,6 +5068,11 @@ int main(int argc, char **argv) {
   const precision_policy_kind policies[] = {
       precision_policy_kind::native, precision_policy_kind::mixed, precision_policy_kind::f32};
   for (size_t p = 0; p < sizeof(policies) / sizeof(policies[0]); ++p) {
+    if (host_custom_only) {
+      run_host_custom_fallback_case(policies[p], false);
+      run_host_custom_fallback_case(policies[p], true);
+      continue;
+    }
     if (multilevel_only) {
       run_multilevel_case("d1-real-e-l2t1", policies[p], vol1d(2.4, 7.0), true, false,
                           false);
@@ -5014,7 +5181,7 @@ int main(int argc, char **argv) {
                      false, 2, &bloch2, 0.17);
     }
     if (gyro_only || beta_only || bfast_only || magnetic_only || material_only || flux_only ||
-        noisy_only || multilevel_only)
+        noisy_only || multilevel_only || host_custom_only)
       continue;
     run_dispersion_case("real-lorentz-copy", policies[p], true, false, false, false, false, 2,
                         NULL, 1u << CONNECT_COPY);
@@ -5077,6 +5244,11 @@ int main(int argc, char **argv) {
     test_finite_diagnostics(policies[p]);
   }
   if (noisy_only) {
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (host_custom_only) {
+    test_host_custom_postdispatch_poison();
     master_printf("nvidia_timestep: PASS\n");
     return 0;
   }

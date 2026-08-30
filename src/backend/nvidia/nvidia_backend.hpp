@@ -23,6 +23,21 @@ namespace meep {
 class NvidiaBackendState;
 class NvidiaExecutable;
 
+struct NvidiaHostFallbackStatistics {
+  size_t segment_executions;
+  size_t callback_resolutions;
+  size_t device_to_host_calls;
+  size_t device_to_host_bytes;
+  size_t host_to_device_calls;
+  size_t host_to_device_bytes;
+  size_t synchronizations;
+
+  NvidiaHostFallbackStatistics()
+      : segment_executions(0), callback_resolutions(0), device_to_host_calls(0),
+        device_to_host_bytes(0), host_to_device_calls(0), host_to_device_bytes(0),
+        synchronizations(0) {}
+};
+
 struct NvidiaCwStatistics {
   CwSolveResult result;
   size_t reduction_count;
@@ -181,6 +196,7 @@ public:
   void prepare_state_rebuild(BackendState &state, DirtyMask reasons) override;
   bool accepts(const execution_options &options, std::string &why) const override;
   NvidiaCwStatistics cw_statistics_for_testing() const;
+  NvidiaHostFallbackStatistics host_fallback_statistics_for_testing() const;
 
 private:
   friend class NvidiaBackendState;
@@ -189,6 +205,8 @@ private:
   NvidiaBackendState *current_state() const;
   NvidiaExecutable &checked_executable(Executable &executable,
                                        const NvidiaBackendState &state) const;
+  void execute_host_segment(NvidiaExecutable &executable, NvidiaBackendState &state,
+                            size_t segment_index);
   void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
   fields &f_;
   execution_options options_;

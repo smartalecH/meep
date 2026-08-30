@@ -531,7 +531,13 @@ public:
   ~NvidiaBackendState() override {}
 
   void ensure_staging(size_t bytes) {
-    if (staging_.size() < bytes) staging_.allocate(bytes);
+    if (staging_.size() >= bytes) return;
+    /* Preserve the installed epoch's staging on allocation failure.  This is
+       required when an unpublished replacement executable asks for a larger
+       host segment while the old executable remains retryable. */
+    nvidia::pinned_buffer replacement;
+    replacement.allocate(bytes);
+    staging_ = std::move(replacement);
   }
 
   void ensure_dft_reduction_buffers(size_t result_bytes, size_t partial_bytes) {
@@ -563,6 +569,7 @@ public:
   bool cw_skip_source_evaluation_;
   size_t cw_workspace_allocations_;
   NvidiaCwStatistics cw_statistics_;
+  NvidiaHostFallbackStatistics host_fallback_statistics_;
   std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
   nvidia::device_buffer noisy_seed_slots_;
   int noisy_seed_active_slot_;
@@ -595,7 +602,26 @@ struct NvidiaCompiledOperation {
   size_t legacy_flux_first;
   size_t legacy_flux_count;
   size_t source_staging_offset;
+  size_t host_segment_index;
   double source_time_offset;
+};
+
+struct NvidiaCompiledHostTransfer {
+  ArrayRef array;
+  AccessMode mode;
+  ArraySpec spec;
+  size_t staging_offset;
+  size_t storage_offset;
+  size_t storage_bytes;
+  size_t host_offset;
+};
+
+struct NvidiaCompiledHostSegment {
+  HostSegment segment;
+  std::vector<HostCallbackDescriptor> callbacks;
+  std::vector<Operation> operations;
+  std::vector<NvidiaCompiledHostTransfer> transfers;
+  size_t staging_bytes;
 };
 
 struct NvidiaCompiledPolarizationAction {
@@ -689,6 +715,8 @@ public:
                    const std::vector<NvidiaCompiledMaterialRefresh> &material_refreshes,
                    size_t material_staging_bytes, uint64_t material_target_signature,
                    size_t source_scalar_count, size_t source_staging_elements,
+                   const std::vector<NvidiaCompiledHostSegment> &host_segments,
+                   size_t host_staging_bytes,
                    NvidiaBackendState &state)
       : owner_(owner), state_token_(state_token), program_(program), signature_(signature),
         storage_fingerprint_(storage_fingerprint),
@@ -711,7 +739,7 @@ public:
         magnetic_layout_fingerprint_(magnetic_layout_fingerprint),
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
         material_target_signature_(material_target_signature),
-        source_scalar_count_(source_scalar_count) {
+        source_scalar_count_(source_scalar_count), host_segments_(host_segments) {
     for (const nvidia::compiled_polarization_update &update : polarization_updates_)
       has_noisy_updates_ = has_noisy_updates_ ||
                            update.kind ==
@@ -815,6 +843,7 @@ public:
       for (nvidia::multilevel_transition_launch &update : multilevel_transition_updates_)
         update.coefficients = coefficient_base + update.coefficient_byte_offset;
       if (material_staging_bytes) material_staging_.allocate(material_staging_bytes);
+      if (host_staging_bytes) state.ensure_staging(host_staging_bytes);
       if (!source_points.empty()) {
         source_points_.allocate(checked_product(source_points.size(), sizeof(source_points[0]),
                                                 "allocating NVIDIA source points"),
@@ -899,6 +928,7 @@ public:
   std::vector<NvidiaCompiledMaterialRefresh> material_refreshes_;
   uint64_t material_target_signature_;
   size_t source_scalar_count_;
+  std::vector<NvidiaCompiledHostSegment> host_segments_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
   nvidia::device_buffer halo_scratch_;
@@ -3751,7 +3781,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         if (d.kind != SusceptibilityKind::lorentzian &&
             d.kind != SusceptibilityKind::noisy_lorentzian &&
             d.kind != SusceptibilityKind::gyrotropic &&
-            d.kind != SusceptibilityKind::multilevel)
+            d.kind != SusceptibilityKind::multilevel &&
+            d.kind != SusceptibilityKind::host_custom)
           throw std::invalid_argument(std::string("NVIDIA does not support polarization kind ") +
                                       susceptibility_kind_name(d.kind));
         if (d.kind == SusceptibilityKind::lorentzian && d.lorentzian_states.empty())
@@ -3766,7 +3797,17 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           throw std::invalid_argument("NVIDIA cylindrical multilevel media are not supported");
         if (plan.program == StepProgram::solve_cw && d.kind == SusceptibilityKind::multilevel)
           throw std::invalid_argument("NVIDIA solve_cw does not support multilevel media");
+        if (plan.program == StepProgram::solve_cw && d.kind == SusceptibilityKind::host_custom)
+          throw std::invalid_argument("NVIDIA solve_cw does not support host-custom media");
       }
+    }
+    if (!plan.host_segments.empty() || !plan.host_callbacks.empty()) {
+      std::string host_error;
+      if (plan.program != StepProgram::ordinary ||
+          !validate_host_callback_plan(f_, plan, &host_error))
+        throw std::invalid_argument(host_error.empty()
+                                        ? "NVIDIA host-callback plan is invalid"
+                                        : host_error);
     }
     bool has_noisy_updates = false, has_noisy_descriptors = false;
     for (const PolarizationUpdate &update : plan.polarization_updates)
@@ -3974,8 +4015,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     size_t legacy_flux_partial_count = 0;
     std::vector<NvidiaCompiledMagneticState> magnetic_states;
     std::vector<NvidiaCompiledMaterialRefresh> material_refreshes;
+    std::vector<NvidiaCompiledHostSegment> host_segments;
     size_t magnetic_snapshot_bytes = 0;
     size_t material_staging_bytes = 0;
+    size_t host_staging_bytes = 0;
     size_t source_staging_elements = 0;
     operations.reserve(plan.operations.size());
     cylindrical_radial_prefixes.reserve(plan.cylindrical_radial_prefixes.size());
@@ -4119,6 +4162,15 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         got_half.update_h != want_half.update_h || got_half.transfer_h != want_half.transfer_h)
       throw std::invalid_argument("NVIDIA magnetic half-step schedule is non-canonical");
 
+    std::vector<size_t> host_segment_owner(
+        plan.operations.size(), std::numeric_limits<size_t>::max());
+    for (size_t segment_index = 0; segment_index < plan.host_segments.size(); ++segment_index) {
+      const HostSegment &segment = plan.host_segments[segment_index];
+      for (size_t i = segment.operation_index;
+           i < size_t(segment.operation_index) + segment.operation_count; ++i)
+        host_segment_owner[i] = segment_index;
+    }
+
     /* Capability validation is deliberately fail-fast. The first local reason
        is stable and actionable; the collective below only establishes that no
        rank can enter execution after any rank rejected its plan. */
@@ -4127,7 +4179,15 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       NvidiaCompiledOperation compiled = {};
       compiled.kind = op.kind;
       compiled.guard = op.guard;
+      compiled.host_segment_index = std::numeric_limits<size_t>::max();
       compiled.source_time_offset = op.source_time_offset;
+      /* A host marker owns these complete operations.  Do not lower even the
+         built-in subset: a mixed list must retain legacy order, and a
+         host-owned PE/PH halo has no device ArrayIds to lower. */
+      if (host_segment_owner[oi] != std::numeric_limits<size_t>::max()) {
+        operations.push_back(compiled);
+        continue;
+      }
       switch (op.kind) {
         case OpKind::update_db: {
           if (size_t(op.descriptor_index) + op.descriptor_count > plan.db_updates.size()) {
@@ -4749,12 +4809,68 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         case OpKind::increment_time:
           break;
 
+        case OpKind::host_callback: {
+          if (op.descriptor_count != 1 || op.descriptor_index >= plan.host_segments.size()) {
+            set_reason(local_error, oi, "host segment span is out of range");
+            break;
+          }
+          const HostSegment &source = plan.host_segments[op.descriptor_index];
+          NvidiaCompiledHostSegment segment = {};
+          segment.segment = source;
+          segment.staging_bytes = 0;
+          for (size_t i = source.callback_index;
+               i < size_t(source.callback_index) + source.callback_count; ++i)
+            segment.callbacks.push_back(plan.host_callbacks[i]);
+          for (size_t i = source.operation_index;
+               i < size_t(source.operation_index) + source.operation_count; ++i) {
+            Operation covered = plan.operations[i];
+            /* The resident scheduler has already evaluated the marker guard.
+               A standalone CPU segment must not evaluate the same guard again. */
+            covered.guard = guard_always();
+            segment.operations.push_back(covered);
+          }
+          for (const BufferAccess &access : op.accesses) {
+            if (!is_valid(access.array.id) || access.array.id.value >= state.plan_.arrays.size()) {
+              set_reason(local_error, oi, "host segment access has an invalid ArrayId");
+              break;
+            }
+            const ArraySpec &spec = state.plan_.arrays[access.array.id.value];
+            const size_t host_bytes = checked_product(
+                access.array.elements, host_element_bytes(spec.element_type),
+                "sizing NVIDIA host-segment native transfer");
+            const char *host_base = static_cast<const char *>(
+                f_.array_catalog->resolve_untyped(access.array.id));
+            if (!host_base) {
+              set_reason(local_error, oi, "host segment access resolves to a null host row");
+              break;
+            }
+            const AccessRange range = checked_access(state.plan_, access.array, host_base,
+                                                     host_bytes);
+            NvidiaCompiledHostTransfer transfer = {};
+            transfer.array = access.array;
+            transfer.mode = access.mode;
+            transfer.spec = spec;
+            transfer.staging_offset = segment.staging_bytes;
+            transfer.storage_offset = range.storage_offset;
+            transfer.storage_bytes = range.storage_bytes;
+            transfer.host_offset = checked_product(
+                access.array.offset, host_element_bytes(spec.element_type),
+                "resolving NVIDIA host-segment native offset");
+            segment.staging_bytes = checked_add(segment.staging_bytes, range.storage_bytes,
+                                                "sizing NVIDIA host-segment staging");
+            segment.transfers.push_back(transfer);
+          }
+          if (!local_error.empty()) break;
+          host_staging_bytes = std::max(host_staging_bytes, segment.staging_bytes);
+          compiled.host_segment_index = host_segments.size();
+          host_segments.push_back(segment);
+          break;
+        }
         case OpKind::zero_boundary:
         case OpKind::pack_halo:
         case OpKind::exchange_local:
         case OpKind::unpack_halo:
-        case OpKind::reduction:
-        case OpKind::host_callback: set_reason(local_error, oi, op_kind_name(op.kind)); break;
+        case OpKind::reduction: set_reason(local_error, oi, op_kind_name(op.kind)); break;
         case OpKind::pack_state:
         case OpKind::unpack_state:
           if (plan.program != StepProgram::solve_cw)
@@ -4815,7 +4931,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           plan.magnetic_half_step, material_refreshes, material_staging_bytes,
           plan.material_phase_target_signature,
           source_plan ? source_plan->scalars.size() : 0,
-          source_staging_elements, state));
+          source_staging_elements, host_segments, host_staging_bytes, state));
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -6054,6 +6170,12 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         const NvidiaCompiledOperation &op = executable.operations_[oi];
         if (op.guard.kind == GuardKind::segment_boundary && !segment_guard) continue;
         switch (op.kind) {
+          case OpKind::host_callback:
+            execute_host_segment(executable, state, op.host_segment_index);
+            oi = checked_add(oi, executable.host_segments_[op.host_segment_index]
+                                     .segment.operation_count,
+                             "skipping NVIDIA host-segment operations");
+            break;
           case OpKind::restore_magnetic_fields:
             if (f_.synchronized_magnetic_fields) {
               preflight_magnetic_transition(executable, state, false);
@@ -6334,6 +6456,83 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     throw;
   }
   state.device_authoritative_ = true;
+}
+
+void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,
+                                         NvidiaBackendState &state,
+                                         size_t segment_index) {
+  if (segment_index >= executable.host_segments_.size())
+    throw std::logic_error("NVIDIA host segment index is out of range");
+  const NvidiaCompiledHostSegment &segment = executable.host_segments_[segment_index];
+  ++state.host_fallback_statistics_.segment_executions;
+
+  /* Resolve pointer-free identities immediately before entering the host
+     session.  The resolved pointers are deliberately not retained: a later
+     rebuild must recompile, and an identity mismatch fails before any D2H. */
+  for (const HostCallbackDescriptor &callback : segment.callbacks) {
+    ResolvedHostCallback resolved;
+    std::string error;
+    if (!resolve_host_callback(f_, callback, resolved, &error))
+      throw std::invalid_argument(error.empty() ? "NVIDIA host callback identity is stale"
+                                                : error);
+    ++state.host_fallback_statistics_.callback_resolutions;
+  }
+
+  char *staging = static_cast<char *>(state.staging_.data());
+  for (const NvidiaCompiledHostTransfer &transfer : segment.transfers) {
+    if (transfer.mode == AccessMode::write) continue;
+    state.arenas_->copy_to_host_async(staging + transfer.staging_offset,
+                                      transfer.array.id.value, transfer.storage_offset,
+                                      transfer.storage_bytes, *state.transfer_);
+    ++state.host_fallback_statistics_.device_to_host_calls;
+    state.host_fallback_statistics_.device_to_host_bytes += transfer.storage_bytes;
+  }
+  /* Even a segment whose declared catalog union is write-only may consult or
+     mutate opaque host-owned state.  It still forms a hard ordering boundary
+     with all previously enqueued device work. */
+  state.transfer_->synchronize();
+  ++state.host_fallback_statistics_.synchronizations;
+  for (const NvidiaCompiledHostTransfer &transfer : segment.transfers) {
+    if (transfer.mode == AccessMode::write) continue;
+    char *host = static_cast<char *>(f_.array_catalog->resolve_untyped(transfer.array.id));
+    if (!host) throw std::logic_error("NVIDIA host segment resolved a null native row");
+    storage_to_host(host + transfer.host_offset, staging + transfer.staging_offset,
+                    transfer.spec, transfer.array.elements);
+  }
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::host_segment_after_download))
+    throw std::runtime_error("injected NVIDIA host-segment post-download failure");
+
+  StepPlan host_plan;
+  host_plan.program = StepProgram::ordinary;
+  host_plan.operations = segment.operations;
+  f_.execute_step_plan(host_plan, 0);
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::host_segment_after_callback))
+    throw std::runtime_error("injected NVIDIA host-segment post-callback failure");
+
+  bool uploaded = false;
+  for (const NvidiaCompiledHostTransfer &transfer : segment.transfers) {
+    if (transfer.mode == AccessMode::read) continue;
+    const char *host = static_cast<const char *>(
+        f_.array_catalog->resolve_untyped(transfer.array.id));
+    if (!host) throw std::logic_error("NVIDIA host segment resolved a null native row");
+    host_to_storage(staging + transfer.staging_offset, host + transfer.host_offset,
+                    transfer.spec, transfer.array.elements);
+    state.arenas_->copy_from_host_async(transfer.array.id.value, transfer.storage_offset,
+                                        staging + transfer.staging_offset,
+                                        transfer.storage_bytes, *state.transfer_);
+    ++state.host_fallback_statistics_.host_to_device_calls;
+    state.host_fallback_statistics_.host_to_device_bytes += transfer.storage_bytes;
+    uploaded = true;
+  }
+  if (uploaded) {
+    state.transfer_->synchronize();
+    ++state.host_fallback_statistics_.synchronizations;
+  }
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::host_segment_after_upload))
+    throw std::runtime_error("injected NVIDIA host-segment post-upload failure");
 }
 
 void NvidiaBackend::read(ArrayRef ref, void *host_buffer, size_t bytes) {
@@ -6618,6 +6817,11 @@ NvidiaExecutable &NvidiaBackend::checked_executable(Executable &raw_executable,
 NvidiaCwStatistics NvidiaBackend::cw_statistics_for_testing() const {
   NvidiaBackendState *state = current_state();
   return state ? state->cw_statistics_ : NvidiaCwStatistics();
+}
+
+NvidiaHostFallbackStatistics NvidiaBackend::host_fallback_statistics_for_testing() const {
+  NvidiaBackendState *state = current_state();
+  return state ? state->host_fallback_statistics_ : NvidiaHostFallbackStatistics();
 }
 
 ExecutionBackend *make_nvidia_backend(fields &f, const execution_options &options,
