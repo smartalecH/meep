@@ -118,6 +118,8 @@ struct Operation {
   uint32_t polarization_subtraction_count;
   uint32_t magnetic_state_index;
   uint32_t magnetic_state_count;
+  uint32_t legacy_flux_index;
+  uint32_t legacy_flux_count;
   Guard guard;
   /* CPU execution keeps using the coarse field_type entry point. Device
      executors consume the half-open descriptor span. For finite_value_check,
@@ -376,6 +378,75 @@ struct PolarizationSubtraction {
   size_t elements;
 };
 
+/* One legacy time-domain flux monitor owns a private half-step scalar and a
+   final public scalar. The portable plan names the ordered term span only;
+   backend-private scalar storage must never appear as an ArrayId. */
+struct LegacyFluxUpdate {
+  uint32_t flux_ordinal;
+  uint32_t term_index;
+  uint32_t term_count;
+  /* PR6 hashes the original normal+volume into this identity. Realized terms
+     alone are insufficient because distinct requested volumes can clip to the
+     same owned region. */
+  uint64_t recipe_signature;
+};
+
+inline bool operator==(const LegacyFluxUpdate &a, const LegacyFluxUpdate &b) {
+  return a.flux_ordinal == b.flux_ordinal && a.term_index == b.term_index &&
+         a.term_count == b.term_count && a.recipe_signature == b.recipe_signature;
+}
+
+/* One signed E/H product over one canonical chunk-loop region. Boundary
+   weights are stored in loop-axis order as {s0,s1,e0,e1}. The instantaneous
+   value is accumulated in f64 after four-point Yee centering of each field. */
+struct LegacyFluxTerm {
+  uint32_t flux_ordinal;
+  uint32_t term_ordinal;
+  uint32_t region_ordinal;
+  int sign;
+  int chunk;
+  component e_component;
+  component h_component;
+  ArrayId e_real;
+  ArrayId e_imag;
+  ArrayId h_real;
+  ArrayId h_imag;
+  ivec begin;
+  ivec end;
+  ivec lattice_shift;
+  int symmetry_index;
+  size_t base;
+  size_t counts[3];
+  ptrdiff_t strides[3];
+  ptrdiff_t e_offsets[2];
+  ptrdiff_t h_offsets[2];
+  double phase_real;
+  double phase_imag;
+  double boundary_weights[3][4];
+  double dV0;
+  double dV1;
+};
+
+inline bool operator==(const LegacyFluxTerm &a, const LegacyFluxTerm &b) {
+  if (a.flux_ordinal != b.flux_ordinal || a.term_ordinal != b.term_ordinal ||
+      a.region_ordinal != b.region_ordinal || a.sign != b.sign || a.chunk != b.chunk ||
+      a.e_component != b.e_component || a.h_component != b.h_component ||
+      a.e_real != b.e_real || a.e_imag != b.e_imag || a.h_real != b.h_real ||
+      a.h_imag != b.h_imag || !(a.begin == b.begin) || !(a.end == b.end) ||
+      !(a.lattice_shift == b.lattice_shift) || a.symmetry_index != b.symmetry_index ||
+      a.base != b.base || a.phase_real != b.phase_real || a.phase_imag != b.phase_imag ||
+      a.dV0 != b.dV0 || a.dV1 != b.dV1)
+    return false;
+  for (int i = 0; i < 3; ++i) {
+    if (a.counts[i] != b.counts[i] || a.strides[i] != b.strides[i]) return false;
+    for (int j = 0; j < 4; ++j)
+      if (a.boundary_weights[i][j] != b.boundary_weights[i][j]) return false;
+  }
+  for (int i = 0; i < 2; ++i)
+    if (a.e_offsets[i] != b.e_offsets[i] || a.h_offsets[i] != b.h_offsets[i]) return false;
+  return true;
+}
+
 /* A resident magnetic snapshot is backend-private storage.  The portable plan
    names only the live array and its semantic identity; it deliberately does
    not expose the legacy lazy host *_backup pointers. */
@@ -549,6 +620,8 @@ struct StepPlan {
   std::vector<ConstitutiveUpdate> eh_updates;
   std::vector<PolarizationUpdate> polarization_updates;
   std::vector<PolarizationSubtraction> polarization_subtractions;
+  std::vector<LegacyFluxUpdate> legacy_flux_updates;
+  std::vector<LegacyFluxTerm> legacy_flux_terms;
   std::vector<MagneticStateArray> magnetic_state_arrays;
   std::vector<MaterialRefreshArray> material_refresh_arrays;
   CwStateLayout cw_state_layout;
@@ -580,6 +653,8 @@ struct StepPlan {
     eh_updates.clear();
     polarization_updates.clear();
     polarization_subtractions.clear();
+    legacy_flux_updates.clear();
+    legacy_flux_terms.clear();
     magnetic_state_arrays.clear();
     material_refresh_arrays.clear();
     cw_state_layout.clear();

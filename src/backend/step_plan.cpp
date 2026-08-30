@@ -437,6 +437,8 @@ public:
     op.polarization_subtraction_count = 0;
     op.magnetic_state_index = 0;
     op.magnetic_state_count = 0;
+    op.legacy_flux_index = 0;
+    op.legacy_flux_count = 0;
     op.guard = g;
     op.ft = ft;
     op.source_time_offset = src_offset;
@@ -577,6 +579,18 @@ public:
     if (present) add(k, ft, guard_static(true), src_offset);
   }
 
+  void add_legacy_flux(bool present, OpKind kind) {
+    if (!present) return;
+    if (plan_.legacy_flux_updates.empty()) {
+      uint32_t ordinal = 0;
+      for (const flux_vol *flux = f_.fluxes; flux; flux = flux->next, ++ordinal)
+        plan_.legacy_flux_updates.push_back(LegacyFluxUpdate{ordinal, 0, 0, 0});
+    }
+    Operation &op = add(kind, field_type(NUM_FIELD_TYPES), guard_static(true));
+    op.legacy_flux_index = 0;
+    op.legacy_flux_count = uint32_t(plan_.legacy_flux_updates.size());
+  }
+
   /* One semantic boundary step.
    *
    * The plan asks for this to expand into zero-metal, pack, transfer and
@@ -632,6 +646,8 @@ public:
              (sig >> 2);
       mix(sig, uint64_t(op.magnetic_state_index));
       mix(sig, uint64_t(op.magnetic_state_count));
+      mix(sig, uint64_t(op.legacy_flux_index));
+      mix(sig, uint64_t(op.legacy_flux_count));
       uint64_t source_bits = 0;
       static_assert(sizeof(source_bits) == sizeof(op.source_time_offset), "double is not 64-bit");
       memcpy(&source_bits, &op.source_time_offset, sizeof(source_bits));
@@ -667,6 +683,10 @@ public:
       hash_polarization(sig, d);
     for (const PolarizationSubtraction &d : plan.polarization_subtractions)
       hash_polarization_subtraction(sig, d);
+    for (const LegacyFluxUpdate &d : plan.legacy_flux_updates)
+      hash_legacy_flux_update(sig, d);
+    for (const LegacyFluxTerm &d : plan.legacy_flux_terms)
+      hash_legacy_flux_term(sig, d);
     for (const MagneticStateArray &d : plan.magnetic_state_arrays)
       hash_magnetic_state(sig, d);
     for (const MaterialRefreshArray &d : plan.material_refresh_arrays)
@@ -865,6 +885,48 @@ private:
     hash_id(sig, d.target);
     hash_id(sig, d.p);
     mix(sig, uint64_t(d.elements));
+  }
+
+  static void hash_legacy_flux_update(uint64_t &sig, const LegacyFluxUpdate &d) {
+    mix(sig, uint64_t(d.flux_ordinal));
+    mix(sig, uint64_t(d.term_index));
+    mix(sig, uint64_t(d.term_count));
+    mix(sig, d.recipe_signature);
+  }
+
+  static void hash_legacy_flux_term(uint64_t &sig, const LegacyFluxTerm &d) {
+    mix(sig, uint64_t(d.flux_ordinal));
+    mix(sig, uint64_t(d.term_ordinal));
+    mix(sig, uint64_t(d.region_ordinal));
+    mix(sig, uint64_t(d.sign));
+    mix(sig, uint64_t(d.chunk));
+    mix(sig, uint64_t(d.e_component));
+    mix(sig, uint64_t(d.h_component));
+    hash_id(sig, d.e_real);
+    hash_id(sig, d.e_imag);
+    hash_id(sig, d.h_real);
+    hash_id(sig, d.h_imag);
+    for (int i = 0; i < 3; ++i) {
+      mix(sig, uint64_t(d.begin.yucky_val(i)));
+      mix(sig, uint64_t(d.end.yucky_val(i)));
+      mix(sig, uint64_t(d.lattice_shift.yucky_val(i)));
+    }
+    mix(sig, uint64_t(d.symmetry_index));
+    mix(sig, uint64_t(d.base));
+    for (int i = 0; i < 3; ++i) {
+      mix(sig, uint64_t(d.counts[i]));
+      mix(sig, uint64_t(d.strides[i]));
+      for (int j = 0; j < 4; ++j)
+        mix_double(sig, d.boundary_weights[i][j]);
+    }
+    for (int i = 0; i < 2; ++i) {
+      mix(sig, uint64_t(d.e_offsets[i]));
+      mix(sig, uint64_t(d.h_offsets[i]));
+    }
+    mix_double(sig, d.phase_real);
+    mix_double(sig, d.phase_imag);
+    mix_double(sig, d.dV0);
+    mix_double(sig, d.dV1);
   }
 
   static void hash_magnetic_state(uint64_t &sig, const MagneticStateArray &d) {
@@ -1820,7 +1882,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   const uint32_t magnetic_transfer_h = p.operation_count();
   p.add_boundaries(H_stuff);
 
-  p.add_if(has_fluxes, OpKind::update_flux_half);
+  p.add_legacy_flux(has_fluxes, OpKind::update_flux_half);
 
   p.add_if(has_sources, OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), 0.5);
   p.add_db(D_stuff);
@@ -1834,7 +1896,7 @@ StepPlan build_step_plan(fields &f, StepProgram program) {
   p.add_boundaries(PE_stuff);
   p.add_boundaries(E_stuff);
 
-  p.add_if(has_fluxes, OpKind::update_flux);
+  p.add_legacy_flux(has_fluxes, OpKind::update_flux);
   p.add(OpKind::increment_time);
   /* The decimation predicate is a device_predicate: the node stays in the
      graph and the kernel returns early when the step is not due. */
