@@ -24,6 +24,7 @@
 #include <stdexcept>
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/descriptors.hpp"
 #include "config.h"
 
 namespace meep {
@@ -129,6 +130,75 @@ typedef struct {
   realnum *Ntmp; // temporary length L array of levels, used in updating
   realnum data[1];
 } multilevel_data;
+
+bool preflight_multilevel_internal_data(const std::vector<double> &gamma_matrix,
+                                        size_t levels, size_t transitions, size_t ntot,
+                                        size_t active_rows, realnum dt, std::string &error) {
+  error.clear();
+  if (!levels || !transitions || levels > size_t(std::numeric_limits<int>::max()) ||
+      levels > std::numeric_limits<size_t>::max() / levels ||
+      gamma_matrix.size() != levels * levels || !std::isfinite(double(dt)) || dt <= 0) {
+    error = "invalid multilevel dimensions or timestep";
+    return false;
+  }
+  const size_t max = std::numeric_limits<size_t>::max();
+  if (ntot > max / levels || active_rows > max / transitions ||
+      active_rows * transitions > max / 2 ||
+      (ntot && 2 * active_rows * transitions > max / ntot)) {
+    error = "multilevel storage extent overflow";
+    return false;
+  }
+  const size_t polarization_elements = 2 * active_rows * transitions * ntot;
+  const size_t level_square = levels * levels;
+  const size_t population_elements = ntot * levels;
+  if (level_square > max - levels || level_square + levels > max - population_elements ||
+      level_square + levels + population_elements > max - polarization_elements) {
+    error = "multilevel storage extent overflow";
+    return false;
+  }
+  const size_t payload_elements =
+      level_square + levels + population_elements + polarization_elements;
+  if (!payload_elements ||
+      payload_elements - 1 > (max - sizeof(multilevel_data)) / sizeof(realnum)) {
+    error = "multilevel allocation byte size overflow";
+    return false;
+  }
+  if (active_rows > max / 2 || 2 * active_rows > max / transitions ||
+      2 * active_rows * transitions > max / sizeof(realnumP)) {
+    error = "multilevel pointer-table size overflow";
+    return false;
+  }
+#ifndef HAVE_LAPACK
+  error = "LAPACK is needed for resident multilevel support";
+  return false;
+#else
+  std::vector<realnum> matrix(level_square);
+  for (size_t i = 0; i < level_square; ++i) {
+    matrix[i] = realnum(gamma_matrix[i]);
+    if (!std::isfinite(double(matrix[i]))) {
+      error = "multilevel Gamma is not representable in realnum";
+      return false;
+    }
+  }
+  for (size_t i = 0; i < levels; ++i) {
+    matrix[i * levels + i] = realnum(1) + matrix[i * levels + i] * dt / 2;
+    if (!std::isfinite(double(matrix[i * levels + i]))) {
+      error = "multilevel Gamma timestep matrix is nonfinite";
+      return false;
+    }
+  }
+  if (!invert(matrix.data(), int(levels))) {
+    error = "multilevel Gamma timestep matrix is singular";
+    return false;
+  }
+  for (realnum value : matrix)
+    if (!std::isfinite(double(value))) {
+      error = "multilevel Gamma inverse is nonfinite";
+      return false;
+    }
+  return true;
+#endif
+}
 
 void *multilevel_susceptibility::new_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2],
                                                    const grid_volume &gv) const {

@@ -92,7 +92,7 @@ void fields::advance(int n) {
     (void)backend_abort_host_custom_dispatch(*this);
     local_error = "unknown backend advance failure";
   }
-  backend_note_noisy_collective_for_testing();
+  if (collective_noisy_dispatch) backend_note_noisy_collective_for_testing();
   const bool failed = or_to_all(!local_error.empty());
   if (failed) {
     backend->poison();
@@ -107,28 +107,49 @@ void fields::ensure_backend_executable() {
      region recipes and both flux-marker access sets. Stage descriptors, both
      plans, and the replacement executable as one resident transaction. */
   if (backend_try_refresh_legacy_flux(*this, "fields::advance legacy flux refresh")) {
-    bool local_noisy = false;
+    bool local_noisy = false, local_multilevel = has_local_exact_multilevel(*this);
     for (const PolarizationUpdate &update : step_plans[0]->polarization_updates)
       local_noisy = local_noisy || update.kind == PolarizationUpdateKind::noisy_add;
-    backend_state->noisy_preflight_required = or_to_all(local_noisy);
+    for (const PolarizationUpdateGroup &group : step_plans[0]->polarization_groups)
+      local_multilevel =
+          local_multilevel || group.kind == PolarizationGroupKind::multilevel;
+    size_t local_presence = size_t(local_noisy) | (size_t(local_multilevel) << 1);
+    size_t global_presence = 0;
+    bw_or_to_all(&local_presence, &global_presence, 1);
+    backend_state->noisy_preflight_required = (global_presence & 1) != 0;
     backend_state->noisy_static_validation_required =
         backend_state->noisy_preflight_required;
+    backend_state->multilevel_preflight_required = (global_presence & 2) != 0;
+    backend_state->multilevel_static_validation_required = false;
+    backend_state->multilevel_plan_validated = backend_state->multilevel_preflight_required;
+    backend_state->multilevel_validated_plan_signature = step_plans[0]->signature;
     return;
   }
 
   /* step_plan_for clears dirty_executable, so remember whether the compiled
      backend artifact was stale before asking it to rebuild the data plan. */
+  const DirtyMask entry_dirty_mask = DirtyMask(dirty_mask);
   const bool local_recompile = !executable || is_dirty(*this, dirty_executable);
   const StepPlan &plan = step_plan_for(StepProgram::ordinary);
   bool recompile = local_recompile;
+  bool staged_multilevel_presence = false;
+  bool staged_multilevel_validation = false;
   if (backend->requires_full_storage_preparation()) {
-    bool local_noisy = false;
+    bool local_noisy = false, local_multilevel = has_local_exact_multilevel(*this);
     for (const PolarizationUpdate &update : plan.polarization_updates)
       local_noisy = local_noisy || update.kind == PolarizationUpdateKind::noisy_add;
+    for (const PolarizationUpdateGroup &group : plan.polarization_groups)
+      local_multilevel =
+          local_multilevel || group.kind == PolarizationGroupKind::multilevel;
     const bool inspect_noisy_signature = local_noisy || backend_state->noisy_plan_validated ||
                                          backend_state->noisy_preflight_required;
+    const bool inspect_multilevel_signature =
+        local_multilevel || backend_state->multilevel_plan_validated ||
+        backend_state->multilevel_preflight_required;
     const uint64_t recomputed_signature =
-        inspect_noisy_signature ? compute_step_plan_signature(plan) : plan.signature;
+        (inspect_noisy_signature || inspect_multilevel_signature)
+            ? compute_step_plan_signature(plan)
+            : plan.signature;
     const bool changed_validated_plan = backend_state->noisy_plan_validated &&
                                         (backend_state->noisy_validated_plan_signature !=
                                              plan.signature ||
@@ -137,15 +158,32 @@ void fields::ensure_backend_executable() {
                                              backend_state->noisy_preflight_required;
     const bool require_static_validation =
         changed_validated_plan || (local_noisy && !backend_state->noisy_plan_validated);
+    const bool changed_validated_multilevel_plan =
+        backend_state->multilevel_plan_validated &&
+        (backend_state->multilevel_validated_plan_signature != plan.signature ||
+         recomputed_signature != plan.signature);
+    const bool preserve_validated_multilevel_presence =
+        backend_state->multilevel_plan_validated &&
+        backend_state->multilevel_preflight_required;
+    const bool require_multilevel_validation =
+        backend_state->multilevel_static_validation_required ||
+        changed_validated_multilevel_plan ||
+        (local_multilevel && !backend_state->multilevel_plan_validated);
     size_t local_status = size_t(local_recompile) | (size_t(local_noisy) << 1) |
                           (size_t(preserve_validated_presence) << 2) |
-                          (size_t(require_static_validation) << 3);
+                          (size_t(require_static_validation) << 3) |
+                          (size_t(local_multilevel) << 4) |
+                          (size_t(preserve_validated_multilevel_presence) << 5) |
+                          (size_t(require_multilevel_validation) << 6);
     size_t global_status = 0;
     bw_or_to_all(&local_status, &global_status, 1);
-    recompile = (global_status & 1) != 0;
+    recompile = (global_status & (size_t(1) | (size_t(1) << 6))) != 0;
     backend_state->noisy_preflight_required =
         (global_status & (size_t(2) | size_t(4))) != 0;
     backend_state->noisy_static_validation_required = (global_status & size_t(8)) != 0;
+    staged_multilevel_presence =
+        (global_status & ((size_t(1) << 4) | (size_t(1) << 5))) != 0;
+    staged_multilevel_validation = (global_status & (size_t(1) << 6)) != 0;
   }
   if (!recompile) return;
 
@@ -153,8 +191,16 @@ void fields::ensure_backend_executable() {
   Executable *replacement = NULL;
   std::string local_error;
   try {
-    replacement = backend->compile(plan, *backend_state);
-    if (!replacement) throw std::runtime_error("backend returned no executable");
+    if (staged_multilevel_validation) {
+      bool local_multilevel_actions = false;
+      local_error = backend_validate_multilevel_plan(*this, plan, local_multilevel_actions);
+      if (local_error.empty() && local_multilevel_actions != has_local_exact_multilevel(*this))
+        local_error = "multilevel live state and installed action presence differ";
+    }
+    if (local_error.empty()) {
+      replacement = backend->compile(plan, *backend_state);
+      if (!replacement) throw std::runtime_error("backend returned no executable");
+    }
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -164,16 +210,24 @@ void fields::ensure_backend_executable() {
   }
   const bool failed = backend->requires_full_storage_preparation() ? or_to_all(!local_error.empty())
                                                                    : !local_error.empty();
+  if (backend->requires_full_storage_preparation() && staged_multilevel_validation)
+    backend_note_multilevel_collective_for_testing();
   if (failed) {
     delete replacement;
     executable = previous;
-    dirty_mask |= dirty_executable;
+    dirty_mask = entry_dirty_mask;
     if (local_error.empty())
       throw std::runtime_error("backend compilation failed on another MPI rank");
     throw std::runtime_error(local_error);
   }
   executable = replacement;
   delete previous;
+  if (staged_multilevel_validation) {
+    backend_state->multilevel_preflight_required = staged_multilevel_presence;
+    backend_state->multilevel_static_validation_required = false;
+    backend_state->multilevel_plan_validated = staged_multilevel_presence;
+    backend_state->multilevel_validated_plan_signature = plan.signature;
+  }
 }
 
 void fields::advance_cpu(int n) {

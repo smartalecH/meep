@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <new>
@@ -40,6 +41,9 @@ static int legacy_flux_prepare_failure_rank_for_testing = -1;
 static int noisy_preflight_failure_rank_for_testing = -1;
 static int noisy_preflight_failure_mode_for_testing = 0;
 static size_t noisy_collective_count_for_testing = 0;
+static int multilevel_preflight_failure_rank_for_testing = -1;
+static int multilevel_preflight_failure_mode_for_testing = 0;
+static size_t multilevel_collective_count_for_testing = 0;
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
   for (int chunk = 0; chunk < f.num_chunks; ++chunk)
@@ -85,6 +89,23 @@ void backend_note_noisy_collective_for_testing() {
   ++noisy_collective_count_for_testing;
 }
 
+void backend_set_multilevel_preflight_failure_for_testing(int rank, int mode) {
+  multilevel_preflight_failure_rank_for_testing = rank;
+  multilevel_preflight_failure_mode_for_testing = mode;
+}
+
+void backend_reset_multilevel_collective_count_for_testing() {
+  multilevel_collective_count_for_testing = 0;
+}
+
+size_t backend_multilevel_collective_count_for_testing() {
+  return multilevel_collective_count_for_testing;
+}
+
+void backend_note_multilevel_collective_for_testing() {
+  ++multilevel_collective_count_for_testing;
+}
+
 namespace {
 
 typedef std::tuple<int, int, int> NoisyGroupTuple;
@@ -119,7 +140,7 @@ bool same_noisy_access(const BufferAccess &a, const BufferAccess &b) {
          a.array.elements == b.array.elements && a.mode == b.mode;
 }
 
-bool same_noisy_operation(const Operation &a, const Operation &b) {
+bool same_polarization_operation(const Operation &a, const Operation &b) {
   if (a.kind != b.kind || a.ft != b.ft || a.descriptor_index != b.descriptor_index ||
       a.descriptor_count != b.descriptor_count ||
       a.material_refresh_index != b.material_refresh_index ||
@@ -130,6 +151,8 @@ bool same_noisy_operation(const Operation &a, const Operation &b) {
       a.cylindrical_m_descriptor_count != b.cylindrical_m_descriptor_count ||
       a.cylindrical_origin_action_index != b.cylindrical_origin_action_index ||
       a.cylindrical_origin_action_count != b.cylindrical_origin_action_count ||
+      a.polarization_group_index != b.polarization_group_index ||
+      a.polarization_group_count != b.polarization_group_count ||
       a.polarization_subtraction_index != b.polarization_subtraction_index ||
       a.polarization_subtraction_count != b.polarization_subtraction_count ||
       a.magnetic_state_index != b.magnetic_state_index ||
@@ -145,6 +168,123 @@ bool same_noisy_operation(const Operation &a, const Operation &b) {
   for (size_t i = 0; i < a.accesses.size(); ++i)
     if (!same_noisy_access(a.accesses[i], b.accesses[i])) return false;
   return true;
+}
+
+bool same_internal_layout(const InternalArrayLayout &a, const InternalArrayLayout &b) {
+  return ((!a.name && !b.name) || (a.name && b.name && !strcmp(a.name, b.name))) &&
+         a.element_type == b.element_type && a.offset_elements == b.offset_elements &&
+         a.elements == b.elements && a.c == b.c && a.cmp == b.cmp;
+}
+
+bool same_multilevel_descriptor(const PolarizationDescriptor &a,
+                                const PolarizationDescriptor &b) {
+  if (a.kind != SusceptibilityKind::multilevel || b.kind != SusceptibilityKind::multilevel ||
+      a.chunk != b.chunk || a.ft != b.ft || a.state_index != b.state_index ||
+      a.has_internal_state != b.has_internal_state ||
+      a.multilevel.levels != b.multilevel.levels ||
+      a.multilevel.transitions != b.multilevel.transitions ||
+      a.multilevel.gamma_matrix != b.multilevel.gamma_matrix ||
+      a.multilevel.initial_populations != b.multilevel.initial_populations ||
+      a.multilevel.alpha != b.multilevel.alpha || a.multilevel.omega != b.multilevel.omega ||
+      a.multilevel.transition_gamma != b.multilevel.transition_gamma ||
+      a.multilevel.sigmat != b.multilevel.sigmat ||
+      a.multilevel_gamma_inv != b.multilevel_gamma_inv ||
+      a.multilevel_populations != b.multilevel_populations ||
+      a.multilevel_population_points != b.multilevel_population_points ||
+      a.per_thread_scratch_elements != b.per_thread_scratch_elements ||
+      a.required_w != b.required_w || a.required_w_prev != b.required_w_prev ||
+      a.needs_halo != b.needs_halo || a.multilevel_states.size() != b.multilevel_states.size() ||
+      a.internal_arrays.size() != b.internal_arrays.size())
+    return false;
+  for (size_t i = 0; i < a.multilevel_states.size(); ++i) {
+    const MultilevelStateArrays &x = a.multilevel_states[i];
+    const MultilevelStateArrays &y = b.multilevel_states[i];
+    if (x.transition_index != y.transition_index || x.c != y.c || x.cmp != y.cmp ||
+        x.p != y.p || x.p_prev != y.p_prev || x.elements != y.elements)
+      return false;
+  }
+  for (size_t i = 0; i < a.internal_arrays.size(); ++i)
+    if (!same_internal_layout(a.internal_arrays[i], b.internal_arrays[i])) return false;
+  return true;
+}
+
+std::string validate_multilevel_plan(const fields &f, const StepPlan &plan,
+                                     bool &local_multilevel_actions) {
+  local_multilevel_actions = false;
+  if (multilevel_preflight_failure_rank_for_testing == my_rank()) {
+    if (multilevel_preflight_failure_mode_for_testing == 3)
+      return "injected multilevel static validation failure";
+    if (multilevel_preflight_failure_mode_for_testing == 4) throw std::bad_alloc();
+  }
+  if (!f.array_catalog || !f.descriptors)
+    return "multilevel preflight has no catalog or descriptor set";
+  if (compute_step_plan_signature(plan) != plan.signature)
+    return "installed multilevel plan signature is stale";
+
+  std::vector<const PolarizationDescriptor *> installed_descriptors;
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+    if (descriptor.kind == SusceptibilityKind::multilevel)
+      installed_descriptors.push_back(&descriptor);
+  for (const PolarizationUpdateGroup &group : plan.polarization_groups)
+    local_multilevel_actions =
+        local_multilevel_actions || group.kind == PolarizationGroupKind::multilevel;
+  local_multilevel_actions = local_multilevel_actions || !installed_descriptors.empty() ||
+                             has_local_exact_multilevel(f);
+
+  fields &mutable_f = const_cast<fields &>(f);
+  std::vector<PolarizationDescriptor> rebuilt_descriptors;
+  StepPlan canonical;
+  DescriptorSet *const installed_set = mutable_f.descriptors;
+  try {
+    build_polarization_descriptors(mutable_f, rebuilt_descriptors);
+    DescriptorSet staged = *installed_set;
+    staged.polarizations = rebuilt_descriptors;
+    mutable_f.descriptors = &staged;
+    canonical = build_step_plan(mutable_f, StepProgram::ordinary);
+    mutable_f.descriptors = installed_set;
+  }
+  catch (...) {
+    mutable_f.descriptors = installed_set;
+    throw;
+  }
+
+  std::vector<const PolarizationDescriptor *> canonical_descriptors;
+  for (const PolarizationDescriptor &descriptor : rebuilt_descriptors)
+    if (descriptor.kind == SusceptibilityKind::multilevel)
+      canonical_descriptors.push_back(&descriptor);
+  if (installed_descriptors.size() != canonical_descriptors.size())
+    return "installed multilevel descriptors differ from live exact states";
+  for (size_t i = 0; i < installed_descriptors.size(); ++i)
+    if (!same_multilevel_descriptor(*installed_descriptors[i], *canonical_descriptors[i]))
+      return "installed multilevel descriptor is not canonical";
+
+  std::vector<const Operation *> installed_ops, canonical_ops;
+  for (const Operation &op : plan.operations)
+    if (op.kind == OpKind::update_polarization) installed_ops.push_back(&op);
+  for (const Operation &op : canonical.operations)
+    if (op.kind == OpKind::update_polarization) canonical_ops.push_back(&op);
+  if (plan.coordinate_generation != canonical.coordinate_generation)
+    return "installed multilevel coordinate generation is not canonical";
+  if (plan.polarization_updates != canonical.polarization_updates)
+    return "installed ordinary polarization rows are not canonical";
+  if (plan.polarization_subtractions != canonical.polarization_subtractions)
+    return "installed polarization subtraction rows are not canonical";
+  if (plan.polarization_groups != canonical.polarization_groups)
+    return "installed polarization groups are not canonical";
+  if (plan.multilevel_population_updates != canonical.multilevel_population_updates)
+    return "installed multilevel population updates are not canonical";
+  if (plan.multilevel_population_terms != canonical.multilevel_population_terms)
+    return "installed multilevel population terms are not canonical";
+  if (plan.multilevel_transition_updates != canonical.multilevel_transition_updates)
+    return "installed multilevel transition updates are not canonical";
+  if (plan.multilevel_coefficients != canonical.multilevel_coefficients)
+    return "installed multilevel coefficients are not canonical";
+  if (installed_ops.size() != canonical_ops.size())
+    return "installed multilevel polarization operation count is not canonical";
+  for (size_t i = 0; i < installed_ops.size(); ++i)
+    if (!same_polarization_operation(*installed_ops[i], *canonical_ops[i]))
+      return "installed multilevel polarization operation is not canonical";
+  return std::string();
 }
 
 bool full_seed_snapshot_equal(const RandomSeedSnapshot &a, const RandomSeedSnapshot &b) {
@@ -287,7 +427,7 @@ std::string validate_noisy_plan(const fields &f, const StepPlan &plan,
   if (installed_ops.size() != canonical_ops.size())
     return "installed polarization operation count is noncanonical";
   for (size_t i = 0; i < installed_ops.size(); ++i)
-    if (!same_noisy_operation(*installed_ops[i], *canonical_ops[i]))
+    if (!same_polarization_operation(*installed_ops[i], *canonical_ops[i]))
       return "installed polarization operation span or access set is noncanonical";
   return std::string();
 }
@@ -303,6 +443,11 @@ std::string validate_noisy_snapshot(const RandomSeedSnapshot &snapshot) {
 }
 
 } // namespace
+
+std::string backend_validate_multilevel_plan(const fields &f, const StepPlan &plan,
+                                             bool &local_multilevel_actions) {
+  return validate_multilevel_plan(f, plan, local_multilevel_actions);
+}
 
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site) {
   if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
@@ -1483,8 +1628,16 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
         dft_plan_signature(f.step_plans[0]->dft_updates) !=
             dft_plan_signature(f.descriptors->dfts);
   }
-  const bool mixed_structural = or_to_all(
-      (f.dirty_mask & ~flux_closure) != dirty_none || stable_provenance_mismatch);
+  const bool local_multilevel_presence =
+      has_local_exact_multilevel(f) ||
+      (f.backend_state && f.backend_state->multilevel_preflight_required);
+  size_t local_shape =
+      size_t((f.dirty_mask & ~flux_closure) != dirty_none || stable_provenance_mismatch) |
+      (size_t(local_multilevel_presence) << 1);
+  size_t global_shape = 0;
+  bw_or_to_all(&local_shape, &global_shape, 1);
+  const bool mixed_structural = (global_shape & 1) != 0;
+  const bool any_multilevel = (global_shape & 2) != 0;
 
   std::string local_error;
   size_t local_definition = size_t(legacy_flux_definition_signature(f));
@@ -1566,9 +1719,17 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
         f.step_plans[0]
             ? build_legacy_flux_only_step_plan(f, StepProgram::ordinary, *f.step_plans[0])
             : build_step_plan(f, StepProgram::ordinary)));
-    replacement_executable = f.backend->compile(*replacement_plan, *f.backend_state);
-    if (!replacement_executable)
-      throw std::runtime_error("backend returned no legacy-flux replacement executable");
+    if (any_multilevel) {
+      bool local_multilevel_actions = false;
+      local_error = validate_multilevel_plan(f, *replacement_plan, local_multilevel_actions);
+      if (local_error.empty() && local_multilevel_actions != has_local_exact_multilevel(f))
+        local_error = "multilevel live state and legacy-flux replacement actions differ";
+    }
+    if (local_error.empty()) {
+      replacement_executable = f.backend->compile(*replacement_plan, *f.backend_state);
+      if (!replacement_executable)
+        throw std::runtime_error("backend returned no legacy-flux replacement executable");
+    }
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -1578,6 +1739,7 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
   }
   f.descriptors = live_descriptors;
 
+  if (any_multilevel) backend_note_multilevel_collective_for_testing();
   const bool failed = or_to_all(!local_error.empty());
   if (failed) {
     delete replacement_executable;
@@ -1594,6 +1756,12 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
   f.step_plans[0] = replacement_plan.release();
   f.step_plans[1] = old_plans[1];
   f.executable = replacement_executable;
+  if (f.backend_state) {
+    f.backend_state->multilevel_preflight_required = any_multilevel;
+    f.backend_state->multilevel_static_validation_required = false;
+    f.backend_state->multilevel_plan_validated = any_multilevel;
+    f.backend_state->multilevel_validated_plan_signature = f.step_plans[0]->signature;
+  }
   clear_dirty(f, dirty_flux_plan | dirty_regions | dirty_executable);
   delete old_executable;
   delete old_plans[0];
@@ -1915,15 +2083,21 @@ void fields::init_backend() {
                              dirty_executable | dirty_flux_plan;
   const size_t poison_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 1);
   const size_t flux_present_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 2);
+  const size_t multilevel_present_bit =
+      size_t(1) << (std::numeric_limits<size_t>::digits - 3);
   size_t local_status = size_t(dirty_mask & relevant);
   if (backend->is_poisoned()) local_status |= poison_bit;
   if (fluxes || (descriptors && !descriptors->legacy_fluxes.empty()))
     local_status |= flux_present_bit;
+  if (has_local_exact_multilevel(*this)) local_status |= multilevel_present_bit;
   size_t global_status = 0;
   bw_or_to_all(&local_status, &global_status, 1);
-  if (global_status & poison_bit)
+  if (global_status & poison_bit) {
+    if (backend->requires_full_storage_preparation()) backend->poison();
     throw std::runtime_error("fields::init_backend: resident backend is poisoned");
+  }
   const bool any_flux = (global_status & flux_present_bit) != 0;
+  const bool any_multilevel = (global_status & multilevel_present_bit) != 0;
 
   if (!backend->requires_full_storage_preparation()) {
     /* Most CPU execution keeps its historical lazy storage preparation.
@@ -1996,13 +2170,30 @@ void fields::init_backend() {
   std::unique_ptr<PreparedMaterialCoefficientStorage> prepared_coefficients;
   std::unique_ptr<StepPlan> preclassification_ordinary;
   if (rebuild_state) {
-    std::string flux_error;
+    std::string preflight_error;
+    if (any_multilevel) try {
+        if (multilevel_preflight_failure_rank_for_testing == my_rank()) {
+          if (multilevel_preflight_failure_mode_for_testing == 1)
+            preflight_error = "injected multilevel recipe validation failure";
+          else if (multilevel_preflight_failure_mode_for_testing == 2)
+            throw std::bad_alloc();
+        }
+        if (preflight_error.empty())
+          preflight_error = validate_resident_multilevel_recipes(*this);
+      }
+      catch (const std::exception &e) {
+        preflight_error = e.what();
+      }
+      catch (...) {
+        preflight_error = "unknown resident multilevel recipe preflight failure";
+      }
     size_t local_flux_definition = size_t(legacy_flux_definition_signature(*this));
     size_t reference_flux_definition = local_flux_definition;
     broadcast(0, &reference_flux_definition, 1);
-    if (local_flux_definition != reference_flux_definition)
-      flux_error = "legacy flux definitions differ across MPI ranks";
-    backend_reconcile_host_access(flux_error, "fields::init_backend legacy flux preflight");
+    if (local_flux_definition != reference_flux_definition && preflight_error.empty())
+      preflight_error = "legacy flux definitions differ across MPI ranks";
+    if (any_multilevel) backend_note_multilevel_collective_for_testing();
+    backend_reconcile_host_access(preflight_error, "fields::init_backend definition preflight");
 
     std::string coefficient_error;
     try {
