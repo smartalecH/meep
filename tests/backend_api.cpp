@@ -3972,6 +3972,564 @@ static void test_resident_multilevel_lifecycle() {
   }
 }
 
+static void expect_collective_multilevel_static_failure(fields &f, lifetime_counts &counts,
+                                                        const char *message) {
+  BackendState *const state = f.backend_state;
+  Executable *const executable = f.executable;
+  StepPlan *const plan = f.step_plans[0];
+  StoragePlan *const storage = f.storage_plan;
+  CpuArrayCatalog *const catalog = f.array_catalog;
+  const DirtyMask dirty = DirtyMask(f.dirty_mask);
+  const int entry_t = f.t;
+  const int dispatches = counts.advance_attempts;
+  bool failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { failed = true; }
+  CHECK(and_to_all(failed) && f.backend_state == state && f.executable == executable &&
+            f.step_plans[0] == plan && f.storage_plan == storage &&
+            f.array_catalog == catalog && DirtyMask(f.dirty_mask) == dirty && f.t == entry_t &&
+            counts.advance_attempts == dispatches && !f.backend->is_poisoned(),
+        message);
+}
+
+static void test_resident_multilevel_collective_preflight() {
+  const grid_volume gv = vol2d(3.0, 3.0, 10.0);
+
+  /* Rank-local recipe validation and allocation failures must be reconciled
+     before prepare_storage reaches the legacy allocator/LAPACK path.  Two
+     chunks deliberately leave idle ranks when this runs at np4. */
+  for (int target = 0; target < count_processors(); ++target)
+    for (int mode = 1; mode <= 2; ++mode) {
+      structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+      add_multilevel_lifecycle_states(s);
+      fields f(&s);
+      f.use_real_fields();
+      f.require_component(Ez);
+      f.require_component(Hz);
+      lifetime_counts counts;
+      f.backend = new tracking_backend(f, counts);
+      CpuArrayCatalog *const catalog = f.array_catalog;
+      StoragePlan *const storage = f.storage_plan;
+      DescriptorSet *const descriptors = f.descriptors;
+      StepPlan *const plan = f.step_plans[0];
+      const DirtyMask dirty = DirtyMask(f.dirty_mask);
+      backend_set_multilevel_preflight_failure_for_testing(target, mode);
+      bool failed = false;
+      try { f.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_multilevel_preflight_failure_for_testing(-1, 0);
+      bool unallocated = true;
+      for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+        if (f.chunks[chunk]->is_mine())
+          FOR_FIELD_TYPES(ft)
+            for (polarization_state *state = f.chunks[chunk]->pol[ft]; state;
+                 state = state->next)
+              unallocated = unallocated && !state->data;
+      CHECK(and_to_all(failed) && !f.backend_state && !f.executable &&
+                f.array_catalog == catalog && f.storage_plan == storage &&
+                f.descriptors == descriptors && f.step_plans[0] == plan &&
+                DirtyMask(f.dirty_mask) == dirty && counts.states_created == 0 &&
+                counts.advance_attempts == 0 && and_to_all(unallocated) &&
+                !f.backend->is_poisoned(),
+            "rank-asymmetric multilevel recipe preflight failure published partial state");
+      f.advance(1);
+      CHECK(f.backend_state && f.executable && counts.advance_attempts == 1 &&
+                !f.backend->is_poisoned(),
+            "multilevel recipe preflight failure was not retryable");
+    }
+
+  for (int malformed = 0; malformed < 8; ++malformed) {
+    structure invalid_structure(gv, unit_epsilon, no_pml(), identity(), 2);
+    realnum gamma[] = {realnum(0.02), 0, 0, realnum(0.03)};
+    realnum n0[] = {realnum(0.8), realnum(0.2)};
+    realnum alpha[] = {realnum(-0.4), realnum(0.5)};
+    realnum omega[] = {realnum(0.63)};
+    realnum damping[] = {realnum(0.04)};
+    realnum sigmat[] = {1, 1, 1, 1, 1};
+    if (malformed == 0) gamma[1] = std::numeric_limits<realnum>::quiet_NaN();
+    if (malformed == 1) n0[0] = std::numeric_limits<realnum>::infinity();
+    if (malformed == 2) alpha[0] = std::numeric_limits<realnum>::quiet_NaN();
+    if (malformed == 3) alpha[0] = realnum(0.4);
+    if (malformed == 4) omega[0] = std::numeric_limits<realnum>::infinity();
+    if (malformed == 5) damping[0] = std::numeric_limits<realnum>::quiet_NaN();
+    if (malformed == 6) sigmat[3] = std::numeric_limits<realnum>::infinity();
+    if (malformed == 7) gamma[0] = realnum(-2.0 / invalid_structure.dt);
+    multilevel_susceptibility invalid(2, 1, gamma, n0, alpha, omega, damping, sigmat);
+    invalid_structure.add_susceptibility(unit_epsilon, E_stuff, invalid);
+    fields rejected(&invalid_structure);
+    rejected.use_real_fields();
+    rejected.require_component(Ez);
+    lifetime_counts rejected_counts;
+    rejected.backend = new tracking_backend(rejected, rejected_counts);
+    bool failed = false;
+    try { rejected.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    bool unallocated = true;
+    for (int chunk = 0; chunk < rejected.num_chunks; ++chunk)
+      if (rejected.chunks[chunk]->is_mine())
+        for (polarization_state *state = rejected.chunks[chunk]->pol[E_stuff]; state;
+             state = state->next)
+          unallocated = unallocated && !state->data;
+    CHECK(and_to_all(failed) && !rejected.backend_state && !rejected.executable &&
+              rejected_counts.states_created == 0 && rejected_counts.advance_attempts == 0 &&
+              and_to_all(unallocated) && !rejected.backend->is_poisoned(),
+          "malformed live multilevel recipe reached allocation or dispatch");
+  }
+
+  {
+    structure cylindrical_structure(volcyl(2.0, 3.0, 8.0), unit_epsilon, no_pml(),
+                                     identity(), 2);
+    add_multilevel_lifecycle_states(cylindrical_structure);
+    fields cylindrical(&cylindrical_structure);
+    cylindrical.use_real_fields();
+    cylindrical.require_component(Ez);
+    lifetime_counts cylindrical_counts;
+    cylindrical.backend = new tracking_backend(cylindrical, cylindrical_counts);
+    bool failed = false;
+    try { cylindrical.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(and_to_all(failed) && !cylindrical.backend_state && !cylindrical.executable &&
+              cylindrical_counts.states_created == 0 &&
+              cylindrical_counts.advance_attempts == 0 &&
+              !cylindrical.backend->is_poisoned(),
+          "unsupported cylindrical multilevel recipe crossed allocation or dispatch");
+  }
+
+  structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+  add_multilevel_lifecycle_states(s);
+  fields f(&s);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.require_component(Hz);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  backend_reset_multilevel_collective_count_for_testing();
+  f.advance(1);
+  CHECK(f.backend_state->multilevel_preflight_required &&
+            f.backend_state->multilevel_plan_validated &&
+            !f.backend_state->multilevel_static_validation_required,
+        "valid multilevel plan did not publish cached validation state");
+  const bool local_multilevel = has_local_exact_multilevel(f);
+  CHECK(or_to_all(local_multilevel), "collective multilevel fixture has no live exact state");
+  CHECK(local_multilevel || (f.step_plans[0]->multilevel_population_updates.empty() &&
+                             f.step_plans[0]->multilevel_transition_updates.empty()),
+        "idle multilevel rank published local update rows");
+  const size_t collectives_after_build = backend_multilevel_collective_count_for_testing();
+  BackendState *const stable_state = f.backend_state;
+  Executable *const stable_executable = f.executable;
+  const int compiles_after_build = counts.executables_created;
+  f.advance(1);
+  CHECK(f.backend_state == stable_state && f.executable == stable_executable &&
+            counts.executables_created == compiles_after_build &&
+            backend_multilevel_collective_count_for_testing() == collectives_after_build,
+        "steady multilevel advance rebuilt state or ran a static-validation collective");
+
+  for (int target = 0; target < count_processors(); ++target)
+    for (int mode = 3; mode <= 4; ++mode) {
+      f.backend_state->multilevel_static_validation_required = true;
+      backend_set_multilevel_preflight_failure_for_testing(target, mode);
+      expect_collective_multilevel_static_failure(
+          f, counts, "rank-asymmetric multilevel static failure crossed dispatch");
+      backend_set_multilevel_preflight_failure_for_testing(-1, 0);
+      f.advance(1);
+      CHECK(!f.backend->is_poisoned(),
+            "rank-asymmetric multilevel static failure was not retryable");
+    }
+
+  const StepPlan stable_plan = *f.step_plans[0];
+  if (my_rank() == 0) f.step_plans[0]->signature ^= UINT64_C(1);
+  expect_collective_multilevel_static_failure(
+      f, counts, "stale multilevel plan signature crossed the dispatch boundary");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_group = false;
+  if (my_rank() == 0)
+    for (Operation &op : f.step_plans[0]->operations)
+      if (!changed_group && op.kind == OpKind::update_polarization &&
+          op.polarization_group_count) {
+        --op.polarization_group_count;
+        changed_group = true;
+      }
+  CHECK(or_to_all(changed_group), "multilevel operation mutation found no group span");
+  if (my_rank() == 0)
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel operation group span crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_access = false;
+  if (my_rank() == 0)
+    for (Operation &op : f.step_plans[0]->operations)
+      if (!changed_access && op.kind == OpKind::update_polarization &&
+          op.polarization_group_count && !op.accesses.empty()) {
+        op.accesses.pop_back();
+        f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+        changed_access = true;
+      }
+  CHECK(or_to_all(changed_access), "multilevel operation mutation found no access set");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel operation access mutation crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool removed_action = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_updates.empty()) {
+    f.step_plans[0]->multilevel_population_updates.erase(
+        f.step_plans[0]->multilevel_population_updates.begin());
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    removed_action = true;
+  }
+  CHECK(or_to_all(removed_action), "multilevel missing-action mutation found no population row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed missing multilevel action crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool added_action = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_updates.empty()) {
+    f.step_plans[0]->multilevel_population_updates.push_back(
+        f.step_plans[0]->multilevel_population_updates.back());
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    added_action = true;
+  }
+  CHECK(or_to_all(added_action), "multilevel extra-action mutation found no population row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed extra multilevel action crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool reordered_actions = false;
+  if (my_rank() == 0 && f.step_plans[0]->multilevel_population_updates.size() > 1) {
+    std::swap(f.step_plans[0]->multilevel_population_updates[0],
+              f.step_plans[0]->multilevel_population_updates[1]);
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    reordered_actions = true;
+  }
+  CHECK(or_to_all(reordered_actions),
+        "multilevel reordered-action mutation found fewer than two population rows");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed reordered multilevel actions crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_action = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_updates.empty()) {
+    ++f.step_plans[0]->multilevel_population_updates[0].levels;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_action = true;
+  }
+  CHECK(or_to_all(changed_action), "multilevel action mutation found no population row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel action mutation crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_array_id = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_updates.empty()) {
+    f.step_plans[0]->multilevel_population_updates[0].gamma_inv =
+        ArrayId{std::numeric_limits<uint32_t>::max()};
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_array_id = true;
+  }
+  CHECK(or_to_all(changed_array_id), "multilevel ArrayId mutation found no population row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed out-of-range multilevel ArrayId crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_region = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_updates.empty()) {
+    ++f.step_plans[0]->multilevel_population_updates[0].region.base;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_region = true;
+  }
+  CHECK(or_to_all(changed_region), "multilevel range mutation found no population row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel region range crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_offset = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_terms.empty()) {
+    ++f.step_plans[0]->multilevel_population_terms[0].centered_offsets[0];
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_offset = true;
+  }
+  CHECK(or_to_all(changed_offset), "multilevel offset mutation found no population term");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel centered offset crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_scratch = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_updates.empty()) {
+    f.step_plans[0]->multilevel_population_updates[0].scratch_elements_per_point =
+        std::numeric_limits<size_t>::max();
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_scratch = true;
+  }
+  CHECK(or_to_all(changed_scratch), "multilevel scratch mutation found no population row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel scratch budget crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  if (my_rank() == 0) {
+    ++f.mutation_generation[static_cast<int>(MutationKind::coordinate_definition)];
+    f.backend_state->multilevel_static_validation_required = true;
+  }
+  expect_collective_multilevel_static_failure(
+      f, counts, "stale multilevel topology generation crossed dispatch");
+  if (my_rank() == 0)
+    --f.mutation_generation[static_cast<int>(MutationKind::coordinate_definition)];
+
+  bool changed_term = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_population_terms.empty()) {
+    ++f.step_plans[0]->multilevel_population_terms[0].transition_index;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_term = true;
+  }
+  CHECK(or_to_all(changed_term), "multilevel term mutation found no population term");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel population term crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_transition = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_transition_updates.empty()) {
+    ++f.step_plans[0]->multilevel_transition_updates[0].positive_level;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_transition = true;
+  }
+  CHECK(or_to_all(changed_transition), "multilevel transition mutation found no update row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel transition action crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_coefficient = false;
+  if (my_rank() == 0 && !f.step_plans[0]->multilevel_coefficients.empty()) {
+    f.step_plans[0]->multilevel_coefficients[0] += 0.125;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_coefficient = true;
+  }
+  CHECK(or_to_all(changed_coefficient), "multilevel coefficient mutation found no coefficient");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel coefficient mutation crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  bool changed_subtraction = false;
+  if (my_rank() == 0 && !f.step_plans[0]->polarization_subtractions.empty()) {
+    ++f.step_plans[0]->polarization_subtractions[0].transition_index;
+    f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+    changed_subtraction = true;
+  }
+  CHECK(or_to_all(changed_subtraction),
+        "multilevel subtraction mutation found no subtraction row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "re-signed multilevel subtraction crossed dispatch");
+  *f.step_plans[0] = stable_plan;
+
+  const DescriptorSet stable_descriptors = *f.descriptors;
+  bool changed_descriptor = false;
+  if (my_rank() == 0)
+    for (PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (!changed_descriptor && descriptor.kind == SusceptibilityKind::multilevel &&
+          !descriptor.multilevel.gamma_matrix.empty()) {
+        descriptor.multilevel.gamma_matrix[0] += 0.125;
+        changed_descriptor = true;
+      }
+  CHECK(or_to_all(changed_descriptor), "multilevel descriptor mutation found no exact state");
+  f.backend_state->multilevel_static_validation_required = true;
+  expect_collective_multilevel_static_failure(
+      f, counts, "multilevel descriptor mutation crossed the dispatch boundary");
+  *f.descriptors = stable_descriptors;
+
+  ArrayId gamma_id = invalid_array();
+  if (my_rank() == 0)
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (descriptor.kind == SusceptibilityKind::multilevel) {
+        gamma_id = descriptor.multilevel_gamma_inv;
+        break;
+      }
+  bool changed_catalog_role = false;
+  array_role saved_role = array_role::polarization;
+  if (my_rank() == 0 && is_valid(gamma_id)) {
+    ArraySpec &spec = const_cast<ArraySpec &>(f.array_catalog->spec(gamma_id));
+    saved_role = spec.role;
+    spec.role = array_role::field;
+    f.backend_state->multilevel_static_validation_required = true;
+    changed_catalog_role = true;
+  }
+  CHECK(or_to_all(changed_catalog_role), "multilevel catalog mutation found no GammaInv row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "multilevel catalog-role mutation crossed dispatch");
+  if (my_rank() == 0 && is_valid(gamma_id))
+    const_cast<ArraySpec &>(f.array_catalog->spec(gamma_id)).role = saved_role;
+
+  bool changed_catalog_extent = false;
+  size_t saved_elements = 0;
+  if (my_rank() == 0 && is_valid(gamma_id)) {
+    ArraySpec &spec = const_cast<ArraySpec &>(f.array_catalog->spec(gamma_id));
+    saved_elements = spec.elements;
+    spec.elements = 0;
+    f.backend_state->multilevel_static_validation_required = true;
+    changed_catalog_extent = true;
+  }
+  CHECK(or_to_all(changed_catalog_extent), "multilevel catalog extent found no GammaInv row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "multilevel catalog-extent mutation crossed dispatch");
+  if (my_rank() == 0 && is_valid(gamma_id))
+    const_cast<ArraySpec &>(f.array_catalog->spec(gamma_id)).elements = saved_elements;
+
+  bool changed_gamma_value = false;
+  realnum saved_gamma = 0;
+  if (my_rank() == 0 && is_valid(gamma_id)) {
+    realnum *gamma = f.array_catalog->resolve<realnum>(gamma_id);
+    saved_gamma = gamma[0];
+    gamma[0] = std::numeric_limits<realnum>::infinity();
+    f.backend_state->multilevel_static_validation_required = true;
+    changed_gamma_value = true;
+  }
+  CHECK(or_to_all(changed_gamma_value), "multilevel GammaInv mutation found no authoritative row");
+  expect_collective_multilevel_static_failure(
+      f, counts, "nonfinite authoritative multilevel GammaInv crossed dispatch");
+  if (my_rank() == 0 && is_valid(gamma_id))
+    f.array_catalog->resolve<realnum>(gamma_id)[0] = saved_gamma;
+  f.advance(1);
+
+  f.add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+  f.advance(1);
+  CHECK(f.backend_state == stable_state && f.backend_state->multilevel_plan_validated,
+        "legacy-flux refresh lost validated multilevel state");
+  const StepPlan stable_flux_plan = *f.step_plans[0];
+  DescriptorSet *const flux_descriptors = f.descriptors;
+  Executable *const flux_executable = f.executable;
+  changed_group = false;
+  if (my_rank() == 0)
+    for (Operation &op : f.step_plans[0]->operations)
+      if (!changed_group && op.kind == OpKind::update_polarization &&
+          op.polarization_group_count) {
+        --op.polarization_group_count;
+        f.step_plans[0]->signature = compute_step_plan_signature(*f.step_plans[0]);
+        changed_group = true;
+      }
+  CHECK(or_to_all(changed_group), "flux graft mutation found no multilevel group span");
+  f.add_flux_vol(Y, volume(vec(-0.8, -0.2), vec(0.8, -0.2)));
+  const int dispatches_before_flux_failure = counts.advance_attempts;
+  bool flux_failed = false;
+  try { f.advance(1); }
+  catch (const std::runtime_error &) { flux_failed = true; }
+  CHECK(and_to_all(flux_failed) && f.backend_state == stable_state &&
+            f.descriptors == flux_descriptors && f.executable == flux_executable &&
+            counts.advance_attempts == dispatches_before_flux_failure &&
+            is_dirty(f, dirty_flux_plan) && !f.backend->is_poisoned(),
+        "invalid multilevel flux graft was published or dispatched");
+  *f.step_plans[0] = stable_flux_plan;
+  f.advance(1);
+  CHECK(f.backend_state == stable_state && f.backend_state->multilevel_plan_validated,
+        "multilevel flux graft failure was not retryable");
+
+  f.remove_susceptibilities();
+  f.advance(1);
+  CHECK(!f.backend_state->multilevel_preflight_required &&
+            !f.backend_state->multilevel_plan_validated &&
+            !f.backend_state->multilevel_static_validation_required,
+        "removing the last multilevel state retained cached presence or validation");
+  backend_reset_multilevel_collective_count_for_testing();
+  f.advance(1);
+  CHECK(backend_multilevel_collective_count_for_testing() == 0,
+        "post-removal steady path retained a multilevel-specific collective");
+
+  /* A never-multilevel resident plan must not enter any multilevel-specific
+     validation or post-dispatch collective. */
+  structure plain_structure(gv, unit_epsilon, no_pml(), identity(), 2);
+  fields plain(&plain_structure);
+  plain.require_component(Ez);
+  lifetime_counts plain_counts;
+  plain.backend = new tracking_backend(plain, plain_counts);
+  backend_reset_multilevel_collective_count_for_testing();
+  plain.advance(1);
+  plain.advance(1);
+  CHECK(backend_multilevel_collective_count_for_testing() == 0 &&
+            !plain.backend_state->multilevel_preflight_required &&
+            !plain.backend_state->multilevel_plan_validated,
+        "never-multilevel resident path entered multilevel collective validation");
+
+  /* A post-dispatch failure poisons its local backend without imposing a
+     clean-step collective.  The next public entry reduction propagates that
+     poison to every owner and idle rank before another dispatch can begin. */
+  for (int target = 0; target < count_processors(); ++target) {
+    structure poison_structure(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_multilevel_lifecycle_states(poison_structure);
+    fields poisoned(&poison_structure);
+    poisoned.use_real_fields();
+    poisoned.require_component(Ez);
+    poisoned.require_component(Hz);
+    lifetime_counts poison_counts;
+    poisoned.backend = new tracking_backend(poisoned, poison_counts);
+    poisoned.advance(1);
+    poison_counts.fail_advance = my_rank() == target;
+    const int attempts = poison_counts.advance_attempts;
+    bool failed = false;
+    try { poisoned.advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(sum_to_all(int(failed)) == 1 &&
+              poisoned.backend->is_poisoned() == (my_rank() == target) &&
+              poison_counts.advance_attempts == attempts + 1,
+          "rank-asymmetric multilevel dispatch failure did not poison its local backend");
+    const int attempts_after_failure = poison_counts.advance_attempts;
+    bool propagated = false;
+    try { poisoned.advance(1); }
+    catch (const std::runtime_error &) { propagated = true; }
+    CHECK(and_to_all(propagated) && poisoned.backend->is_poisoned() &&
+              poison_counts.advance_attempts == attempts_after_failure,
+          "multilevel post-dispatch poison was not propagated before the next dispatch");
+  }
+
+  std::string error;
+  const std::vector<double> identity_gamma = {0.0, 0.0, 0.0, 0.0};
+  CHECK(!preflight_multilevel_internal_data(identity_gamma, 0, 1, 1, 1, realnum(0.1), error),
+        "zero-level multilevel allocation preflight was accepted");
+  CHECK(!preflight_multilevel_internal_data(identity_gamma, 2, 0, 1, 1, realnum(0.1), error),
+        "zero-transition multilevel allocation preflight was accepted");
+  CHECK(!preflight_multilevel_internal_data(std::vector<double>(3, 0.0), 2, 1, 1, 1,
+                                             realnum(0.1), error),
+        "mismatched multilevel Gamma extent was accepted");
+  CHECK(!preflight_multilevel_internal_data(identity_gamma, 2, 1, 1, 1, realnum(0), error),
+        "zero multilevel timestep was accepted");
+  CHECK(!preflight_multilevel_internal_data(
+            identity_gamma, 2, 1, 1, 1, std::numeric_limits<realnum>::infinity(), error),
+        "nonfinite multilevel timestep was accepted");
+  CHECK(!preflight_multilevel_internal_data(identity_gamma, 2, 1,
+                                             std::numeric_limits<size_t>::max(), 1,
+                                             realnum(0.1), error),
+        "overflowing multilevel allocation extent was accepted");
+  CHECK(!preflight_multilevel_internal_data(identity_gamma, 2,
+                                             std::numeric_limits<size_t>::max(), 1, 2,
+                                             realnum(0.1), error),
+        "overflowing multilevel pointer-table extent was accepted");
+  const std::vector<double> singular_gamma = {-20.0, 0.0, 0.0, 0.0};
+  CHECK(!preflight_multilevel_internal_data(singular_gamma, 2, 1, 1, 1, realnum(0.1), error),
+        "singular multilevel timestep matrix was accepted");
+}
+
+static void test_resident_multilevel_split_communicator() {
+  const int groups = count_processors();
+  divide_parallel_processes(groups);
+  CHECK(my_rank() == 0, "one-rank multilevel split communicator did not have local rank zero");
+  {
+    const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+    add_multilevel_lifecycle_states(s);
+    fields f(&s);
+    f.use_real_fields();
+    f.require_component(Ez);
+    f.require_component(Hz);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    backend_reset_multilevel_collective_count_for_testing();
+    f.advance(1);
+    const size_t rebuild_collectives = backend_multilevel_collective_count_for_testing();
+    f.advance(1);
+    CHECK(f.backend_state && f.executable && f.backend_state->multilevel_plan_validated &&
+              f.backend_state->multilevel_preflight_required &&
+              counts.advance_attempts == 2 &&
+              backend_multilevel_collective_count_for_testing() == rebuild_collectives,
+          "split-communicator multilevel validation used the wrong communicator or repeated");
+  }
+  end_divide_parallel();
+}
+
 static void test_resident_polarization_preparation() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
@@ -5789,9 +6347,16 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_BACKEND_API_MULTILEVEL_ONLY")) {
     test_resident_multilevel_lifecycle();
+    test_resident_multilevel_collective_preflight();
     failures = sum_to_all(failures);
     if (failures) return 1;
     master_printf("backend_api: multilevel checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_MULTILEVEL_SPLIT_ONLY")) {
+    test_resident_multilevel_split_communicator();
+    if (failures) return 1;
+    master_printf("backend_api: multilevel split-communicator checks passed\n");
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_NOISY_DEFAULT_ONLY")) {
@@ -5854,6 +6419,7 @@ int main(int argc, char **argv) {
   test_cpu_cw_hook_declines_without_initialization();
   test_resident_polarization_preparation();
   test_resident_multilevel_lifecycle();
+  test_resident_multilevel_collective_preflight();
   test_resident_noisy_seed_lifecycle();
   test_resident_noisy_prelaunch_failures();
   test_resident_noisy_collective_preflight();

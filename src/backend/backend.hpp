@@ -61,7 +61,9 @@ struct BackendState {
         cw_plan_signature(0), accepted_random_seed(), random_seed_snapshot_accepted(false),
         noisy_preflight_required(false), noisy_plan_validated(false),
         noisy_static_validation_required(false), noisy_validated_plan_signature(0),
-        noisy_stream_count(0),
+        noisy_stream_count(0), multilevel_preflight_required(false),
+        multilevel_plan_validated(false), multilevel_static_validation_required(false),
+        multilevel_validated_plan_signature(0),
         noisy_first_stream_tag(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
@@ -84,6 +86,10 @@ struct BackendState {
   bool noisy_static_validation_required;
   uint64_t noisy_validated_plan_signature;
   size_t noisy_stream_count;
+  bool multilevel_preflight_required;
+  bool multilevel_plan_validated;
+  bool multilevel_static_validation_required;
+  uint64_t multilevel_validated_plan_signature;
   uint64_t noisy_first_stream_tag;
 };
 
@@ -302,6 +308,12 @@ StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
 bool backend_try_refresh_legacy_flux(fields &f, const char *site);
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
+std::string backend_validate_multilevel_plan(const fields &f, const StepPlan &plan,
+                                             bool &local_multilevel_actions);
+void backend_set_multilevel_preflight_failure_for_testing(int rank, int mode);
+void backend_reset_multilevel_collective_count_for_testing();
+size_t backend_multilevel_collective_count_for_testing();
+void backend_note_multilevel_collective_for_testing();
 void backend_set_noisy_preflight_failure_for_testing(int rank, int mode);
 void backend_reset_noisy_collective_count_for_testing();
 size_t backend_noisy_collective_count_for_testing();

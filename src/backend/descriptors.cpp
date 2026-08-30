@@ -112,6 +112,86 @@ public:
   }
 };
 
+bool has_local_exact_multilevel(const fields &f) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    const fields_chunk *fc = f.chunks[chunk];
+    if (!fc || !fc->is_mine()) continue;
+    FOR_FIELD_TYPES(ft)
+      for (const polarization_state *state = fc->pol[ft]; state; state = state->next)
+        if (state->s && typeid(*state->s) == typeid(multilevel_susceptibility)) return true;
+  }
+  return false;
+}
+
+std::string validate_resident_multilevel_recipes(const fields &f) {
+  try {
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      const fields_chunk *fc = f.chunks[chunk];
+      if (!fc || !fc->is_mine()) continue;
+      FOR_FIELD_TYPES(ft) {
+        for (const polarization_state *state = fc->pol[ft]; state; state = state->next) {
+          const bool exact = state->s && typeid(*state->s) == typeid(multilevel_susceptibility);
+          if (!exact) continue;
+          if (f.gv.dim == Dcyl)
+            return "resident multilevel polarization does not support cylindrical coordinates";
+          if (ft != E_stuff && ft != H_stuff)
+            return "resident multilevel polarization has an invalid field family";
+          const multilevel_susceptibility &live =
+              static_cast<const multilevel_susceptibility &>(*state->s);
+          const MultilevelParameters parameters =
+              susceptibility_descriptor_builder::multilevel_parameters(live);
+          const std::vector<double> *vectors[] = {
+              &parameters.gamma_matrix,       &parameters.initial_populations,
+              &parameters.alpha,              &parameters.omega,
+              &parameters.transition_gamma,   &parameters.sigmat};
+          for (const std::vector<double> *values : vectors)
+            for (double value : *values)
+              if (!std::isfinite(value) || !std::isfinite(double(realnum(value))))
+                return "resident multilevel parameter is nonfinite or not representable";
+          for (size_t transition = 0; transition < parameters.transitions; ++transition) {
+            bool positive = false, negative = false;
+            for (size_t level = 0; level < parameters.levels; ++level) {
+              const double value =
+                  parameters.alpha[level * parameters.transitions + transition];
+              positive = positive || value > 0;
+              negative = negative || value < 0;
+            }
+            if (!positive || !negative)
+              return "resident multilevel transition lacks a positive or negative level";
+          }
+
+          size_t active_rows = 0;
+          if (state->data) {
+            std::vector<InternalArrayLayout> layout;
+            if (!state->s->internal_layout(layout, fc->gv, state->data) || layout.size() < 2 ||
+                (layout.size() - 2) % (2 * size_t(parameters.transitions)))
+              return "resident multilevel live storage has an invalid row count";
+            active_rows = (layout.size() - 2) / (2 * size_t(parameters.transitions));
+          }
+          else {
+            realnum *(*live_fields)[2] = const_cast<fields_chunk *>(fc)->f;
+            FOR_COMPONENTS(c) DOCMP2 {
+              if (state->s->needs_P(c, cmp, live_fields)) ++active_rows;
+            }
+          }
+          std::string error;
+          if (!preflight_multilevel_internal_data(parameters.gamma_matrix, parameters.levels,
+                                                  parameters.transitions, size_t(fc->gv.ntot()),
+                                                  active_rows, fc->dt, error))
+            return error;
+        }
+      }
+    }
+  }
+  catch (const std::exception &e) {
+    return e.what();
+  }
+  catch (...) {
+    return "unknown resident multilevel recipe preflight failure";
+  }
+  return std::string();
+}
+
 const char *source_time_kind_name(SourceTimeKind k) {
   switch (k) {
     case SourceTimeKind::gaussian: return "gaussian";
