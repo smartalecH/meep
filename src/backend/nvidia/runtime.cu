@@ -590,8 +590,13 @@ void copy_device_to_host_async(void *destination, const device_buffer &source,
     throw std::invalid_argument("source buffer and CUDA stream belong to different devices");
   device_scope scope(source.device());
   const char *source_address = static_cast<const char *>(source.opaque_handle()) + source_offset;
-  check(cudaMemcpyAsync(destination, source_address, bytes, cudaMemcpyDeviceToHost,
-                        reinterpret_cast<cudaStream_t>(on_stream.opaque_handle())),
+  const cudaError_t result = consume_failure(testing::failure_point::device_to_host_copy)
+                                 ? cudaErrorUnknown
+                                 : cudaMemcpyAsync(destination, source_address, bytes,
+                                                   cudaMemcpyDeviceToHost,
+                                                   reinterpret_cast<cudaStream_t>(
+                                                       on_stream.opaque_handle()));
+  check(result,
         "cudaMemcpyAsync(device-to-host)");
   device_to_host_calls.fetch_add(1, std::memory_order_relaxed);
   device_to_host_bytes.fetch_add(bytes, std::memory_order_relaxed);
