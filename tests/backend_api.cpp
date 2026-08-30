@@ -182,6 +182,8 @@ struct lifetime_counts {
   bool reenter_custom_callback;
   bool omit_custom_last_segment;
   bool undercount_custom_last_segment;
+  bool redistribute_custom_callbacks;
+  bool reorder_custom_second_step;
   bool cw_saw_transient_mode;
   bool cw_final_dft_at_entry_time;
   CwSolveStatus cw_status;
@@ -217,7 +219,8 @@ struct lifetime_counts {
         poison_custom_preflight(false), fail_custom_before_entry(false),
         fail_custom_later_before_entry(false), fail_custom_after_entry(false),
         reenter_custom_callback(false), omit_custom_last_segment(false),
-        undercount_custom_last_segment(false),
+        undercount_custom_last_segment(false), redistribute_custom_callbacks(false),
+        reorder_custom_second_step(false),
         cw_saw_transient_mode(false),
         cw_final_dft_at_entry_time(false),
         cw_status(CwSolveStatus::converged) {}
@@ -338,10 +341,20 @@ public:
               (counts.fail_custom_later_before_entry && segment == 1))
             throw std::runtime_error("injected pre-callback host custom failure");
           session.record_download(32);
-          size_t callback_count = compiled.custom_callbacks[segment];
+          const size_t callback_segment =
+              counts.reorder_custom_second_step && step == 1
+                  ? compiled.custom_callbacks.size() - segment - 1
+                  : segment;
+          size_t callback_count = compiled.custom_callbacks[callback_segment];
           if (counts.undercount_custom_last_segment &&
               segment + 1 == compiled.custom_callbacks.size() && callback_count)
             --callback_count;
+          if (counts.redistribute_custom_callbacks && compiled.custom_callbacks.size() >= 2) {
+            if (segment == 0 && callback_count)
+              --callback_count;
+            else if (segment == 1)
+              ++callback_count;
+          }
           session.enter_callback(callback_count);
           if (counts.reenter_custom_callback && segment == 0) {
             HostCustomFallbackSession nested(*this);
@@ -4040,6 +4053,12 @@ static uint64_t custom_counter_value(const HostCustomFallbackStats &stats,
     case HostCustomFallbackCounter::sessions: return stats.sessions;
     case HostCustomFallbackCounter::callbacks: return stats.callbacks;
     case HostCustomFallbackCounter::completed_sessions: return stats.completed_sessions;
+    case HostCustomFallbackCounter::staging_allocations: return stats.staging_allocations;
+    case HostCustomFallbackCounter::staging_bytes: return stats.staging_bytes;
+    case HostCustomFallbackCounter::downloads: return stats.downloads;
+    case HostCustomFallbackCounter::download_bytes: return stats.download_bytes;
+    case HostCustomFallbackCounter::uploads: return stats.uploads;
+    case HostCustomFallbackCounter::upload_bytes: return stats.upload_bytes;
     case HostCustomFallbackCounter::retryable_failures: return stats.retryable_failures;
     case HostCustomFallbackCounter::poisoned_failures: return stats.poisoned_failures;
   }
@@ -4113,6 +4132,12 @@ static void test_resident_host_custom_policy_lifecycle() {
         HostCustomFallbackCounter::sessions,
         HostCustomFallbackCounter::callbacks,
         HostCustomFallbackCounter::completed_sessions,
+        HostCustomFallbackCounter::staging_allocations,
+        HostCustomFallbackCounter::staging_bytes,
+        HostCustomFallbackCounter::downloads,
+        HostCustomFallbackCounter::download_bytes,
+        HostCustomFallbackCounter::uploads,
+        HostCustomFallbackCounter::upload_bytes,
         HostCustomFallbackCounter::retryable_failures,
         HostCustomFallbackCounter::poisoned_failures};
     for (HostCustomFallbackCounter counter : counters) {
@@ -4150,6 +4175,208 @@ static void test_resident_host_custom_policy_lifecycle() {
                            "single MPI rank");
     return;
   }
+
+  /* Warning capacity is part of enablement publication. Overflow leaves the
+     fallback disabled and the untouched epoch remains retryable. */
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    backend_set_host_custom_counter_for_testing(
+        *tracking, HostCustomFallbackCounter::warnings,
+        std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::overflow_error &) { overflowed = true; }
+    CHECK(overflowed && !tracking->host_custom_fallback_enabled() && !f.backend_state &&
+              !f.executable && counts.custom_preflights == 0 && counts.advance_attempts == 0,
+          "warning overflow partially published custom enablement");
+    backend_set_host_custom_counter_for_testing(*tracking, HostCustomFallbackCounter::warnings,
+                                                0);
+    f.advance(1);
+    CHECK(tracking->host_custom_fallback_enabled() &&
+              tracking->host_custom_fallback_stats().warnings == 1 &&
+              tracking->host_custom_fallback_stats().completed_sessions == 2 &&
+              !tracking->is_poisoned(),
+          "warning overflow did not leave a retryable custom epoch");
+  }
+
+  /* All dispatch-wide lifecycle deltas are reserved before backend preflight,
+     so no session can become reachable if a later exact counter would wrap. */
+  for (HostCustomFallbackCounter counter : {HostCustomFallbackCounter::sessions,
+                                            HostCustomFallbackCounter::callbacks,
+                                            HostCustomFallbackCounter::completed_sessions}) {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    const int preflights_before = counts.custom_preflights;
+    const int advances_before = counts.advance_attempts;
+    backend_set_host_custom_counter_for_testing(*tracking, counter,
+                                                std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::overflow_error &) { overflowed = true; }
+    CHECK(overflowed && counts.custom_preflights == preflights_before &&
+              counts.advance_attempts == advances_before &&
+              !tracking->is_poisoned(),
+          "dispatch counter capacity failure reached preflight or callback entry");
+  }
+
+  /* The concrete staging and transfer recorders precheck both halves of each
+     pair. A byte overflow must not leave its count incremented. */
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    backend_set_host_custom_counter_for_testing(
+        *tracking, HostCustomFallbackCounter::staging_bytes,
+        std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { overflowed = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(overflowed && stats.staging_allocations == 0 &&
+              stats.staging_bytes == std::numeric_limits<uint64_t>::max() &&
+              stats.sessions == 0 && stats.retryable_failures == 1 && !tracking->is_poisoned(),
+          "staging byte overflow partially incremented its allocation count");
+    backend_set_host_custom_counter_for_testing(*tracking,
+                                                HostCustomFallbackCounter::staging_bytes, 0);
+    f.advance(1);
+    CHECK(stats.staging_allocations == 1 && stats.staging_bytes == 64 &&
+              stats.completed_sessions == 2 && !tracking->is_poisoned(),
+          "staging accounting overflow was not retryable");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    backend_set_host_custom_counter_for_testing(*tracking, HostCustomFallbackCounter::downloads,
+                                                7);
+    backend_set_host_custom_counter_for_testing(
+        *tracking, HostCustomFallbackCounter::download_bytes,
+        std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::overflow_error &) { overflowed = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(overflowed && stats.downloads == 7 &&
+              stats.download_bytes == std::numeric_limits<uint64_t>::max() &&
+              stats.callbacks == 4 && stats.retryable_failures == 1 &&
+              !tracking->is_poisoned(),
+          "download byte overflow partially incremented its transfer count");
+    backend_set_host_custom_counter_for_testing(*tracking,
+                                                HostCustomFallbackCounter::download_bytes, 0);
+    f.advance(1);
+    CHECK(stats.downloads == 9 && stats.download_bytes == 64 &&
+              stats.completed_sessions == 4 && !tracking->is_poisoned(),
+          "download accounting overflow was not retryable");
+  }
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    backend_set_host_custom_counter_for_testing(*tracking, HostCustomFallbackCounter::uploads, 7);
+    backend_set_host_custom_counter_for_testing(
+        *tracking, HostCustomFallbackCounter::upload_bytes,
+        std::numeric_limits<uint64_t>::max());
+    bool overflowed = false;
+    try { f.advance(1); }
+    catch (const std::overflow_error &) { overflowed = true; }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(overflowed && stats.uploads == 7 &&
+              stats.upload_bytes == std::numeric_limits<uint64_t>::max() &&
+              stats.callbacks == 6 && stats.poisoned_failures == 1 && tracking->is_poisoned(),
+          "upload byte overflow partially incremented its transfer count or escaped poison");
+  }
+
+  /* Native descriptors are ignored by the fallback schedule, while stateful
+     and stateless custom descriptors contribute [2,4] in either live-list
+     order: constitutive skips stateless, polarization includes both. */
+  for (int order = 0; order < 2; ++order) {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    if (order == 0) {
+      s.add_susceptibility(unit_epsilon, E_stuff, lorentzian_susceptibility(0.7, 0.03));
+      add_custom_lifecycle_state(s);
+      s.add_susceptibility(unit_epsilon, E_stuff,
+                           lifecycle_stateless_custom_susceptibility());
+    }
+    else {
+      s.add_susceptibility(unit_epsilon, E_stuff,
+                           lifecycle_stateless_custom_susceptibility());
+      add_custom_lifecycle_state(s);
+      s.add_susceptibility(unit_epsilon, E_stuff, lorentzian_susceptibility(0.7, 0.03));
+    }
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(stats.sessions == 2 && stats.callbacks == 6 && stats.completed_sessions == 2 &&
+              !tracking->is_poisoned(),
+          "mixed native/stateful/stateless custom order %d changed the exact [2,4] schedule",
+          order);
+  }
+
+  auto expect_schedule_poison = [](const char *label, bool redistribute, bool reorder) {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    s.add_susceptibility(unit_epsilon, E_stuff,
+                         lifecycle_stateless_custom_susceptibility());
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    counts.redistribute_custom_callbacks = redistribute;
+    counts.reorder_custom_second_step = reorder;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    bool rejected = false;
+    try { f.advance(reorder ? 2 : 1); }
+    catch (const std::logic_error &) { rejected = true; }
+    CHECK(rejected && tracking->is_poisoned() &&
+              tracking->host_custom_fallback_stats().poisoned_failures == 1,
+          "%s was accepted because its aggregate callback total matched", label);
+  };
+  expect_schedule_poison("same-total callback redistribution", true, false);
+  expect_schedule_poison("second-step callback reorder", false, true);
 
   /* A stateless custom susceptibility contributes no constitutive virtual but
      still receives update_P. advance(2) also pins exact per-step multiplication

@@ -111,6 +111,12 @@ enum class HostCustomFallbackCounter {
   sessions,
   callbacks,
   completed_sessions,
+  staging_allocations,
+  staging_bytes,
+  downloads,
+  download_bytes,
+  uploads,
+  upload_bytes,
   retryable_failures,
   poisoned_failures
 };
@@ -199,7 +205,8 @@ public:
         host_custom_callback_entered_(false), host_custom_failure_recorded_(false),
         host_custom_sessions_at_dispatch_(0), host_custom_callbacks_at_dispatch_(0),
         host_custom_completed_sessions_at_dispatch_(0), host_custom_expected_sessions_(0),
-        host_custom_expected_callbacks_(0) {}
+        host_custom_expected_callbacks_(0), host_custom_dispatch_plan_(NULL),
+        host_custom_next_operation_(0), host_custom_claimed_sessions_(0) {}
   virtual ~ExecutionBackend() {}
 
   virtual BackendState *create_state(const StoragePlan &) = 0;
@@ -338,6 +345,9 @@ private:
   uint64_t host_custom_completed_sessions_at_dispatch_;
   uint64_t host_custom_expected_sessions_;
   uint64_t host_custom_expected_callbacks_;
+  const StepPlan *host_custom_dispatch_plan_;
+  size_t host_custom_next_operation_;
+  uint64_t host_custom_claimed_sessions_;
   HostCustomFallbackStats host_custom_stats_;
 };
 
@@ -364,6 +374,7 @@ private:
   HostCustomFallbackSession &operator=(const HostCustomFallbackSession &);
 
   ExecutionBackend &backend_;
+  size_t expected_callback_count_;
   bool entered_;
   bool complete_;
 };

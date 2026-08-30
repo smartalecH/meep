@@ -276,10 +276,22 @@ void destroy_backend_state(BackendState *&state) {
   state = NULL;
 }
 
-static void add_custom_stat(uint64_t &value, size_t added, const char *what) {
-  if (uint64_t(added) > std::numeric_limits<uint64_t>::max() - value)
+static void check_custom_stat_capacity(uint64_t value, uint64_t added, const char *what) {
+  if (added > std::numeric_limits<uint64_t>::max() - value)
     throw std::overflow_error(std::string("host custom fallback ") + what + " counter overflow");
-  value += uint64_t(added);
+}
+
+static void add_custom_stat(uint64_t &value, uint64_t added, const char *what) {
+  check_custom_stat_capacity(value, added, what);
+  value += added;
+}
+
+static void add_custom_stat_pair(uint64_t &count, uint64_t &bytes, size_t added_bytes,
+                                 const char *count_what, const char *byte_what) {
+  check_custom_stat_capacity(count, 1, count_what);
+  check_custom_stat_capacity(bytes, uint64_t(added_bytes), byte_what);
+  ++count;
+  bytes += uint64_t(added_bytes);
 }
 
 static bool add_custom_stat_noexcept(uint64_t &value, size_t added) noexcept {
@@ -299,6 +311,20 @@ void backend_set_host_custom_counter_for_testing(ExecutionBackend &backend,
     case HostCustomFallbackCounter::callbacks: target = &backend.host_custom_stats_.callbacks; break;
     case HostCustomFallbackCounter::completed_sessions:
       target = &backend.host_custom_stats_.completed_sessions;
+      break;
+    case HostCustomFallbackCounter::staging_allocations:
+      target = &backend.host_custom_stats_.staging_allocations;
+      break;
+    case HostCustomFallbackCounter::staging_bytes:
+      target = &backend.host_custom_stats_.staging_bytes;
+      break;
+    case HostCustomFallbackCounter::downloads: target = &backend.host_custom_stats_.downloads; break;
+    case HostCustomFallbackCounter::download_bytes:
+      target = &backend.host_custom_stats_.download_bytes;
+      break;
+    case HostCustomFallbackCounter::uploads: target = &backend.host_custom_stats_.uploads; break;
+    case HostCustomFallbackCounter::upload_bytes:
+      target = &backend.host_custom_stats_.upload_bytes;
       break;
     case HostCustomFallbackCounter::retryable_failures:
       target = &backend.host_custom_stats_.retryable_failures;
@@ -322,6 +348,20 @@ void backend_increment_host_custom_counter_for_testing(ExecutionBackend &backend
     case HostCustomFallbackCounter::completed_sessions:
       target = &backend.host_custom_stats_.completed_sessions;
       break;
+    case HostCustomFallbackCounter::staging_allocations:
+      target = &backend.host_custom_stats_.staging_allocations;
+      break;
+    case HostCustomFallbackCounter::staging_bytes:
+      target = &backend.host_custom_stats_.staging_bytes;
+      break;
+    case HostCustomFallbackCounter::downloads: target = &backend.host_custom_stats_.downloads; break;
+    case HostCustomFallbackCounter::download_bytes:
+      target = &backend.host_custom_stats_.download_bytes;
+      break;
+    case HostCustomFallbackCounter::uploads: target = &backend.host_custom_stats_.uploads; break;
+    case HostCustomFallbackCounter::upload_bytes:
+      target = &backend.host_custom_stats_.upload_bytes;
+      break;
     case HostCustomFallbackCounter::retryable_failures:
       target = &backend.host_custom_stats_.retryable_failures;
       break;
@@ -334,12 +374,12 @@ void backend_increment_host_custom_counter_for_testing(ExecutionBackend &backend
 }
 
 void ExecutionBackend::note_host_custom_staging_allocation(size_t bytes) {
-  add_custom_stat(host_custom_stats_.staging_allocations, 1, "staging allocation");
-  add_custom_stat(host_custom_stats_.staging_bytes, bytes, "staging byte");
+  add_custom_stat_pair(host_custom_stats_.staging_allocations, host_custom_stats_.staging_bytes,
+                       bytes, "staging allocation", "staging byte");
 }
 
 HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend)
-    : backend_(backend), entered_(false), complete_(false) {
+    : backend_(backend), expected_callback_count_(0), entered_(false), complete_(false) {
   if (!backend_.host_custom_enabled_)
     throw std::logic_error("host custom fallback session is not enabled");
   if (backend_.is_poisoned())
@@ -348,18 +388,37 @@ HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend)
     throw std::logic_error("reentrant host custom fallback session");
   if (!backend_.host_custom_dispatch_pending_)
     throw std::logic_error("host custom fallback session has no prepared dispatch");
-  try { add_custom_stat(backend_.host_custom_stats_.sessions, 1, "session"); }
-  catch (...) {
-    if (backend_.host_custom_callback_entered_) {
-      backend_.poison();
-      if (!add_custom_stat_noexcept(backend_.host_custom_stats_.poisoned_failures, 1))
-        backend_.poison();
-    }
-    else if (!add_custom_stat_noexcept(backend_.host_custom_stats_.retryable_failures, 1))
-      backend_.poison();
-    backend_.host_custom_failure_recorded_ = true;
-    throw;
+  if (!backend_.host_custom_dispatch_plan_ ||
+      backend_.host_custom_claimed_sessions_ >= backend_.host_custom_expected_sessions_)
+    throw std::logic_error("host custom fallback session exceeds the prepared schedule");
+
+  const StepPlan &plan = *backend_.host_custom_dispatch_plan_;
+  size_t operation_index = backend_.host_custom_next_operation_;
+  while (operation_index < plan.operations.size() &&
+         plan.operations[operation_index].kind != OpKind::host_callback)
+    ++operation_index;
+  if (operation_index == plan.operations.size()) {
+    operation_index = 0;
+    while (operation_index < plan.operations.size() &&
+           plan.operations[operation_index].kind != OpKind::host_callback)
+      ++operation_index;
   }
+  if (operation_index == plan.operations.size())
+    throw std::logic_error("host custom fallback schedule contains no next host segment");
+  const Operation &op = plan.operations[operation_index];
+  const HostSegment &segment = plan.host_segments[op.descriptor_index];
+  for (uint32_t i = 0; i < segment.callback_count; ++i) {
+    const HostCallbackDescriptor &callback =
+        plan.host_callbacks[size_t(segment.callback_index) + i];
+    if (segment.phase != HostSegmentPhase::constitutive || callback.has_internal_state)
+      ++expected_callback_count_;
+  }
+
+  /* Dispatch preparation reserved all three exact lifecycle deltas. These
+     commits cannot fail after the first callback becomes reachable. */
+  ++backend_.host_custom_stats_.sessions;
+  ++backend_.host_custom_claimed_sessions_;
+  backend_.host_custom_next_operation_ = operation_index + 1;
   backend_.host_custom_session_active_ = true;
 }
 
@@ -382,30 +441,34 @@ void HostCustomFallbackSession::enter_callback(size_t callback_count) {
   if (complete_ || !backend_.host_custom_session_active_)
     throw std::logic_error("host custom callback entered outside an active session");
   if (entered_) throw std::logic_error("host custom callback boundary entered twice");
-  add_custom_stat(backend_.host_custom_stats_.callbacks, callback_count, "callback");
   entered_ = true;
   backend_.host_custom_callback_entered_ = true;
+  if (callback_count != expected_callback_count_)
+    throw std::logic_error("host custom callback count does not match the prepared schedule");
+  backend_.host_custom_stats_.callbacks += uint64_t(callback_count);
 }
 
 void HostCustomFallbackSession::record_download(size_t bytes) {
   if (complete_ || !backend_.host_custom_session_active_ || entered_)
     throw std::logic_error("host custom download recorded outside the pre-callback session");
-  add_custom_stat(backend_.host_custom_stats_.downloads, 1, "download");
-  add_custom_stat(backend_.host_custom_stats_.download_bytes, bytes, "download byte");
+  add_custom_stat_pair(backend_.host_custom_stats_.downloads,
+                       backend_.host_custom_stats_.download_bytes, bytes, "download",
+                       "download byte");
 }
 
 void HostCustomFallbackSession::record_upload(size_t bytes) {
   if (complete_ || !backend_.host_custom_session_active_ || !entered_)
     throw std::logic_error("host custom upload recorded outside the post-callback session");
-  add_custom_stat(backend_.host_custom_stats_.uploads, 1, "upload");
-  add_custom_stat(backend_.host_custom_stats_.upload_bytes, bytes, "upload byte");
+  add_custom_stat_pair(backend_.host_custom_stats_.uploads,
+                       backend_.host_custom_stats_.upload_bytes, bytes, "upload",
+                       "upload byte");
 }
 
 void HostCustomFallbackSession::complete() {
   if (complete_ || !backend_.host_custom_session_active_)
     throw std::logic_error("host custom fallback session completed out of order");
   if (!entered_) throw std::logic_error("host custom fallback session completed before callback");
-  add_custom_stat(backend_.host_custom_stats_.completed_sessions, 1, "completed session");
+  ++backend_.host_custom_stats_.completed_sessions;
   complete_ = true;
   backend_.host_custom_session_active_ = false;
 }
@@ -439,12 +502,15 @@ void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use
     why = "selected resident backend does not implement host custom susceptibility fallback";
 
   if (!why.empty()) throw std::runtime_error(std::string(site) + ": " + why);
-  f.backend->host_custom_enabled_ = true;
   if (!f.backend->host_custom_warning_emitted_) {
-    add_custom_stat(f.backend->host_custom_stats_.warnings, 1, "warning");
-    master_printf("meep: warning: using host custom susceptibility fallback\n");
+    check_custom_stat_capacity(f.backend->host_custom_stats_.warnings, 1, "warning");
+    ++f.backend->host_custom_stats_.warnings;
     f.backend->host_custom_warning_emitted_ = true;
+    f.backend->host_custom_enabled_ = true;
+    master_printf("meep: warning: using host custom susceptibility fallback\n");
   }
+  else
+    f.backend->host_custom_enabled_ = true;
 }
 
 static uint64_t checked_custom_dispatch_total(size_t per_step, int num_steps,
@@ -506,6 +572,15 @@ void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
   host_custom_dispatch_expectation(*f.step_plans[0], num_steps, expected_sessions,
                                    expected_callbacks);
 
+  const uint64_t sessions_at_dispatch = f.backend->host_custom_stats_.sessions;
+  const uint64_t callbacks_at_dispatch = f.backend->host_custom_stats_.callbacks;
+  const uint64_t completed_sessions_at_dispatch =
+      f.backend->host_custom_stats_.completed_sessions;
+  check_custom_stat_capacity(sessions_at_dispatch, expected_sessions, "session");
+  check_custom_stat_capacity(callbacks_at_dispatch, expected_callbacks, "callback");
+  check_custom_stat_capacity(completed_sessions_at_dispatch, expected_sessions,
+                             "completed session");
+
   add_custom_stat(f.backend->host_custom_stats_.preflights, 1, "preflight");
   try {
     f.backend->preflight_host_custom_fallback(executable, state);
@@ -538,12 +613,14 @@ void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
   f.backend->host_custom_dispatch_pending_ = true;
   f.backend->host_custom_callback_entered_ = false;
   f.backend->host_custom_failure_recorded_ = false;
-  f.backend->host_custom_sessions_at_dispatch_ = f.backend->host_custom_stats_.sessions;
-  f.backend->host_custom_callbacks_at_dispatch_ = f.backend->host_custom_stats_.callbacks;
-  f.backend->host_custom_completed_sessions_at_dispatch_ =
-      f.backend->host_custom_stats_.completed_sessions;
+  f.backend->host_custom_sessions_at_dispatch_ = sessions_at_dispatch;
+  f.backend->host_custom_callbacks_at_dispatch_ = callbacks_at_dispatch;
+  f.backend->host_custom_completed_sessions_at_dispatch_ = completed_sessions_at_dispatch;
   f.backend->host_custom_expected_sessions_ = expected_sessions;
   f.backend->host_custom_expected_callbacks_ = expected_callbacks;
+  f.backend->host_custom_dispatch_plan_ = f.step_plans[0];
+  f.backend->host_custom_next_operation_ = 0;
+  f.backend->host_custom_claimed_sessions_ = 0;
 }
 
 void backend_finish_host_custom_dispatch(fields &f, const char *site) {
@@ -564,7 +641,8 @@ void backend_finish_host_custom_dispatch(fields &f, const char *site) {
   if (!f.backend->host_custom_dispatch_pending_ || f.backend->host_custom_session_active_ ||
       counters_regressed || session_delta != f.backend->host_custom_expected_sessions_ ||
       completed_delta != f.backend->host_custom_expected_sessions_ ||
-      callback_delta != f.backend->host_custom_expected_callbacks_) {
+      callback_delta != f.backend->host_custom_expected_callbacks_ ||
+      f.backend->host_custom_claimed_sessions_ != f.backend->host_custom_expected_sessions_) {
     f.backend->poison();
     if (!f.backend->host_custom_failure_recorded_)
       add_custom_stat(f.backend->host_custom_stats_.poisoned_failures, 1,
@@ -578,6 +656,9 @@ void backend_finish_host_custom_dispatch(fields &f, const char *site) {
   f.backend->host_custom_failure_recorded_ = false;
   f.backend->host_custom_expected_sessions_ = 0;
   f.backend->host_custom_expected_callbacks_ = 0;
+  f.backend->host_custom_dispatch_plan_ = NULL;
+  f.backend->host_custom_next_operation_ = 0;
+  f.backend->host_custom_claimed_sessions_ = 0;
 }
 
 bool backend_abort_host_custom_dispatch(fields &f) noexcept {
@@ -602,6 +683,9 @@ bool backend_abort_host_custom_dispatch(fields &f) noexcept {
   f.backend->host_custom_callback_entered_ = false;
   f.backend->host_custom_expected_sessions_ = 0;
   f.backend->host_custom_expected_callbacks_ = 0;
+  f.backend->host_custom_dispatch_plan_ = NULL;
+  f.backend->host_custom_next_operation_ = 0;
+  f.backend->host_custom_claimed_sessions_ = 0;
   return poison;
 }
 
