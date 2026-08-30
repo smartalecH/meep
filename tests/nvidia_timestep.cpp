@@ -3562,6 +3562,33 @@ static void test_host_custom_complex_eh_composition() {
   require(std::abs(cpu_flux->flux() - gpu_flux->flux()) <=
               (sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-12),
           "complex E+H custom DFT/flux composition changed flux");
+  int cpu_rank = 0, gpu_rank = 0;
+  size_t cpu_dims[3] = {0, 0, 0}, gpu_dims[3] = {0, 0, 0};
+  std::unique_ptr<std::complex<realnum>[]> expected_dft(
+      cpu.get_dft_array(cpu_monitor, monitor_component, 0, &cpu_rank, cpu_dims));
+  std::unique_ptr<std::complex<realnum>[]> observed_dft(
+      gpu.get_dft_array(gpu_monitor, monitor_component, 0, &gpu_rank, gpu_dims));
+  require(expected_dft && observed_dft,
+          "complex E+H custom DFT/flux composition returned no DFT values");
+  require(cpu_rank == gpu_rank, "complex E+H custom DFT/flux composition changed DFT rank");
+  size_t dft_elements = 1;
+  for (int axis = 0; axis < cpu_rank; ++axis) {
+    require(cpu_dims[axis] == gpu_dims[axis],
+            "complex E+H custom DFT/flux composition changed DFT dimensions");
+    dft_elements *= cpu_dims[axis];
+  }
+  require(dft_elements > 0, "complex E+H custom DFT/flux composition produced an empty DFT array");
+  const double dft_tolerance = sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-12;
+  bool saw_dft_signal = false;
+  for (size_t i = 0; i < dft_elements; ++i) {
+    const double error = std::abs(expected_dft[i] - observed_dft[i]);
+    require(error <= dft_tolerance * (1.0 + std::abs(expected_dft[i])),
+            "complex E+H custom DFT/flux composition changed accumulated DFT values");
+    saw_dft_signal =
+        saw_dft_signal || std::abs(expected_dft[i]) > std::numeric_limits<realnum>::epsilon();
+  }
+  require(saw_dft_signal,
+          "complex E+H custom DFT/flux composition did not accumulate a DFT signal");
   require(!cpu_trace.events.empty() && cpu_trace.events == gpu_trace.events,
           "complex E+H custom fallback changed callback order or count");
   master_printf("nvidia_timestep: host-custom complex E+H composition PASS\n");
