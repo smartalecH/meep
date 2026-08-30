@@ -631,8 +631,6 @@ void refresh_legacy_flux_descriptors(fields &f) {
 
 /* --- Susceptibilities ----------------------------------------------------- */
 
-namespace {
-
 SusceptibilityKind classify_susceptibility(const susceptibility *s) {
   if (typeid(*s) == typeid(noisy_lorentzian_susceptibility))
     return SusceptibilityKind::noisy_lorentzian;
@@ -641,6 +639,8 @@ SusceptibilityKind classify_susceptibility(const susceptibility *s) {
   if (typeid(*s) == typeid(lorentzian_susceptibility)) return SusceptibilityKind::lorentzian;
   return SusceptibilityKind::host_custom;
 }
+
+namespace {
 
 uint64_t polarization_component_bit(component c, int cmp) {
   static_assert(2 * NUM_FIELD_COMPONENTS <= 64,

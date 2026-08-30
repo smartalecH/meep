@@ -77,6 +77,46 @@ struct BackendState {
   bool random_seed_snapshot_accepted;
 };
 
+/* Host-custom polarization fallback is deliberately split from its eventual
+   PR5/PR6 descriptor payload.  PR7 owns only policy and lifecycle: an exact
+   live-type scan enables this boundary, a backend preflights before dispatch,
+   and the later host-segment lowering enters a session immediately before it
+   invokes user code. */
+enum class HostCustomFallbackUse { time_domain, solve_cw, magnetic_synchronization };
+
+struct HostCustomFallbackStats {
+  uint64_t warnings;
+  uint64_t preflights;
+  uint64_t sessions;
+  uint64_t callbacks;
+  uint64_t completed_sessions;
+  uint64_t staging_allocations;
+  uint64_t staging_bytes;
+  uint64_t downloads;
+  uint64_t download_bytes;
+  uint64_t uploads;
+  uint64_t upload_bytes;
+  uint64_t retryable_failures;
+  uint64_t poisoned_failures;
+
+  HostCustomFallbackStats()
+      : warnings(0), preflights(0), sessions(0), callbacks(0), completed_sessions(0),
+        staging_allocations(0), staging_bytes(0), downloads(0), download_bytes(0), uploads(0),
+        upload_bytes(0), retryable_failures(0), poisoned_failures(0) {}
+};
+
+enum class HostCustomFallbackCounter {
+  warnings,
+  preflights,
+  sessions,
+  callbacks,
+  completed_sessions,
+  retryable_failures,
+  poisoned_failures
+};
+
+class HostCustomFallbackSession;
+
 struct InitializationPlan; // src/backend/initialization_plan.hpp
 
 /* Retire a backend epoch while its derived state is still intact. This clears
@@ -153,7 +193,13 @@ struct DftReductionRequest {
 
 class ExecutionBackend {
 public:
-  ExecutionBackend() : poisoned_(false) {}
+  ExecutionBackend()
+      : poisoned_(false), host_custom_enabled_(false), host_custom_warning_emitted_(false),
+        host_custom_dispatch_pending_(false), host_custom_session_active_(false),
+        host_custom_callback_entered_(false), host_custom_failure_recorded_(false),
+        host_custom_sessions_at_dispatch_(0), host_custom_callbacks_at_dispatch_(0),
+        host_custom_completed_sessions_at_dispatch_(0), host_custom_expected_sessions_(0),
+        host_custom_expected_callbacks_(0) {}
   virtual ~ExecutionBackend() {}
 
   virtual BackendState *create_state(const StoragePlan &) = 0;
@@ -174,6 +220,19 @@ public:
   virtual void refresh_noisy_seed(const RandomSeedSnapshot &, BackendState &) {
     throw std::logic_error("backend does not implement noisy seed refresh");
   }
+
+  /* Capability and allocation-free dispatch preflight for the compact custom
+     fallback.  The concrete PR6/P2 backend validates its compiled host-segment
+     identities here; staging must already have been reserved at rebuild. No
+     susceptibility virtual may be invoked. Throwing preserves the active
+     epoch unless the implementation self-poisons after irreversible work. */
+  virtual bool supports_host_custom_fallback() const { return false; }
+  virtual void preflight_host_custom_fallback(Executable &, BackendState &) {
+    throw std::logic_error("backend does not implement host custom susceptibility fallback");
+  }
+
+  bool host_custom_fallback_enabled() const { return host_custom_enabled_; }
+  const HostCustomFallbackStats &host_custom_fallback_stats() const { return host_custom_stats_; }
 
   /* A resident CW solve is one coarse operation. CPU declines this hook and
      keeps the legacy solver unchanged. preflight_cw must not invoke source
@@ -249,8 +308,64 @@ public:
      ones that abort. */
   virtual bool accepts(const execution_options &opts, std::string &why) const = 0;
 
+protected:
+  /* Accounting hooks for the later concrete staging adapter. They deliberately
+     do not perform allocation or transfer themselves. */
+  void note_host_custom_staging_allocation(size_t bytes);
+
 private:
+  friend class HostCustomFallbackSession;
+  friend void backend_preflight_host_custom_fallback(fields &, HostCustomFallbackUse,
+                                                      const char *);
+  friend void backend_prepare_host_custom_dispatch(fields &, Executable &, BackendState &, int,
+                                                   const char *);
+  friend void backend_finish_host_custom_dispatch(fields &, const char *);
+  friend bool backend_abort_host_custom_dispatch(fields &) noexcept;
+  friend void backend_set_host_custom_counter_for_testing(
+      ExecutionBackend &, HostCustomFallbackCounter, uint64_t);
+  friend void backend_increment_host_custom_counter_for_testing(
+      ExecutionBackend &, HostCustomFallbackCounter);
+
   bool poisoned_;
+  bool host_custom_enabled_;
+  bool host_custom_warning_emitted_;
+  bool host_custom_dispatch_pending_;
+  bool host_custom_session_active_;
+  bool host_custom_callback_entered_;
+  bool host_custom_failure_recorded_;
+  uint64_t host_custom_sessions_at_dispatch_;
+  uint64_t host_custom_callbacks_at_dispatch_;
+  uint64_t host_custom_completed_sessions_at_dispatch_;
+  uint64_t host_custom_expected_sessions_;
+  uint64_t host_custom_expected_callbacks_;
+  HostCustomFallbackStats host_custom_stats_;
+};
+
+/* RAII boundary used by the future compiled host-segment adapter. For every
+   ordered segment it records D2H, enters immediately before the user virtual,
+   records H2D afterward, and completes only once the segment is coherent.
+   Construction rejects recursion. Destruction before callback entry is
+   retryable; after enter_callback(), any incomplete exit poisons the backend. */
+class HostCustomFallbackSession {
+public:
+  explicit HostCustomFallbackSession(ExecutionBackend &backend);
+  ~HostCustomFallbackSession();
+
+  /* Record the exact number of susceptibility virtuals entered by this
+     segment. Constitutive segments omit stateless callbacks; polarization
+     segments include them because update_P is invoked even with null data. */
+  void enter_callback(size_t callback_count);
+  void record_download(size_t bytes);
+  void record_upload(size_t bytes);
+  void complete();
+
+private:
+  HostCustomFallbackSession(const HostCustomFallbackSession &);
+  HostCustomFallbackSession &operator=(const HostCustomFallbackSession &);
+
+  ExecutionBackend &backend_;
+  bool entered_;
+  bool complete_;
 };
 
 /* Selects and constructs a backend, or fails with a clear collective error.
@@ -290,6 +405,28 @@ StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
 bool backend_try_refresh_legacy_flux(fields &f, const char *site);
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
+
+/* Exact-type capability gate.  It runs before resident storage preparation and
+   is intentionally independent of the PR6 descriptor/host-segment schema. */
+void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use,
+                                            const char *site);
+/* Per-dispatch hooks. Preflight failure is retryable and preserves the current
+   epoch. A backend that accepts fallback must execute exactly the ordinary
+   plan's host segments for every requested step and report the exact number
+   of susceptibility virtuals entered by each session. */
+void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
+                                          BackendState &state, int num_steps,
+                                          const char *site);
+void backend_finish_host_custom_dispatch(fields &f, const char *site);
+/* Returns whether the failed dispatch crossed callback entry and therefore
+   requires poisoning. Non-custom resident dispatch failures remain poison. */
+bool backend_abort_host_custom_dispatch(fields &f) noexcept;
+/* Narrow counter-overflow seam for backend_api. */
+void backend_set_host_custom_counter_for_testing(ExecutionBackend &backend,
+                                                 HostCustomFallbackCounter counter,
+                                                 uint64_t value);
+void backend_increment_host_custom_counter_for_testing(ExecutionBackend &backend,
+                                                       HostCustomFallbackCounter counter);
 
 /* Preserve resident-authoritative values and retire the old backend objects
    before a host-side field-layout mutation can delete or replace their

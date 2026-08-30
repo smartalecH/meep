@@ -62,6 +62,53 @@ static double unit_epsilon(const vec &) { return 1.0; }
 static double phase_conductivity(const vec &);
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
 
+class lifecycle_custom_susceptibility : public lorentzian_susceptibility {
+public:
+  lifecycle_custom_susceptibility(realnum omega, realnum gamma, bool publish_layout_ = false)
+      : lorentzian_susceptibility(omega, gamma), publish_layout(publish_layout_) {}
+  lifecycle_custom_susceptibility(const lifecycle_custom_susceptibility &other)
+      : lorentzian_susceptibility(other), publish_layout(other.publish_layout) {}
+  susceptibility *clone() const override { return new lifecycle_custom_susceptibility(*this); }
+  void *new_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2],
+                          const grid_volume &gv) const override {
+    ++allocations;
+    return lorentzian_susceptibility::new_internal_data(W, gv);
+  }
+  void init_internal_data(realnum *W[NUM_FIELD_COMPONENTS][2], realnum dt,
+                          const grid_volume &gv, void *data) const override {
+    ++initializations;
+    lorentzian_susceptibility::init_internal_data(W, dt, gv, data);
+  }
+  bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &gv,
+                       void *data) const override {
+    ++layout_queries;
+    if (!publish_layout) {
+      out.clear();
+      return false;
+    }
+    return lorentzian_susceptibility::internal_layout(out, gv, data);
+  }
+
+  static void reset_counts() { allocations = initializations = layout_queries = 0; }
+  static int allocations;
+  static int initializations;
+  static int layout_queries;
+
+private:
+  bool publish_layout;
+};
+
+int lifecycle_custom_susceptibility::allocations = 0;
+int lifecycle_custom_susceptibility::initializations = 0;
+int lifecycle_custom_susceptibility::layout_queries = 0;
+
+class lifecycle_stateless_custom_susceptibility : public susceptibility {
+public:
+  susceptibility *clone() const override {
+    return new lifecycle_stateless_custom_susceptibility(*this);
+  }
+};
+
 struct lifetime_counts {
   int states_created;
   int states_destroyed;
@@ -85,6 +132,7 @@ struct lifetime_counts {
   int malformed_cw_result;
   int noisy_seed_refresh_attempts;
   int noisy_seed_refreshes;
+  int custom_preflights;
   RandomSeedSnapshot last_noisy_seed;
   size_t arrays_at_create;
   size_t polarization_arrays_at_create;
@@ -126,6 +174,14 @@ struct lifetime_counts {
   bool mutate_cw_cache_during_preflight;
   bool mutate_after_cw_boundary;
   bool fail_noisy_seed_refresh;
+  bool fail_custom_preflight;
+  bool poison_custom_preflight;
+  bool fail_custom_before_entry;
+  bool fail_custom_later_before_entry;
+  bool fail_custom_after_entry;
+  bool reenter_custom_callback;
+  bool omit_custom_last_segment;
+  bool undercount_custom_last_segment;
   bool cw_saw_transient_mode;
   bool cw_final_dft_at_entry_time;
   CwSolveStatus cw_status;
@@ -137,7 +193,7 @@ struct lifetime_counts {
         magnetic_synchronizes(0), magnetic_restores(0),
         cw_executables_created(0), cw_executables_destroyed(0), cw_preflights(0), cw_solves(0),
         cw_callback_effects(0), malformed_cw_result(0), noisy_seed_refresh_attempts(0),
-        noisy_seed_refreshes(0), last_noisy_seed(), arrays_at_create(0),
+        noisy_seed_refreshes(0), custom_preflights(0), last_noisy_seed(), arrays_at_create(0),
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
         multilevel_population_updates_at_compile(0),
@@ -151,13 +207,17 @@ struct lifetime_counts {
         authoritative_value(0), migrate_multilevel_values(false),
         authoritative_population(realnum(0.625)), authoritative_p(realnum(0.375)),
         authoritative_p_prev(realnum(-0.25)), multilevel_migrations(0), fail_rebuild(false),
-        fail_initialize(false), fail_compile(false), fail_advance(false),
+        fail_create_state(false), fail_initialize(false), fail_compile(false), fail_advance(false),
         corrupt_catalog_after_compile(false),
         fail_magnetic_synchronize(false), fail_magnetic_restore(false),
         fail_magnetic_synchronize_dispatch(false), fail_cw_preflight(false),
         fail_cw_dispatch(false), alias_cw_to_ordinary(false),
         mutate_cw_cache_during_preflight(false), mutate_after_cw_boundary(false),
-        fail_noisy_seed_refresh(false),
+        fail_noisy_seed_refresh(false), fail_custom_preflight(false),
+        poison_custom_preflight(false), fail_custom_before_entry(false),
+        fail_custom_later_before_entry(false), fail_custom_after_entry(false),
+        reenter_custom_callback(false), omit_custom_last_segment(false),
+        undercount_custom_last_segment(false),
         cw_saw_transient_mode(false),
         cw_final_dft_at_entry_time(false),
         cw_status(CwSolveStatus::converged) {}
@@ -170,11 +230,13 @@ struct tracking_state : BackendState {
 };
 
 struct tracking_executable : Executable {
-  explicit tracking_executable(lifetime_counts &counts_) : counts(counts_) {
+  tracking_executable(lifetime_counts &counts_, const std::vector<size_t> &custom_callbacks_)
+      : counts(counts_), custom_callbacks(custom_callbacks_) {
     ++counts.executables_created;
   }
   ~tracking_executable() override { ++counts.executables_destroyed; }
   lifetime_counts &counts;
+  std::vector<size_t> custom_callbacks;
 };
 
 struct tracking_cw_executable : Executable {
@@ -188,9 +250,11 @@ struct tracking_cw_executable : Executable {
 class tracking_backend : public ExecutionBackend {
 public:
   tracking_backend(fields &f_, lifetime_counts &counts_, bool magnetic_supported_ = false,
-                   bool cw_supported_ = false)
+                   bool cw_supported_ = false, bool custom_supported_ = false,
+                   bool execute_custom_ = false)
       : f(f_), counts(counts_), magnetic_supported(magnetic_supported_),
-        cw_supported(cw_supported_) {}
+        cw_supported(cw_supported_), custom_supported(custom_supported_),
+        execute_custom(execute_custom_), custom_staging_prepared(false) {}
 
   BackendState *create_state(const StoragePlan &plan) override {
     if (counts.fail_create_state) throw std::runtime_error("injected state creation failure");
@@ -240,13 +304,55 @@ public:
     for (const PolarizationUpdate &update : plan.polarization_updates)
       if (update.kind == PolarizationUpdateKind::gyrotropic)
         counts.gyrotropic_update_at_compile = true;
-    Executable *result = new tracking_executable(counts);
+    std::vector<size_t> custom_callbacks;
+    for (const Operation &op : plan.operations) {
+      if (op.kind != OpKind::host_callback || op.descriptor_count != 1 ||
+          op.descriptor_index >= plan.host_segments.size())
+        continue;
+      const HostSegment &segment = plan.host_segments[op.descriptor_index];
+      size_t callback_count = 0;
+      for (uint32_t i = 0; i < segment.callback_count; ++i) {
+        const HostCallbackDescriptor &callback =
+            plan.host_callbacks[size_t(segment.callback_index) + i];
+        if (segment.phase != HostSegmentPhase::constitutive || callback.has_internal_state)
+          ++callback_count;
+      }
+      custom_callbacks.push_back(callback_count);
+    }
+    Executable *result = new tracking_executable(counts, custom_callbacks);
     if (counts.corrupt_catalog_after_compile) f.array_catalog->clear();
     return result;
   }
-  void advance(Executable &, BackendState &, int) override {
+  void advance(Executable &executable, BackendState &, int num_steps) override {
     ++counts.advance_attempts;
     if (counts.fail_advance) throw std::runtime_error("injected backend advance failure");
+    if (execute_custom && host_custom_fallback_enabled()) {
+      tracking_executable &compiled = static_cast<tracking_executable &>(executable);
+      for (int step = 0; step < num_steps; ++step)
+        for (size_t segment = 0; segment < compiled.custom_callbacks.size(); ++segment) {
+          if (counts.omit_custom_last_segment &&
+              segment + 1 == compiled.custom_callbacks.size())
+            continue;
+          HostCustomFallbackSession session(*this);
+          if ((counts.fail_custom_before_entry && segment == 0) ||
+              (counts.fail_custom_later_before_entry && segment == 1))
+            throw std::runtime_error("injected pre-callback host custom failure");
+          session.record_download(32);
+          size_t callback_count = compiled.custom_callbacks[segment];
+          if (counts.undercount_custom_last_segment &&
+              segment + 1 == compiled.custom_callbacks.size() && callback_count)
+            --callback_count;
+          session.enter_callback(callback_count);
+          if (counts.reenter_custom_callback && segment == 0) {
+            HostCustomFallbackSession nested(*this);
+            (void)nested;
+          }
+          if (counts.fail_custom_after_entry && segment == 0)
+            throw std::runtime_error("injected host custom callback failure");
+          session.record_upload(48);
+          session.complete();
+        }
+    }
     ++counts.advanced;
   }
   void refresh_noisy_seed(const RandomSeedSnapshot &candidate, BackendState &) override {
@@ -255,6 +361,17 @@ public:
       throw std::runtime_error("injected noisy seed refresh failure");
     counts.last_noisy_seed = candidate;
     ++counts.noisy_seed_refreshes;
+  }
+  bool supports_host_custom_fallback() const override { return custom_supported; }
+  void preflight_host_custom_fallback(Executable &, BackendState &) override {
+    ++counts.custom_preflights;
+    if (counts.poison_custom_preflight) poison();
+    if (counts.fail_custom_preflight)
+      throw std::runtime_error("injected host custom fallback preflight failure");
+    if (!custom_staging_prepared) {
+      note_host_custom_staging_allocation(64);
+      custom_staging_prepared = true;
+    }
   }
   bool supports_cw(const CwSolveRequest &, std::string &why) const override {
     if (cw_supported) return true;
@@ -392,6 +509,9 @@ private:
   lifetime_counts &counts;
   bool magnetic_supported;
   bool cw_supported;
+  bool custom_supported;
+  bool execute_custom;
+  bool custom_staging_prepared;
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL);
@@ -3897,6 +4017,408 @@ static void test_resident_multilevel_lifecycle() {
   }
 }
 
+static execution_options warned_custom_options(
+    precision_policy_kind precision = precision_policy_kind::native) {
+  execution_options opts;
+  opts.backend = backend_kind::automatic;
+  opts.precision = precision;
+  opts.fallback = fallback_policy::warn;
+  opts.strict = false;
+  return opts;
+}
+
+static void add_custom_lifecycle_state(structure &s, bool publish_layout = false) {
+  s.add_susceptibility(unit_epsilon, E_stuff,
+                       lifecycle_custom_susceptibility(0.85, 0.07, publish_layout));
+}
+
+static uint64_t custom_counter_value(const HostCustomFallbackStats &stats,
+                                     HostCustomFallbackCounter counter) {
+  switch (counter) {
+    case HostCustomFallbackCounter::warnings: return stats.warnings;
+    case HostCustomFallbackCounter::preflights: return stats.preflights;
+    case HostCustomFallbackCounter::sessions: return stats.sessions;
+    case HostCustomFallbackCounter::callbacks: return stats.callbacks;
+    case HostCustomFallbackCounter::completed_sessions: return stats.completed_sessions;
+    case HostCustomFallbackCounter::retryable_failures: return stats.retryable_failures;
+    case HostCustomFallbackCounter::poisoned_failures: return stats.poisoned_failures;
+  }
+  return 0;
+}
+
+static void test_resident_host_custom_policy_lifecycle() {
+  auto expect_early_rejection = [](const char *label, const execution_options &opts,
+                                   bool backend_support, const char *message,
+                                   int phasein_time = 0) {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s, true);
+    fields f(&s);
+    f.require_component(Ez);
+    f.phasein_time = phasein_time;
+    lifecycle_custom_susceptibility::reset_counts();
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts, false, false, backend_support, true);
+    f.options = opts;
+    bool rejected = false;
+    std::string what;
+    try {
+      f.advance(1);
+    }
+    catch (const std::exception &e) {
+      rejected = true;
+      what = e.what();
+    }
+    CHECK(rejected && (!message || what.find(message) != std::string::npos),
+          "%s was not rejected by the early custom capability gate: %s", label, what.c_str());
+    CHECK(!f.backend_state && !f.executable && counts.states_created == 0 &&
+              counts.executables_created == 0 && lifecycle_custom_susceptibility::allocations == 0 &&
+              lifecycle_custom_susceptibility::initializations == 0 &&
+              lifecycle_custom_susceptibility::layout_queries == 0 && !f.backend->is_poisoned() &&
+              f.backend->host_custom_fallback_stats().warnings == 0,
+          "%s reached allocation, descriptor callbacks, publication, warning, or poison", label);
+  };
+
+  {
+    execution_options strict = warned_custom_options();
+    strict.strict = true;
+    expect_early_rejection("strict custom fallback", strict, true, "strict=false");
+  }
+  {
+    execution_options error = warned_custom_options();
+    error.fallback = fallback_policy::error;
+    expect_early_rejection("error-policy custom fallback", error, true, "fallback=warn");
+  }
+  expect_early_rejection("mixed-precision custom fallback",
+                         warned_custom_options(precision_policy_kind::mixed), true,
+                         "precision=native");
+  expect_early_rejection("f32 custom fallback", warned_custom_options(precision_policy_kind::f32),
+                         true, "precision=native");
+  expect_early_rejection("unsupported-backend custom fallback", warned_custom_options(), false,
+                         count_processors() == 1 ? "does not implement" : "single MPI rank");
+  if (count_processors() == 1)
+    expect_early_rejection("material-phasing custom fallback", warned_custom_options(), true,
+                           "material phasing", 2);
+
+  {
+    grid_volume gv = vol2d(1.0, 1.0, 4.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+    fields f(&s);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts);
+    f.backend = tracking;
+    const HostCustomFallbackCounter counters[] = {
+        HostCustomFallbackCounter::warnings,
+        HostCustomFallbackCounter::preflights,
+        HostCustomFallbackCounter::sessions,
+        HostCustomFallbackCounter::callbacks,
+        HostCustomFallbackCounter::completed_sessions,
+        HostCustomFallbackCounter::retryable_failures,
+        HostCustomFallbackCounter::poisoned_failures};
+    for (HostCustomFallbackCounter counter : counters) {
+      backend_set_host_custom_counter_for_testing(*tracking, counter,
+                                                  std::numeric_limits<uint64_t>::max());
+      bool overflowed = false;
+      try { backend_increment_host_custom_counter_for_testing(*tracking, counter); }
+      catch (const std::overflow_error &) { overflowed = true; }
+      CHECK(overflowed &&
+                custom_counter_value(tracking->host_custom_fallback_stats(), counter) ==
+                    std::numeric_limits<uint64_t>::max(),
+            "host custom fallback counter wrapped instead of rejecting overflow");
+      backend_set_host_custom_counter_for_testing(*tracking, counter, 0);
+    }
+  }
+
+  /* Exact built-ins never enter the custom policy path, even with strict mode
+     and a backend that deliberately declines the fallback hook. */
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    s.add_susceptibility(unit_epsilon, E_stuff, lorentzian_susceptibility(0.85, 0.07));
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    f.advance(1);
+    CHECK(counts.states_created == 1 && counts.advanced == 1 &&
+              f.backend->host_custom_fallback_stats().warnings == 0,
+          "exact built-in was misclassified as host custom fallback");
+  }
+
+  if (count_processors() != 1) {
+    expect_early_rejection("MPI custom fallback", warned_custom_options(), true,
+                           "single MPI rank");
+    return;
+  }
+
+  /* A stateless custom susceptibility contributes no constitutive virtual but
+     still receives update_P. advance(2) also pins exact per-step multiplication
+     of the two host-segment sessions. */
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    s.add_susceptibility(unit_epsilon, E_stuff,
+                         lifecycle_stateless_custom_susceptibility());
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(2);
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(stats.sessions == 4 && stats.completed_sessions == 4 && stats.callbacks == 4 &&
+              !tracking->is_poisoned(),
+          "stateless/batched custom dispatch did not preserve exact segment and callback counts");
+  }
+
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifecycle_custom_susceptibility::reset_counts();
+    lifetime_counts counts;
+    tracking_backend *tracking = new tracking_backend(f, counts, true, true, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    f.advance(1);
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(f.backend_state && f.executable && tracking->host_custom_fallback_enabled() &&
+              lifecycle_custom_susceptibility::allocations > 0 && stats.warnings == 1 &&
+              stats.preflights == 1 && stats.sessions == 2 && stats.callbacks == 4 &&
+              stats.completed_sessions == 2 && stats.retryable_failures == 0 &&
+              stats.poisoned_failures == 0 && stats.staging_allocations == 1 &&
+              stats.staging_bytes == 64 && stats.downloads == 2 && stats.download_bytes == 64 &&
+              stats.uploads == 2 && stats.upload_bytes == 96,
+          "warned custom fallback did not publish exactly one complete first session");
+
+    f.advance(1);
+    CHECK(stats.warnings == 1 && stats.preflights == 2 && stats.sessions == 4 &&
+              stats.callbacks == 8 && stats.completed_sessions == 4 &&
+              stats.staging_allocations == 1 && stats.downloads == 4 && stats.uploads == 4,
+          "steady custom fallback repeated its warning or lost session accounting");
+
+    BackendState *const state = f.backend_state;
+    Executable *const executable = f.executable;
+    const int attempts = counts.advance_attempts;
+    counts.fail_custom_preflight = true;
+    bool rejected = false;
+    try {
+      f.advance(1);
+    }
+    catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    CHECK(rejected && f.backend_state == state && f.executable == executable &&
+              counts.advance_attempts == attempts && !tracking->is_poisoned() &&
+              stats.retryable_failures == 1,
+          "custom pre-entry failure dispatched, replaced the epoch, or poisoned the backend");
+    counts.fail_custom_preflight = false;
+    f.advance(1);
+    CHECK(stats.completed_sessions == 6 && counts.advance_attempts == attempts + 1,
+          "custom pre-entry failure was not retryable");
+
+    const int attempts_before_session_failure = counts.advance_attempts;
+    const uint64_t callbacks_before_session_failure = stats.callbacks;
+    counts.fail_custom_before_entry = true;
+    rejected = false;
+    try {
+      f.advance(1);
+    }
+    catch (const std::runtime_error &) {
+      rejected = true;
+    }
+    CHECK(rejected && !tracking->is_poisoned() && f.backend_state == state &&
+              f.executable == executable &&
+              counts.advance_attempts == attempts_before_session_failure + 1 &&
+              stats.callbacks == callbacks_before_session_failure &&
+              stats.retryable_failures == 2,
+          "failure before custom callback entry was not retryable");
+    counts.fail_custom_before_entry = false;
+    f.advance(1);
+    CHECK(stats.completed_sessions == 8,
+          "custom session did not recover after a pre-callback failure");
+
+    rejected = false;
+    try {
+      backend_preflight_host_custom_fallback(f, HostCustomFallbackUse::solve_cw,
+                                             "backend_api custom solve_cw");
+    }
+    catch (const std::runtime_error &e) {
+      rejected = std::string(e.what()).find("time-domain") != std::string::npos;
+    }
+    CHECK(rejected && !tracking->is_poisoned() && f.backend_state == state &&
+              f.executable == executable && stats.warnings == 1,
+          "custom solve_cw scope rejection changed the installed epoch");
+
+    rejected = false;
+    try {
+      f.synchronize_magnetic_fields();
+    }
+    catch (const std::runtime_error &e) {
+      rejected = std::string(e.what()).find("custom susceptibility") != std::string::npos;
+    }
+    CHECK(rejected && !tracking->is_poisoned() && f.backend_state == state &&
+              f.executable == executable && counts.magnetic_synchronizes == 0,
+          "custom magnetic synchronization entered a transition or changed the epoch");
+
+    f.reset();
+    f.advance(1);
+    CHECK(stats.warnings == 1 && stats.completed_sessions == 10,
+          "custom reset lost the installed policy or repeated its warning");
+
+    const uint64_t preflights_before_remove = stats.preflights;
+    const uint64_t sessions_before_remove = stats.sessions;
+    f.remove_susceptibilities();
+    f.advance(1);
+    CHECK(!tracking->host_custom_fallback_enabled() && stats.warnings == 1 &&
+              stats.preflights == preflights_before_remove &&
+              stats.sessions == sessions_before_remove,
+          "custom removal retained a fallback dispatch or repeated its warning");
+  }
+
+  /* fields has no public live add-susceptibility API symmetric with removal.
+     Re-add is therefore a fresh fields construction; clone and backend
+     reselection below pin the supported reconstruction paths. */
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s, true);
+    fields readded(&s);
+    readded.require_component(Ez);
+    lifetime_counts initial_counts;
+    tracking_backend *initial = new tracking_backend(readded, initial_counts, false, false, true,
+                                                     true);
+    readded.backend = initial;
+    readded.options = warned_custom_options();
+    readded.advance(1);
+    CHECK(initial->host_custom_fallback_stats().warnings == 1 &&
+              initial->host_custom_fallback_stats().sessions == 2 &&
+              initial->host_custom_fallback_stats().completed_sessions == 2,
+          "fresh custom reconstruction did not restore the exact segment lifecycle");
+
+    fields copied(readded);
+    lifetime_counts copied_counts;
+    tracking_backend *copied_backend =
+        new tracking_backend(copied, copied_counts, false, false, true, true);
+    copied.backend = copied_backend;
+    copied.options = warned_custom_options();
+    copied.advance(1);
+    CHECK(copied_backend->host_custom_fallback_enabled() &&
+              copied_backend->host_custom_fallback_stats().warnings == 1 &&
+              copied_backend->host_custom_fallback_stats().sessions == 2 &&
+              copied_backend->host_custom_fallback_stats().callbacks == 4 &&
+              copied_backend->host_custom_fallback_stats().completed_sessions == 2,
+          "fields clone did not rebuild the exact custom fallback session set");
+
+    execution_options cpu;
+    readded.select_backend(cpu);
+    CHECK(!readded.backend_state && !readded.executable,
+          "custom backend reselection retained the resident epoch");
+    delete readded.backend;
+    lifetime_counts reselection_counts;
+    tracking_backend *reselected =
+        new tracking_backend(readded, reselection_counts, false, false, true, true);
+    readded.backend = reselected;
+    readded.options = warned_custom_options();
+    readded.advance(1);
+    CHECK(reselected->host_custom_fallback_enabled() &&
+              reselected->host_custom_fallback_stats().warnings == 1 &&
+              reselected->host_custom_fallback_stats().sessions == 2 &&
+              reselected->host_custom_fallback_stats().callbacks == 4 &&
+              reselected->host_custom_fallback_stats().completed_sessions == 2,
+          "backend reselection did not rebuild the exact custom fallback session set");
+  }
+
+  auto expect_poison = [](const char *label, bool fail_after_entry, bool reenter,
+                          bool execute_session, bool fail_advance,
+                          bool fail_later_before_entry, bool omit_last_segment,
+                          bool undercount_last_segment) {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    counts.fail_custom_after_entry = fail_after_entry;
+    counts.reenter_custom_callback = reenter;
+    counts.fail_advance = fail_advance;
+    counts.fail_custom_later_before_entry = fail_later_before_entry;
+    counts.omit_custom_last_segment = omit_last_segment;
+    counts.undercount_custom_last_segment = undercount_last_segment;
+    tracking_backend *tracking =
+        new tracking_backend(f, counts, false, false, true, execute_session);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    bool rejected = false;
+    try {
+      f.advance(1);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
+    const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
+    CHECK(rejected && tracking->is_poisoned() && stats.poisoned_failures == 1,
+          "%s did not poison exactly once", label);
+    if (fail_advance)
+      CHECK(counts.advance_attempts == 1 && stats.callbacks == 0 &&
+                stats.retryable_failures == 0,
+            "%s was misclassified as a retryable pre-callback session failure", label);
+    if (fail_later_before_entry)
+      CHECK(counts.advance_attempts == 1 && stats.callbacks == 2 &&
+                stats.completed_sessions == 1 && stats.retryable_failures == 0,
+            "%s ignored the earlier irreversible callback boundary", label);
+    const uint64_t callbacks = stats.callbacks;
+    bool poison_rejected = false;
+    try {
+      f.advance(1);
+    }
+    catch (const std::exception &) {
+      poison_rejected = true;
+    }
+    CHECK(poison_rejected && stats.callbacks == callbacks,
+          "%s allowed a callback after poison", label);
+  };
+
+  expect_poison("generic resident advance failure with custom enabled", false, false, true, true,
+                false, false, false);
+  expect_poison("later segment pre-entry failure", false, false, true, false, true, false,
+                false);
+  expect_poison("post-entry custom callback failure", true, false, true, false, false, false,
+                false);
+  expect_poison("reentrant custom callback", false, true, true, false, false, false, false);
+  expect_poison("omitted custom callback session", false, false, false, false, false, false,
+                false);
+  expect_poison("omitted later custom segment", false, false, true, false, false, true, false);
+  expect_poison("partial custom segment callback count", false, false, true, false, false, false,
+                true);
+
+  {
+    grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    counts.poison_custom_preflight = true;
+    tracking_backend *tracking = new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    bool rejected = false;
+    try {
+      f.advance(1);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
+    CHECK(rejected && tracking->is_poisoned() && counts.advance_attempts == 0 &&
+              tracking->host_custom_fallback_stats().poisoned_failures == 1,
+          "self-poisoning custom preflight published or dispatched");
+  }
+}
+
 static void test_resident_polarization_preparation() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
@@ -5299,6 +5821,13 @@ int main(int argc, char **argv) {
     master_printf("backend_api: multilevel checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_CUSTOM_ONLY")) {
+    test_resident_host_custom_policy_lifecycle();
+    failures = sum_to_all(failures);
+    if (failures) return 1;
+    master_printf("backend_api: custom fallback checks passed\n");
+    return 0;
+  }
   if (getenv("MEEP_BACKEND_API_NOISY_DEFAULT_ONLY")) {
     test_resident_noisy_lazy_default();
     if (failures) return 1;
@@ -5347,6 +5876,7 @@ int main(int argc, char **argv) {
   test_cpu_cw_hook_declines_without_initialization();
   test_resident_polarization_preparation();
   test_resident_multilevel_lifecycle();
+  test_resident_host_custom_policy_lifecycle();
   test_resident_noisy_seed_lifecycle();
   test_resident_noisy_prelaunch_failures();
   test_resident_advance_failure_poison();

@@ -181,6 +181,9 @@ struct LegacyFluxDescriptor {
 enum class SusceptibilityKind { lorentzian, noisy_lorentzian, gyrotropic, multilevel, host_custom };
 
 const char *susceptibility_kind_name(SusceptibilityKind k);
+/* Exact dynamic-type classification shared by descriptor construction and the
+   pre-allocation resident capability gate. Derived built-ins remain custom. */
+SusceptibilityKind classify_susceptibility(const susceptibility *s);
 
 struct LorentzianParameters {
   double omega_0;

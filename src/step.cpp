@@ -62,11 +62,15 @@ void fields::advance(int n) {
   init_backend();
   ensure_backend_executable();
   backend_refresh_noisy_seed(*this, *step_plans[0], "fields::advance noisy seed refresh");
+  backend_prepare_host_custom_dispatch(*this, *executable, *backend_state, n,
+                                       "fields::advance custom fallback preflight");
   try {
     backend->advance(*executable, *backend_state, n);
+    backend_finish_host_custom_dispatch(*this, "fields::advance custom fallback dispatch");
   }
   catch (...) {
-    if (backend->requires_full_storage_preparation()) backend->poison();
+    const bool poison = backend_abort_host_custom_dispatch(*this);
+    if (backend->requires_full_storage_preparation() && poison) backend->poison();
     throw;
   }
 }

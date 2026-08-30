@@ -1849,6 +1849,7 @@ struct HaloPlan;
 struct StepPlan;                 // src/backend/step_plan.hpp -- backend-private
 struct DescriptorSet;            // src/backend/descriptors.hpp -- backend-private
 class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
+enum class HostCustomFallbackUse; // src/backend/backend.hpp -- backend-private
 class PreparedBackendEpoch;      // src/backend/backend_access.cpp -- backend-private
 struct BackendEpochSnapshot;     // tests/backend_api.cpp -- lifecycle invariant probe
 struct BackendState;
@@ -2492,6 +2493,8 @@ private:
   friend bool backend_try_solve_cw(fields &, const CwSolveRequest &, CwSolveResult &);
   friend bool backend_try_refresh_legacy_flux(fields &, const char *);
   friend void backend_refresh_noisy_seed(fields &, const StepPlan &, const char *);
+  friend void backend_preflight_host_custom_fallback(fields &, HostCustomFallbackUse,
+                                                      const char *);
   friend class PreparedBackendEpoch;
   friend struct BackendEpochSnapshot;
   int synchronized_magnetic_fields; // count number of nested synchs

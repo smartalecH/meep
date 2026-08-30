@@ -34,6 +34,16 @@ static int cw_clone_fail_after_for_testing = -1;
 static bool cw_plan_corruption_for_testing = false;
 static int legacy_flux_prepare_failure_rank_for_testing = -1;
 
+static bool has_live_host_custom_susceptibility(const fields &f) {
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    for (field_type ft : {E_stuff, H_stuff})
+      for (const polarization_state *state = f.chunks[chunk]->pol[ft]; state;
+           state = state->next)
+        if (state->s && classify_susceptibility(state->s) == SusceptibilityKind::host_custom)
+          return true;
+  return false;
+}
+
 void backend_set_cw_clone_fail_after_for_testing(int checkpoints) {
   cw_clone_fail_after_for_testing = checkpoints;
 }
@@ -177,6 +187,8 @@ std::string cheap_cw_rejection(const fields &f, const CwSolveRequest &request,
   if (f.phasein_time > 0) return "resident solve_cw does not support active material phasing";
   if (live_magnetic_snapshot)
     return "resident solve_cw does not support a live magnetic snapshot";
+  if (has_live_host_custom_susceptibility(f))
+    return "host custom susceptibility fallback supports only time-domain stepping, not solve_cw";
   if (f.fluxes) return "resident solve_cw does not support legacy flux accumulators";
   if (has_cw_material_topology(f))
     return "resident solve_cw does not support dispersion, polarization, or nonlinear media";
@@ -262,6 +274,335 @@ void destroy_backend_state(BackendState *&state) {
   state->clear_cw_executable();
   delete state;
   state = NULL;
+}
+
+static void add_custom_stat(uint64_t &value, size_t added, const char *what) {
+  if (uint64_t(added) > std::numeric_limits<uint64_t>::max() - value)
+    throw std::overflow_error(std::string("host custom fallback ") + what + " counter overflow");
+  value += uint64_t(added);
+}
+
+static bool add_custom_stat_noexcept(uint64_t &value, size_t added) noexcept {
+  if (uint64_t(added) > std::numeric_limits<uint64_t>::max() - value) return false;
+  value += uint64_t(added);
+  return true;
+}
+
+void backend_set_host_custom_counter_for_testing(ExecutionBackend &backend,
+                                                 HostCustomFallbackCounter counter,
+                                                 uint64_t value) {
+  uint64_t *target = NULL;
+  switch (counter) {
+    case HostCustomFallbackCounter::warnings: target = &backend.host_custom_stats_.warnings; break;
+    case HostCustomFallbackCounter::preflights: target = &backend.host_custom_stats_.preflights; break;
+    case HostCustomFallbackCounter::sessions: target = &backend.host_custom_stats_.sessions; break;
+    case HostCustomFallbackCounter::callbacks: target = &backend.host_custom_stats_.callbacks; break;
+    case HostCustomFallbackCounter::completed_sessions:
+      target = &backend.host_custom_stats_.completed_sessions;
+      break;
+    case HostCustomFallbackCounter::retryable_failures:
+      target = &backend.host_custom_stats_.retryable_failures;
+      break;
+    case HostCustomFallbackCounter::poisoned_failures:
+      target = &backend.host_custom_stats_.poisoned_failures;
+      break;
+  }
+  if (!target) throw std::invalid_argument("invalid host custom fallback counter");
+  *target = value;
+}
+
+void backend_increment_host_custom_counter_for_testing(ExecutionBackend &backend,
+                                                       HostCustomFallbackCounter counter) {
+  uint64_t *target = NULL;
+  switch (counter) {
+    case HostCustomFallbackCounter::warnings: target = &backend.host_custom_stats_.warnings; break;
+    case HostCustomFallbackCounter::preflights: target = &backend.host_custom_stats_.preflights; break;
+    case HostCustomFallbackCounter::sessions: target = &backend.host_custom_stats_.sessions; break;
+    case HostCustomFallbackCounter::callbacks: target = &backend.host_custom_stats_.callbacks; break;
+    case HostCustomFallbackCounter::completed_sessions:
+      target = &backend.host_custom_stats_.completed_sessions;
+      break;
+    case HostCustomFallbackCounter::retryable_failures:
+      target = &backend.host_custom_stats_.retryable_failures;
+      break;
+    case HostCustomFallbackCounter::poisoned_failures:
+      target = &backend.host_custom_stats_.poisoned_failures;
+      break;
+  }
+  if (!target) throw std::invalid_argument("invalid host custom fallback counter");
+  add_custom_stat(*target, 1, "test");
+}
+
+void ExecutionBackend::note_host_custom_staging_allocation(size_t bytes) {
+  add_custom_stat(host_custom_stats_.staging_allocations, 1, "staging allocation");
+  add_custom_stat(host_custom_stats_.staging_bytes, bytes, "staging byte");
+}
+
+HostCustomFallbackSession::HostCustomFallbackSession(ExecutionBackend &backend)
+    : backend_(backend), entered_(false), complete_(false) {
+  if (!backend_.host_custom_enabled_)
+    throw std::logic_error("host custom fallback session is not enabled");
+  if (backend_.is_poisoned())
+    throw std::logic_error("resident backend is poisoned by a failed custom callback");
+  if (backend_.host_custom_session_active_)
+    throw std::logic_error("reentrant host custom fallback session");
+  if (!backend_.host_custom_dispatch_pending_)
+    throw std::logic_error("host custom fallback session has no prepared dispatch");
+  try { add_custom_stat(backend_.host_custom_stats_.sessions, 1, "session"); }
+  catch (...) {
+    if (backend_.host_custom_callback_entered_) {
+      backend_.poison();
+      if (!add_custom_stat_noexcept(backend_.host_custom_stats_.poisoned_failures, 1))
+        backend_.poison();
+    }
+    else if (!add_custom_stat_noexcept(backend_.host_custom_stats_.retryable_failures, 1))
+      backend_.poison();
+    backend_.host_custom_failure_recorded_ = true;
+    throw;
+  }
+  backend_.host_custom_session_active_ = true;
+}
+
+HostCustomFallbackSession::~HostCustomFallbackSession() {
+  if (complete_) return;
+  backend_.host_custom_session_active_ = false;
+  if (!backend_.host_custom_failure_recorded_) {
+    if (entered_ || backend_.host_custom_callback_entered_) {
+      backend_.poison();
+      if (!add_custom_stat_noexcept(backend_.host_custom_stats_.poisoned_failures, 1))
+        backend_.poison();
+    }
+    else if (!add_custom_stat_noexcept(backend_.host_custom_stats_.retryable_failures, 1))
+      backend_.poison();
+    backend_.host_custom_failure_recorded_ = true;
+  }
+}
+
+void HostCustomFallbackSession::enter_callback(size_t callback_count) {
+  if (complete_ || !backend_.host_custom_session_active_)
+    throw std::logic_error("host custom callback entered outside an active session");
+  if (entered_) throw std::logic_error("host custom callback boundary entered twice");
+  add_custom_stat(backend_.host_custom_stats_.callbacks, callback_count, "callback");
+  entered_ = true;
+  backend_.host_custom_callback_entered_ = true;
+}
+
+void HostCustomFallbackSession::record_download(size_t bytes) {
+  if (complete_ || !backend_.host_custom_session_active_ || entered_)
+    throw std::logic_error("host custom download recorded outside the pre-callback session");
+  add_custom_stat(backend_.host_custom_stats_.downloads, 1, "download");
+  add_custom_stat(backend_.host_custom_stats_.download_bytes, bytes, "download byte");
+}
+
+void HostCustomFallbackSession::record_upload(size_t bytes) {
+  if (complete_ || !backend_.host_custom_session_active_ || !entered_)
+    throw std::logic_error("host custom upload recorded outside the post-callback session");
+  add_custom_stat(backend_.host_custom_stats_.uploads, 1, "upload");
+  add_custom_stat(backend_.host_custom_stats_.upload_bytes, bytes, "upload byte");
+}
+
+void HostCustomFallbackSession::complete() {
+  if (complete_ || !backend_.host_custom_session_active_)
+    throw std::logic_error("host custom fallback session completed out of order");
+  if (!entered_) throw std::logic_error("host custom fallback session completed before callback");
+  add_custom_stat(backend_.host_custom_stats_.completed_sessions, 1, "completed session");
+  complete_ = true;
+  backend_.host_custom_session_active_ = false;
+}
+
+void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use,
+                                            const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
+
+  const bool present = has_live_host_custom_susceptibility(f);
+  if (!present) {
+    f.backend->host_custom_enabled_ = false;
+    return;
+  }
+
+  std::string why;
+  if (f.options.strict || f.options.fallback != fallback_policy::warn)
+    why = "host custom susceptibility fallback requires strict=false and fallback=warn";
+  else if (f.options.precision != precision_policy_kind::native)
+    why = "host custom susceptibility fallback supports only precision=native";
+  else if (use != HostCustomFallbackUse::time_domain)
+    why = use == HostCustomFallbackUse::solve_cw
+              ? "host custom susceptibility fallback supports only time-domain stepping, not solve_cw"
+              : "host custom susceptibility fallback does not support magnetic synchronization";
+  else if (count_processors() != 1)
+    why = "host custom susceptibility fallback supports only a single MPI rank";
+  else if (f.phasein_time > 0)
+    why = "host custom susceptibility fallback does not support active material phasing";
+  else if (f.synchronized_magnetic_fields)
+    why = "host custom susceptibility fallback cannot enter with synchronized magnetic fields";
+  else if (!f.backend->supports_host_custom_fallback())
+    why = "selected resident backend does not implement host custom susceptibility fallback";
+
+  if (!why.empty()) throw std::runtime_error(std::string(site) + ": " + why);
+  f.backend->host_custom_enabled_ = true;
+  if (!f.backend->host_custom_warning_emitted_) {
+    add_custom_stat(f.backend->host_custom_stats_.warnings, 1, "warning");
+    master_printf("meep: warning: using host custom susceptibility fallback\n");
+    f.backend->host_custom_warning_emitted_ = true;
+  }
+}
+
+static uint64_t checked_custom_dispatch_total(size_t per_step, int num_steps,
+                                              const char *what) {
+  if (num_steps <= 0)
+    throw std::invalid_argument(std::string("host custom fallback has invalid ") + what +
+                                " step count");
+  if (per_step > std::numeric_limits<uint64_t>::max() / uint64_t(num_steps))
+    throw std::overflow_error(std::string("host custom fallback ") + what + " count overflow");
+  return uint64_t(per_step) * uint64_t(num_steps);
+}
+
+static void host_custom_dispatch_expectation(const StepPlan &plan, int num_steps,
+                                             uint64_t &sessions, uint64_t &callbacks) {
+  size_t sessions_per_step = 0, callbacks_per_step = 0;
+  for (const Operation &op : plan.operations) {
+    if (op.kind != OpKind::host_callback) continue;
+    if (op.guard.kind != GuardKind::always)
+      throw std::invalid_argument(
+          "host custom fallback plan contains a dynamically guarded host segment");
+    if (op.descriptor_count != 1 || op.descriptor_index >= plan.host_segments.size())
+      throw std::invalid_argument("host custom fallback plan has an invalid segment marker");
+    const HostSegment &segment = plan.host_segments[op.descriptor_index];
+    if (uint64_t(segment.callback_index) + uint64_t(segment.callback_count) >
+        plan.host_callbacks.size())
+      throw std::invalid_argument("host custom fallback plan has an invalid callback span");
+    if (sessions_per_step == std::numeric_limits<size_t>::max())
+      throw std::overflow_error("host custom fallback session count overflow");
+    ++sessions_per_step;
+    for (uint32_t i = 0; i < segment.callback_count; ++i) {
+      const HostCallbackDescriptor &callback =
+          plan.host_callbacks[size_t(segment.callback_index) + i];
+      if (segment.phase == HostSegmentPhase::constitutive && !callback.has_internal_state)
+        continue;
+      if (callbacks_per_step == std::numeric_limits<size_t>::max())
+        throw std::overflow_error("host custom fallback callback count overflow");
+      ++callbacks_per_step;
+    }
+  }
+  if (!sessions_per_step)
+    throw std::invalid_argument("host custom fallback plan contains no host segments");
+  sessions = checked_custom_dispatch_total(sessions_per_step, num_steps, "session");
+  callbacks = checked_custom_dispatch_total(callbacks_per_step, num_steps, "callback");
+}
+
+void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
+                                          BackendState &state, int num_steps,
+                                          const char *site) {
+  if (!f.backend || !f.backend->host_custom_enabled_) return;
+  if (f.backend->is_poisoned())
+    throw std::runtime_error(std::string(site) +
+                             ": resident backend is poisoned by a failed custom callback");
+  if (f.backend->host_custom_dispatch_pending_ || f.backend->host_custom_session_active_)
+    throw std::logic_error(std::string(site) + ": prior custom fallback dispatch is incomplete");
+  if (!f.step_plans[0])
+    throw std::logic_error(std::string(site) + ": ordinary StepPlan is unavailable");
+
+  uint64_t expected_sessions = 0, expected_callbacks = 0;
+  host_custom_dispatch_expectation(*f.step_plans[0], num_steps, expected_sessions,
+                                   expected_callbacks);
+
+  add_custom_stat(f.backend->host_custom_stats_.preflights, 1, "preflight");
+  try {
+    f.backend->preflight_host_custom_fallback(executable, state);
+  }
+  catch (const std::exception &e) {
+    if (f.backend->is_poisoned())
+      add_custom_stat(f.backend->host_custom_stats_.poisoned_failures, 1,
+                      "poisoned failure");
+    else
+      add_custom_stat(f.backend->host_custom_stats_.retryable_failures, 1,
+                      "retryable failure");
+    throw std::runtime_error(std::string(site) + ": " + e.what());
+  }
+  catch (...) {
+    if (f.backend->is_poisoned())
+      add_custom_stat(f.backend->host_custom_stats_.poisoned_failures, 1,
+                      "poisoned failure");
+    else
+      add_custom_stat(f.backend->host_custom_stats_.retryable_failures, 1,
+                      "retryable failure");
+    throw std::runtime_error(std::string(site) +
+                             ": unknown host custom fallback preflight failure");
+  }
+  if (f.backend->is_poisoned()) {
+    add_custom_stat(f.backend->host_custom_stats_.poisoned_failures, 1,
+                    "poisoned failure");
+    throw std::runtime_error(std::string(site) +
+                             ": custom fallback preflight poisoned the resident backend");
+  }
+  f.backend->host_custom_dispatch_pending_ = true;
+  f.backend->host_custom_callback_entered_ = false;
+  f.backend->host_custom_failure_recorded_ = false;
+  f.backend->host_custom_sessions_at_dispatch_ = f.backend->host_custom_stats_.sessions;
+  f.backend->host_custom_callbacks_at_dispatch_ = f.backend->host_custom_stats_.callbacks;
+  f.backend->host_custom_completed_sessions_at_dispatch_ =
+      f.backend->host_custom_stats_.completed_sessions;
+  f.backend->host_custom_expected_sessions_ = expected_sessions;
+  f.backend->host_custom_expected_callbacks_ = expected_callbacks;
+}
+
+void backend_finish_host_custom_dispatch(fields &f, const char *site) {
+  if (!f.backend || !f.backend->host_custom_enabled_) return;
+  const HostCustomFallbackStats &stats = f.backend->host_custom_stats_;
+  const bool counters_regressed =
+      stats.sessions < f.backend->host_custom_sessions_at_dispatch_ ||
+      stats.callbacks < f.backend->host_custom_callbacks_at_dispatch_ ||
+      stats.completed_sessions < f.backend->host_custom_completed_sessions_at_dispatch_;
+  const uint64_t session_delta =
+      counters_regressed ? 0 : stats.sessions - f.backend->host_custom_sessions_at_dispatch_;
+  const uint64_t callback_delta =
+      counters_regressed ? 0 : stats.callbacks - f.backend->host_custom_callbacks_at_dispatch_;
+  const uint64_t completed_delta =
+      counters_regressed
+          ? 0
+          : stats.completed_sessions - f.backend->host_custom_completed_sessions_at_dispatch_;
+  if (!f.backend->host_custom_dispatch_pending_ || f.backend->host_custom_session_active_ ||
+      counters_regressed || session_delta != f.backend->host_custom_expected_sessions_ ||
+      completed_delta != f.backend->host_custom_expected_sessions_ ||
+      callback_delta != f.backend->host_custom_expected_callbacks_) {
+    f.backend->poison();
+    if (!f.backend->host_custom_failure_recorded_)
+      add_custom_stat(f.backend->host_custom_stats_.poisoned_failures, 1,
+                      "poisoned failure");
+    f.backend->host_custom_failure_recorded_ = true;
+    throw std::runtime_error(std::string(site) +
+                             ": backend omitted or incompletely closed the custom fallback session");
+  }
+  f.backend->host_custom_dispatch_pending_ = false;
+  f.backend->host_custom_callback_entered_ = false;
+  f.backend->host_custom_failure_recorded_ = false;
+  f.backend->host_custom_expected_sessions_ = 0;
+  f.backend->host_custom_expected_callbacks_ = 0;
+}
+
+bool backend_abort_host_custom_dispatch(fields &f) noexcept {
+  if (!f.backend || !f.backend->host_custom_enabled_) return true;
+  /* A generic resident advance failure is post-dispatch and therefore
+     poisonous even when the backend failed before opening a custom segment.
+     The sole retryable case is an explicitly recorded session failure before
+     callback entry; its destructor has already classified that boundary. */
+  bool poison = f.backend->is_poisoned() || f.backend->host_custom_callback_entered_ ||
+                !f.backend->host_custom_failure_recorded_;
+  if (!f.backend->host_custom_failure_recorded_) {
+    uint64_t &counter = poison ? f.backend->host_custom_stats_.poisoned_failures
+                               : f.backend->host_custom_stats_.retryable_failures;
+    if (!add_custom_stat_noexcept(counter, 1)) {
+      f.backend->poison();
+      poison = true;
+    }
+    f.backend->host_custom_failure_recorded_ = true;
+  }
+  f.backend->host_custom_dispatch_pending_ = false;
+  f.backend->host_custom_session_active_ = false;
+  f.backend->host_custom_callback_entered_ = false;
+  f.backend->host_custom_expected_sessions_ = 0;
+  f.backend->host_custom_expected_callbacks_ = 0;
+  return poison;
 }
 
 CwSolveSession::CwSolveSession(fields &owner, const CwSolveRequest &request)
@@ -966,11 +1307,13 @@ void backend_publish_dft_chains(fields &owner, int count, dft_chunk *const *head
 void backend_require_magnetic_synchronization(const fields &f, const char *site) {
   if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
   const bool poisoned = f.backend->is_poisoned();
-  const bool unsupported = !f.backend->supports_magnetic_synchronization();
+  const bool custom = has_live_host_custom_susceptibility(f);
+  const bool unsupported = custom || !f.backend->supports_magnetic_synchronization();
   if (!or_to_all(poisoned || unsupported)) return;
   throw std::runtime_error(
       std::string(site) +
       (poisoned      ? ": resident backend is poisoned by a failed magnetic transition"
+       : custom      ? ": host custom susceptibility fallback does not support magnetic synchronization"
        : unsupported ? ": magnetic synchronization is not supported by the resident backend"
                      : ": magnetic synchronization is unavailable on another MPI rank"));
 }
@@ -1164,6 +1507,14 @@ void fields::init_backend() {
     clear_dirty(*this, dirty_initialization);
     return;
   }
+
+  /* Capability policy is intentionally checked from the live exact dynamic
+     types before any resident material preparation, polarization allocation,
+     descriptor callback, or backend-state creation. PR6 will attach validated
+     host-segment identities to this already-approved lifecycle boundary. */
+  if (!backend_state || is_dirty(*this, dirty_storage))
+    backend_preflight_host_custom_fallback(
+        *this, HostCustomFallbackUse::time_domain, "fields::init_backend custom fallback");
 
   /* A phase may have been configured while the CPU backend was still lazy and
      only then moved to a resident backend.  Before that backend freezes its
