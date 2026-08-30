@@ -25,6 +25,7 @@
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
 #include "backend/prepare.hpp"
+#include "backend/random_state.hpp"
 #include "backend/step_plan.hpp"
 
 namespace meep {
@@ -48,6 +49,33 @@ void backend_set_cw_plan_corruption_for_testing(bool enabled) {
 
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank) {
   legacy_flux_prepare_failure_rank_for_testing = rank;
+}
+
+void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
+  bool has_noisy_actions = false;
+  for (const PolarizationUpdate &update : plan.polarization_updates)
+    has_noisy_actions = has_noisy_actions || update.kind == PolarizationUpdateKind::noisy_add;
+  if (!has_noisy_actions) return;
+  if (!f.backend_state) throw std::logic_error(std::string(site) + ": missing backend state");
+
+  const RandomSeedSnapshot candidate = ensure_random_seed_snapshot();
+  BackendState &state = *f.backend_state;
+  if (state.random_seed_snapshot_accepted &&
+      state.accepted_random_seed.generation == candidate.generation)
+    return;
+
+  try {
+    f.backend->refresh_noisy_seed(candidate, state);
+  }
+  catch (const std::exception &e) {
+    throw std::runtime_error(std::string(site) + ": " + e.what());
+  }
+  catch (...) {
+    throw std::runtime_error(std::string(site) + ": unknown noisy seed refresh failure");
+  }
+  state.accepted_random_seed = candidate;
+  state.random_seed_snapshot_accepted = true;
 }
 
 namespace {

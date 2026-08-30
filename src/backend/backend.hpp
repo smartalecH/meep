@@ -38,6 +38,7 @@
 #include "backend/classification.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
+#include "backend/random_state.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 
@@ -57,7 +58,7 @@ struct Executable {
 struct BackendState {
   BackendState()
       : cw_executable(NULL), cw_storage_fingerprint(0), cw_step_plan_signature(0),
-        cw_plan_signature(0) {}
+        cw_plan_signature(0), accepted_random_seed(), random_seed_snapshot_accepted(false) {}
   virtual ~BackendState() { delete cw_executable; }
 
   void clear_cw_executable() {
@@ -72,6 +73,8 @@ struct BackendState {
   uint64_t cw_storage_fingerprint;
   uint64_t cw_step_plan_signature;
   uint64_t cw_plan_signature;
+  RandomSeedSnapshot accepted_random_seed;
+  bool random_seed_snapshot_accepted;
 };
 
 struct InitializationPlan; // src/backend/initialization_plan.hpp
@@ -162,6 +165,15 @@ public:
 
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
   virtual void advance(Executable &, BackendState &, int num_steps) = 0;
+
+  /* Refresh backend-private noisy-RNG metadata without rebuilding storage or
+     executable state. Throwing must leave the previously active seed usable;
+     an implementation may poison itself only after an irreversible/enqueued
+     transfer failure. The caller publishes the candidate host snapshot only
+     after this hook returns successfully. */
+  virtual void refresh_noisy_seed(const RandomSeedSnapshot &, BackendState &) {
+    throw std::logic_error("backend does not implement noisy seed refresh");
+  }
 
   /* A resident CW solve is one coarse operation. CPU declines this hook and
      keeps the legacy solver unchanged. preflight_cw must not invoke source
@@ -274,6 +286,7 @@ StepPlan build_legacy_flux_only_step_plan(fields &f, StepProgram program,
                                           const StepPlan &stable);
 bool backend_try_refresh_legacy_flux(fields &f, const char *site);
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
+void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
 
 /* Preserve resident-authoritative values and retire the old backend objects
    before a host-side field-layout mutation can delete or replace their
