@@ -647,6 +647,8 @@ void clear_failure() {
   injected_failure.store(static_cast<int>(failure_point::none), std::memory_order_relaxed);
 }
 
+bool consume_failure_for_testing(failure_point point) { return consume_failure(point); }
+
 transfer_accounting current_transfer_accounting() {
   transfer_accounting result;
   result.host_to_device_calls = host_to_device_calls.load(std::memory_order_relaxed);

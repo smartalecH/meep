@@ -38,15 +38,29 @@ unsigned int launch_blocks(size_t elements, const char *what) {
 }
 
 size_t region_elements(const flat_region &region, const char *what) {
+  if (region.base > size_t(std::numeric_limits<ptrdiff_t>::max()))
+    throw std::overflow_error(std::string(what) + " region base overflows");
   size_t result = 1;
+  size_t maximum_index = region.base;
   for (int axis = 0; axis < 3; ++axis) {
     if (!region.counts[axis])
       throw std::invalid_argument(std::string(what) + " has an empty region axis");
     if (region.strides[axis] < 0)
       throw std::invalid_argument(std::string(what) + " has a negative region stride");
+    if (region.counts[axis] > 1 && region.strides[axis] == 0)
+      throw std::invalid_argument(std::string(what) + " has a zero active region stride");
     if (result > std::numeric_limits<size_t>::max() / region.counts[axis])
       throw std::overflow_error(std::string(what) + " region size overflows");
     result *= region.counts[axis];
+    const size_t stride = size_t(region.strides[axis]);
+    const size_t steps = region.counts[axis] - 1;
+    if (steps && stride > std::numeric_limits<size_t>::max() / steps)
+      throw std::overflow_error(std::string(what) + " region stride overflows");
+    const size_t extent = steps * stride;
+    if (extent > size_t(std::numeric_limits<ptrdiff_t>::max()) ||
+        maximum_index > size_t(std::numeric_limits<ptrdiff_t>::max()) - extent)
+      throw std::overflow_error(std::string(what) + " region index overflows");
+    maximum_index += extent;
   }
   return result;
 }
@@ -229,6 +243,9 @@ void launch_reduction_typed(const cw_reduction_launch &launch, const stream &str
     throw std::invalid_argument("NVIDIA solve_cw dot has a null right operand");
   if (Operation != 0 && launch.y)
     throw std::invalid_argument(std::string(what) + " has an unexpected right operand");
+  if (launch.partials == launch.result || launch.x == launch.partials ||
+      launch.x == launch.result || launch.y == launch.partials || launch.y == launch.result)
+    throw std::invalid_argument(std::string(what) + " has unsupported aliasing");
   if (!launch.elements || !launch.blocks)
     throw std::invalid_argument(std::string(what) + " has an empty extent");
   const size_t needed = 1 + (launch.elements - 1) / cw_threads;
@@ -313,6 +330,8 @@ void launch_cw_source_batch(const cw_source_batch_launch &launch, const void *de
                             const stream &stream) {
   if (!launch.target_real || !launch.target_imag || !launch.points || !device_scalars)
     throw std::invalid_argument("NVIDIA solve_cw source has a null array");
+  if (launch.target_real == launch.target_imag)
+    throw std::invalid_argument("NVIDIA solve_cw source aliases its destinations");
   if (!launch.point_count)
     throw std::invalid_argument("NVIDIA solve_cw source has no spatial points");
   if (!std::isfinite(launch.dt) || launch.dt <= 0.0)
