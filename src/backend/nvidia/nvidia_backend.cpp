@@ -31,6 +31,7 @@
 #include "backend/halo_plan.hpp"
 #include "backend/nvidia/arena.hpp"
 #include "backend/nvidia/nvidia_dft.hpp"
+#include "backend/nvidia/nvidia_flux.hpp"
 #include "backend/nvidia/nvidia_magnetic.hpp"
 #include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
@@ -549,6 +550,8 @@ struct NvidiaCompiledOperation {
   size_t polarization_count;
   size_t subtraction_first;
   size_t subtraction_count;
+  size_t legacy_flux_first;
+  size_t legacy_flux_count;
   size_t source_staging_offset;
   double source_time_offset;
 };
@@ -584,6 +587,13 @@ struct NvidiaCompiledMaterialRefresh {
   size_t bytes;
 };
 
+struct NvidiaCompiledLegacyFluxUpdate {
+  uint32_t flux_ordinal;
+  size_t term_first;
+  size_t term_count;
+  uint64_t recipe_signature;
+};
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, StepProgram program, uint64_t signature,
@@ -613,6 +623,9 @@ public:
                        &polarization_subtractions,
                    const std::vector<nvidia::dft_launch> &dft_updates,
                    const std::vector<double> &dft_omega,
+                   const std::vector<NvidiaCompiledLegacyFluxUpdate> &legacy_flux_updates,
+                   const std::vector<nvidia::legacy_flux_term_launch> &legacy_flux_terms,
+                   size_t legacy_flux_partial_count,
                    const std::vector<NvidiaCompiledMagneticState> &magnetic_states,
                    size_t magnetic_snapshot_bytes, uint64_t magnetic_layout_fingerprint,
                    const MagneticHalfStep &magnetic_half_step,
@@ -632,6 +645,8 @@ public:
         halo_plans_(halo_plans), finite_checks_(finite_checks), source_batches_(source_batches),
         source_copies_(source_copies), polarization_updates_(polarization_updates),
         polarization_subtractions_(polarization_subtractions), dft_updates_(dft_updates),
+        legacy_flux_updates_(legacy_flux_updates), legacy_flux_terms_(legacy_flux_terms),
+        legacy_flux_global_(legacy_flux_updates.size(), 0.0),
         magnetic_states_(magnetic_states), magnetic_snapshot_bytes_(magnetic_snapshot_bytes),
         magnetic_layout_fingerprint_(magnetic_layout_fingerprint),
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
@@ -689,8 +704,22 @@ public:
         for (size_t i = 0; i < dft_updates_.size(); ++i)
           dft_updates_[i].omega = omega_base;
       }
+      if (!legacy_flux_updates_.empty()) {
+        const size_t scalar_bytes = checked_product(legacy_flux_updates_.size(), sizeof(double),
+                                                    "allocating NVIDIA legacy flux scalars");
+        legacy_flux_half_.allocate(scalar_bytes, state.device_);
+        legacy_flux_current_.allocate(scalar_bytes, state.device_);
+        legacy_flux_host_.allocate(scalar_bytes);
+        nvidia::fill_byte_async(legacy_flux_half_, 0, 0, scalar_bytes, *state.transfer_);
+        nvidia::fill_byte_async(legacy_flux_current_, 0, 0, scalar_bytes, *state.transfer_);
+      }
+      if (legacy_flux_partial_count)
+        legacy_flux_partials_.allocate(
+            checked_product(legacy_flux_partial_count, sizeof(double),
+                            "allocating NVIDIA legacy flux reduction scratch"),
+            state.device_);
       if (!halo_gathers.empty() || !halo_scatters.empty() || !source_points.empty() ||
-          !dft_omega.empty())
+          !dft_omega.empty() || !legacy_flux_updates_.empty())
         state.transfer_->synchronize();
     }
     catch (...) {
@@ -723,6 +752,9 @@ public:
   std::vector<nvidia::compiled_polarization_update> polarization_updates_;
   std::vector<nvidia::polarization_subtract_launch> polarization_subtractions_;
   std::vector<nvidia::dft_launch> dft_updates_;
+  std::vector<NvidiaCompiledLegacyFluxUpdate> legacy_flux_updates_;
+  std::vector<nvidia::legacy_flux_term_launch> legacy_flux_terms_;
+  std::vector<double> legacy_flux_global_;
   std::vector<NvidiaCompiledMagneticState> magnetic_states_;
   size_t magnetic_snapshot_bytes_;
   uint64_t magnetic_layout_fingerprint_;
@@ -740,6 +772,10 @@ public:
   nvidia::pinned_buffer material_staging_;
   nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
+  nvidia::device_buffer legacy_flux_half_;
+  nvidia::device_buffer legacy_flux_current_;
+  nvidia::device_buffer legacy_flux_partials_;
+  nvidia::pinned_buffer legacy_flux_host_;
 };
 
 class NvidiaCwExecutable : public Executable {
@@ -1672,6 +1708,120 @@ nvidia::dft_launch compile_dft(const DftDescriptor &source, const fields &f,
   if (source.omega.size() > std::numeric_limits<size_t>::max() - packed_omega.size())
     throw std::overflow_error("NVIDIA DFT frequency table size overflow");
   packed_omega.insert(packed_omega.end(), source.omega.begin(), source.omega.end());
+  return result;
+}
+
+const ArraySpec &validate_legacy_flux_field(const NvidiaBackendState &state, ArrayId id,
+                                            int chunk, component c, int cmp,
+                                            const char *what) {
+  if (!is_valid(id) || id.value >= state.plan_.arrays.size() ||
+      id.value >= state.plan_.keys.size())
+    throw std::out_of_range(std::string(what) + " uses an invalid ArrayId");
+  const ArraySpec &spec = state.plan_.arrays[id.value];
+  const StorageKey &key = state.plan_.keys[id.value];
+  if (spec.role != array_role::field || spec.element_type != ElementType::realnum_value ||
+      key.kind != int(array_kind::f) || key.chunk != chunk || key.component_ != int(c) ||
+      key.cmp != cmp)
+    throw std::invalid_argument(std::string(what) + " has the wrong field identity");
+  return spec;
+}
+
+nvidia::legacy_flux_term_launch compile_legacy_flux_term(const LegacyFluxTerm &source,
+                                                          const fields &f,
+                                                          NvidiaBackendState &state) {
+  if (source.chunk < 0 || source.chunk >= f.num_chunks || !f.chunks[source.chunk] ||
+      !f.chunks[source.chunk]->is_mine())
+    throw std::invalid_argument("legacy flux term has an invalid local chunk");
+  if (source.sign != 1 && source.sign != -1)
+    throw std::invalid_argument("legacy flux term has an invalid sign");
+  if (!std::isfinite(source.phase_real) || !std::isfinite(source.phase_imag) ||
+      !std::isfinite(source.dV0) || !std::isfinite(source.dV1))
+    throw std::invalid_argument("legacy flux term has a nonfinite coefficient");
+
+  nvidia::legacy_flux_term_launch result = {};
+  result.region.base = source.base;
+  size_t points = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!source.counts[axis] || source.strides[axis] < 0)
+      throw std::invalid_argument("legacy flux term has invalid region geometry");
+    result.region.counts[axis] = source.counts[axis];
+    result.region.strides[axis] = source.strides[axis];
+    points = checked_product(points, source.counts[axis],
+                             "sizing NVIDIA legacy flux region");
+    result.start0[axis] = source.boundary_weights[axis][0];
+    result.start1[axis] = source.boundary_weights[axis][1];
+    result.end0[axis] = source.boundary_weights[axis][2];
+    result.end1[axis] = source.boundary_weights[axis][3];
+    for (int endpoint = 0; endpoint < 4; ++endpoint)
+      if (!std::isfinite(source.boundary_weights[axis][endpoint]))
+        throw std::invalid_argument("legacy flux term has a nonfinite boundary weight");
+  }
+  result.points = points;
+  result.blocks = nvidia::legacy_flux_partial_count(points);
+  result.phase_real = source.phase_real;
+  result.phase_imag = source.phase_imag;
+  result.dV0 = source.dV0;
+  result.dV1 = source.dV1;
+  result.sign = source.sign;
+  for (int i = 0; i < 2; ++i) {
+    result.e_offsets[i] = source.e_offsets[i];
+    result.h_offsets[i] = source.h_offsets[i];
+  }
+
+  if ((!is_valid(source.e_real) && is_valid(source.e_imag)) ||
+      (!is_valid(source.h_real) && is_valid(source.h_imag)))
+    throw std::invalid_argument("legacy flux imaginary field has no real counterpart");
+  if (f.is_real && (is_valid(source.e_imag) || is_valid(source.h_imag)))
+    throw std::invalid_argument("real legacy flux term has imaginary field storage");
+  if (!f.is_real && ((is_valid(source.e_real) && !is_valid(source.e_imag)) ||
+                     (is_valid(source.h_real) && !is_valid(source.h_imag))))
+    throw std::invalid_argument("complex legacy flux term lacks imaginary field storage");
+
+  bool have_precision = false;
+  nvidia::scalar_precision precision = nvidia::scalar_precision::f64;
+  const auto bind = [&](ArrayId id, component c, int cmp, const char *what) -> const void * {
+    if (!is_valid(id)) return NULL;
+    (void)validate_legacy_flux_field(state, id, source.chunk, c, cmp, what);
+    const nvidia::scalar_precision current = scalar_precision_for(state.plan_, id, what);
+    if (have_precision && current != precision)
+      throw std::invalid_argument("legacy flux term mixes field storage precisions");
+    precision = current;
+    have_precision = true;
+    return device_address(state, id, what);
+  };
+  result.e_real = bind(source.e_real, source.e_component, 0, "legacy flux E real field");
+  result.e_imag = bind(source.e_imag, source.e_component, 1, "legacy flux E imaginary field");
+  result.h_real = bind(source.h_real, source.h_component, 0, "legacy flux H real field");
+  result.h_imag = bind(source.h_imag, source.h_component, 1, "legacy flux H imaginary field");
+  result.precision = precision;
+
+  const ptrdiff_t region_min = source.base > size_t(std::numeric_limits<ptrdiff_t>::max())
+                                   ? throw std::overflow_error(
+                                         "legacy flux term base exceeds ptrdiff_t")
+                                   : ptrdiff_t(source.base);
+  const ptrdiff_t region_max = checked_region_max(result.region);
+  const ptrdiff_t e_both = checked_shift(source.e_offsets[0], source.e_offsets[1],
+                                         "validating legacy flux E interpolation");
+  const ptrdiff_t h_both = checked_shift(source.h_offsets[0], source.h_offsets[1],
+                                         "validating legacy flux H interpolation");
+  if (is_valid(source.e_real)) {
+    validate_shifted_index_range(state.plan_, source.e_real, region_min, region_max, 0,
+                                 source.e_offsets[0], source.e_offsets[1], e_both,
+                                 "legacy flux E real field");
+    if (is_valid(source.e_imag))
+      validate_shifted_index_range(state.plan_, source.e_imag, region_min, region_max, 0,
+                                   source.e_offsets[0], source.e_offsets[1], e_both,
+                                   "legacy flux E imaginary field");
+  }
+  if (is_valid(source.h_real)) {
+    validate_shifted_index_range(state.plan_, source.h_real, region_min, region_max, 0,
+                                 source.h_offsets[0], source.h_offsets[1], h_both,
+                                 "legacy flux H real field");
+    if (is_valid(source.h_imag))
+      validate_shifted_index_range(state.plan_, source.h_imag, region_min, region_max, 0,
+                                   source.h_offsets[0], source.h_offsets[1], h_both,
+                                   "legacy flux H imaginary field");
+  }
   return result;
 }
 
@@ -2834,8 +2984,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                                       [](double k) { return k != 0.0; });
     if (use_bfast != !plan.bfast_updates.empty())
       throw std::invalid_argument("NVIDIA BFAST coordinate and descriptor state disagree");
-    if (f_.fluxes)
-      throw std::invalid_argument("NVIDIA PR3 does not support legacy time-domain flux monitors");
     if (has_polarization(f_) && !f_.descriptors)
       throw std::invalid_argument("NVIDIA dispersion state has no prepared descriptors");
     if (f_.descriptors) {
@@ -2909,6 +3057,9 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     std::vector<nvidia::polarization_subtract_launch> polarization_subtractions;
     std::vector<nvidia::dft_launch> dft_updates;
     std::vector<double> dft_omega;
+    std::vector<NvidiaCompiledLegacyFluxUpdate> legacy_flux_updates;
+    std::vector<nvidia::legacy_flux_term_launch> legacy_flux_terms;
+    size_t legacy_flux_partial_count = 0;
     std::vector<NvidiaCompiledMagneticState> magnetic_states;
     std::vector<NvidiaCompiledMaterialRefresh> material_refreshes;
     size_t magnetic_snapshot_bytes = 0;
@@ -2962,7 +3113,47 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           }
         }
       }
-    const StepPlan canonical = build_step_plan(f_, plan.program);
+    const size_t stable_index = plan.program == StepProgram::ordinary ? 0 : 1;
+    const StepPlan *stable_plan = f_.step_plans[stable_index];
+    const DirtyMask flux_closure =
+        DirtyMask(dirty_flux_plan | dirty_regions | dirty_executable);
+    const bool stable_provenance_matches =
+        stable_plan && f_.descriptors &&
+        stable_plan->source_signature == source_plan_signature(f_.descriptors->sources) &&
+        dft_plan_signature(stable_plan->dft_updates) ==
+            dft_plan_signature(f_.descriptors->dfts);
+    const bool flux_only_refresh = is_dirty(f_, dirty_flux_plan) &&
+                                   (f_.dirty_mask & ~flux_closure) == dirty_none &&
+                                   stable_provenance_matches;
+    const StepPlan canonical =
+        flux_only_refresh
+            ? build_legacy_flux_only_step_plan(f_, plan.program, *stable_plan)
+            : build_step_plan(f_, plan.program);
+    if (plan.legacy_flux_updates != canonical.legacy_flux_updates ||
+        plan.legacy_flux_terms != canonical.legacy_flux_terms)
+      throw std::invalid_argument("NVIDIA legacy flux descriptors are non-canonical");
+    legacy_flux_updates.reserve(plan.legacy_flux_updates.size());
+    legacy_flux_terms.reserve(plan.legacy_flux_terms.size());
+    if (plan.legacy_flux_updates.size() > size_t(std::numeric_limits<int>::max()))
+      throw std::overflow_error("NVIDIA legacy flux monitor count exceeds MPI range");
+    for (size_t i = 0; i < plan.legacy_flux_updates.size(); ++i) {
+      const LegacyFluxUpdate &update = plan.legacy_flux_updates[i];
+      if (update.flux_ordinal != i ||
+          size_t(update.term_index) + update.term_count > plan.legacy_flux_terms.size())
+        throw std::invalid_argument("NVIDIA legacy flux update has an invalid ordered span");
+      const size_t first = legacy_flux_terms.size();
+      for (size_t j = update.term_index; j < size_t(update.term_index) + update.term_count; ++j) {
+        if (plan.legacy_flux_terms[j].flux_ordinal != update.flux_ordinal)
+          throw std::invalid_argument("NVIDIA legacy flux term belongs to the wrong monitor");
+        nvidia::legacy_flux_term_launch launch =
+            compile_legacy_flux_term(plan.legacy_flux_terms[j], f_, state);
+        legacy_flux_partial_count = std::max(legacy_flux_partial_count, launch.blocks);
+        legacy_flux_terms.push_back(launch);
+      }
+      legacy_flux_updates.push_back(NvidiaCompiledLegacyFluxUpdate{
+          update.flux_ordinal, first, legacy_flux_terms.size() - first,
+          update.recipe_signature});
+    }
     if (plan.material_phase_target_signature != compute_material_phase_target_signature(f_))
       throw std::invalid_argument("NVIDIA material phase target fingerprint is stale");
     if (plan.material_refresh_arrays.size() != expected_material_refreshes ||
@@ -3498,6 +3689,38 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           compiled.count = dft_updates.size() - compiled.first;
           break;
         }
+        case OpKind::update_flux_half:
+        case OpKind::update_flux: {
+          if (plan.program != StepProgram::ordinary) {
+            set_reason(local_error, oi, "legacy flux marker in solve_cw plan");
+            break;
+          }
+          if (op.legacy_flux_index != 0 ||
+              op.legacy_flux_count != plan.legacy_flux_updates.size() ||
+              op.legacy_flux_count != legacy_flux_updates.size()) {
+            set_reason(local_error, oi, "legacy flux marker span is incomplete");
+            break;
+          }
+          if (oi >= canonical.operations.size()) {
+            set_reason(local_error, oi, "legacy flux marker is absent from canonical plan");
+            break;
+          }
+          const Operation &expected = canonical.operations[oi];
+          bool same_accesses = op.accesses.size() == expected.accesses.size();
+          for (size_t i = 0; same_accesses && i < op.accesses.size(); ++i)
+            same_accesses = op.accesses[i].array.id == expected.accesses[i].array.id &&
+                            op.accesses[i].array.offset == expected.accesses[i].array.offset &&
+                            op.accesses[i].array.elements == expected.accesses[i].array.elements &&
+                            op.accesses[i].mode == expected.accesses[i].mode;
+          if (expected.kind != op.kind || expected.legacy_flux_index != op.legacy_flux_index ||
+              expected.legacy_flux_count != op.legacy_flux_count || !same_accesses) {
+            set_reason(local_error, oi, "legacy flux marker identity or accesses are stale");
+            break;
+          }
+          compiled.legacy_flux_first = op.legacy_flux_index;
+          compiled.legacy_flux_count = op.legacy_flux_count;
+          break;
+        }
         case OpKind::update_polarization: {
           if (size_t(op.descriptor_index) + op.descriptor_count >
               plan.polarization_updates.size()) {
@@ -3548,8 +3771,6 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
         case OpKind::pack_halo:
         case OpKind::exchange_local:
         case OpKind::unpack_halo:
-        case OpKind::update_flux_half:
-        case OpKind::update_flux:
         case OpKind::reduction:
         case OpKind::host_callback: set_reason(local_error, oi, op_kind_name(op.kind)); break;
         case OpKind::pack_state:
@@ -3603,7 +3824,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           cylindrical_axis_updates, cylindrical_origin_actions, constitutive_updates, zero_updates,
           halo_plans, halo_gathers, halo_scatters, halo_scratch_bytes, finite_checks,
           source_batches, source_points, source_copies, polarization_updates,
-          polarization_subtractions, dft_updates, dft_omega,
+          polarization_subtractions, dft_updates, dft_omega, legacy_flux_updates,
+          legacy_flux_terms, legacy_flux_partial_count,
           magnetic_states, magnetic_snapshot_bytes,
           magnetic_layout_fingerprint(state.fingerprint_, plan.magnetic_state_arrays),
           plan.magnetic_half_step, material_refreshes, material_staging_bytes,
@@ -4814,6 +5036,22 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
       }
       if (op.material_count) state.transfer_->synchronize();
     };
+    const auto accumulate_legacy_flux = [&](const NvidiaCompiledOperation &op) {
+      for (size_t i = op.legacy_flux_first;
+           i < op.legacy_flux_first + op.legacy_flux_count; ++i) {
+        const NvidiaCompiledLegacyFluxUpdate &update = executable.legacy_flux_updates_[i];
+        double *result = static_cast<double *>(
+                             executable.legacy_flux_current_.opaque_handle()) +
+                         update.flux_ordinal;
+        for (size_t j = update.term_first; j < update.term_first + update.term_count; ++j) {
+          const nvidia::legacy_flux_term_launch &term = executable.legacy_flux_terms_[j];
+          if (!term.e_real || !term.h_real) continue;
+          nvidia::launch_legacy_flux_term(term,
+                                          executable.legacy_flux_partials_.opaque_handle(),
+                                          result, *state.transfer_);
+        }
+      }
+    };
     for (int step = 0; step < num_steps; ++step) {
       bool segment_guard = false;
       if (executable.program_ == StepProgram::solve_cw) {
@@ -4982,6 +5220,37 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               count_cw_kernel();
             }
             break;
+          case OpKind::update_flux_half: {
+            const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
+                                                 "clearing NVIDIA legacy flux half sample");
+            nvidia::fill_byte_async(executable.legacy_flux_current_, 0, 0, bytes,
+                                    *state.transfer_);
+            accumulate_legacy_flux(op);
+            nvidia::copy_device_to_device_async(executable.legacy_flux_half_, 0,
+                                                executable.legacy_flux_current_, 0, bytes,
+                                                *state.transfer_);
+            break;
+          }
+          case OpKind::update_flux: {
+            const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
+                                                 "copying NVIDIA legacy flux result");
+            nvidia::fill_byte_async(executable.legacy_flux_current_, 0, 0, bytes,
+                                    *state.transfer_);
+            accumulate_legacy_flux(op);
+            nvidia::launch_legacy_flux_average(executable.legacy_flux_current_.opaque_handle(),
+                                               executable.legacy_flux_half_.opaque_handle(),
+                                               op.legacy_flux_count, *state.transfer_);
+            nvidia::copy_device_to_host_async(executable.legacy_flux_host_.data(),
+                                              executable.legacy_flux_current_, 0, bytes,
+                                              *state.transfer_);
+            state.transfer_->synchronize();
+            sum_to_all(static_cast<const double *>(executable.legacy_flux_host_.data()),
+                       executable.legacy_flux_global_.data(), int(op.legacy_flux_count));
+            backend_publish_legacy_flux(f_, executable.legacy_flux_global_.data(),
+                                        executable.legacy_flux_global_.size(),
+                                        "NVIDIA legacy flux publication");
+            break;
+          }
           case OpKind::finite_value_check: {
             if (account_cw && cw_profile_mode_requested()) break;
             const bool due = finite_mode == FiniteCheckMode::step ||
