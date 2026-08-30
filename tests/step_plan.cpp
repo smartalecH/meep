@@ -1978,8 +1978,12 @@ static void test_legacy_flux_schema_signature() {
                        "signature ignored legacy flux ordinal");
   CHECK_FLUX_SIGNATURE(++changed.legacy_flux_updates[0].term_index,
                        "signature ignored legacy flux term span");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_updates[0].term_count,
+                       "signature ignored legacy flux term count");
   CHECK_FLUX_SIGNATURE(++changed.legacy_flux_updates[0].recipe_signature,
                        "signature ignored legacy flux recipe identity");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].term_ordinal,
+                       "signature ignored legacy flux signed-product ordinal");
   CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].region_ordinal,
                        "signature ignored legacy flux region ordinal");
   CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].sign = 1,
@@ -1988,11 +1992,17 @@ static void test_legacy_flux_schema_signature() {
                        "signature ignored legacy flux chunk");
   CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].e_real.value,
                        "signature ignored legacy flux field identity");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].h_imag.value,
+                       "signature ignored legacy flux imaginary field identity");
   CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].begin.set_direction(
                            X, changed.legacy_flux_terms[0].begin.in_direction(X) + 2),
                        "signature ignored legacy flux region extent");
   CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].base,
                        "signature ignored legacy flux base");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].counts[2],
+                       "signature ignored legacy flux loop count");
+  CHECK_FLUX_SIGNATURE(++changed.legacy_flux_terms[0].strides[1],
+                       "signature ignored legacy flux loop stride");
   CHECK_FLUX_SIGNATURE(--changed.legacy_flux_terms[0].e_offsets[0],
                        "signature ignored legacy flux interpolation offset");
   CHECK_FLUX_SIGNATURE(changed.legacy_flux_terms[0].phase_imag += 0.25,
@@ -2014,23 +2024,58 @@ static void test_live_legacy_flux_spans() {
   grid_volume gv = vol2d(3.0, 3.0, 8.0);
   structure s(gv, one, no_pml());
   fields f(&s);
+  f.require_component(Ex);
+  f.require_component(Ey);
+  f.require_component(Hx);
+  f.require_component(Hy);
   f.add_flux_plane(volume(vec(0.0, -1.0), vec(0.0, 1.0)));
+  f.advance(1);
+  refresh_legacy_flux_descriptors(f);
   StepPlan one = build_step_plan(f, StepProgram::ordinary);
   CHECK(one.legacy_flux_updates.size() == 1,
         "one live legacy flux produced %zu update rows", one.legacy_flux_updates.size());
-  const LegacyFluxUpdate expected_one = {0, 0, 0, 0};
+  const uint32_t one_count = uint32_t(f.descriptors->legacy_fluxes[0].terms.size());
+  const LegacyFluxUpdate expected_one = {
+      0, 0, one_count, f.descriptors->legacy_fluxes[0].recipe_signature};
   if (!one.legacy_flux_updates.empty())
     CHECK(one.legacy_flux_updates[0] == expected_one,
-          "one live legacy flux has the wrong empty PR5 recipe span");
+          "one live legacy flux has the wrong PR6 recipe span");
+  CHECK(or_to_all(one_count > 0), "one live legacy flux produced no recipe terms");
 
   f.add_flux_plane(volume(vec(0.5, -1.0), vec(0.5, 1.0)));
+  const StepPlan stale = build_step_plan(f, StepProgram::ordinary);
+  CHECK(stale.legacy_flux_updates.size() == 2 && stale.legacy_flux_terms.empty(),
+        "stale PR6 recipes were consumed after a legacy flux list mutation");
+  for (const Operation &op : stale.operations)
+    if (op.kind == OpKind::update_flux_half || op.kind == OpKind::update_flux)
+      CHECK(op.accesses.empty(), "%s consumed stale legacy flux accesses",
+            op_kind_name(op.kind));
+  refresh_legacy_flux_descriptors(f);
   StepPlan two = build_step_plan(f, StepProgram::ordinary);
   CHECK(two.legacy_flux_updates.size() == 2,
         "two live legacy fluxes produced %zu update rows", two.legacy_flux_updates.size());
+  uint32_t term_index = 0;
   for (size_t i = 0; i < two.legacy_flux_updates.size(); ++i) {
-    const LegacyFluxUpdate expected = {uint32_t(i), 0, 0, 0};
+    const uint32_t count = uint32_t(f.descriptors->legacy_fluxes[i].terms.size());
+    const LegacyFluxUpdate expected = {uint32_t(i), term_index, count,
+                                       f.descriptors->legacy_fluxes[i].recipe_signature};
     CHECK(two.legacy_flux_updates[i] == expected,
-          "legacy flux update %zu has the wrong list ordinal or PR5 recipe span", i);
+          "legacy flux update %zu has the wrong list ordinal or PR6 recipe span", i);
+    term_index += count;
+  }
+  CHECK(two.legacy_flux_terms.size() == term_index,
+        "legacy flux plan has %zu terms for spans totaling %u", two.legacy_flux_terms.size(),
+        term_index);
+
+  std::vector<ArrayId> expected_accesses;
+  for (const LegacyFluxTerm &term : two.legacy_flux_terms) {
+    const ArrayId ids[] = {term.e_real, term.e_imag, term.h_real, term.h_imag};
+    for (ArrayId id : ids) {
+      if (!is_valid(id)) continue;
+      bool duplicate = false;
+      for (ArrayId prior : expected_accesses) duplicate = duplicate || prior == id;
+      if (!duplicate) expected_accesses.push_back(id);
+    }
   }
 
   size_t markers = 0;
@@ -2039,11 +2084,17 @@ static void test_live_legacy_flux_spans() {
       ++markers;
       CHECK(op.legacy_flux_index == 0 && op.legacy_flux_count == 2,
             "%s does not cover both live legacy flux updates", op_kind_name(op.kind));
-      /* PR5 owns the action vocabulary and live list ordinals. PR6 owns the
-         region recipes and is therefore the first layer that can attach the
-         exact field-read union to both markers. */
-      CHECK(op.accesses.empty(), "%s populated accesses before PR6 flux recipes",
-            op_kind_name(op.kind));
+      CHECK(op.accesses.size() == expected_accesses.size(),
+            "%s has %zu accesses, expected the exact %zu-field recipe union",
+            op_kind_name(op.kind), op.accesses.size(), expected_accesses.size());
+      for (size_t i = 0; i < op.accesses.size() && i < expected_accesses.size(); ++i) {
+        const BufferAccess &access = op.accesses[i];
+        const ArraySpec &spec = f.array_catalog->spec(expected_accesses[i]);
+        CHECK(access.array.id == expected_accesses[i] && access.array.offset == 0 &&
+                  access.array.elements == spec.elements && access.mode == AccessMode::read,
+              "%s access %zu does not match the exact recipe read union", op_kind_name(op.kind),
+              i);
+      }
     }
   CHECK(markers == 2, "two live legacy fluxes produced %zu flux markers", markers);
 }

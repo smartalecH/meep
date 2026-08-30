@@ -170,6 +170,42 @@ void add_access(fields &f, Operation &op, ArrayId id, AccessMode mode) {
   op.accesses.push_back(BufferAccess{ArrayRef{id, 0, spec.elements}, mode});
 }
 
+LegacyFluxTerm make_legacy_flux_term(uint32_t flux_ordinal,
+                                    const LegacyFluxTermDescriptor &source) {
+  LegacyFluxTerm term = {};
+  term.flux_ordinal = flux_ordinal;
+  term.term_ordinal = source.term_ordinal;
+  term.region_ordinal = source.region_ordinal;
+  term.sign = source.sign;
+  term.chunk = source.chunk;
+  term.e_component = source.e_component;
+  term.h_component = source.h_component;
+  term.e_real = source.e_real;
+  term.e_imag = source.e_imag;
+  term.h_real = source.h_real;
+  term.h_imag = source.h_imag;
+  term.begin = source.begin;
+  term.end = source.end;
+  term.lattice_shift = source.lattice_shift;
+  term.symmetry_index = source.symmetry_index;
+  term.base = source.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    term.counts[axis] = source.counts[axis];
+    term.strides[axis] = source.strides[axis];
+    for (int endpoint = 0; endpoint < 4; ++endpoint)
+      term.boundary_weights[axis][endpoint] = source.boundary_weights[axis][endpoint];
+  }
+  for (int i = 0; i < 2; ++i) {
+    term.e_offsets[i] = source.e_offsets[i];
+    term.h_offsets[i] = source.h_offsets[i];
+  }
+  term.phase_real = source.phase_real;
+  term.phase_imag = source.phase_imag;
+  term.dV0 = source.dV0;
+  term.dV1 = source.dV1;
+  return term;
+}
+
 size_t checked_product(size_t a, size_t b, const char *what) {
   if (a && b > std::numeric_limits<size_t>::max() / a) throw std::overflow_error(what);
   return a * b;
@@ -590,13 +626,44 @@ public:
   void add_legacy_flux(bool present, OpKind kind) {
     if (!present) return;
     if (plan_.legacy_flux_updates.empty()) {
-      uint32_t ordinal = 0;
-      for (const flux_vol *flux = f_.fluxes; flux; flux = flux->next, ++ordinal)
-        plan_.legacy_flux_updates.push_back(LegacyFluxUpdate{ordinal, 0, 0, 0});
+      size_t live_count = 0;
+      for (const flux_vol *flux = f_.fluxes; flux; flux = flux->next) ++live_count;
+      if (live_count > std::numeric_limits<uint32_t>::max())
+        throw std::overflow_error("legacy flux update count overflow");
+
+      const bool recipes_current =
+          f_.descriptors && f_.descriptors->legacy_fluxes.size() == live_count &&
+          f_.descriptors->legacy_flux_generation ==
+              generation(f_, MutationKind::legacy_flux_definition);
+      for (uint32_t ordinal = 0; ordinal < uint32_t(live_count); ++ordinal) {
+        const size_t first = plan_.legacy_flux_terms.size();
+        if (recipes_current) {
+          const LegacyFluxDescriptor &descriptor = f_.descriptors->legacy_fluxes[ordinal];
+          if (descriptor.flux_ordinal != ordinal)
+            throw std::runtime_error("legacy flux descriptor order does not match the live list");
+          for (const LegacyFluxTermDescriptor &source : descriptor.terms)
+            plan_.legacy_flux_terms.push_back(make_legacy_flux_term(ordinal, source));
+        }
+        const size_t count = plan_.legacy_flux_terms.size() - first;
+        if (first > std::numeric_limits<uint32_t>::max() ||
+            count > std::numeric_limits<uint32_t>::max())
+          throw std::overflow_error("legacy flux term span overflow");
+        plan_.legacy_flux_updates.push_back(
+            LegacyFluxUpdate{ordinal, uint32_t(first), uint32_t(count),
+                             recipes_current
+                                 ? f_.descriptors->legacy_fluxes[ordinal].recipe_signature
+                                 : 0});
+      }
     }
     Operation &op = add(kind, field_type(NUM_FIELD_TYPES), guard_static(true));
     op.legacy_flux_index = 0;
     op.legacy_flux_count = uint32_t(plan_.legacy_flux_updates.size());
+    for (const LegacyFluxTerm &term : plan_.legacy_flux_terms) {
+      add_access(f_, op, term.e_real, AccessMode::read);
+      add_access(f_, op, term.e_imag, AccessMode::read);
+      add_access(f_, op, term.h_real, AccessMode::read);
+      add_access(f_, op, term.h_imag, AccessMode::read);
+    }
   }
 
   /* One semantic boundary step.
