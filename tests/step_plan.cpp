@@ -43,6 +43,7 @@
 
 #include "backend/lifecycle.hpp"
 #include "backend/prepare.hpp"
+#include "backend/random_state.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/step_plan.hpp"
 #include "meep_internals.hpp"
@@ -1369,6 +1370,7 @@ static void test_polarization_schema_signature() {
   update.region.strides[1] = 17;
   update.region.strides[2] = 37;
   update.region.variant_key = polarization_one_offdiagonal | polarization_drude;
+  update.ft = E_stuff;
   update.state_index = 4;
   update.p = ArrayId{1};
   update.p_prev = ArrayId{2};
@@ -1392,6 +1394,8 @@ static void test_polarization_schema_signature() {
   update.gyro_tensor[1][0] = -0.11;
   update.gyro_model = GYROTROPIC_SATURATED;
   update.dt = 0.01;
+  update.noise_amplitude = 0.0;
+  update.noise_algorithm_version = 0;
   plan.polarization_updates.push_back(update);
 
   PolarizationSubtraction subtraction = {};
@@ -1426,6 +1430,10 @@ static void test_polarization_schema_signature() {
   CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].region.begin.set_direction(
                             X, changed.polarization_updates[0].region.begin.in_direction(X) + 2),
                         "signature ignored polarization region begin");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].ft = H_stuff,
+                        "signature ignored polarization field family");
+  CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].state_index,
+                        "signature ignored polarization state ordinal");
   CHECK_SIGNATURE_FIELD(++changed.polarization_updates[0].p.value,
                         "signature ignored polarization ArrayId");
   CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].kind = PolarizationUpdateKind::lorentzian,
@@ -1442,9 +1450,314 @@ static void test_polarization_schema_signature() {
                         "signature ignored gyrotropic tensor");
   CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].gyro_model = GYROTROPIC_DRUDE,
                         "signature ignored gyrotropic model");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].noise_amplitude = 0.125,
+                        "signature ignored noise amplitude");
+  CHECK_SIGNATURE_FIELD(changed.polarization_updates[0].noise_algorithm_version = 1,
+                        "signature ignored noise algorithm version");
   CHECK_SIGNATURE_FIELD(++changed.polarization_subtractions[0].elements,
                         "signature ignored polarization subtraction size");
 #undef CHECK_SIGNATURE_FIELD
+
+  const PolarizationUpdate copy = update;
+  CHECK(copy == update, "identical polarization updates compare unequal");
+  PolarizationUpdate changed_update = update;
+  changed_update.ft = H_stuff;
+  CHECK(changed_update != update, "polarization field family did not affect equality");
+  changed_update = update;
+  changed_update.noise_amplitude = 0.125;
+  CHECK(changed_update != update, "noise amplitude did not affect equality");
+  changed_update = update;
+  changed_update.noise_algorithm_version = 1;
+  CHECK(changed_update != update, "noise algorithm version did not affect equality");
+
+  plan.clear();
+  CHECK(plan.polarization_updates.empty() && plan.polarization_subtractions.empty(),
+        "StepPlan::clear retained polarization state");
+  plan.clear();
+  CHECK(plan.polarization_updates.empty() && plan.polarization_subtractions.empty(),
+        "StepPlan::clear is not idempotent for polarization state");
+}
+
+static void test_noisy_polarization_group_schedule() {
+  grid_volume gv = vol2d(3.0, 3.0, 8.0);
+  structure s(gv, one, no_pml(), identity(), 2);
+  fields f(&s);
+  FOR_COMPONENTS(c)
+  if (gv.has_field(c)) f.require_component(c);
+  gaussian_src_time source(0.2, 0.1);
+  f.add_point_source(Ez, source, vec(0.0, 0.0));
+  f.advance(1);
+
+  bool owns_chunk = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+  std::vector<ArrayId> ids;
+  if (f.array_catalog)
+    for (size_t i = 0; i < f.array_catalog->size() && ids.size() < 6; ++i)
+      if (!is_valid(f.array_catalog->spec(ArrayId{uint32_t(i)}).alias_of))
+        ids.push_back(ArrayId{uint32_t(i)});
+
+  bool exercised = false;
+  if (ids.size() >= 6) {
+    exercised = true;
+    auto blank = [&](int state, component c, int cmp) {
+      PolarizationUpdate update = {};
+      update.kind = PolarizationUpdateKind::lorentzian;
+      update.region.chunk = 0;
+      update.region.c = c;
+      update.region.cmp = cmp;
+      update.region.begin = ivec(0, 0, 0);
+      update.region.end = ivec(2, 2, 0);
+      update.region.base = 0;
+      update.region.counts[0] = update.region.counts[1] = 2;
+      update.region.counts[2] = 1;
+      update.region.strides[0] = 1;
+      update.region.strides[1] = 4;
+      update.region.strides[2] = 0;
+      update.region.variant_key = 0;
+      update.ft = is_electric(c) ? E_stuff : H_stuff;
+      update.state_index = state;
+      update.p = update.p_prev = invalid_array();
+      update.p_cross1 = update.p_prev_cross1 = invalid_array();
+      update.p_cross2 = update.p_prev_cross2 = invalid_array();
+      update.primary_w = update.cross_w1 = update.cross_w2 = invalid_array();
+      update.diagonal_sigma = update.offdiagonal_sigma1 = update.offdiagonal_sigma2 =
+          invalid_array();
+      update.primary_stride = update.cross_stride1 = update.cross_stride2 = 0;
+      update.omega_0 = 0.31;
+      update.gamma = 0.07;
+      update.alpha = 0.0;
+      memset(update.gyro_tensor, 0, sizeof(update.gyro_tensor));
+      update.gyro_model = GYROTROPIC_LORENTZIAN;
+      update.dt = 0.0125;
+      update.noise_amplitude = 0.0;
+      update.noise_algorithm_version = 0;
+      return update;
+    };
+    auto recurrence = [&](int state, component c, int cmp, size_t base) {
+      PolarizationUpdate update = blank(state, c, cmp);
+      update.p = ids[base];
+      update.p_prev = ids[base + 1];
+      update.primary_w = ids[base + 2];
+      update.diagonal_sigma = ids[base + 3];
+      return update;
+    };
+    auto noise = [&](const PolarizationUpdate &recurrence_row, ArrayId p, ArrayId sigma) {
+      PolarizationUpdate update = blank(recurrence_row.state_index, recurrence_row.region.c,
+                                        recurrence_row.region.cmp);
+      update.kind = PolarizationUpdateKind::noisy_add;
+      update.p = p;
+      update.diagonal_sigma = sigma;
+      update.omega_0 = recurrence_row.omega_0;
+      update.gamma = recurrence_row.gamma;
+      update.dt = recurrence_row.dt;
+      update.noise_amplitude = 0.125;
+      update.noise_algorithm_version = counter_random_algorithm_version;
+      return update;
+    };
+
+    StepPlan plan;
+    Operation op = {};
+    op.kind = OpKind::update_polarization;
+    op.ft = E_stuff;
+    op.guard = guard_always();
+    op.descriptor_index = 0;
+    op.descriptor_count = 0;
+    append_polarization_update_group(f, plan, op, std::vector<PolarizationUpdate>(),
+                                     std::vector<PolarizationUpdate>());
+    CHECK(plan.polarization_updates.empty() && op.descriptor_count == 0 && op.accesses.empty(),
+          "empty polarization group changed the plan");
+
+    const PolarizationUpdate a0 = recurrence(0, Ex, 0, 0);
+    const PolarizationUpdate a1 = recurrence(0, Ey, 0, 0);
+    const PolarizationUpdate a_noise_only = blank(0, Ez, 0);
+    const std::vector<PolarizationUpdate> a_recurrences{a0, a1};
+    const std::vector<PolarizationUpdate> a_noise{
+        noise(a0, a0.p, a0.diagonal_sigma), noise(a1, a1.p, a1.diagonal_sigma),
+        noise(a_noise_only, ids[0], ids[3])};
+    append_polarization_update_group(f, plan, op, a_recurrences, a_noise);
+
+    const PolarizationUpdate deterministic = recurrence(1, Ez, 0, 0);
+    append_polarization_update_group(f, plan, op, std::vector<PolarizationUpdate>{deterministic},
+                                     std::vector<PolarizationUpdate>());
+
+    const PolarizationUpdate b0 = recurrence(2, Ez, 1, 0);
+    PolarizationUpdate b0_drude = b0;
+    b0_drude.region.variant_key |= polarization_drude;
+    const std::vector<PolarizationUpdate> b_noise{
+        noise(b0_drude, b0_drude.p, b0_drude.diagonal_sigma)};
+    append_polarization_update_group(f, plan, op,
+                                     std::vector<PolarizationUpdate>{b0_drude}, b_noise);
+
+    CHECK(op.descriptor_index == 0 && op.descriptor_count == plan.polarization_updates.size(),
+          "noisy polarization operation span does not cover every grouped action");
+    CHECK(plan.polarization_updates.size() == 8,
+          "noisy polarization schedule has %zu actions, expected 8",
+          plan.polarization_updates.size());
+    const PolarizationUpdateKind expected_kinds[] = {
+        PolarizationUpdateKind::lorentzian, PolarizationUpdateKind::lorentzian,
+        PolarizationUpdateKind::noisy_add,  PolarizationUpdateKind::noisy_add,
+        PolarizationUpdateKind::noisy_add,  PolarizationUpdateKind::lorentzian,
+        PolarizationUpdateKind::lorentzian, PolarizationUpdateKind::noisy_add};
+    const int expected_states[] = {0, 0, 0, 0, 0, 1, 2, 2};
+    for (size_t i = 0; i < plan.polarization_updates.size(); ++i) {
+      CHECK(plan.polarization_updates[i].kind == expected_kinds[i] &&
+                plan.polarization_updates[i].state_index == expected_states[i],
+            "noisy susceptibility group order differs at action %zu", i);
+    }
+    CHECK((plan.polarization_updates[6].region.variant_key & polarization_drude) != 0,
+          "noisy schedule did not retain the Drude recurrence variant");
+    CHECK(!is_valid(plan.polarization_updates[4].primary_w),
+          "noise-only row unexpectedly requires a primary W array");
+
+    std::vector<BufferAccess> expected_accesses;
+    auto expect_access = [&](ArrayId id, AccessMode mode) {
+      if (!is_valid(id)) return;
+      merge_expected_access(expected_accesses,
+                            BufferAccess{ArrayRef{id, 0, f.array_catalog->spec(id).elements}, mode});
+    };
+    for (const PolarizationUpdate &update : a_recurrences) {
+      expect_access(update.p, AccessMode::read_write);
+      expect_access(update.p_prev, AccessMode::read_write);
+      expect_access(update.primary_w, AccessMode::read);
+      expect_access(update.diagonal_sigma, AccessMode::read);
+    }
+    expect_access(deterministic.p, AccessMode::read_write);
+    expect_access(deterministic.p_prev, AccessMode::read_write);
+    expect_access(deterministic.primary_w, AccessMode::read);
+    expect_access(deterministic.diagonal_sigma, AccessMode::read);
+    expect_access(b0_drude.p, AccessMode::read_write);
+    expect_access(b0_drude.p_prev, AccessMode::read_write);
+    expect_access(b0_drude.primary_w, AccessMode::read);
+    expect_access(b0_drude.diagonal_sigma, AccessMode::read);
+    for (const PolarizationUpdate &update : a_noise) {
+      expect_access(update.p, AccessMode::read_write);
+      expect_access(update.diagonal_sigma, AccessMode::read);
+    }
+    for (const PolarizationUpdate &update : b_noise) {
+      expect_access(update.p, AccessMode::read_write);
+      expect_access(update.diagonal_sigma, AccessMode::read);
+    }
+    CHECK(op.accesses.size() == expected_accesses.size(),
+          "noisy operation has %zu accesses, expected exact union of %zu", op.accesses.size(),
+          expected_accesses.size());
+    for (const BufferAccess &want : expected_accesses) {
+      const BufferAccess *got = find_access(op, want.array.id);
+      CHECK(got && same_access(*got, want), "noisy operation has an incorrect access for ArrayId %u",
+            want.array.id.value);
+    }
+
+    plan.operations.push_back(op);
+    plan.signature = compute_step_plan_signature(plan);
+    StepPlan reordered = plan;
+    std::swap(reordered.polarization_updates[1], reordered.polarization_updates[2]);
+    CHECK(compute_step_plan_signature(reordered) != plan.signature,
+          "signature ignored recurrence/noise group ordering");
+
+    bool rejected = false;
+    try {
+      StepPlan malformed_plan;
+      Operation malformed_op = op;
+      malformed_op.accesses.clear();
+      malformed_op.descriptor_index = malformed_op.descriptor_count = 0;
+      PolarizationUpdate malformed_noise = a_noise[0];
+      malformed_noise.p_prev = ids[4];
+      append_polarization_update_group(f, malformed_plan, malformed_op,
+                                       std::vector<PolarizationUpdate>(),
+                                       std::vector<PolarizationUpdate>{malformed_noise});
+    }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected, "noncanonical noisy action was accepted");
+
+    StepPlan noise_only_plan;
+    Operation noise_only_op = {};
+    noise_only_op.kind = OpKind::update_polarization;
+    noise_only_op.ft = E_stuff;
+    noise_only_op.guard = guard_always();
+    PolarizationUpdate noise_only_identity = blank(5, Ex, 0);
+    const PolarizationUpdate isolated_noise = noise(noise_only_identity, ids[4], ids[5]);
+    append_polarization_update_group(f, noise_only_plan, noise_only_op,
+                                     std::vector<PolarizationUpdate>(),
+                                     std::vector<PolarizationUpdate>{isolated_noise});
+    CHECK(noise_only_op.accesses.size() == 2,
+          "noise-only group has %zu accesses instead of exact P+sigma", noise_only_op.accesses.size());
+    const BufferAccess *noise_p = find_access(noise_only_op, isolated_noise.p);
+    const BufferAccess *noise_sigma = find_access(noise_only_op, isolated_noise.diagonal_sigma);
+    CHECK(noise_p && noise_p->mode == AccessMode::read_write,
+          "noise-only P access is not read-write");
+    CHECK(noise_sigma && noise_sigma->mode == AccessMode::read,
+          "noise-only diagonal sigma access is not read-only");
+
+    auto expect_group_rejection = [&](const std::vector<PolarizationUpdate> &recurrences,
+                                      const std::vector<PolarizationUpdate> &noise_rows,
+                                      const char *message) {
+      StepPlan malformed_plan;
+      Operation malformed_op = {};
+      malformed_op.kind = OpKind::update_polarization;
+      malformed_op.ft = recurrences.empty() ? noise_rows.front().ft : recurrences.front().ft;
+      malformed_op.guard = guard_always();
+      bool group_rejected = false;
+      try {
+        append_polarization_update_group(f, malformed_plan, malformed_op, recurrences, noise_rows);
+      }
+      catch (const std::invalid_argument &) { group_rejected = true; }
+      CHECK(group_rejected && malformed_plan.polarization_updates.empty() &&
+                malformed_op.descriptor_count == 0 && malformed_op.accesses.empty(),
+            "%s", message);
+    };
+
+    PolarizationUpdate mixed_kind = a1;
+    mixed_kind.kind = PolarizationUpdateKind::gyrotropic;
+    expect_group_rejection(std::vector<PolarizationUpdate>{a0, mixed_kind},
+                           std::vector<PolarizationUpdate>(),
+                           "mixed Lorentz/gyrotropic recurrence group was accepted");
+
+    PolarizationUpdate gyrotropic = a0;
+    gyrotropic.kind = PolarizationUpdateKind::gyrotropic;
+    expect_group_rejection(std::vector<PolarizationUpdate>{gyrotropic},
+                           std::vector<PolarizationUpdate>{a_noise[0]},
+                           "gyrotropic recurrence accepted a noisy-add group");
+
+    PolarizationUpdate mismatched_noise = a_noise[0];
+    mismatched_noise.p = ids[4];
+    expect_group_rejection(std::vector<PolarizationUpdate>{a0},
+                           std::vector<PolarizationUpdate>{mismatched_noise},
+                           "noise row with mismatched P was accepted");
+    mismatched_noise = a_noise[0];
+    mismatched_noise.diagonal_sigma = ids[5];
+    expect_group_rejection(std::vector<PolarizationUpdate>{a0},
+                           std::vector<PolarizationUpdate>{mismatched_noise},
+                           "noise row with mismatched diagonal sigma was accepted");
+    mismatched_noise = a_noise[0];
+    ++mismatched_noise.region.base;
+    expect_group_rejection(std::vector<PolarizationUpdate>{a0},
+                           std::vector<PolarizationUpdate>{mismatched_noise},
+                           "noise row with mismatched region was accepted");
+    mismatched_noise = a_noise[0];
+    mismatched_noise.gamma += 0.01;
+    expect_group_rejection(std::vector<PolarizationUpdate>{a0},
+                           std::vector<PolarizationUpdate>{mismatched_noise},
+                           "noise row with mismatched recurrence coefficients was accepted");
+    std::vector<PolarizationUpdate> inconsistent_noise = a_noise;
+    inconsistent_noise[1].noise_amplitude += 0.25;
+    expect_group_rejection(a_recurrences, inconsistent_noise,
+                           "noise group with inconsistent coefficients was accepted");
+    expect_group_rejection(a_recurrences,
+                           std::vector<PolarizationUpdate>{a_noise.front()},
+                           "noisy recurrence group with an omitted noise row was accepted");
+
+    const size_t before_reappearance = plan.polarization_updates.size();
+    rejected = false;
+    try {
+      append_polarization_update_group(f, plan, op, a_recurrences, a_noise);
+    }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected && plan.polarization_updates.size() == before_reappearance,
+          "noncontiguous repeated polarization identity was accepted");
+  }
+  CHECK(exercised || !owns_chunk,
+        "an owning rank lacked enough catalog rows for noisy schedule coverage");
+  CHECK(or_to_all(exercised), "no rank had enough catalog rows for noisy schedule coverage");
 }
 
 static void test_legacy_flux_schema_signature() {
@@ -1980,6 +2293,7 @@ int main(int argc, char **argv) {
   test_material_schema_signature();
   test_magnetic_schema_signature();
   test_polarization_schema_signature();
+  test_noisy_polarization_group_schedule();
   test_legacy_flux_schema_signature();
   test_live_legacy_flux_spans();
   test_beta_schema_signature();
