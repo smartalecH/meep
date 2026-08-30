@@ -90,6 +90,8 @@ struct lifetime_counts {
   size_t polarization_arrays_at_create;
   size_t polarization_updates_at_compile;
   size_t polarization_subtractions_at_compile;
+  size_t multilevel_population_updates_at_compile;
+  size_t multilevel_transition_updates_at_compile;
   size_t beta_updates_at_compile;
   size_t bfast_updates_at_compile;
   size_t cylindrical_m_updates_at_compile;
@@ -104,6 +106,11 @@ struct lifetime_counts {
   bool rebuild_saw_live_imaginary;
   bool migrate_authoritative_value;
   realnum authoritative_value;
+  bool migrate_multilevel_values;
+  realnum authoritative_population;
+  realnum authoritative_p;
+  realnum authoritative_p_prev;
+  int multilevel_migrations;
   bool fail_rebuild;
   bool fail_create_state;
   bool fail_initialize;
@@ -133,13 +140,17 @@ struct lifetime_counts {
         noisy_seed_refreshes(0), last_noisy_seed(), arrays_at_create(0),
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
+        multilevel_population_updates_at_compile(0),
+        multilevel_transition_updates_at_compile(0),
         bfast_updates_at_compile(0), cylindrical_m_updates_at_compile(0),
         cylindrical_origin_actions_at_compile(0), legacy_flux_updates_at_compile(0),
         legacy_flux_terms_at_compile(0), legacy_flux_half_accesses_at_compile(0),
         legacy_flux_final_accesses_at_compile(0), gyrotropic_update_at_compile(false),
         polarization_zero_at_create(true), connections_current_at_create(false),
         rebuild_saw_live_imaginary(false), migrate_authoritative_value(false),
-        authoritative_value(0), fail_rebuild(false), fail_create_state(false),
+        authoritative_value(0), migrate_multilevel_values(false),
+        authoritative_population(realnum(0.625)), authoritative_p(realnum(0.375)),
+        authoritative_p_prev(realnum(-0.25)), multilevel_migrations(0), fail_rebuild(false),
         fail_initialize(false), fail_compile(false), fail_advance(false),
         corrupt_catalog_after_compile(false),
         fail_magnetic_synchronize(false), fail_magnetic_restore(false),
@@ -208,6 +219,10 @@ public:
     if (counts.fail_compile) throw std::runtime_error("injected executable compilation failure");
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
     counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
+    counts.multilevel_population_updates_at_compile =
+        plan.multilevel_population_updates.size();
+    counts.multilevel_transition_updates_at_compile =
+        plan.multilevel_transition_updates.size();
     counts.beta_updates_at_compile = plan.beta_updates.size();
     counts.bfast_updates_at_compile = plan.bfast_updates.size();
     counts.cylindrical_m_updates_at_compile = plan.cylindrical_m_updates.size();
@@ -344,6 +359,28 @@ public:
         const ArrayId id = f.array_catalog->find({chunk, int(array_kind::f), int(c), 1, 0});
         if (is_valid(id) && f.array_catalog->resolve<realnum>(id) == f.chunks[chunk]->f[c][1])
           counts.rebuild_saw_live_imaginary = true;
+      }
+    }
+    if (counts.migrate_multilevel_values && f.descriptors && f.array_catalog) {
+      for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+        if (descriptor.kind != SusceptibilityKind::multilevel ||
+            !is_valid(descriptor.multilevel_populations))
+          continue;
+        realnum *populations =
+            f.array_catalog->resolve<realnum>(descriptor.multilevel_populations);
+        const size_t population_elements =
+            f.array_catalog->spec(descriptor.multilevel_populations).elements;
+        for (size_t i = 0; i < population_elements; ++i)
+          populations[i] = counts.authoritative_population + realnum(i) * realnum(0.000125);
+        for (const MultilevelStateArrays &row : descriptor.multilevel_states) {
+          realnum *p = f.array_catalog->resolve<realnum>(row.p);
+          realnum *p_prev = f.array_catalog->resolve<realnum>(row.p_prev);
+          for (size_t i = 0; i < row.elements; ++i) {
+            p[i] = counts.authoritative_p + realnum(i) * realnum(0.00025);
+            p_prev[i] = counts.authoritative_p_prev - realnum(i) * realnum(0.000375);
+          }
+        }
+        ++counts.multilevel_migrations;
       }
     }
     if (counts.fail_rebuild) throw std::runtime_error("injected layout migration failure");
@@ -3479,6 +3516,387 @@ static void test_backend_reselection_invalidates_representation() {
   delete s;
 }
 
+static void add_multilevel_lifecycle_states(structure &s) {
+  const realnum e_gamma[] = {realnum(0.02), 0, 0, 0, realnum(0.03), 0, 0, 0,
+                             realnum(0.04)};
+  const realnum e_n0[] = {realnum(0.7), realnum(0.2), realnum(0.1)};
+  const realnum e_alpha[] = {realnum(-0.2), realnum(0.3), realnum(0.4), realnum(-0.5),
+                             realnum(-0.6), realnum(0.7)};
+  const realnum e_omega[] = {realnum(0.73), realnum(0.91)};
+  const realnum e_damping[] = {realnum(0.06), realnum(0.08)};
+  const realnum e_sigmat[] = {1, 1, 1, 1, 1, 2, 2, 2, 2, 2};
+  multilevel_susceptibility electric(3, 2, e_gamma, e_n0, e_alpha, e_omega, e_damping,
+                                     e_sigmat);
+  const realnum h_gamma[] = {realnum(0.01), realnum(0.005), 0, realnum(0.025)};
+  const realnum h_n0[] = {realnum(0.8), realnum(0.2)};
+  const realnum h_alpha[] = {realnum(-0.4), realnum(0.5)};
+  const realnum h_omega[] = {realnum(0.63)};
+  const realnum h_damping[] = {realnum(0.04)};
+  const realnum h_sigmat[] = {3, 3, 3, 3, 3};
+  multilevel_susceptibility magnetic(2, 1, h_gamma, h_n0, h_alpha, h_omega, h_damping,
+                                     h_sigmat);
+  s.add_susceptibility(unit_epsilon, E_stuff, electric);
+  s.add_susceptibility(unit_epsilon, H_stuff, magnetic);
+}
+
+struct multilevel_value_snapshot {
+  StorageKey key;
+  const void *address;
+  std::vector<realnum> values;
+};
+
+static std::vector<multilevel_value_snapshot> capture_multilevel_values(const fields &f) {
+  std::vector<multilevel_value_snapshot> result;
+  if (!f.array_catalog) return result;
+  for (size_t i = 0; i < f.array_catalog->size(); ++i) {
+    const ArrayId id{uint32_t(i)};
+    const StorageKey key = f.array_catalog->key(id);
+    if (key.kind != int(array_kind::polarization_internal)) continue;
+    const ArraySpec &spec = f.array_catalog->spec(id);
+    if (is_valid(spec.alias_of) || spec.element_type != ElementType::realnum_value) continue;
+    const realnum *values = f.array_catalog->resolve<realnum>(id);
+    result.push_back(multilevel_value_snapshot{
+        key, values, std::vector<realnum>(values, values + spec.elements)});
+  }
+  return result;
+}
+
+static bool multilevel_addresses_match(const std::vector<multilevel_value_snapshot> &expected,
+                                       const fields &actual, bool should_match) {
+  if (!actual.array_catalog) return expected.empty();
+  for (const multilevel_value_snapshot &row : expected) {
+    const ArrayId id = actual.array_catalog->find(row.key);
+    if (!is_valid(id)) return false;
+    if ((actual.array_catalog->resolve_untyped(id) == row.address) != should_match) return false;
+  }
+  return true;
+}
+
+static bool multilevel_values_equal(const std::vector<multilevel_value_snapshot> &expected,
+                                    const fields &actual) {
+  if (!actual.array_catalog) return expected.empty();
+  for (const multilevel_value_snapshot &row : expected) {
+    const ArrayId id = actual.array_catalog->find(row.key);
+    if (!is_valid(id) || id.value >= actual.array_catalog->size()) return false;
+    const ArraySpec &spec = actual.array_catalog->spec(id);
+    if (spec.elements != row.values.size()) return false;
+    const realnum *values = actual.array_catalog->resolve<realnum>(id);
+    if (memcmp(values, row.values.data(), row.values.size() * sizeof(realnum))) return false;
+  }
+  return true;
+}
+
+static void test_resident_multilevel_lifecycle() {
+  grid_volume gv = vol2d(3.0, 3.0, 10.0);
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_multilevel_lifecycle_states(s);
+    fields f(&s);
+    f.use_real_fields();
+    f.require_component(Ez);
+    f.require_component(Hz);
+    gaussian_src_time source(0.3, 0.1);
+    f.add_point_source(Ez, source, vec(0.11, 0.13));
+    f.add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    bool owns_chunk = false;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+    bool initially_null = true;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      if (f.chunks[chunk]->is_mine())
+        FOR_FIELD_TYPES(ft)
+          for (polarization_state *state = f.chunks[chunk]->pol[ft]; state;
+               state = state->next)
+            initially_null = initially_null && !state->data;
+    CHECK(and_to_all(initially_null),
+          "multilevel state was allocated before resident preflight");
+
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    f.advance(1);
+    CHECK(or_to_all(counts.multilevel_population_updates_at_compile > 0 &&
+                    counts.multilevel_transition_updates_at_compile > 0),
+          "resident cold build omitted multilevel actions");
+    CHECK(or_to_all(counts.polarization_arrays_at_create > 0) &&
+              and_to_all(counts.connections_current_at_create),
+          "resident state was created before multilevel storage/topology preparation");
+    BackendState *const state = f.backend_state;
+    Executable *const executable = f.executable;
+    const int entry_t = f.t;
+    const std::vector<multilevel_value_snapshot> initialized_values =
+        capture_multilevel_values(f);
+
+    ArrayId gamma_id = invalid_array();
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (descriptor.kind == SusceptibilityKind::multilevel) {
+        gamma_id = descriptor.multilevel_gamma_inv;
+        break;
+      }
+    CHECK(is_valid(gamma_id) || !owns_chunk,
+          "resident multilevel fixture has no GammaInv row on an owning rank");
+    realnum authoritative_gamma = 0;
+    if (is_valid(gamma_id)) {
+      realnum *gamma = f.array_catalog->resolve<realnum>(gamma_id);
+      gamma[0] += realnum(0.125);
+      authoritative_gamma = gamma[0];
+    }
+    counts.migrate_multilevel_values = true;
+
+    fields copy(f);
+    CHECK(f.backend_state == state && f.executable == executable && f.t == entry_t,
+          "fields clone retired or advanced its resident source epoch");
+    CHECK(or_to_all(counts.multilevel_migrations > 0),
+          "fields clone did not materialize resident multilevel state");
+    const std::vector<multilevel_value_snapshot> source_values = capture_multilevel_values(f);
+    build_storage_catalog(copy, *copy.array_catalog, *copy.storage_plan);
+    build_polarization_descriptors(copy, copy.descriptors->polarizations);
+    CHECK(multilevel_values_equal(source_values, copy),
+          "fields clone lost multilevel GammaInv/N/P/P_prev values");
+    CHECK(multilevel_addresses_match(source_values, copy, false),
+          "fields clone aliased source multilevel storage");
+    if (is_valid(gamma_id))
+      CHECK(f.array_catalog->resolve<realnum>(gamma_id)[0] == authoritative_gamma,
+            "clone migration overwrote host-authoritative GammaInv");
+
+    counts.fail_rebuild = true;
+    bool clone_rejected = false;
+    try { fields rejected(f); }
+    catch (const std::runtime_error &) { clone_rejected = true; }
+    CHECK(and_to_all(clone_rejected) && f.backend_state == state && f.executable == executable &&
+              f.t == entry_t,
+          "failed resident clone changed the source epoch");
+    counts.fail_rebuild = false;
+
+    const std::vector<multilevel_value_snapshot> before_zero_addresses =
+        capture_multilevel_values(f);
+    const std::vector<multilevel_value_snapshot> independent_copy =
+        capture_multilevel_values(copy);
+    f.zero_fields();
+    CHECK(f.backend_state == state && f.executable == executable && f.t == entry_t,
+          "zero_fields replaced resident multilevel state or advanced time");
+    CHECK(multilevel_values_equal(initialized_values, f) &&
+              multilevel_addresses_match(before_zero_addresses, f, true),
+          "zero_fields did not restore exact GammaInv/N0/zero-P values in-place");
+    CHECK(multilevel_values_equal(independent_copy, copy),
+          "zero_fields mutated the independent multilevel clone");
+    f.zero_fields();
+    CHECK(f.backend_state == state && f.executable == executable && f.t == entry_t &&
+              multilevel_values_equal(initialized_values, f) &&
+              multilevel_addresses_match(before_zero_addresses, f, true),
+          "repeated multilevel zero_fields changed the resident epoch, rows, or addresses");
+    f.advance(f.t + 1);
+    CHECK(f.backend_state == state && f.executable == executable,
+          "advance rebuilt resident state after multilevel zero_fields");
+
+    BackendState *const rebuilt = f.backend_state;
+    Executable *const rebuilt_executable = f.executable;
+    src_time *const source_before_reset = f.sources;
+    flux_vol *const flux_before_reset = f.fluxes;
+    DescriptorSet *const descriptors_before_reset = f.descriptors;
+    StepPlan *const ordinary_plan_before_reset = f.step_plans[0];
+    StepPlan *const cw_plan_before_reset = f.step_plans[1];
+    const DirtyMask dirty_before_reset = DirtyMask(f.dirty_mask);
+    counts.fail_rebuild = true;
+    bool reset_rejected = false;
+    try { f.reset(); }
+    catch (const std::runtime_error &) { reset_rejected = true; }
+    CHECK(and_to_all(reset_rejected) && f.backend_state == rebuilt &&
+              f.sources == source_before_reset && f.fluxes == flux_before_reset &&
+              f.descriptors == descriptors_before_reset &&
+              f.step_plans[0] == ordinary_plan_before_reset &&
+              f.step_plans[1] == cw_plan_before_reset &&
+              DirtyMask(f.dirty_mask) == dirty_before_reset && f.t == entry_t,
+          "failed multilevel reset changed definitions, plans, time, dirtiness, or resident state");
+    counts.fail_rebuild = false;
+    const std::vector<multilevel_value_snapshot> before_reset_addresses =
+        capture_multilevel_values(f);
+    f.reset();
+    CHECK(f.backend_state == rebuilt && f.executable == rebuilt_executable && f.t == 0 &&
+              !f.sources && !f.fluxes &&
+              multilevel_values_equal(initialized_values, f) &&
+              multilevel_addresses_match(before_reset_addresses, f, true),
+          "multilevel reset replaced state or failed to clear definitions and restore exact rows");
+    f.reset();
+    CHECK(f.backend_state == rebuilt && f.executable == rebuilt_executable && f.t == 0 &&
+              !f.sources && !f.fluxes && multilevel_values_equal(initialized_values, f) &&
+              multilevel_addresses_match(before_reset_addresses, f, true),
+          "repeated multilevel reset changed the resident epoch, rows, or addresses");
+  }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_multilevel_lifecycle_states(s);
+    fields f(&s);
+    f.use_real_fields();
+    f.require_component(Ez);
+    bool owns_chunk = false;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    f.advance(1);
+    counts.migrate_multilevel_values = true;
+    f.backend->prepare_state_rebuild(*f.backend_state, dirty_storage);
+    ArrayId gamma_id = invalid_array();
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (descriptor.kind == SusceptibilityKind::multilevel) {
+        gamma_id = descriptor.multilevel_gamma_inv;
+        break;
+      }
+    const StorageKey gamma_key =
+        is_valid(gamma_id) ? f.array_catalog->key(gamma_id) : StorageKey{-1, -1, -1, -1, 0};
+    realnum authoritative_gamma = 0;
+    if (is_valid(gamma_id)) {
+      realnum *gamma = f.array_catalog->resolve<realnum>(gamma_id);
+      gamma[0] += realnum(0.15625);
+      authoritative_gamma = gamma[0];
+    }
+    const std::vector<multilevel_value_snapshot> values_before_growth =
+        capture_multilevel_values(f);
+    const int states_before_growth = counts.states_created;
+    const int destroyed_before_growth = counts.states_destroyed;
+    const size_t arrays_before_growth = counts.arrays_at_create;
+    f.require_component(Hz);
+    f.advance(f.t + 1);
+    CHECK(counts.states_created == states_before_growth + 1 &&
+              counts.states_destroyed == destroyed_before_growth + 1 && f.backend_state &&
+              f.executable && (!owns_chunk || counts.arrays_at_create > arrays_before_growth),
+          "multilevel field growth did not replace and expand the resident epoch");
+    CHECK(multilevel_values_equal(values_before_growth, f),
+          "multilevel field growth lost resident N/P/P_prev values");
+    if (is_valid(gamma_id)) {
+      gamma_id = f.array_catalog->find(gamma_key);
+      CHECK(is_valid(gamma_id) &&
+                f.array_catalog->resolve<realnum>(gamma_id)[0] == authoritative_gamma,
+            "field-growth rebuild overwrote or lost host-authoritative GammaInv");
+    }
+  }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 3);
+    add_multilevel_lifecycle_states(s);
+    fields f(&s);
+    f.use_real_fields();
+    f.require_component(Ez);
+    f.require_component(Hz);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    f.advance(1);
+    counts.migrate_multilevel_values = true;
+    BackendState *const state_before_remove = f.backend_state;
+    Executable *const executable_before_remove = f.executable;
+    const DirtyMask dirty_before_remove = DirtyMask(f.dirty_mask);
+    const int t_before_remove = f.t;
+    CpuArrayCatalog *const catalog_before_remove = f.array_catalog;
+    DescriptorSet *const descriptors_before_remove = f.descriptors;
+    StepPlan *const ordinary_plan_before_remove = f.step_plans[0];
+    std::vector<polarization_state *> polarization_before_remove;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      FOR_FIELD_TYPES(ft) polarization_before_remove.push_back(f.chunks[chunk]->pol[ft]);
+    counts.fail_rebuild = true;
+    bool remove_rejected = false;
+    try { f.remove_susceptibilities(); }
+    catch (const std::runtime_error &) { remove_rejected = true; }
+    bool polarization_unchanged = true;
+    size_t polarization_index = 0;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      FOR_FIELD_TYPES(ft) polarization_unchanged =
+          polarization_unchanged &&
+          f.chunks[chunk]->pol[ft] == polarization_before_remove[polarization_index++];
+    CHECK(and_to_all(remove_rejected) && f.backend_state == state_before_remove &&
+              f.executable == executable_before_remove &&
+              f.t == t_before_remove && f.array_catalog == catalog_before_remove &&
+              f.descriptors == descriptors_before_remove &&
+              f.step_plans[0] == ordinary_plan_before_remove &&
+              DirtyMask(f.dirty_mask) == dirty_before_remove && polarization_unchanged,
+          "failed multilevel removal changed the live epoch or polarization lists");
+    counts.fail_rebuild = false;
+    const int migrations_before = counts.multilevel_migrations;
+    f.remove_susceptibilities();
+    CHECK(!f.backend_state && !f.executable &&
+              or_to_all(counts.multilevel_migrations > migrations_before),
+          "multilevel removal did not migrate and retire resident state first");
+    bool empty = true;
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+      FOR_FIELD_TYPES(ft) empty = empty && !f.chunks[chunk]->pol[ft];
+    CHECK(and_to_all(empty), "distributed multilevel removal retained polarization state");
+    f.remove_susceptibilities();
+    f.advance(f.t + 1);
+    bool stale_catalog = false, stale_descriptors = false, stale_actions = false,
+         stale_halos = false;
+    for (size_t i = 0; i < f.array_catalog->size(); ++i)
+      stale_catalog = stale_catalog ||
+                      f.array_catalog->key(ArrayId{uint32_t(i)}).kind ==
+                          int(array_kind::polarization_internal);
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      stale_descriptors = stale_descriptors || descriptor.kind == SusceptibilityKind::multilevel;
+    const StepPlan &removed_plan = *f.step_plans[0];
+    stale_actions = !removed_plan.multilevel_population_updates.empty() ||
+                    !removed_plan.multilevel_population_terms.empty() ||
+                    !removed_plan.multilevel_transition_updates.empty();
+    for (const HaloPlan &plan : f.halos->plans)
+      if (plan.ft == PE_stuff || plan.ft == PH_stuff) {
+        std::vector<ElementRef> refs;
+        expand_gather(plan, refs);
+        stale_halos = stale_halos || !refs.empty();
+        expand_scatter(plan, refs);
+        stale_halos = stale_halos || !refs.empty();
+      }
+    CHECK(and_to_all(!stale_catalog && !stale_descriptors && !stale_actions && !stale_halos),
+          "same-object removal rebuild retained multilevel catalog, plan, or halo state");
+
+    fields readded(&s);
+    readded.use_real_fields();
+    readded.require_component(Ez);
+    readded.require_component(Hz);
+    lifetime_counts readded_counts;
+    readded.backend = new tracking_backend(readded, readded_counts);
+    readded.advance(1);
+    CHECK(or_to_all(readded_counts.multilevel_population_updates_at_compile > 0),
+          "fresh remove/re-add construction lost multilevel actions");
+  }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_multilevel_lifecycle_states(s);
+    fields f(&s);
+    f.use_real_fields();
+    f.require_component(Ez);
+    f.require_component(Hz);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    f.options.precision = precision_policy_kind::mixed;
+    f.advance(1);
+    counts.migrate_multilevel_values = true;
+    f.backend->prepare_state_rebuild(*f.backend_state, dirty_storage);
+    ArrayId gamma_id = invalid_array();
+    for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations)
+      if (descriptor.kind == SusceptibilityKind::multilevel) {
+        gamma_id = descriptor.multilevel_gamma_inv;
+        break;
+      }
+    realnum authoritative_gamma = 0;
+    if (is_valid(gamma_id)) {
+      realnum *gamma = f.array_catalog->resolve<realnum>(gamma_id);
+      gamma[0] += realnum(0.1875);
+      authoritative_gamma = gamma[0];
+    }
+    const std::vector<multilevel_value_snapshot> values_before_reselection =
+        capture_multilevel_values(f);
+    execution_options cpu;
+    f.select_backend(cpu);
+    CHECK(!f.backend_state && !f.executable &&
+              or_to_all(counts.multilevel_migrations > 0) &&
+              multilevel_values_equal(values_before_reselection, f) &&
+              multilevel_addresses_match(values_before_reselection, f, true),
+          "CPU reselection did not migrate and retire multilevel resident state");
+    if (is_valid(gamma_id))
+      CHECK(f.array_catalog->resolve<realnum>(gamma_id)[0] == authoritative_gamma,
+            "precision/backend reselection overwrote host-authoritative GammaInv");
+  }
+}
+
 static void test_resident_polarization_preparation() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   lorentzian_susceptibility susceptibility(1.1, 0.05);
@@ -4874,6 +5292,13 @@ int main(int argc, char **argv) {
     master_printf("backend_api: noisy checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_MULTILEVEL_ONLY")) {
+    test_resident_multilevel_lifecycle();
+    failures = sum_to_all(failures);
+    if (failures) return 1;
+    master_printf("backend_api: multilevel checks passed\n");
+    return 0;
+  }
   if (getenv("MEEP_BACKEND_API_NOISY_DEFAULT_ONLY")) {
     test_resident_noisy_lazy_default();
     if (failures) return 1;
@@ -4921,6 +5346,7 @@ int main(int argc, char **argv) {
   test_cold_cw_preflight_restores_existing_plans();
   test_cpu_cw_hook_declines_without_initialization();
   test_resident_polarization_preparation();
+  test_resident_multilevel_lifecycle();
   test_resident_noisy_seed_lifecycle();
   test_resident_noisy_prelaunch_failures();
   test_resident_advance_failure_poison();

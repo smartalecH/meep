@@ -189,6 +189,14 @@ fields::fields(structure *s, const execution_options &opts, double m, double bet
 
 fields::fields(const fields &thef)
     : S(thef.S), gv(thef.gv), user_volume(thef.user_volume), v(thef.v), working_on(&times_spent) {
+  /* A resident backend may own newer polarization populations and transition
+     history than the host mirrors. Materialize those values before the copy
+     constructor snapshots any chunk. Failure preserves the source resident
+     epoch (although a backend may already have refreshed some host mirrors)
+     and aborts construction before this object owns allocations. */
+  if (thef.backend_state && thef.backend && thef.backend->requires_full_storage_preparation())
+    backend_preflight_field_layout_change(
+        const_cast<fields &>(thef), DirtyMask(dirty_initialization), "fields::fields copy");
   shared_chunks = thef.shared_chunks;
   components_allocated = thef.components_allocated;
   synchronized_magnetic_fields = thef.synchronized_magnetic_fields;
@@ -831,7 +839,13 @@ void fields_chunk::remove_susceptibilities(bool shared_chunks) {
 }
 
 void fields::remove_susceptibilities() {
+  if (backend_state && backend && backend->requires_full_storage_preparation())
+    backend_prepare_field_layout_change(
+        *this, invalidation_closure(MutationKind::material_definition),
+        "fields::remove_susceptibilities");
   invalidate(*this, MutationKind::material_definition);
+  note_connections_invalidated(*this);
+  chunk_connections_valid = false;
   mark_local_invalidation(*this);
   changed_materials = true;
   for (int i = 0; i < num_chunks; i++)
@@ -875,6 +889,10 @@ void fields::zero_fields() {
 }
 
 void fields::reset() {
+  const bool resident = backend_state && backend && backend->requires_full_storage_preparation();
+  if (resident)
+    backend_preflight_field_layout_change(*this, DirtyMask(dirty_initialization),
+                                          "fields::reset");
   remove_sources();
   remove_fluxes();
   zero_fields();
