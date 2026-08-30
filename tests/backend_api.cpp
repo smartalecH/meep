@@ -3119,8 +3119,38 @@ static void test_resident_legacy_flux_lifecycle() {
   flux_vol *newer = f->add_flux_vol(Y, volume(vec(-0.8, -0.2), vec(0.8, -0.2)));
   f->descriptors->regions.push_back(ChunkLoopRegion());
   const BackendEpochSnapshot failed_entry(*f);
-  counts.fail_compile = my_rank() == 0;
+  CpuArrayCatalog *const live_catalog = f->array_catalog;
+  if (my_rank() == 0) f->array_catalog = NULL;
   bool failed = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  if (my_rank() == 0) f->array_catalog = live_catalog;
+  CHECK(sum_to_all(int(failed)) == count_processors() && failed_entry.matches(*f) &&
+            f->backend_state == state && f->executable == old_executable &&
+            is_dirty(*f, dirty_flux_plan),
+        "rank-asymmetric missing legacy flux catalog was not rejected collectively");
+
+  backend_set_legacy_flux_descriptor_failure_for_testing(0, 0);
+  failed = false;
+  try {
+    f->advance(1);
+  }
+  catch (const std::runtime_error &) {
+    failed = true;
+  }
+  backend_set_legacy_flux_descriptor_failure_for_testing(-1, -1);
+  CHECK(sum_to_all(int(failed)) == count_processors() && failed_entry.matches(*f) &&
+            f->backend_state == state && f->executable == old_executable &&
+            f->descriptors == old_descriptors && f->step_plans[0] == old_ordinary &&
+            f->step_plans[1] == old_cw && is_dirty(*f, dirty_flux_plan),
+        "per-monitor legacy flux failure was not reconciled before the next monitor");
+
+  counts.fail_compile = my_rank() == 0;
+  failed = false;
   try {
     f->advance(1);
   }
@@ -3281,6 +3311,32 @@ static void test_resident_legacy_flux_rank_mismatch() {
     f->require_component(Ey);
     f->require_component(Hy);
     f->require_component(Hz);
+    f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    f->advance(1);
+    StepPlan *const old_plan = f->step_plans[0];
+    if (my_rank() == 0)
+      f->add_flux_vol(Y, volume(vec(-0.8, -0.2), vec(0.8, -0.2)));
+    bool failed = false;
+    try {
+      f->advance(1);
+    }
+    catch (const std::runtime_error &) {
+      failed = true;
+    }
+    CHECK(sum_to_all(int(failed)) == count_processors() && f->step_plans[0] == old_plan &&
+              is_dirty(*f, dirty_flux_plan) && is_dirty(*f, dirty_executable),
+          "warm CPU rank-asymmetric legacy flux mutation was not rejected collectively");
+    delete f;
+    delete s;
+  }
+
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->require_component(Ey);
+    f->require_component(Hy);
+    f->require_component(Hz);
     if (my_rank() == 0)
       f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
     lifetime_counts counts;
@@ -3421,7 +3477,8 @@ static void test_resident_legacy_flux_catalog_rebuild() {
 
     const uint64_t cpu_flux_generation =
         generation(*f, MutationKind::legacy_flux_definition);
-    invalidate(*f, MutationKind::field_layout, "CPU legacy flux catalog rebuild test");
+    if (my_rank() == 0)
+      invalidate(*f, MutationKind::field_layout, "CPU legacy flux catalog rebuild test");
     f->advance(1);
     const StepPlan rebuilt_cpu_plan = build_step_plan(*f, StepProgram::ordinary);
     const bool any_rebuilt_cpu_flux_term =
