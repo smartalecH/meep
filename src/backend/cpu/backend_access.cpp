@@ -44,14 +44,20 @@ static size_t noisy_collective_count_for_testing = 0;
 static int multilevel_preflight_failure_rank_for_testing = -1;
 static int multilevel_preflight_failure_mode_for_testing = 0;
 static size_t multilevel_collective_count_for_testing = 0;
+static int host_custom_collective_failure_rank_for_testing = -1;
+static int host_custom_collective_failure_mode_for_testing = 0;
+static size_t host_custom_collective_count_for_testing = 0;
+static bool host_custom_mpi_override_for_testing = false;
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
-  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    if (!f.chunks[chunk]->is_mine()) continue;
     for (field_type ft : {E_stuff, H_stuff})
       for (const polarization_state *state = f.chunks[chunk]->pol[ft]; state;
            state = state->next)
         if (state->s && classify_susceptibility(state->s) == SusceptibilityKind::host_custom)
           return true;
+  }
   return false;
 }
 
@@ -104,6 +110,35 @@ size_t backend_multilevel_collective_count_for_testing() {
 
 void backend_note_multilevel_collective_for_testing() {
   ++multilevel_collective_count_for_testing;
+}
+
+void backend_set_host_custom_collective_failure_for_testing(int rank, int mode) {
+  host_custom_collective_failure_rank_for_testing = rank;
+  host_custom_collective_failure_mode_for_testing = mode;
+}
+
+void backend_set_host_custom_mpi_override_for_testing(bool enabled) {
+  host_custom_mpi_override_for_testing = enabled;
+}
+
+void backend_reset_host_custom_collective_count_for_testing() {
+  host_custom_collective_count_for_testing = 0;
+}
+
+size_t backend_host_custom_collective_count_for_testing() {
+  return host_custom_collective_count_for_testing;
+}
+
+void backend_note_host_custom_collective_for_testing() {
+  ++host_custom_collective_count_for_testing;
+}
+
+void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
+                                       BackendState &state) {
+  if (host_custom_collective_failure_rank_for_testing == my_rank() &&
+      host_custom_collective_failure_mode_for_testing == 4)
+    throw std::runtime_error("injected host custom plan validation failure");
+  f.backend->validate_host_custom_plan(plan, state);
 }
 
 namespace {
@@ -952,44 +987,35 @@ void HostCustomFallbackSession::complete() {
   backend_.host_custom_session_active_ = false;
 }
 
-void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use,
-                                            const char *site) {
-  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
-
-  const bool present = has_live_host_custom_susceptibility(f);
-  if (!present) {
-    f.backend->host_custom_enabled_ = false;
-    return;
-  }
-
+static std::string host_custom_policy_error(const fields &f, HostCustomFallbackUse use,
+                                            bool any_present, bool magnetic_synchronized) {
   std::string why;
-  if (f.options.strict || f.options.fallback != fallback_policy::warn)
+  if (any_present && (f.options.strict || f.options.fallback != fallback_policy::warn))
     why = "host custom susceptibility fallback requires strict=false and fallback=warn";
-  else if (f.options.precision != precision_policy_kind::native)
+  else if (any_present && f.options.precision != precision_policy_kind::native)
     why = "host custom susceptibility fallback supports only precision=native";
-  else if (use != HostCustomFallbackUse::time_domain)
+  else if (any_present && use != HostCustomFallbackUse::time_domain)
     why = use == HostCustomFallbackUse::solve_cw
               ? "host custom susceptibility fallback supports only time-domain stepping, not solve_cw"
               : "host custom susceptibility fallback does not support magnetic synchronization";
-  else if (count_processors() != 1)
+  else if (any_present && count_processors() != 1 && !host_custom_mpi_override_for_testing)
     why = "host custom susceptibility fallback supports only a single MPI rank";
-  else if (f.phasein_time > 0)
+  else if (any_present && f.phasein_time > 0)
     why = "host custom susceptibility fallback does not support active material phasing";
-  else if (f.synchronized_magnetic_fields)
+  else if (any_present && magnetic_synchronized)
     why = "host custom susceptibility fallback cannot enter with synchronized magnetic fields";
-  else if (!f.backend->supports_host_custom_fallback())
+  else if (any_present && !f.backend->supports_host_custom_fallback())
     why = "selected resident backend does not implement host custom susceptibility fallback";
+  return why;
+}
 
-  if (!why.empty()) throw std::runtime_error(std::string(site) + ": " + why);
-  if (!f.backend->host_custom_warning_emitted_) {
-    check_custom_stat_capacity(f.backend->host_custom_stats_.warnings, 1, "warning");
-    ++f.backend->host_custom_stats_.warnings;
-    f.backend->host_custom_warning_emitted_ = true;
-    f.backend->host_custom_enabled_ = true;
+void backend_publish_host_custom_policy(fields &f, bool local_present, bool any_present) {
+  f.backend->host_custom_enabled_ = local_present;
+  if (any_present && !f.backend->host_custom_warning_emitted_) {
+    add_custom_stat(f.backend->host_custom_stats_.warnings, 1, "warning");
     master_printf("meep: warning: using host custom susceptibility fallback\n");
+    f.backend->host_custom_warning_emitted_ = true;
   }
-  else
-    f.backend->host_custom_enabled_ = true;
 }
 
 static uint64_t checked_custom_dispatch_total(size_t per_step, int num_steps,
@@ -1033,6 +1059,28 @@ static void host_custom_dispatch_expectation(const StepPlan &plan, int num_steps
     throw std::invalid_argument("host custom fallback plan contains no host segments");
   sessions = checked_custom_dispatch_total(sessions_per_step, num_steps, "session");
   callbacks = checked_custom_dispatch_total(callbacks_per_step, num_steps, "callback");
+}
+
+std::string backend_host_custom_policy_publish_error(const fields &f, bool any_present) {
+  if (any_present && !f.backend->host_custom_warning_emitted_ &&
+      f.backend->host_custom_stats_.warnings == std::numeric_limits<uint64_t>::max())
+    return "host custom fallback warning counter overflow";
+  return std::string();
+}
+
+void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use,
+                                            const char *site) {
+  if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
+
+  const bool local_present = has_live_host_custom_susceptibility(f);
+  const bool any_present = or_to_all(local_present);
+  std::string why =
+      host_custom_policy_error(f, use, any_present, f.synchronized_magnetic_fields != 0);
+  if (why.empty()) why = backend_host_custom_policy_publish_error(f, any_present);
+
+  backend_note_host_custom_collective_for_testing();
+  backend_reconcile_host_access(why, site);
+  backend_publish_host_custom_policy(f, local_present, any_present);
 }
 
 void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
@@ -1102,8 +1150,8 @@ void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
   f.backend->host_custom_claimed_sessions_ = 0;
 }
 
-void backend_finish_host_custom_dispatch(fields &f, const char *site) {
-  if (!f.backend || !f.backend->host_custom_enabled_) return;
+bool backend_finish_host_custom_dispatch(fields &f, const char *site) {
+  if (!f.backend || !f.backend->host_custom_enabled_) return false;
   const HostCustomFallbackStats &stats = f.backend->host_custom_stats_;
   const bool counters_regressed =
       stats.sessions < f.backend->host_custom_sessions_at_dispatch_ ||
@@ -1138,6 +1186,7 @@ void backend_finish_host_custom_dispatch(fields &f, const char *site) {
   f.backend->host_custom_dispatch_plan_ = NULL;
   f.backend->host_custom_next_operation_ = 0;
   f.backend->host_custom_claimed_sessions_ = 0;
+  return true;
 }
 
 bool backend_abort_host_custom_dispatch(fields &f) noexcept {
@@ -1166,6 +1215,19 @@ bool backend_abort_host_custom_dispatch(fields &f) noexcept {
   f.backend->host_custom_next_operation_ = 0;
   f.backend->host_custom_claimed_sessions_ = 0;
   return poison;
+}
+
+void backend_discard_host_custom_dispatch(fields &f) noexcept {
+  if (!f.backend) return;
+  f.backend->host_custom_dispatch_pending_ = false;
+  f.backend->host_custom_session_active_ = false;
+  f.backend->host_custom_callback_entered_ = false;
+  f.backend->host_custom_failure_recorded_ = false;
+  f.backend->host_custom_expected_sessions_ = 0;
+  f.backend->host_custom_expected_callbacks_ = 0;
+  f.backend->host_custom_dispatch_plan_ = NULL;
+  f.backend->host_custom_next_operation_ = 0;
+  f.backend->host_custom_claimed_sessions_ = 0;
 }
 
 CwSolveSession::CwSolveSession(fields &owner, const CwSolveRequest &request)
@@ -1631,13 +1693,16 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
   const bool local_multilevel_presence =
       has_local_exact_multilevel(f) ||
       (f.backend_state && f.backend_state->multilevel_preflight_required);
+  const bool local_custom_presence =
+      f.backend_state && f.backend_state->host_custom_preflight_required;
   size_t local_shape =
       size_t((f.dirty_mask & ~flux_closure) != dirty_none || stable_provenance_mismatch) |
-      (size_t(local_multilevel_presence) << 1);
+      (size_t(local_multilevel_presence) << 1) | (size_t(local_custom_presence) << 2);
   size_t global_shape = 0;
   bw_or_to_all(&local_shape, &global_shape, 1);
   const bool mixed_structural = (global_shape & 1) != 0;
   const bool any_multilevel = (global_shape & 2) != 0;
+  const bool any_custom = (global_shape & 4) != 0;
 
   std::string local_error;
   size_t local_definition = size_t(legacy_flux_definition_signature(f));
@@ -1725,6 +1790,8 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
       if (local_error.empty() && local_multilevel_actions != has_local_exact_multilevel(f))
         local_error = "multilevel live state and legacy-flux replacement actions differ";
     }
+    if (local_error.empty() && any_custom)
+      backend_validate_host_custom_plan(f, *replacement_plan, *f.backend_state);
     if (local_error.empty()) {
       replacement_executable = f.backend->compile(*replacement_plan, *f.backend_state);
       if (!replacement_executable)
@@ -1740,6 +1807,7 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
   f.descriptors = live_descriptors;
 
   if (any_multilevel) backend_note_multilevel_collective_for_testing();
+  if (any_custom) backend_note_host_custom_collective_for_testing();
   const bool failed = or_to_all(!local_error.empty());
   if (failed) {
     delete replacement_executable;
@@ -1761,6 +1829,9 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
     f.backend_state->multilevel_static_validation_required = false;
     f.backend_state->multilevel_plan_validated = any_multilevel;
     f.backend_state->multilevel_validated_plan_signature = f.step_plans[0]->signature;
+    f.backend_state->host_custom_preflight_required = any_custom;
+    f.backend_state->host_custom_plan_validated = any_custom;
+    f.backend_state->host_custom_validated_plan_signature = f.step_plans[0]->signature;
   }
   clear_dirty(f, dirty_flux_plan | dirty_regions | dirty_executable);
   delete old_executable;
@@ -2085,11 +2156,13 @@ void fields::init_backend() {
   const size_t flux_present_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 2);
   const size_t multilevel_present_bit =
       size_t(1) << (std::numeric_limits<size_t>::digits - 3);
+  const size_t custom_present_bit = size_t(1) << (std::numeric_limits<size_t>::digits - 4);
   size_t local_status = size_t(dirty_mask & relevant);
   if (backend->is_poisoned()) local_status |= poison_bit;
   if (fluxes || (descriptors && !descriptors->legacy_fluxes.empty()))
     local_status |= flux_present_bit;
   if (has_local_exact_multilevel(*this)) local_status |= multilevel_present_bit;
+  if (has_live_host_custom_susceptibility(*this)) local_status |= custom_present_bit;
   size_t global_status = 0;
   bw_or_to_all(&local_status, &global_status, 1);
   if (global_status & poison_bit) {
@@ -2098,6 +2171,7 @@ void fields::init_backend() {
   }
   const bool any_flux = (global_status & flux_present_bit) != 0;
   const bool any_multilevel = (global_status & multilevel_present_bit) != 0;
+  const bool any_custom = (global_status & custom_present_bit) != 0;
 
   if (!backend->requires_full_storage_preparation()) {
     /* Most CPU execution keeps its historical lazy storage preparation.
@@ -2123,13 +2197,43 @@ void fields::init_backend() {
 
   dirty_mask |= DirtyMask(global_status & size_t(relevant));
 
-  /* Capability policy is intentionally checked from the live exact dynamic
-     types before any resident material preparation, polarization allocation,
-     descriptor callback, or backend-state creation. PR6 will attach validated
-     host-segment identities to this already-approved lifecycle boundary. */
-  if (!backend_state || is_dirty(*this, dirty_storage))
-    backend_preflight_host_custom_fallback(
-        *this, HostCustomFallbackUse::time_domain, "fields::init_backend custom fallback");
+  /* Stage custom policy/readiness on every rank before any resident material
+     preparation, polarization allocation, descriptor callback, or state
+     creation. Publication happens only after the collective succeeds. PR6
+     extends validate_host_custom_rebuild with exact host-segment identities. */
+  const bool custom_rebuild = !backend_state || is_dirty(*this, dirty_storage);
+  if (custom_rebuild) {
+    if (!any_custom)
+      backend_publish_host_custom_policy(*this, false, false);
+    else {
+      std::string custom_error =
+          host_custom_policy_error(*this, HostCustomFallbackUse::time_domain, true,
+                                   synchronized_magnetic_fields != 0);
+      if (custom_error.empty())
+        custom_error = backend_host_custom_policy_publish_error(*this, true);
+      if (custom_error.empty()) try {
+        if (host_custom_collective_failure_rank_for_testing == my_rank()) {
+          if (host_custom_collective_failure_mode_for_testing == 1)
+            custom_error = "injected host custom identity validation failure";
+          else if (host_custom_collective_failure_mode_for_testing == 2)
+            custom_error = "injected host custom range validation failure";
+          else if (host_custom_collective_failure_mode_for_testing == 3)
+            throw std::bad_alloc();
+        }
+        if (custom_error.empty()) backend->validate_host_custom_rebuild();
+      }
+      catch (const std::exception &e) {
+        custom_error = e.what();
+      }
+      catch (...) {
+        custom_error = "unknown host custom rebuild validation failure";
+      }
+      backend_note_host_custom_collective_for_testing();
+      backend_reconcile_host_access(custom_error, "fields::init_backend custom fallback");
+      backend_publish_host_custom_policy(*this, has_live_host_custom_susceptibility(*this),
+                                         true);
+    }
+  }
 
   /* A phase may have been configured while the CPU backend was still lazy and
      only then moved to a resident backend.  Before that backend freezes its
@@ -2248,6 +2352,9 @@ void fields::init_backend() {
                                     "fields::init_backend legacy flux stable plan");
     }
     backend_state = backend->create_state(*storage_plan);
+    backend_state->host_custom_preflight_required = any_custom;
+    backend_state->host_custom_plan_validated = false;
+    backend_state->host_custom_validated_plan_signature = 0;
     dirty_mask |= dirty_initialization | dirty_classification;
   }
 

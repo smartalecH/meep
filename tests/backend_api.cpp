@@ -4836,6 +4836,270 @@ static void test_resident_host_custom_policy_lifecycle() {
   }
 }
 
+static void test_resident_host_custom_collective_preflight() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+
+  /* The public policy still rejects multi-rank fallback before any legacy or
+     resident allocation. The explicit override below exists only to exercise
+     later collective boundaries that are otherwise unreachable by contract. */
+  if (count_processors() > 1) {
+    for (int target = 0; target < count_processors(); ++target) {
+      structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+      add_custom_lifecycle_state(s, true);
+      fields f(&s);
+      f.require_component(Ez);
+      lifecycle_custom_susceptibility::reset_counts();
+      lifetime_counts counts;
+      f.backend = new tracking_backend(f, counts, false, false, true, true);
+      f.options = warned_custom_options();
+      if (my_rank() == target) f.options.strict = true;
+      backend_set_host_custom_mpi_override_for_testing(true);
+      bool failed = false;
+      try { f.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_host_custom_mpi_override_for_testing(false);
+      CHECK(and_to_all(failed) && !f.backend_state && !f.executable &&
+                counts.states_created == 0 && counts.advance_attempts == 0 &&
+                lifecycle_custom_susceptibility::allocations == 0 &&
+                lifecycle_custom_susceptibility::initializations == 0 &&
+                lifecycle_custom_susceptibility::layout_queries == 0 &&
+                !f.backend->host_custom_fallback_enabled() && !f.backend->is_poisoned(),
+            "rank-asymmetric custom policy failure crossed allocation or callback");
+    }
+
+    for (int target = 0; target < count_processors(); ++target) {
+      structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+      add_custom_lifecycle_state(s, true);
+      fields f(&s);
+      f.require_component(Ez);
+      lifecycle_custom_susceptibility::reset_counts();
+      lifetime_counts counts;
+      tracking_backend *tracking =
+          new tracking_backend(f, counts, false, false, true, true);
+      f.backend = tracking;
+      f.options = warned_custom_options();
+      if (my_rank() == target)
+        backend_set_host_custom_counter_for_testing(
+            *tracking, HostCustomFallbackCounter::warnings,
+            std::numeric_limits<uint64_t>::max());
+      backend_set_host_custom_mpi_override_for_testing(true);
+      bool failed = false;
+      try { f.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_host_custom_mpi_override_for_testing(false);
+      CHECK(and_to_all(failed) && !f.backend_state && !f.executable &&
+                counts.states_created == 0 && counts.advance_attempts == 0 &&
+                !f.backend->host_custom_fallback_enabled() && !f.backend->is_poisoned(),
+            "rank-asymmetric custom policy publication overflow was not atomic");
+    }
+
+    for (int target = 0; target < count_processors(); ++target)
+      for (int mode = 1; mode <= 3; ++mode) {
+        structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+        add_custom_lifecycle_state(s, true);
+        fields f(&s);
+        f.require_component(Ez);
+        lifecycle_custom_susceptibility::reset_counts();
+        lifetime_counts counts;
+        f.backend = new tracking_backend(f, counts, false, false, true, true);
+        f.options = warned_custom_options();
+        backend_set_host_custom_mpi_override_for_testing(true);
+        backend_set_host_custom_collective_failure_for_testing(target, mode);
+        bool failed = false;
+        try { f.advance(1); }
+        catch (const std::runtime_error &) { failed = true; }
+        backend_set_host_custom_collective_failure_for_testing(-1, 0);
+        backend_set_host_custom_mpi_override_for_testing(false);
+        CHECK(and_to_all(failed) && !f.backend_state && !f.executable &&
+                  counts.states_created == 0 && counts.advance_attempts == 0 &&
+                  lifecycle_custom_susceptibility::allocations == 0 &&
+                  lifecycle_custom_susceptibility::initializations == 0 &&
+                  lifecycle_custom_susceptibility::layout_queries == 0 &&
+                  !f.backend->host_custom_fallback_enabled() && !f.backend->is_poisoned(),
+              "rank-asymmetric custom identity/range/rebuild failure published partial state");
+      }
+
+    for (int target = 0; target < count_processors(); ++target) {
+      structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+      add_custom_lifecycle_state(s);
+      fields f(&s);
+      f.require_component(Ez);
+      lifetime_counts counts;
+      f.backend = new tracking_backend(f, counts, false, false, true, true);
+      f.options = warned_custom_options();
+      backend_set_host_custom_mpi_override_for_testing(true);
+      backend_set_host_custom_collective_failure_for_testing(target, 4);
+      bool failed = false;
+      try { f.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_host_custom_collective_failure_for_testing(-1, 0);
+      CHECK(and_to_all(failed) && f.backend_state && !f.executable &&
+                !f.backend_state->host_custom_plan_validated &&
+                counts.states_created == 1 && counts.advance_attempts == 0 &&
+                f.backend->host_custom_fallback_stats().callbacks == 0 &&
+                !f.backend->is_poisoned(),
+            "rank-asymmetric custom plan readiness failure compiled or dispatched");
+      f.advance(1);
+      CHECK(f.executable && f.backend_state->host_custom_plan_validated &&
+                counts.advance_attempts == 1,
+            "custom plan readiness failure was not retryable");
+      backend_set_host_custom_mpi_override_for_testing(false);
+    }
+  }
+
+  backend_set_host_custom_mpi_override_for_testing(count_processors() > 1);
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking =
+        new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    backend_reset_host_custom_collective_count_for_testing();
+    f.advance(1);
+    CHECK(f.backend_state && f.executable &&
+              f.backend_state->host_custom_preflight_required &&
+              f.backend_state->host_custom_plan_validated,
+          "collective custom rebuild did not publish validated presence");
+    const size_t first_collectives = backend_host_custom_collective_count_for_testing();
+    BackendState *const state = f.backend_state;
+    Executable *const executable = f.executable;
+    const int attempts = counts.advance_attempts;
+    f.advance(1);
+    CHECK(f.backend_state == state && f.executable == executable &&
+              counts.advance_attempts == attempts + 1 &&
+              backend_host_custom_collective_count_for_testing() == first_collectives + 2,
+          "steady custom dispatch rebuilt state or missed prepare/dispatch reconciliation");
+
+    /* One owner rejects staging after the executable exists. Every successful
+       peer must discard its pending marker, and the installed epoch remains
+       retryable without a callback or dispatch. */
+    const int staging_target = 0;
+    CHECK(my_rank() != staging_target || tracking->host_custom_fallback_enabled(),
+          "custom staging failure target does not own a callback segment");
+    counts.fail_custom_preflight = my_rank() == staging_target;
+    const int attempts_before_staging = counts.advance_attempts;
+    const uint64_t callbacks_before_staging =
+        tracking->host_custom_fallback_stats().callbacks;
+    bool staging_failed = false;
+    try { f.advance(1); }
+    catch (const std::runtime_error &) { staging_failed = true; }
+    CHECK(and_to_all(staging_failed) && f.backend_state == state && f.executable == executable &&
+              counts.advance_attempts == attempts_before_staging &&
+              tracking->host_custom_fallback_stats().callbacks == callbacks_before_staging &&
+              !f.backend->is_poisoned(),
+          "asymmetric custom staging failure dispatched, replaced, or poisoned the epoch");
+    counts.fail_custom_preflight = false;
+    f.advance(1);
+
+    /* A callback failure on an owner, or a generic resident failure on an idle
+       rank, poisons and rejects every participant in this dispatch. */
+    for (int target = 0; target < count_processors(); ++target) {
+      structure ps(gv, unit_epsilon, no_pml(), identity(), 2);
+      add_custom_lifecycle_state(ps);
+      fields poisoned(&ps);
+      poisoned.require_component(Ez);
+      lifetime_counts poison_counts;
+      tracking_backend *poison_tracking =
+          new tracking_backend(poisoned, poison_counts, false, false, true, true);
+      poisoned.backend = poison_tracking;
+      poisoned.options = warned_custom_options();
+      poisoned.advance(1);
+      const bool local_callback_owner = poison_tracking->host_custom_fallback_enabled();
+      poison_counts.fail_custom_after_entry = local_callback_owner && my_rank() == target;
+      poison_counts.fail_advance = !local_callback_owner && my_rank() == target;
+      bool failed = false;
+      try { poisoned.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      CHECK(and_to_all(failed) && poisoned.backend->is_poisoned(),
+            "rank-asymmetric custom postdispatch failure did not poison every rank");
+    }
+
+    if (count_processors() > 1) {
+      structure ps(gv, unit_epsilon, no_pml(), identity(), 2);
+      add_custom_lifecycle_state(ps);
+      fields poisoned(&ps);
+      poisoned.require_component(Ez);
+      lifetime_counts poison_counts;
+      tracking_backend *poison_tracking =
+          new tracking_backend(poisoned, poison_counts, false, false, true, true);
+      poisoned.backend = poison_tracking;
+      poisoned.options = warned_custom_options();
+      poisoned.advance(1);
+      const bool local_owner = poison_tracking->host_custom_fallback_enabled();
+      const bool target_owner = and_to_all(my_rank() != 0 || local_owner);
+      const bool peer_owner = or_to_all(local_owner && my_rank() != 0);
+      poison_counts.fail_custom_before_entry = local_owner && my_rank() == 0;
+      bool failed = false;
+      try { poisoned.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      CHECK(target_owner && peer_owner && and_to_all(failed) &&
+                poisoned.backend->is_poisoned(),
+            "peer callback completion did not poison a collectively failed pre-entry dispatch");
+    }
+
+    f.remove_susceptibilities();
+    f.advance(1);
+    CHECK(!f.backend_state->host_custom_preflight_required &&
+              !f.backend_state->host_custom_plan_validated &&
+              !tracking->host_custom_fallback_enabled(),
+          "removing the final custom state retained collective presence");
+    backend_reset_host_custom_collective_count_for_testing();
+    f.advance(1);
+    CHECK(backend_host_custom_collective_count_for_testing() == 0,
+          "post-removal steady path retained a custom-specific collective");
+  }
+  backend_set_host_custom_mpi_override_for_testing(false);
+
+  /* A resident plan that never contains a custom state must not pay a custom
+     validation or dispatch collective, including on clean steady steps. */
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    f.backend = new tracking_backend(f, counts);
+    backend_reset_host_custom_collective_count_for_testing();
+    f.advance(1);
+    f.advance(1);
+    CHECK(backend_host_custom_collective_count_for_testing() == 0 &&
+              !f.backend_state->host_custom_preflight_required &&
+              !f.backend_state->host_custom_plan_validated,
+          "never-custom steady path entered custom collective validation");
+  }
+}
+
+static void test_resident_host_custom_split_communicator() {
+  const int groups = count_processors();
+  divide_parallel_processes(groups);
+  CHECK(my_rank() == 0, "one-rank custom split communicator did not have local rank zero");
+  {
+    const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+    add_custom_lifecycle_state(s);
+    fields f(&s);
+    f.require_component(Ez);
+    lifetime_counts counts;
+    tracking_backend *tracking =
+        new tracking_backend(f, counts, false, false, true, true);
+    f.backend = tracking;
+    f.options = warned_custom_options();
+    backend_reset_host_custom_collective_count_for_testing();
+    f.advance(1);
+    const size_t rebuild_collectives = backend_host_custom_collective_count_for_testing();
+    f.advance(1);
+    CHECK(f.backend_state && f.executable &&
+              f.backend_state->host_custom_preflight_required &&
+              f.backend_state->host_custom_plan_validated && counts.advance_attempts == 2 &&
+              backend_host_custom_collective_count_for_testing() == rebuild_collectives + 2,
+          "split-communicator custom validation used the wrong communicator");
+  }
+  end_divide_parallel();
+}
+
 static void expect_collective_multilevel_static_failure(fields &f, lifetime_counts &counts,
                                                         const char *message) {
   BackendState *const state = f.backend_state;
@@ -7219,9 +7483,16 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_BACKEND_API_CUSTOM_ONLY")) {
     test_resident_host_custom_policy_lifecycle();
+    test_resident_host_custom_collective_preflight();
     failures = sum_to_all(failures);
     if (failures) return 1;
     master_printf("backend_api: custom fallback checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_CUSTOM_SPLIT_ONLY")) {
+    test_resident_host_custom_split_communicator();
+    if (failures) return 1;
+    master_printf("backend_api: custom split-communicator checks passed\n");
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_MULTILEVEL_SPLIT_ONLY")) {
@@ -7291,6 +7562,7 @@ int main(int argc, char **argv) {
   test_resident_polarization_preparation();
   test_resident_multilevel_lifecycle();
   test_resident_host_custom_policy_lifecycle();
+  test_resident_host_custom_collective_preflight();
   test_resident_multilevel_collective_preflight();
   test_resident_noisy_seed_lifecycle();
   test_resident_noisy_prelaunch_failures();

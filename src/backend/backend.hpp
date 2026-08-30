@@ -63,7 +63,8 @@ struct BackendState {
         noisy_static_validation_required(false), noisy_validated_plan_signature(0),
         noisy_stream_count(0), multilevel_preflight_required(false),
         multilevel_plan_validated(false), multilevel_static_validation_required(false),
-        multilevel_validated_plan_signature(0),
+        multilevel_validated_plan_signature(0), host_custom_preflight_required(false),
+        host_custom_plan_validated(false), host_custom_validated_plan_signature(0),
         noisy_first_stream_tag(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
@@ -90,6 +91,12 @@ struct BackendState {
   bool multilevel_plan_validated;
   bool multilevel_static_validation_required;
   uint64_t multilevel_validated_plan_signature;
+  /* Global installed custom presence. Idle ranks retain this bit so rebuild
+     and dispatch failure boundaries remain collective, while the backend's
+     host_custom_enabled_ bit stays local to ranks that own callbacks. */
+  bool host_custom_preflight_required;
+  bool host_custom_plan_validated;
+  uint64_t host_custom_validated_plan_signature;
   uint64_t noisy_first_stream_tag;
 };
 
@@ -255,6 +262,11 @@ public:
   virtual void preflight_host_custom_fallback(Executable &, BackendState &) {
     throw std::logic_error("backend does not implement host custom susceptibility fallback");
   }
+  /* PR8 owns the allocation-free collective boundary. The final PR6 restack
+     overrides these adapter points to validate compiled host-segment identity,
+     ranges, and reserved staging without coupling policy code to that schema. */
+  virtual void validate_host_custom_rebuild() {}
+  virtual void validate_host_custom_plan(const StepPlan &, BackendState &) {}
 
   bool host_custom_fallback_enabled() const { return host_custom_enabled_; }
   const HostCustomFallbackStats &host_custom_fallback_stats() const { return host_custom_stats_; }
@@ -342,10 +354,13 @@ private:
   friend class HostCustomFallbackSession;
   friend void backend_preflight_host_custom_fallback(fields &, HostCustomFallbackUse,
                                                       const char *);
+  friend void backend_publish_host_custom_policy(fields &, bool, bool);
+  friend std::string backend_host_custom_policy_publish_error(const fields &, bool);
   friend void backend_prepare_host_custom_dispatch(fields &, Executable &, BackendState &, int,
                                                    const char *);
-  friend void backend_finish_host_custom_dispatch(fields &, const char *);
+  friend bool backend_finish_host_custom_dispatch(fields &, const char *);
   friend bool backend_abort_host_custom_dispatch(fields &) noexcept;
+  friend void backend_discard_host_custom_dispatch(fields &) noexcept;
   friend void backend_set_host_custom_counter_for_testing(
       ExecutionBackend &, HostCustomFallbackCounter, uint64_t);
   friend void backend_increment_host_custom_counter_for_testing(
@@ -441,6 +456,13 @@ void backend_set_multilevel_preflight_failure_for_testing(int rank, int mode);
 void backend_reset_multilevel_collective_count_for_testing();
 size_t backend_multilevel_collective_count_for_testing();
 void backend_note_multilevel_collective_for_testing();
+void backend_set_host_custom_collective_failure_for_testing(int rank, int mode);
+void backend_set_host_custom_mpi_override_for_testing(bool enabled);
+void backend_reset_host_custom_collective_count_for_testing();
+size_t backend_host_custom_collective_count_for_testing();
+void backend_note_host_custom_collective_for_testing();
+void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
+                                       BackendState &state);
 void backend_set_noisy_preflight_failure_for_testing(int rank, int mode);
 void backend_reset_noisy_collective_count_for_testing();
 size_t backend_noisy_collective_count_for_testing();
@@ -451,6 +473,8 @@ void backend_set_legacy_flux_descriptor_failure_for_testing(int rank, int flux_o
    is intentionally independent of the PR6 descriptor/host-segment schema. */
 void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use,
                                             const char *site);
+void backend_publish_host_custom_policy(fields &f, bool local_present, bool any_present);
+std::string backend_host_custom_policy_publish_error(const fields &f, bool any_present);
 /* Per-dispatch hooks. Preflight failure is retryable and preserves the current
    epoch. A backend that accepts fallback must execute exactly the ordinary
    plan's host segments for every requested step and report the exact number
@@ -458,10 +482,15 @@ void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use
 void backend_prepare_host_custom_dispatch(fields &f, Executable &executable,
                                           BackendState &state, int num_steps,
                                           const char *site);
-void backend_finish_host_custom_dispatch(fields &f, const char *site);
+/* Finish a local custom dispatch and report whether it crossed callback entry;
+   the caller retains that fact until the collective failure decision. */
+bool backend_finish_host_custom_dispatch(fields &f, const char *site);
 /* Returns whether the failed dispatch crossed callback entry and therefore
    requires poisoning. Non-custom resident dispatch failures remain poison. */
 bool backend_abort_host_custom_dispatch(fields &f) noexcept;
+/* Clear a successfully staged but not-yet-dispatched local custom session when
+   another rank rejects the same collective preparation boundary. */
+void backend_discard_host_custom_dispatch(fields &f) noexcept;
 /* Narrow counter-overflow seam for backend_api. */
 void backend_set_host_custom_counter_for_testing(ExecutionBackend &backend,
                                                  HostCustomFallbackCounter counter,

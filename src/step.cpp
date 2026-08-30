@@ -62,14 +62,48 @@ void fields::advance(int n) {
   init_backend();
   ensure_backend_executable();
   backend_refresh_noisy_seed(*this, *step_plans[0], "fields::advance noisy seed refresh");
-  backend_prepare_host_custom_dispatch(*this, *executable, *backend_state, n,
-                                       "fields::advance custom fallback preflight");
+  const bool collective_custom_dispatch =
+      backend->requires_full_storage_preparation() &&
+      backend_state->host_custom_preflight_required;
+  std::string custom_prepare_error;
+  bool custom_prepare_poisoned = false;
+  try {
+    backend_prepare_host_custom_dispatch(*this, *executable, *backend_state, n,
+                                         "fields::advance custom fallback preflight");
+  }
+  catch (const std::exception &e) {
+    custom_prepare_error = e.what();
+    custom_prepare_poisoned = backend->is_poisoned();
+  }
+  catch (...) {
+    custom_prepare_error = "unknown host custom fallback preflight failure";
+    custom_prepare_poisoned = backend->is_poisoned();
+  }
+  if (collective_custom_dispatch) {
+    size_t local_status = size_t(!custom_prepare_error.empty()) |
+                          (size_t(custom_prepare_poisoned) << 1);
+    size_t global_status = 0;
+    backend_note_host_custom_collective_for_testing();
+    bw_or_to_all(&local_status, &global_status, 1);
+    if (global_status & 1) {
+      backend_discard_host_custom_dispatch(*this);
+      if (global_status & 2) backend->poison();
+      if (custom_prepare_error.empty())
+        throw std::runtime_error(
+            "host custom fallback preflight failed on another MPI rank");
+      throw std::runtime_error(custom_prepare_error);
+    }
+  }
+  else if (!custom_prepare_error.empty())
+    throw std::runtime_error(custom_prepare_error);
   const bool collective_noisy_dispatch =
       backend->requires_full_storage_preparation() && backend_state->noisy_preflight_required;
-  if (!collective_noisy_dispatch) {
+  const bool collective_dispatch = collective_noisy_dispatch || collective_custom_dispatch;
+  if (!collective_dispatch) {
     try {
       backend->advance(*executable, *backend_state, n);
-      backend_finish_host_custom_dispatch(*this, "fields::advance custom fallback dispatch");
+      (void)backend_finish_host_custom_dispatch(
+          *this, "fields::advance custom fallback dispatch");
     }
     catch (...) {
       const bool poison = backend_abort_host_custom_dispatch(*this);
@@ -80,22 +114,31 @@ void fields::advance(int n) {
   }
 
   std::string local_error;
+  bool local_poison = false;
+  bool local_crossed_callback = false;
   try {
     backend->advance(*executable, *backend_state, n);
-    backend_finish_host_custom_dispatch(*this, "fields::advance custom fallback dispatch");
+    local_crossed_callback = backend_finish_host_custom_dispatch(
+        *this, "fields::advance custom fallback dispatch");
   }
   catch (const std::exception &e) {
-    (void)backend_abort_host_custom_dispatch(*this);
+    local_poison = backend_abort_host_custom_dispatch(*this);
     local_error = e.what();
   }
   catch (...) {
-    (void)backend_abort_host_custom_dispatch(*this);
+    local_poison = backend_abort_host_custom_dispatch(*this);
     local_error = "unknown backend advance failure";
   }
   if (collective_noisy_dispatch) backend_note_noisy_collective_for_testing();
-  const bool failed = or_to_all(!local_error.empty());
+  if (collective_custom_dispatch) backend_note_host_custom_collective_for_testing();
+  size_t local_status = size_t(!local_error.empty()) |
+                        (size_t(local_poison || collective_noisy_dispatch) << 1) |
+                        (size_t(local_crossed_callback) << 2);
+  size_t global_status = 0;
+  bw_or_to_all(&local_status, &global_status, 1);
+  const bool failed = (global_status & 1) != 0;
   if (failed) {
-    backend->poison();
+    if (global_status & (size_t(2) | size_t(4))) backend->poison();
     if (local_error.empty())
       throw std::runtime_error("backend advance failed on another MPI rank");
     throw std::runtime_error(local_error);
@@ -134,6 +177,8 @@ void fields::ensure_backend_executable() {
   bool recompile = local_recompile;
   bool staged_multilevel_presence = false;
   bool staged_multilevel_validation = false;
+  bool staged_custom_presence = false;
+  bool staged_custom_validation = false;
   if (backend->requires_full_storage_preparation()) {
     bool local_noisy = false, local_multilevel = has_local_exact_multilevel(*this);
     for (const PolarizationUpdate &update : plan.polarization_updates)
@@ -146,8 +191,12 @@ void fields::ensure_backend_executable() {
     const bool inspect_multilevel_signature =
         local_multilevel || backend_state->multilevel_plan_validated ||
         backend_state->multilevel_preflight_required;
+    const bool local_custom = backend->host_custom_fallback_enabled();
+    const bool inspect_custom_signature =
+        local_custom || backend_state->host_custom_plan_validated ||
+        backend_state->host_custom_preflight_required;
     const uint64_t recomputed_signature =
-        (inspect_noisy_signature || inspect_multilevel_signature)
+        (inspect_noisy_signature || inspect_multilevel_signature || inspect_custom_signature)
             ? compute_step_plan_signature(plan)
             : plan.signature;
     const bool changed_validated_plan = backend_state->noisy_plan_validated &&
@@ -169,21 +218,38 @@ void fields::ensure_backend_executable() {
         backend_state->multilevel_static_validation_required ||
         changed_validated_multilevel_plan ||
         (local_multilevel && !backend_state->multilevel_plan_validated);
+    const bool changed_validated_custom_plan =
+        backend_state->host_custom_plan_validated &&
+        (backend_state->host_custom_validated_plan_signature != plan.signature ||
+         (inspect_custom_signature && recomputed_signature != plan.signature));
+    const bool preserve_validated_custom_presence =
+        backend_state->host_custom_plan_validated &&
+        backend_state->host_custom_preflight_required;
+    const bool require_custom_validation =
+        changed_validated_custom_plan ||
+        (local_custom && !backend_state->host_custom_plan_validated);
     size_t local_status = size_t(local_recompile) | (size_t(local_noisy) << 1) |
                           (size_t(preserve_validated_presence) << 2) |
                           (size_t(require_static_validation) << 3) |
                           (size_t(local_multilevel) << 4) |
                           (size_t(preserve_validated_multilevel_presence) << 5) |
-                          (size_t(require_multilevel_validation) << 6);
+                          (size_t(require_multilevel_validation) << 6) |
+                          (size_t(local_custom) << 7) |
+                          (size_t(preserve_validated_custom_presence) << 8) |
+                          (size_t(require_custom_validation) << 9);
     size_t global_status = 0;
     bw_or_to_all(&local_status, &global_status, 1);
-    recompile = (global_status & (size_t(1) | (size_t(1) << 6))) != 0;
+    recompile =
+        (global_status & (size_t(1) | (size_t(1) << 6) | (size_t(1) << 9))) != 0;
     backend_state->noisy_preflight_required =
         (global_status & (size_t(2) | size_t(4))) != 0;
     backend_state->noisy_static_validation_required = (global_status & size_t(8)) != 0;
     staged_multilevel_presence =
         (global_status & ((size_t(1) << 4) | (size_t(1) << 5))) != 0;
     staged_multilevel_validation = (global_status & (size_t(1) << 6)) != 0;
+    staged_custom_presence =
+        (global_status & ((size_t(1) << 7) | (size_t(1) << 8))) != 0;
+    staged_custom_validation = (global_status & (size_t(1) << 9)) != 0;
   }
   if (!recompile) return;
 
@@ -196,6 +262,9 @@ void fields::ensure_backend_executable() {
       local_error = backend_validate_multilevel_plan(*this, plan, local_multilevel_actions);
       if (local_error.empty() && local_multilevel_actions != has_local_exact_multilevel(*this))
         local_error = "multilevel live state and installed action presence differ";
+    }
+    if (local_error.empty() && staged_custom_validation) {
+      backend_validate_host_custom_plan(*this, plan, *backend_state);
     }
     if (local_error.empty()) {
       replacement = backend->compile(plan, *backend_state);
@@ -212,6 +281,8 @@ void fields::ensure_backend_executable() {
                                                                    : !local_error.empty();
   if (backend->requires_full_storage_preparation() && staged_multilevel_validation)
     backend_note_multilevel_collective_for_testing();
+  if (backend->requires_full_storage_preparation() && staged_custom_validation)
+    backend_note_host_custom_collective_for_testing();
   if (failed) {
     delete replacement;
     executable = previous;
@@ -227,6 +298,11 @@ void fields::ensure_backend_executable() {
     backend_state->multilevel_static_validation_required = false;
     backend_state->multilevel_plan_validated = staged_multilevel_presence;
     backend_state->multilevel_validated_plan_signature = plan.signature;
+  }
+  if (staged_custom_validation) {
+    backend_state->host_custom_preflight_required = staged_custom_presence;
+    backend_state->host_custom_plan_validated = staged_custom_presence;
+    backend_state->host_custom_validated_plan_signature = plan.signature;
   }
 }
 
