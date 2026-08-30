@@ -12,7 +12,7 @@ $(BACKEND_HDRS)
 
 # Backend-private headers: NOT installed, and never included from meep.hpp
 # (global rule 5 -- meep.hpp is the SWIG surface).
-BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp
+BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp backend/random_state.hpp
 
 libmeep_la_SOURCES = array_slice.cpp anisotropic_averaging.cpp 		\
 bands.cpp boundaries.cpp bicgstab.cpp casimir.cpp 	\
