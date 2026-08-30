@@ -229,6 +229,7 @@ enum class failure_point {
   pinned_allocate,
   pinned_free,
   host_to_device_copy,
+  device_to_host_copy,
   cw_pack,
   cw_timestep,
   cw_reduction,
