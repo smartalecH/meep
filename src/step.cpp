@@ -166,13 +166,21 @@ void fields::ensure_backend_executable() {
     backend_state->multilevel_static_validation_required = false;
     backend_state->multilevel_plan_validated = backend_state->multilevel_preflight_required;
     backend_state->multilevel_validated_plan_signature = step_plans[0]->signature;
+    if (backend_state->host_custom_policy_pending) {
+      backend_publish_host_custom_policy(*this, backend_state->host_custom_local_presence,
+                                         backend_state->host_custom_preflight_required);
+      backend_state->host_custom_policy_pending = false;
+    }
     return;
   }
 
   /* step_plan_for clears dirty_executable, so remember whether the compiled
      backend artifact was stale before asking it to rebuild the data plan. */
   const DirtyMask entry_dirty_mask = DirtyMask(dirty_mask);
-  const bool local_recompile = !executable || is_dirty(*this, dirty_executable);
+  const bool local_recompile =
+      !executable || is_dirty(*this, dirty_executable) ||
+      (backend->requires_full_storage_preparation() && backend_state &&
+       backend_state->host_custom_policy_pending);
   const StepPlan &plan = step_plan_for(StepProgram::ordinary);
   bool recompile = local_recompile;
   bool staged_multilevel_presence = false;
@@ -191,7 +199,9 @@ void fields::ensure_backend_executable() {
     const bool inspect_multilevel_signature =
         local_multilevel || backend_state->multilevel_plan_validated ||
         backend_state->multilevel_preflight_required;
-    const bool local_custom = backend->host_custom_fallback_enabled();
+    const bool local_custom = backend_state->host_custom_presence_validated
+                                  ? backend_state->host_custom_local_presence
+                                  : backend->host_custom_fallback_enabled();
     const bool inspect_custom_signature =
         local_custom || backend_state->host_custom_plan_validated ||
         backend_state->host_custom_preflight_required;
@@ -303,6 +313,11 @@ void fields::ensure_backend_executable() {
     backend_state->host_custom_preflight_required = staged_custom_presence;
     backend_state->host_custom_plan_validated = staged_custom_presence;
     backend_state->host_custom_validated_plan_signature = plan.signature;
+  }
+  if (backend_state->host_custom_policy_pending) {
+    backend_publish_host_custom_policy(*this, backend_state->host_custom_local_presence,
+                                       backend_state->host_custom_preflight_required);
+    backend_state->host_custom_policy_pending = false;
   }
 }
 

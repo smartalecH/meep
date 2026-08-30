@@ -4968,9 +4968,10 @@ static void test_resident_host_custom_collective_preflight() {
   backend_set_host_custom_mpi_override_for_testing(count_processors() > 1);
 
   /* Policy and its one-shot warning belong to the committed resident epoch,
-     not merely to the early custom capability reconciliation. Exercise both
-     fallible steps after that gate for addition and removal. */
-  for (int injection = 0; injection < 3; ++injection) {
+     not merely to the early custom capability reconciliation. Exercise every
+     fallible step after that gate, including ordinary executable compilation,
+     for addition and removal. */
+  for (int injection = 0; injection < 4; ++injection) {
     structure s(gv, unit_epsilon, no_pml(), identity(), 2);
     add_custom_lifecycle_state(s);
     fields f(&s);
@@ -4984,6 +4985,7 @@ static void test_resident_host_custom_collective_preflight() {
     counts.fail_create_state = injection == 0;
     counts.fail_initialize = injection == 1;
     counts.fail_finalize = injection == 2;
+    counts.fail_compile = injection == 3;
     bool failed = false;
     try { f.advance(1); }
     catch (const std::runtime_error &) { failed = true; }
@@ -4992,20 +4994,30 @@ static void test_resident_host_custom_collective_preflight() {
               !tracking->is_poisoned(),
           "custom addition rebuild failure %d published policy, warning, stats, or poison",
           injection);
+    if (injection == 3)
+      CHECK(f.backend_state && !f.executable &&
+                f.backend_state->host_custom_presence_validated &&
+                or_to_all(f.backend_state->host_custom_local_presence) &&
+                f.backend_state->host_custom_preflight_required &&
+                f.backend_state->host_custom_policy_pending &&
+                !f.backend_state->host_custom_plan_validated &&
+                is_dirty(f, dirty_executable),
+            "custom addition compile failure did not retain a retryable staged epoch");
     counts.fail_create_state = false;
     counts.fail_initialize = false;
     counts.fail_finalize = false;
+    counts.fail_compile = false;
     f.advance(1);
     const bool any_enabled = or_to_all(tracking->host_custom_fallback_enabled());
     CHECK(f.backend_state->host_custom_preflight_required &&
               tracking->host_custom_fallback_enabled() ==
                   f.backend_state->host_custom_local_presence &&
-              any_enabled &&
+              any_enabled && !f.backend_state->host_custom_policy_pending &&
               tracking->host_custom_fallback_stats().warnings == 1,
           "custom addition rebuild failure %d did not publish on retry", injection);
   }
 
-  for (int injection = 0; injection < 3; ++injection) {
+  for (int injection = 0; injection < 4; ++injection) {
     structure s(gv, unit_epsilon, no_pml(), identity(), 2);
     add_custom_lifecycle_state(s);
     fields f(&s);
@@ -5022,6 +5034,7 @@ static void test_resident_host_custom_collective_preflight() {
     counts.fail_create_state = injection == 0;
     counts.fail_initialize = injection == 1;
     counts.fail_finalize = injection == 2;
+    counts.fail_compile = injection == 3;
     bool failed = false;
     try { f.advance(1); }
     catch (const std::runtime_error &) { failed = true; }
@@ -5031,11 +5044,22 @@ static void test_resident_host_custom_collective_preflight() {
               !tracking->is_poisoned(),
           "custom removal rebuild failure %d replaced the committed policy or stats",
           injection);
+    if (injection == 3)
+      CHECK(f.backend_state && !f.executable &&
+                f.backend_state->host_custom_presence_validated &&
+                !f.backend_state->host_custom_local_presence &&
+                !f.backend_state->host_custom_preflight_required &&
+                f.backend_state->host_custom_policy_pending &&
+                !f.backend_state->host_custom_plan_validated &&
+                is_dirty(f, dirty_executable),
+            "custom removal compile failure did not retain a retryable staged epoch");
     counts.fail_create_state = false;
     counts.fail_initialize = false;
     counts.fail_finalize = false;
+    counts.fail_compile = false;
     f.advance(1);
     CHECK(!tracking->host_custom_fallback_enabled() &&
+              !f.backend_state->host_custom_policy_pending &&
               same_host_custom_stats(entry_stats, tracking->host_custom_fallback_stats()),
           "custom removal rebuild failure %d did not publish removal on retry", injection);
   }

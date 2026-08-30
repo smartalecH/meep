@@ -65,7 +65,8 @@ struct BackendState {
         multilevel_plan_validated(false), multilevel_static_validation_required(false),
         multilevel_validated_plan_signature(0), host_custom_preflight_required(false),
         host_custom_plan_validated(false), host_custom_local_presence(false),
-        host_custom_presence_validated(false), host_custom_validated_plan_signature(0),
+        host_custom_presence_validated(false), host_custom_policy_pending(false),
+        host_custom_validated_plan_signature(0),
         noisy_first_stream_tag(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
@@ -103,6 +104,9 @@ struct BackendState {
      resident rebuild commits successfully. */
   bool host_custom_local_presence;
   bool host_custom_presence_validated;
+  /* Policy publication is the final no-throw commit step after the ordinary
+     executable for this staged resident epoch has compiled successfully. */
+  bool host_custom_policy_pending;
   uint64_t host_custom_validated_plan_signature;
   uint64_t noisy_first_stream_tag;
 };

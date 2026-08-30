@@ -2421,7 +2421,7 @@ void fields::init_backend() {
     backend_state->host_custom_local_presence = local_custom;
     backend_state->host_custom_presence_validated = true;
     backend_state->host_custom_preflight_required = any_custom;
-    backend_publish_host_custom_policy(*this, local_custom, any_custom);
+    backend_state->host_custom_policy_pending = true;
   }
 }
 
