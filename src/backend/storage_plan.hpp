@@ -63,13 +63,17 @@ enum class array_kind {
 };
 
 const char *array_kind_name(array_kind k);
+uint64_t polarization_storage_aux(field_type ft, int state_index, size_t layout_ordinal);
+field_type polarization_storage_field_type(uint64_t aux);
+int polarization_storage_state_index(uint64_t aux);
+uint32_t polarization_storage_layout_ordinal(uint64_t aux);
 
 struct StorageKey {
   int chunk;
   int kind;       // array_kind
   int component_; // meep::component, or -1
   int cmp;        // 0/1, or -1
-  int aux;        // direction, susceptibility index, dft index, ...
+  uint64_t aux;   // direction, susceptibility index, or packed polarization state/layout
 
   bool operator==(const StorageKey &o) const {
     return chunk == o.chunk && kind == o.kind && component_ == o.component_ && cmp == o.cmp &&
@@ -83,7 +87,7 @@ struct StorageKeyHash {
     h = h * 31 + size_t(k.kind);
     h = h * 31 + size_t(k.component_ + 2);
     h = h * 31 + size_t(k.cmp + 2);
-    h = h * 31 + size_t(k.aux + 2);
+    h = h * 31 + size_t(k.aux ^ (k.aux >> 32));
     return h;
   }
 };

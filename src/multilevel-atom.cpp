@@ -18,7 +18,10 @@
 /* this file implements multilevel atomic materials for Meep */
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
+#include <limits>
+#include <stdexcept>
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "config.h"
@@ -221,6 +224,94 @@ void *multilevel_susceptibility::copy_internal_data(void *data) const {
   dnew->Ntmp = P;
   dnew->N = P + L;
   return (void *)dnew;
+}
+
+bool multilevel_susceptibility::internal_layout(std::vector<InternalArrayLayout> &out,
+                                                const grid_volume &gv,
+                                                void *P_internal_data) const {
+  out.clear();
+  if (!P_internal_data) return true;
+  if (L <= 0 || T <= 0) throw std::invalid_argument("invalid multilevel internal dimensions");
+  multilevel_data *d = static_cast<multilevel_data *>(P_internal_data);
+  const size_t ntot = size_t(gv.ntot());
+  if (d->ntot != ntot || !d->GammaInv || !d->N || !d->Ntmp)
+    throw std::invalid_argument("invalid multilevel internal storage");
+  const size_t levels = size_t(L);
+  const size_t transitions = size_t(T);
+  if (levels > std::numeric_limits<size_t>::max() / levels ||
+      ntot > std::numeric_limits<size_t>::max() / levels)
+    throw std::overflow_error("multilevel internal layout extent overflow");
+  const size_t gamma_elements = levels * levels;
+  const size_t population_elements = ntot * levels;
+  const uintptr_t blob_begin = reinterpret_cast<uintptr_t>(d);
+  if (d->sz_data > std::numeric_limits<uintptr_t>::max() - blob_begin)
+    throw std::overflow_error("multilevel internal storage extent overflow");
+  const uintptr_t blob_end = blob_begin + d->sz_data;
+  const auto checked_offset = [&](const realnum *p, size_t elements) {
+    const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+    if (!p || address < blob_begin || address > blob_end ||
+        size_t(blob_end - address) / sizeof(realnum) < elements ||
+        size_t(address - blob_begin) % sizeof(realnum))
+      throw std::invalid_argument("multilevel internal row lies outside its storage blob");
+    return size_t(address - blob_begin) / sizeof(realnum);
+  };
+  const size_t gamma_offset = checked_offset(d->GammaInv, gamma_elements);
+  const size_t scratch_offset = checked_offset(d->Ntmp, levels);
+  const size_t population_offset = checked_offset(d->N, population_elements);
+  if (population_offset != scratch_offset + levels)
+    throw std::invalid_argument("multilevel population scratch layout is invalid");
+  size_t live_rows = 0;
+  FOR_COMPONENTS(c) DOCMP2 {
+    if (bool(d->P[c][cmp]) != bool(d->P_prev[c][cmp]))
+      throw std::invalid_argument("incomplete multilevel P/P_prev storage");
+    if (d->P[c][cmp]) {
+      if (live_rows > std::numeric_limits<size_t>::max() - 2 * transitions)
+        throw std::overflow_error("multilevel internal layout row count overflow");
+      live_rows += 2 * transitions;
+    }
+  }
+  if (live_rows > std::numeric_limits<size_t>::max() - 2)
+    throw std::overflow_error("multilevel internal layout row count overflow");
+  out.reserve(live_rows + 2);
+
+  InternalArrayLayout gamma_inv;
+  gamma_inv.name = "GammaInv";
+  gamma_inv.element_type = InternalArrayLayout::realnum_value;
+  gamma_inv.offset_elements = gamma_offset;
+  gamma_inv.elements = gamma_elements;
+  gamma_inv.c = Centered;
+  gamma_inv.cmp = -1;
+  out.push_back(gamma_inv);
+
+  FOR_COMPONENTS(c) DOCMP2 {
+    if (!d->P[c][cmp]) continue;
+    for (int t = 0; t < T; ++t) {
+      if (!d->P[c][cmp][t] || !d->P_prev[c][cmp][t])
+        throw std::invalid_argument("incomplete multilevel transition storage");
+      InternalArrayLayout p;
+      p.name = "P";
+      p.element_type = InternalArrayLayout::realnum_value;
+      p.offset_elements = checked_offset(d->P[c][cmp][t], ntot);
+      p.elements = ntot;
+      p.c = c;
+      p.cmp = cmp;
+      out.push_back(p);
+      InternalArrayLayout p_prev = p;
+      p_prev.name = "P_prev";
+      p_prev.offset_elements = checked_offset(d->P_prev[c][cmp][t], ntot);
+      out.push_back(p_prev);
+    }
+  }
+
+  InternalArrayLayout populations;
+  populations.name = "N";
+  populations.element_type = InternalArrayLayout::realnum_value;
+  populations.offset_elements = population_offset;
+  populations.elements = population_elements;
+  populations.c = Centered;
+  populations.cmp = -1;
+  out.push_back(populations);
+  return true;
 }
 
 int multilevel_susceptibility::num_cinternal_notowned_needed(component c,

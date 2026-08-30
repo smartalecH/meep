@@ -56,6 +56,38 @@ const char *array_kind_name(array_kind k) {
   return "?";
 }
 
+uint64_t polarization_storage_aux(field_type ft, int state_index, size_t layout_ordinal) {
+  const int field = int(ft);
+  if ((ft != E_stuff && ft != H_stuff) || state_index < 0 ||
+      uint64_t(state_index) >
+          (uint64_t(std::numeric_limits<uint32_t>::max()) - uint64_t(field)) /
+              uint64_t(NUM_FIELD_TYPES) ||
+      layout_ordinal > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("polarization storage key overflow");
+  const uint32_t identity =
+      uint32_t(uint64_t(state_index) * uint64_t(NUM_FIELD_TYPES) + uint64_t(field));
+  return (uint64_t(identity) << 32) | uint64_t(uint32_t(layout_ordinal));
+}
+
+field_type polarization_storage_field_type(uint64_t aux) {
+  const uint32_t identity = uint32_t(aux >> 32);
+  const field_type ft = field_type(identity % uint32_t(NUM_FIELD_TYPES));
+  if (ft != E_stuff && ft != H_stuff)
+    throw std::invalid_argument("polarization storage key has an invalid field type");
+  return ft;
+}
+
+int polarization_storage_state_index(uint64_t aux) {
+  const uint32_t identity = uint32_t(aux >> 32);
+  const field_type ft = polarization_storage_field_type(aux);
+  const uint64_t state_index = (uint64_t(identity) - uint64_t(int(ft))) / NUM_FIELD_TYPES;
+  if (state_index > uint64_t(std::numeric_limits<int>::max()))
+    throw std::overflow_error("polarization storage state index overflow");
+  return int(state_index);
+}
+
+uint32_t polarization_storage_layout_ordinal(uint64_t aux) { return uint32_t(aux); }
+
 static size_t element_bytes(ElementType t) {
   switch (t) {
     case ElementType::realnum_value: return sizeof(realnum);
@@ -161,7 +193,7 @@ struct Registrar {
   StoragePlan &plan;
   size_t count = 0;
 
-  void add(int chunk, array_kind kind, int c, int cmp, int aux, void *p, size_t n,
+  void add(int chunk, array_kind kind, int c, int cmp, uint64_t aux, void *p, size_t n,
            array_role role, ElementType type) {
     if (!p) return;
     const StorageKey key{chunk, int(kind), c, cmp, aux};
@@ -277,7 +309,7 @@ size_t build_storage_catalog(fields &f, CpuArrayCatalog &cat, StoragePlan &plan)
           const ElementType type = entry.element_type == InternalArrayLayout::complex_realnum
                                        ? ElementType::complex_realnum
                                        : ElementType::realnum_value;
-          const int aux = si * 1024 + int(li);
+          const uint64_t aux = polarization_storage_aux(ft, si, li);
           r.add(i, array_kind::polarization_internal, int(entry.c), entry.cmp, aux,
                 base + entry.offset_elements, entry.elements, array_role::polarization, type);
         }

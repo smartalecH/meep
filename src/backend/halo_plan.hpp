@@ -95,6 +95,7 @@ public:
   void clear() {
     specs_.clear();
     bases_.clear();
+    keys_.clear();
     index_.clear();
   }
 
@@ -102,13 +103,25 @@ public:
      always yields the same ArrayId within one connectivity generation. */
   ArrayId intern(const HaloArrayKey &key, realnum *base, size_t elements, array_role role);
 
-  realnum *base(ArrayId id) const { return bases_[id.value]; }
-  const ArraySpec &spec(ArrayId id) const { return specs_[id.value]; }
+  bool contains(ArrayId id) const { return id.value < bases_.size(); }
+  realnum *base(ArrayId id) const {
+    if (!contains(id)) meep::abort("halo array id is out of range");
+    return bases_[id.value];
+  }
+  const ArraySpec &spec(ArrayId id) const {
+    if (!contains(id)) meep::abort("halo array spec id is out of range");
+    return specs_[id.value];
+  }
+  const HaloArrayKey &key(ArrayId id) const {
+    if (!contains(id)) meep::abort("halo array key id is out of range");
+    return keys_[id.value];
+  }
   size_t size() const { return specs_.size(); }
 
 private:
   std::vector<ArraySpec> specs_;
   std::vector<realnum *> bases_;
+  std::vector<HaloArrayKey> keys_;
   std::unordered_map<HaloArrayKey, uint32_t, HaloArrayKeyHash> index_;
 };
 
@@ -318,6 +331,7 @@ bool reconcile_host_halo_comm_size(int sender_rank, size_t sender_local,
    source plan remains unchanged and continues to serve the legacy CPU
    executor. */
 bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays,
+                     const HostHaloArrayTable &source_host_arrays,
                      const CpuArrayCatalog &catalog, int field_interleave, HaloPlan &destination,
                      std::string &why);
 

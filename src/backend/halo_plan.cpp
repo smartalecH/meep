@@ -48,6 +48,7 @@ ArrayId HaloArrayTable::intern(const HaloArrayKey &key, realnum *base, size_t el
   spec.classification_provisional = false;
   specs_.push_back(spec);
   bases_.push_back(base);
+  keys_.push_back(key);
   index_[key] = id;
   return ArrayId{id};
 }
@@ -326,6 +327,11 @@ bool remap_elements(const std::vector<ElementRef> &source, const HaloArrayTable 
   destination.reserve(source.size());
   for (size_t i = 0; i < source.size(); ++i) {
     const ElementRef &ref = source[i];
+    if (!source_arrays.contains(ref.array)) {
+      why = "halo source array id is out of range";
+      destination.clear();
+      return false;
+    }
     const realnum *address = source_arrays.base(ref.array) + ref.index;
     ArrayId id = invalid_array();
     ptrdiff_t offset = 0;
@@ -335,6 +341,52 @@ bool remap_elements(const std::vector<ElementRef> &source, const HaloArrayTable 
       return false;
     }
     destination.push_back(ElementRef{id, offset});
+  }
+  return true;
+}
+
+bool validate_host_mirror(const std::vector<ElementRef> &source,
+                          const std::vector<HostElementRef> &host,
+                          const HaloArrayTable &source_arrays,
+                          const HostHaloArrayTable &source_host_arrays, field_type plan_ft,
+                          std::string &why) {
+  if (host.size() != source.size()) {
+    why = "polarization halo lacks a complete ordered host mirror";
+    return false;
+  }
+  const field_type state_ft = plan_ft == PE_stuff ? E_stuff : H_stuff;
+  for (size_t i = 0; i < source.size(); ++i) {
+    if (!source_arrays.contains(source[i].array)) {
+      why = "polarization halo source array id is out of range";
+      return false;
+    }
+    if (!source_host_arrays.contains(host[i].id)) {
+      why = "polarization halo host id is stale or out of range";
+      return false;
+    }
+    const HaloArrayKey &array_key = source_arrays.key(source[i].array);
+    const ArraySpec &array_spec = source_arrays.spec(source[i].array);
+    const HostHaloKey &host_key = source_host_arrays.key(host[i].id);
+    if (source[i].index != 0 || array_spec.role != array_role::polarization ||
+        array_spec.elements != 1 || array_key.role != int(array_spec.role)) {
+      why = "polarization halo source reference has an invalid role, extent, or offset";
+      return false;
+    }
+    if (source_arrays.base(source[i].array) + source[i].index !=
+        source_host_arrays.address(host[i].id)) {
+      why = "polarization halo canonical and host mirrors disagree on address or order";
+      return false;
+    }
+    if (host_key.chunk != array_key.chunk || host_key.ft != int(state_ft) ||
+        host_key.state_index != array_key.aux ||
+        host_key.susceptibility_id != array_key.susceptibility_id ||
+        host_key.component_ != array_key.component_ || host_key.cmp != array_key.cmp ||
+        host_key.internal_index != array_key.internal_index ||
+        host_key.point_index != array_key.point_index ||
+        host_key.complex_internal != array_key.complex_internal) {
+      why = "polarization halo canonical and host mirror keys disagree";
+      return false;
+    }
   }
   return true;
 }
@@ -357,6 +409,7 @@ void expand_zero(const ZeroPlan &source, std::vector<ElementRef> &out) {
 } // namespace
 
 bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays,
+                     const HostHaloArrayTable &source_host_arrays,
                      const CpuArrayCatalog &catalog, int field_interleave, HaloPlan &destination,
                      std::string &why) {
   why.clear();
@@ -364,25 +417,25 @@ bool remap_halo_plan(const HaloPlan &source, const HaloArrayTable &source_arrays
   std::vector<ElementRef> source_gather, source_scatter, gather, scatter;
   expand_gather(source, source_gather);
   expand_scatter(source, source_scatter);
+  const bool polarization = source.ft == PE_stuff || source.ft == PH_stuff;
+
+  if (polarization &&
+      (!validate_host_mirror(source_gather, source.host_gather, source_arrays,
+                             source_host_arrays, source.ft, why) ||
+       !validate_host_mirror(source_scatter, source.host_scatter, source_arrays,
+                             source_host_arrays, source.ft, why)))
+    return false;
 
   std::string gather_why, scatter_why;
   const bool gather_mapped =
       remap_elements(source_gather, source_arrays, catalog, gather, gather_why);
   const bool scatter_mapped =
       remap_elements(source_scatter, source_arrays, catalog, scatter, scatter_why);
-  const bool polarization = source.ft == PE_stuff || source.ft == PH_stuff;
-
   if (!gather_mapped || !scatter_mapped) {
     if (!polarization) {
       why = !gather_mapped ? gather_why : scatter_why;
       return false;
     }
-    if ((!source_gather.empty() && source.host_gather.size() != source_gather.size()) ||
-        (!source_scatter.empty() && source.host_scatter.size() != source_scatter.size())) {
-      why = "polarization halo lacks a complete ordered host mirror";
-      return false;
-    }
-
     staged.storage = HaloStorageDisposition::host_owned;
     staged.gather_slabs.clear();
     staged.scatter_slabs.clear();
