@@ -251,6 +251,18 @@ public:
   susceptibility *clone() const override { return new inherited_lorentzian(*this); }
 };
 
+class opaque_inherited_lorentzian : public lorentzian_susceptibility {
+public:
+  opaque_inherited_lorentzian(realnum omega, realnum gamma)
+      : lorentzian_susceptibility(omega, gamma) {}
+  susceptibility *clone() const override { return new opaque_inherited_lorentzian(*this); }
+  bool internal_layout(std::vector<InternalArrayLayout> &out, const grid_volume &,
+                       void *) const override {
+    out.clear();
+    return false;
+  }
+};
+
 struct host_callback_trace {
   std::vector<char> events;
 };
@@ -3399,6 +3411,60 @@ static void run_host_custom_fallback_case(precision_policy_kind policy, bool mag
                 precision_policy_name(policy));
 }
 
+static void test_host_custom_opaque_halo_ownership() {
+  const grid_volume gv = vol2d(2.4, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  opaque_inherited_lorentzian cpu_custom(0.73, 0.06);
+  opaque_inherited_lorentzian gpu_custom(0.73, 0.06);
+  cpu_structure.add_susceptibility(unit_value, E_stuff, cpu_custom);
+  gpu_structure.add_susceptibility(unit_value, E_stuff, gpu_custom);
+
+  fields cpu(&cpu_structure);
+  fields gpu(&gpu_structure, host_custom_nvidia_options());
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  cpu.require_component(Ez);
+  gpu.require_component(Ez);
+  gaussian_src_time cpu_source(0.31, 0.14), gpu_source(0.31, 0.14);
+  cpu.add_point_source(Ez, cpu_source, vec(0.37, 0.41), 0.21);
+  gpu.add_point_source(Ez, gpu_source, vec(0.37, 0.41), 0.21);
+  cpu.advance(1);
+  cpu.t = 0;
+  build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
+  gpu.init_backend();
+
+  size_t opaque_elements = 0;
+  for (const HaloPlan &source : gpu.halos->plans) {
+    if (source.ft != PE_stuff || !source.block_elements) continue;
+    require(source.storage == HaloStorageDisposition::host_owned,
+            "opaque custom polarization source halo is not host-owned");
+    HaloPlan remapped;
+    std::string why;
+    require(remap_halo_plan(source, gpu.halos->arrays, gpu.halos->host_arrays,
+                            *gpu.array_catalog, gpu.is_real ? 1 : 2, remapped, why),
+            "opaque custom polarization halo remap failed");
+    require(remapped.storage == HaloStorageDisposition::host_owned,
+            "opaque custom polarization halo unexpectedly became device-canonical");
+    opaque_elements += source.block_elements;
+  }
+  require(opaque_elements > 0, "opaque custom fixture produced no host-owned polarization halo");
+
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  size_t owned_halo_descriptors = 0;
+  for (const HostSegment &segment : plan.host_segments)
+    if (segment.phase == HostSegmentPhase::polarization_and_halo)
+      owned_halo_descriptors += segment.host_halo_plan_count;
+  require(owned_halo_descriptors > 0,
+          "opaque custom polarization halo is not owned by a host callback segment");
+
+  initialize_fields(cpu, gpu, false, 0.07);
+  cpu.advance(1);
+  gpu.advance(1);
+  compare_fields(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 1e-6);
+  master_printf("nvidia_timestep: host-custom opaque halo ownership PASS\n");
+}
+
 static void test_host_custom_postdispatch_poison() {
   const nvidia::testing::failure_point failures[] = {
       nvidia::testing::failure_point::device_to_host_copy,
@@ -3752,6 +3818,23 @@ static void run_multilevel_case(const char *name, precision_policy_kind policy,
   cpu.t = 0;
   build_storage_catalog(cpu, *cpu.array_catalog, *cpu.storage_plan);
   gpu.init_backend();
+  const field_type halo_ft = magnetic ? PH_stuff : PE_stuff;
+  size_t canonical_halo_elements = 0;
+  for (const HaloPlan &source : gpu.halos->plans) {
+    if (source.ft != halo_ft || !source.block_elements) continue;
+    require(source.storage == HaloStorageDisposition::host_owned,
+            "multilevel source polarization halo is not initially host-owned");
+    HaloPlan canonical;
+    std::string why;
+    require(remap_halo_plan(source, gpu.halos->arrays, gpu.halos->host_arrays,
+                            *gpu.array_catalog, gpu.is_real ? 1 : 2, canonical, why),
+            "multilevel polarization halo did not remap");
+    require(canonical.storage == HaloStorageDisposition::canonical,
+            "exact multilevel polarization halo remained host-owned after remap");
+    canonical_halo_elements += source.block_elements;
+  }
+  require(canonical_halo_elements > 0,
+          "multilevel fixture produced no remappable polarization halo elements");
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
   initialize_multilevel_fields(cpu, gpu, narrowed, 0.002);
@@ -5537,6 +5620,7 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (host_custom_only) {
+    test_host_custom_opaque_halo_ownership();
     test_host_custom_complex_eh_composition();
     test_host_custom_compile_rejections();
     test_host_custom_postdispatch_poison();

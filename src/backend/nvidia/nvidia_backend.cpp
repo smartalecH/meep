@@ -3446,16 +3446,12 @@ NvidiaCompiledHalo compile_halo(const HaloPlan &source, const fields &f, NvidiaB
                                 std::vector<nvidia::halo_scatter_entry> &scatters) {
   if (!source.same_rank)
     throw std::invalid_argument("NVIDIA PR2 does not support remote halo exchange");
-
-  HaloPlan canonical;
-  std::string why;
-  if (!remap_halo_plan(source, f.halos->arrays, f.halos->host_arrays, *f.array_catalog,
-                       f.is_real ? 1 : 2, canonical, why))
-    throw std::logic_error(std::string("cannot remap local halo plan: ") + why);
+  if (source.storage != HaloStorageDisposition::canonical)
+    throw std::invalid_argument("NVIDIA cannot lower a host-owned halo plan");
 
   std::vector<ElementRef> gather_refs, scatter_refs;
-  expand_gather(canonical, gather_refs);
-  expand_scatter(canonical, scatter_refs);
+  expand_gather(source, gather_refs);
+  expand_scatter(source, scatter_refs);
   if (gather_refs.size() != source.block_elements || scatter_refs.size() != source.block_elements)
     throw std::logic_error("local halo plan expansion does not match its communication block");
   if (!source.block_elements)
@@ -4657,12 +4653,18 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           for (size_t i = 0; i < f_.halos->plans.size(); ++i) {
             const HaloPlan &halo = f_.halos->plans[i];
             if (halo.ft != op.ft || !halo.block_elements) continue;
-            /* Opaque polarization halos execute as part of the encompassing
-               host-callback segment.  They deliberately have no device-side
-               ArrayId representation to lower here. */
-            if (halo.storage == HaloStorageDisposition::host_owned) continue;
+            HaloPlan canonical;
+            std::string why;
+            if (!remap_halo_plan(halo, f_.halos->arrays, f_.halos->host_arrays,
+                                 *f_.array_catalog, f_.is_real ? 1 : 2, canonical, why))
+              throw std::logic_error(std::string("cannot remap local halo plan: ") + why);
+            /* Genuinely opaque polarization halos execute as part of the
+               encompassing host-callback segment.  A source plan starts as
+               host-owned, however, so only skip it after canonical remapping
+               proves that some row has no device ArrayId. */
+            if (canonical.storage == HaloStorageDisposition::host_owned) continue;
             const NvidiaCompiledHalo lowered =
-                compile_halo(halo, f_, state, buffer_elements, halo_gathers, halo_scatters);
+                compile_halo(canonical, f_, state, buffer_elements, halo_gathers, halo_scatters);
             if (have_halo_precision && lowered.gather.precision != halo_precision)
               throw std::invalid_argument(
                   "one NVIDIA boundary operation mixes halo storage precisions");
