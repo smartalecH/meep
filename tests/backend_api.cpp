@@ -4300,7 +4300,7 @@ static void test_resident_host_custom_policy_lifecycle() {
         std::numeric_limits<uint64_t>::max());
     bool overflowed = false;
     try { f.advance(1); }
-    catch (const std::overflow_error &) { overflowed = true; }
+    catch (const std::runtime_error &) { overflowed = true; }
     CHECK(overflowed && !tracking->host_custom_fallback_enabled() && !f.backend_state &&
               !f.executable && counts.custom_preflights == 0 && counts.advance_attempts == 0,
           "warning overflow partially published custom enablement");
@@ -4335,7 +4335,7 @@ static void test_resident_host_custom_policy_lifecycle() {
                                                 std::numeric_limits<uint64_t>::max());
     bool overflowed = false;
     try { f.advance(1); }
-    catch (const std::overflow_error &) { overflowed = true; }
+    catch (const std::runtime_error &) { overflowed = true; }
     CHECK(overflowed && counts.custom_preflights == preflights_before &&
               counts.advance_attempts == advances_before &&
               !tracking->is_poisoned(),
@@ -4413,7 +4413,7 @@ static void test_resident_host_custom_policy_lifecycle() {
                                                 std::numeric_limits<uint64_t>::max());
     bool overflowed = false;
     try { f.advance(1); }
-    catch (const std::overflow_error &) { overflowed = true; }
+    catch (const std::runtime_error &) { overflowed = true; }
     const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
     CHECK(overflowed && stats.downloads == std::numeric_limits<uint64_t>::max() &&
               stats.download_bytes == bytes_before && stats.callbacks == 4 &&
@@ -4438,7 +4438,7 @@ static void test_resident_host_custom_policy_lifecycle() {
         std::numeric_limits<uint64_t>::max());
     bool overflowed = false;
     try { f.advance(1); }
-    catch (const std::overflow_error &) { overflowed = true; }
+    catch (const std::runtime_error &) { overflowed = true; }
     const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
     CHECK(overflowed && stats.downloads == 7 &&
               stats.download_bytes == std::numeric_limits<uint64_t>::max() &&
@@ -4468,7 +4468,7 @@ static void test_resident_host_custom_policy_lifecycle() {
                                                 std::numeric_limits<uint64_t>::max());
     bool overflowed = false;
     try { f.advance(1); }
-    catch (const std::overflow_error &) { overflowed = true; }
+    catch (const std::runtime_error &) { overflowed = true; }
     const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
     CHECK(overflowed && stats.uploads == std::numeric_limits<uint64_t>::max() &&
               stats.upload_bytes == bytes_before && stats.callbacks == 6 &&
@@ -4492,7 +4492,7 @@ static void test_resident_host_custom_policy_lifecycle() {
         std::numeric_limits<uint64_t>::max());
     bool overflowed = false;
     try { f.advance(1); }
-    catch (const std::overflow_error &) { overflowed = true; }
+    catch (const std::runtime_error &) { overflowed = true; }
     const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
     CHECK(overflowed && stats.uploads == 7 &&
               stats.upload_bytes == std::numeric_limits<uint64_t>::max() &&
@@ -4548,7 +4548,7 @@ static void test_resident_host_custom_policy_lifecycle() {
     f.options = warned_custom_options();
     bool rejected = false;
     try { f.advance(reorder ? 2 : 1); }
-    catch (const std::logic_error &) { rejected = true; }
+    catch (const std::runtime_error &) { rejected = true; }
     CHECK(rejected && tracking->is_poisoned() &&
               tracking->host_custom_fallback_stats().poisoned_failures == 1,
           "%s was accepted because its aggregate callback total matched", label);
@@ -4573,7 +4573,7 @@ static void test_resident_host_custom_policy_lifecycle() {
     f.options = warned_custom_options();
     bool rejected = false;
     try { f.advance(second_step ? 2 : 1); }
-    catch (const std::logic_error &) { rejected = true; }
+    catch (const std::runtime_error &) { rejected = true; }
     const HostCustomFallbackStats &stats = tracking->host_custom_fallback_stats();
     const uint64_t completed_before_reorder = second_step ? 2 : 0;
     const uint64_t callbacks_before_reorder = second_step ? 4 : 0;

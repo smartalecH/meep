@@ -148,6 +148,11 @@ void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
   if (host_custom_collective_failure_rank_for_testing == my_rank() &&
       host_custom_collective_failure_mode_for_testing == 4)
     throw std::runtime_error("injected host custom plan validation failure");
+  std::string validation_error;
+  if (!validate_host_callback_plan(f, plan, &validation_error))
+    throw std::runtime_error(validation_error.empty()
+                                 ? "host custom callback plan validation failed"
+                                 : validation_error);
   f.backend->validate_host_custom_plan(plan, state);
   if (f.backend->is_poisoned())
     throw std::runtime_error(
