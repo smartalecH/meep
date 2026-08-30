@@ -426,6 +426,13 @@ void fields::connect_the_chunks() {
 
   comm_sizes.clear();
   const size_t num_reals_per_voxel = is_real ? 1 : 2;
+  bool local_halo_count_error = false;
+  std::string local_halo_count_why;
+  auto note_halo_count_error = [&local_halo_count_error,
+                                &local_halo_count_why](const std::string &why) {
+    local_halo_count_error = true;
+    if (local_halo_count_why.empty()) local_halo_count_why = why;
+  };
   for (int i = 0; i < num_chunks; i++) {
     // First count the border elements...
     const grid_volume vi = chunks[i]->gv;
@@ -454,38 +461,112 @@ void fields::connect_the_chunks() {
                   for (polarization_state *pi = chunks[i]->pol[type(corig)]; pi; pi = pi->next)
                     for (polarization_state *pj = chunks[j]->pol[type(c)]; pj; pj = pj->next)
                       if (*pi->s == *pj->s) {
-                        if (pi->data && chunks[i]->is_mine()) {
-                          ni += pi->s->num_internal_notowned_needed(corig, pi->data);
-                          cni += pi->s->num_cinternal_notowned_needed(corig, pi->data);
+                        const bool have_in = pi->data && chunks[i]->is_mine();
+                        const bool have_out = pj->data && chunks[j]->is_mine();
+                        const int ini =
+                            have_in ? pi->s->num_internal_notowned_needed(corig, pi->data) : 0;
+                        const int oni =
+                            have_out ? pj->s->num_internal_notowned_needed(c, pj->data) : 0;
+                        const int icni =
+                            have_in ? pi->s->num_cinternal_notowned_needed(corig, pi->data) : 0;
+                        const int ocni =
+                            have_out ? pj->s->num_cinternal_notowned_needed(c, pj->data) : 0;
+                        if (!have_in && !have_out) continue;
+                        size_t resolved = 0;
+                        std::string why;
+                        if (!resolve_host_halo_count(have_in, ini, have_out, oni, resolved, why)) {
+                          note_halo_count_error(why);
+                          resolved = 0;
                         }
-                        else if (pj->data && chunks[j]->is_mine()) {
-                          ni += pj->s->num_internal_notowned_needed(c, pj->data);
-                          cni += pj->s->num_cinternal_notowned_needed(c, pj->data);
+                        if (!checked_add_halo_elements(ni, resolved, ni, why))
+                          note_halo_count_error(why);
+                        if (!resolve_host_halo_count(have_in, icni, have_out, ocni, resolved, why)) {
+                          note_halo_count_error("complex " + why);
+                          resolved = 0;
                         }
+                        if (!checked_add_halo_elements(cni, resolved, cni, why))
+                          note_halo_count_error("complex " + why);
                       }
-                  comm_sizes[{f, ip, pair_j_to_i}] += cni * num_reals_per_voxel;
-                  comm_sizes[{f, CONNECT_COPY, pair_j_to_i}] += ni;
+                  size_t complex_reals = 0, updated = 0;
+                  std::string why;
+                  if (!checked_multiply_halo_elements(cni, num_reals_per_voxel, complex_reals,
+                                                      why))
+                    note_halo_count_error(why);
+                  const comms_key complex_key{f, ip, pair_j_to_i};
+                  if (!checked_add_halo_elements(comm_sizes[complex_key], complex_reals, updated,
+                                                 why))
+                    note_halo_count_error(why);
+                  else
+                    comm_sizes[complex_key] = updated;
+                  const comms_key scalar_key{f, CONNECT_COPY, pair_j_to_i};
+                  if (!checked_add_halo_elements(comm_sizes[scalar_key], ni, updated, why))
+                    note_halo_count_error(why);
+                  else
+                    comm_sizes[scalar_key] = updated;
                 }
               } // if is_mine and owns...
             }   // loop over j chunks
         }       // LOOP_OVER_VOL_NOTOWNED
     }           // FOR_COMPONENTS
 
-    // Allocating comm blocks as we go...
+  } // loop over i chunks
+
+  /* A custom susceptibility's virtual count is evaluated independently by
+     the sender and receiver owners.  Reconcile every PE/PH block in one fixed
+     global order before allocating or entering any point-to-point exchange;
+     otherwise rank-dependent custom behavior can produce unequal MPI message
+     sizes and hang.  Count-query failures are likewise made collective before
+     any rank throws. */
+  am_now_working_on(MpiAllTime);
+  const bool any_halo_count_error = or_to_all(local_halo_count_error);
+  finished_working();
+  if (any_halo_count_error)
+    meep::abort("invalid polarization halo count%s%s", local_halo_count_why.empty() ? "" : ": ",
+                local_halo_count_why.c_str());
+
+  bool halo_size_mismatch = false;
+  std::string reconciliation_why;
+  for (field_type ft : {PE_stuff, PH_stuff})
+    for (connect_phase ip : all_connect_phases)
+      for (int i = 0; i < num_chunks; ++i)
+        for (int j = 0; j < num_chunks; ++j) {
+          const int sender_rank = chunks[j]->n_proc();
+          const int receiver_rank = chunks[i]->n_proc();
+          if (sender_rank == receiver_rank) continue;
+          const size_t local_count = get_comm_size({ft, ip, {j, i}});
+          am_now_working_on(MpiAllTime);
+          std::string why;
+          const bool matched = reconcile_host_halo_comm_size(
+              sender_rank, local_count, receiver_rank, local_count, why);
+          finished_working();
+          if (!matched && reconciliation_why.empty()) reconciliation_why = why;
+          halo_size_mismatch = halo_size_mismatch || !matched;
+        }
+  if (halo_size_mismatch) meep::abort("%s", reconciliation_why.c_str());
+
+  // Allocate only after every sender/receiver pair agrees on its block size.
+  for (int i = 0; i < num_chunks; ++i)
     FOR_FIELD_TYPES(ft) {
       for (int j = 0; j < num_chunks; j++) {
         delete[] comm_blocks[ft][j + i * num_chunks];
         comm_blocks[ft][j + i * num_chunks] = new realnum[comm_size_tot(ft, {j, i})];
       }
     }
-  } // loop over i chunks
 
   // Preallocate the plan element lists.
   for (const std::pair<const comms_key, size_t> &key_and_comm_size : comm_sizes) {
     const chunk_pair &pair_j_to_i = key_and_comm_size.first.pair;
     HaloPlan &p = halos->get_or_create(key_and_comm_size.first);
-    if (chunks[pair_j_to_i.first]->is_mine()) p.gather.reserve(key_and_comm_size.second);
-    if (chunks[pair_j_to_i.second]->is_mine()) p.scatter.reserve(key_and_comm_size.second);
+    if (chunks[pair_j_to_i.first]->is_mine()) {
+      p.gather.reserve(key_and_comm_size.second);
+      if (p.ft == PE_stuff || p.ft == PH_stuff)
+        p.host_gather.reserve(key_and_comm_size.second);
+    }
+    if (chunks[pair_j_to_i.second]->is_mine()) {
+      p.scatter.reserve(key_and_comm_size.second);
+      if (p.ft == PE_stuff || p.ft == PH_stuff)
+        p.host_scatter.reserve(key_and_comm_size.second);
+    }
   }
 
   // Next start setting up the connections...
@@ -525,6 +606,16 @@ void fields::connect_the_chunks() {
                                                              ArrayId id, ptrdiff_t idx) {
                 halos->get_or_create({f, ip, pair_j_to_i}).gather.push_back(ElementRef{id, idx});
               };
+              auto push_back_host_incoming = [this, &pair_j_to_i](field_type f, connect_phase ip,
+                                                                  HostHaloId id) {
+                halos->get_or_create({f, ip, pair_j_to_i}).host_scatter.push_back(
+                    HostElementRef{id});
+              };
+              auto push_back_host_outgoing = [this, &pair_j_to_i](field_type f, connect_phase ip,
+                                                                  HostHaloId id) {
+                halos->get_or_create({f, ip, pair_j_to_i}).host_gather.push_back(
+                    HostElementRef{id});
+              };
 
               /* Interning helpers. The f_w case deliberately falls back to the
                  f key when f_w is absent, so the same storage never gets two
@@ -540,14 +631,29 @@ void fields::connect_the_chunks() {
                 return halos->arrays.intern({ch, int(array_role::field), int(cc), cmp, 1}, w,
                                             size_t(chunks[ch]->gv.ntot()), array_role::field);
               };
-              /* Polarization internals are an opaque void* blob today, so the
-                 best available identity is (blob, offset from the blob base).
-                 PR 6 makes each built-in susceptibility publish its layout and
-                 replaces this with a typed ArrayRef. */
-              auto polbase = [this](int ch, field_type ftp, int state_idx, void *data) {
-                return halos->arrays.intern(
-                    {ch, int(array_role::polarization), int(ftp), -1, state_idx},
-                    static_cast<realnum *>(data), 0, array_role::polarization);
+              /* Keep a full ordered host mirror for every polarization halo
+                 entry.  The source-local ArrayId names the exact one-element
+                 address without pointer subtraction; PR3 can later map the
+                 complete side to canonical storage or retain the complete host
+                 mirror, but may never mix the two dispositions. */
+              auto pol_refs = [this](int ch, field_type ftp, int state_idx,
+                                     int susceptibility_id, component cc, int cmp,
+                                     int internal_index, ptrdiff_t point_index,
+                                     bool complex_internal, realnum *address) {
+                const HaloArrayKey array_key{ch,
+                                             int(array_role::polarization),
+                                             int(cc),
+                                             cmp,
+                                             state_idx,
+                                             susceptibility_id,
+                                             internal_index,
+                                             point_index,
+                                             complex_internal};
+                const HostHaloKey host_key{ch, int(ftp), state_idx, susceptibility_id, int(cc),
+                                           cmp, internal_index, point_index, complex_internal};
+                return std::make_pair(
+                    halos->arrays.intern(array_key, address, 1, array_role::polarization),
+                    halos->host_arrays.intern(host_key, address));
               };
 
               if (chunks[j]->gv.owns(here) &&
@@ -587,51 +693,67 @@ void fields::connect_the_chunks() {
                     for (polarization_state *pj = chunks[j]->pol[type(c)]; pj; pj = pj->next) {
                       ++pj_idx;
                       if (*pi->s == *pj->s) {
-                        polarization_state *po = NULL;
-                        if (pi->data && chunks[i]->is_mine())
-                          po = pi;
-                        else if (pj->data && chunks[j]->is_mine())
-                          po = pj;
-                        if (po) {
+                        if ((pi->data && i_is_mine) || (pj->data && j_is_mine)) {
                           const connect_phase iip = CONNECT_COPY;
-                          const ArrayId in_pol =
-                              i_is_mine ? polbase(i, type(corig), pi_idx, pi->data)
-                                        : invalid_array();
-                          const ArrayId out_pol =
-                              j_is_mine ? polbase(j, type(c), pj_idx, pj->data) : invalid_array();
-                          realnum *in_base = static_cast<realnum *>(pi->data);
-                          realnum *out_base = static_cast<realnum *>(pj->data);
-                          const size_t ni = po->s->num_internal_notowned_needed(corig, po->data);
+                          const bool have_in = pi->data && i_is_mine;
+                          const bool have_out = pj->data && j_is_mine;
+                          const int ini = have_in
+                                              ? pi->s->num_internal_notowned_needed(corig, pi->data)
+                                              : 0;
+                          const int oni =
+                              have_out ? pj->s->num_internal_notowned_needed(c, pj->data) : 0;
+                          const int icni = have_in
+                                               ? pi->s->num_cinternal_notowned_needed(corig,
+                                                                                     pi->data)
+                                               : 0;
+                          const int ocni = have_out
+                                               ? pj->s->num_cinternal_notowned_needed(c, pj->data)
+                                               : 0;
+                          size_t ni = 0, cni = 0;
+                          std::string why;
+                          if (!resolve_host_halo_count(have_in, ini, have_out, oni, ni, why))
+                            meep::abort("%s", why.c_str());
+                          if (!resolve_host_halo_count(have_in, icni, have_out, ocni, cni, why))
+                            meep::abort("complex %s", why.c_str());
                           for (size_t k = 0; k < ni; ++k) {
-                            if (i_is_mine) {
-                              push_back_incoming(
-                                  f, iip, in_pol,
-                                  po->s->internal_notowned_ptr(k, corig, n, pi->data) - in_base);
+                            if (have_in) {
+                              realnum *address =
+                                  pi->s->internal_notowned_ptr(k, corig, n, pi->data);
+                              const auto refs = pol_refs(i, type(corig), pi_idx, pi->s->get_id(),
+                                                         corig, -1, int(k), n, false, address);
+                              push_back_incoming(f, iip, refs.first, 0);
+                              push_back_host_incoming(f, iip, refs.second);
                             }
-                            if (j_is_mine) {
-                              push_back_outgoing(
-                                  f, iip, out_pol,
-                                  po->s->internal_notowned_ptr(k, c, m, pj->data) - out_base);
+                            if (have_out) {
+                              realnum *address = pj->s->internal_notowned_ptr(k, c, m, pj->data);
+                              const auto refs = pol_refs(j, type(c), pj_idx, pj->s->get_id(), c, -1,
+                                                         int(k), m, false, address);
+                              push_back_outgoing(f, iip, refs.first, 0);
+                              push_back_host_outgoing(f, iip, refs.second);
                             }
                           }
-                          const size_t cni = po->s->num_cinternal_notowned_needed(corig, po->data);
                           for (size_t k = 0; k < cni; ++k) {
-                            if (i_is_mine) {
+                            if (have_in) {
                               if (ip == CONNECT_PHASE) { push_back_phase(f); }
 
                               DOCMP {
-                                push_back_incoming(
-                                    f, ip, in_pol,
-                                    po->s->cinternal_notowned_ptr(k, corig, cmp, n, pi->data) -
-                                        in_base);
+                                realnum *address = pi->s->cinternal_notowned_ptr(
+                                    k, corig, cmp, n, pi->data);
+                                const auto refs =
+                                    pol_refs(i, type(corig), pi_idx, pi->s->get_id(), corig, cmp,
+                                             int(k), n, true, address);
+                                push_back_incoming(f, ip, refs.first, 0);
+                                push_back_host_incoming(f, ip, refs.second);
                               }
                             }
-                            if (j_is_mine) {
+                            if (have_out) {
                               DOCMP {
-                                push_back_outgoing(
-                                    f, ip, out_pol,
-                                    po->s->cinternal_notowned_ptr(k, c, cmp, m, pj->data) -
-                                        out_base);
+                                realnum *address =
+                                    pj->s->cinternal_notowned_ptr(k, c, cmp, m, pj->data);
+                                const auto refs = pol_refs(j, type(c), pj_idx, pj->s->get_id(), c,
+                                                           cmp, int(k), m, true, address);
+                                push_back_outgoing(f, ip, refs.first, 0);
+                                push_back_host_outgoing(f, ip, refs.second);
                               }
                             }
                           }
@@ -741,6 +863,13 @@ void fields::finalize_halo_plans() {
     std::vector<SlabRef> slabs;
     std::vector<ElementRef> residue;
     std::vector<HaloSegment> order;
+
+    if ((p.ft == PE_stuff || p.ft == PH_stuff) &&
+        chunks[p.chunks.first]->is_mine() && p.host_gather.size() != p.block_elements)
+      meep::abort("opaque host gather does not mirror the complete polarization halo plan");
+    if ((p.ft == PE_stuff || p.ft == PH_stuff) &&
+        chunks[p.chunks.second]->is_mine() && p.host_scatter.size() != p.block_elements)
+      meep::abort("opaque host scatter does not mirror the complete polarization halo plan");
 
     coalesce_into_slabs(p.gather, iv, slabs, residue, order);
     p.gather_slabs.swap(slabs);

@@ -29,6 +29,9 @@
 #define MEEP_BACKEND_HALO_PLAN_HPP
 
 #include <complex>
+#include <functional>
+#include <limits>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -51,21 +54,37 @@ struct HaloArrayKey {
   int component_; // meep::component, or -1
   int cmp;        // 0/1, or -1
   int aux;        // 0 = f, 1 = f_w; polarization: index of the state in the chunk
+  int susceptibility_id;
+  int internal_index;
+  ptrdiff_t point_index;
+  bool complex_internal;
+
+  HaloArrayKey(int chunk_, int role_, int component__, int cmp_, int aux_,
+               int susceptibility_id_ = -1, int internal_index_ = -1,
+               ptrdiff_t point_index_ = -1, bool complex_internal_ = false)
+      : chunk(chunk_), role(role_), component_(component__), cmp(cmp_), aux(aux_),
+        susceptibility_id(susceptibility_id_), internal_index(internal_index_),
+        point_index(point_index_), complex_internal(complex_internal_) {}
 
   bool operator==(const HaloArrayKey &o) const {
     return chunk == o.chunk && role == o.role && component_ == o.component_ && cmp == o.cmp &&
-           aux == o.aux;
+           aux == o.aux && susceptibility_id == o.susceptibility_id &&
+           internal_index == o.internal_index && point_index == o.point_index &&
+           complex_internal == o.complex_internal;
   }
 };
 
 struct HaloArrayKeyHash {
   size_t operator()(const HaloArrayKey &k) const {
-    size_t h = size_t(k.chunk) * 1000003u;
-    h = h * 31 + size_t(k.role);
-    h = h * 31 + size_t(k.component_ + 2);
-    h = h * 31 + size_t(k.cmp + 2);
-    h = h * 31 + size_t(k.aux + 2);
-    return h;
+    size_t h = std::hash<int>()(k.chunk);
+    h = h * 31 + std::hash<int>()(k.role);
+    h = h * 31 + std::hash<int>()(k.component_);
+    h = h * 31 + std::hash<int>()(k.cmp);
+    h = h * 31 + std::hash<int>()(k.aux);
+    h = h * 31 + std::hash<int>()(k.susceptibility_id);
+    h = h * 31 + std::hash<int>()(k.internal_index);
+    h = h * 31 + std::hash<ptrdiff_t>()(k.point_index);
+    return h * 31 + std::hash<bool>()(k.complex_internal);
   }
 };
 
@@ -89,6 +108,89 @@ private:
   std::vector<ArraySpec> specs_;
   std::vector<realnum *> bases_;
   std::unordered_map<HaloArrayKey, uint32_t, HaloArrayKeyHash> index_;
+};
+
+/* Opaque susceptibility state deliberately has no canonical device ArrayId.
+   A custom susceptibility may return halo pointers into storage whose layout
+   is known only to its virtual methods.  Keep the exact live host addresses in
+   a separate table; source-local ArrayIds may coexist only as an address
+   mirror for later all-or-nothing catalog remapping.  HostHaloId is meaningful
+   only for the current connectivity generation. */
+struct HostHaloId {
+  uint64_t generation;
+  uint32_t value;
+  bool operator==(HostHaloId o) const {
+    return generation == o.generation && value == o.value;
+  }
+  bool operator!=(HostHaloId o) const { return !(*this == o); }
+};
+
+inline HostHaloId invalid_host_halo() {
+  return HostHaloId{0, std::numeric_limits<uint32_t>::max()};
+}
+inline bool valid(HostHaloId id) { return id != invalid_host_halo(); }
+
+struct HostHaloKey {
+  int chunk;
+  int ft;
+  int state_index;
+  int susceptibility_id;
+  int component_;
+  int cmp;
+  int internal_index;
+  ptrdiff_t point_index;
+  bool complex_internal;
+
+  bool operator==(const HostHaloKey &o) const {
+    return chunk == o.chunk && ft == o.ft && state_index == o.state_index &&
+           susceptibility_id == o.susceptibility_id && component_ == o.component_ &&
+           cmp == o.cmp && internal_index == o.internal_index && point_index == o.point_index &&
+           complex_internal == o.complex_internal;
+  }
+};
+
+struct HostHaloKeyHash {
+  size_t operator()(const HostHaloKey &k) const {
+    size_t h = std::hash<int>()(k.chunk);
+    h = h * 31 + std::hash<int>()(k.ft);
+    h = h * 31 + std::hash<int>()(k.state_index);
+    h = h * 31 + std::hash<int>()(k.susceptibility_id);
+    h = h * 31 + std::hash<int>()(k.component_);
+    h = h * 31 + std::hash<int>()(k.cmp);
+    h = h * 31 + std::hash<int>()(k.internal_index);
+    h = h * 31 + std::hash<ptrdiff_t>()(k.point_index);
+    return h * 31 + std::hash<bool>()(k.complex_internal);
+  }
+};
+
+class HostHaloArrayTable {
+public:
+  HostHaloArrayTable() : generation_(1) {}
+  void clear() {
+    addresses_.clear();
+    keys_.clear();
+    index_.clear();
+    if (++generation_ == 0) meep::abort("opaque host halo generation overflow");
+  }
+
+  HostHaloId intern(const HostHaloKey &key, realnum *address);
+  realnum *address(HostHaloId id) const;
+  const HostHaloKey &key(HostHaloId id) const;
+  bool contains(HostHaloId id) const {
+    return id.generation == generation_ && id.value < addresses_.size();
+  }
+  size_t size() const { return addresses_.size(); }
+  uint64_t generation() const { return generation_; }
+
+private:
+  uint64_t generation_;
+  std::vector<realnum *> addresses_;
+  std::vector<HostHaloKey> keys_;
+  std::unordered_map<HostHaloKey, uint32_t, HostHaloKeyHash> index_;
+};
+
+struct HostElementRef {
+  HostHaloId id;
 };
 
 /* --- The plan --------------------------------------------------------------
@@ -132,6 +234,13 @@ struct HaloPlan {
   std::vector<ElementRef> gather;
   std::vector<ElementRef> scatter;
 
+  /* Opaque polarization internals have no canonical device identity.  PE/PH
+     plans retain their exact live ordering here instead of manufacturing a
+     zero-sized ArrayId.  PR3 may remap layout-publishing rows to canonical
+     arrays, while these entries remain explicitly host-owned. */
+  std::vector<HostElementRef> host_gather;
+  std::vector<HostElementRef> host_scatter;
+
   /* How to walk the two spans above to reproduce the communication block
      byte-for-byte. Slabs and residue interleave in general, so "all slabs then
      all residue" is not the block order and cannot be assumed. */
@@ -145,6 +254,12 @@ struct HaloPlan {
    appear in the communication block. */
 void expand_gather(const HaloPlan &p, std::vector<ElementRef> &out);
 void expand_scatter(const HaloPlan &p, std::vector<ElementRef> &out);
+void expand_gather_addresses(const HaloPlan &p, const HaloArrayTable &arrays,
+                             const HostHaloArrayTable &host_arrays,
+                             std::vector<realnum *> &out);
+void expand_scatter_addresses(const HaloPlan &p, const HaloArrayTable &arrays,
+                              const HostHaloArrayTable &host_arrays,
+                              std::vector<realnum *> &out);
 
 /* Fold constant-stride runs of ElementRefs on one array into SlabRefs.
 
@@ -175,6 +290,23 @@ struct CoalesceStats {
 
 CoalesceStats coalesce_stats(const std::vector<HaloPlan> &plans);
 
+/* Validate endpoint-specific virtual halo counts before converting them to an
+   unsigned communication size.  An absent endpoint contributes no opinion;
+   two live endpoints must agree exactly. */
+bool resolve_host_halo_count(bool have_in, int incoming, bool have_out, int outgoing,
+                             size_t &count, std::string &why);
+bool checked_add_halo_elements(size_t current, size_t added, size_t &result, std::string &why);
+bool checked_multiply_halo_elements(size_t count, size_t lanes, size_t &result,
+                                    std::string &why);
+
+/* All ranks call this in the same deterministic connection order.  The
+   sender and receiver roots publish the independently computed block size;
+   comparing the two before allocation/exchange prevents an opaque virtual
+   implementation from giving MPI peers different message lengths. */
+bool reconcile_host_halo_comm_size(int sender_rank, size_t sender_local,
+                                   int receiver_rank, size_t receiver_local,
+                                   std::string &why);
+
 /* Metal-zero lists get the same treatment: they were one realnum* per zeroed
    point in fields_chunk::zeroes. Order is irrelevant here since every write is
    a zero, so no HaloSegment list is needed. */
@@ -189,12 +321,14 @@ struct ZeroPlan {
 class halo_plan_set {
 public:
   HaloArrayTable arrays;
+  HostHaloArrayTable host_arrays;
   std::vector<HaloPlan> plans;
   std::unordered_map<comms_key, uint32_t, comms_key_hash_fn> index;
   std::vector<ZeroPlan> zeros[NUM_FIELD_TYPES]; // indexed by chunk
 
   void clear() {
     arrays.clear();
+    host_arrays.clear();
     plans.clear();
     index.clear();
     FOR_FIELD_TYPES(ft) { zeros[ft].clear(); }

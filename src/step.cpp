@@ -216,11 +216,15 @@ void fields_chunk::phase_material(int phasein_time) {
 namespace {
 class side_cursor {
 public:
-  side_cursor(const HaloArrayTable &tbl, const std::vector<SlabRef> &slabs,
-              const std::vector<ElementRef> &residue, const std::vector<HaloSegment> &order)
-      : tbl_(tbl), slabs_(slabs), residue_(residue), order_(order) {}
+  side_cursor(const HaloArrayTable &tbl, const HostHaloArrayTable &host_tbl,
+              const std::vector<SlabRef> &slabs, const std::vector<ElementRef> &residue,
+              const std::vector<HaloSegment> &order, const std::vector<HostElementRef> &host)
+      : tbl_(tbl), host_tbl_(host_tbl), slabs_(slabs), residue_(residue), order_(order),
+        host_(host) {}
 
   realnum *next() {
+    if (!host_.empty())
+      return host_pos_ < host_.size() ? host_tbl_.address(host_[host_pos_++].id) : NULL;
     while (seg_ < order_.size()) {
       const HaloSegment &g = order_[seg_];
       if (g.nslabs) {
@@ -249,9 +253,12 @@ public:
 
 private:
   const HaloArrayTable &tbl_;
+  const HostHaloArrayTable &host_tbl_;
   const std::vector<SlabRef> &slabs_;
   const std::vector<ElementRef> &residue_;
   const std::vector<HaloSegment> &order_;
+  const std::vector<HostElementRef> &host_;
+  size_t host_pos_ = 0;
   size_t seg_ = 0, r_ = 0;
   uint32_t k_ = 0, s_ = 0, rk_ = 0;
 };
@@ -259,7 +266,10 @@ private:
 
 void fields::unpack_halo(const HaloPlan &p, const realnum *block) {
   if (!p.block_elements) return;
-  side_cursor cur(halos->arrays, p.scatter_slabs, p.scatter, p.scatter_order);
+  if (!p.host_scatter.empty() && p.host_scatter.size() != p.block_elements)
+    meep::abort("opaque host scatter length differs from its communication block");
+  side_cursor cur(halos->arrays, halos->host_arrays, p.scatter_slabs, p.scatter, p.scatter_order,
+                  p.host_scatter);
   const realnum *in = block + p.block_offset;
 
   switch (p.phase) {
@@ -290,7 +300,10 @@ void fields::unpack_halo(const HaloPlan &p, const realnum *block) {
 
 void fields::pack_halo(const HaloPlan &p, realnum *block) {
   if (!p.block_elements) return;
-  side_cursor cur(halos->arrays, p.gather_slabs, p.gather, p.gather_order);
+  if (!p.host_gather.empty() && p.host_gather.size() != p.block_elements)
+    meep::abort("opaque host gather length differs from its communication block");
+  side_cursor cur(halos->arrays, halos->host_arrays, p.gather_slabs, p.gather, p.gather_order,
+                  p.host_gather);
   realnum *out = block + p.block_offset;
   for (size_t n = 0; n < p.block_elements; ++n)
     out[n] = *cur.next();

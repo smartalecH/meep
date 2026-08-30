@@ -16,14 +16,25 @@
 */
 
 #include "backend/halo_plan.hpp"
+#include "meep/mympi.hpp"
+
+#include <limits>
 
 namespace meep {
 
 ArrayId HaloArrayTable::intern(const HaloArrayKey &key, realnum *base, size_t elements,
                                array_role role) {
   auto it = index_.find(key);
-  if (it != index_.end()) return ArrayId{it->second};
+  if (it != index_.end()) {
+    const ArrayId id{it->second};
+    if (bases_[id.value] != base || specs_[id.value].elements != elements ||
+        specs_[id.value].role != role)
+      meep::abort("halo array identity resolved to inconsistent storage");
+    return id;
+  }
 
+  if (specs_.size() >= std::numeric_limits<uint32_t>::max())
+    meep::abort("too many halo arrays");
   const uint32_t id = uint32_t(specs_.size());
   ArraySpec spec;
   spec.id = ArrayId{id};
@@ -38,6 +49,34 @@ ArrayId HaloArrayTable::intern(const HaloArrayKey &key, realnum *base, size_t el
   bases_.push_back(base);
   index_[key] = id;
   return ArrayId{id};
+}
+
+HostHaloId HostHaloArrayTable::intern(const HostHaloKey &key, realnum *address) {
+  auto it = index_.find(key);
+  if (it != index_.end()) {
+    const HostHaloId id{generation_, it->second};
+    if (addresses_[id.value] != address)
+      meep::abort("opaque halo identity resolved to two host addresses");
+    return id;
+  }
+  if (!address) meep::abort("opaque halo identity resolved to a null host address");
+  if (addresses_.size() >= std::numeric_limits<uint32_t>::max())
+    meep::abort("too many opaque host halo addresses");
+  const uint32_t id = uint32_t(addresses_.size());
+  addresses_.push_back(address);
+  keys_.push_back(key);
+  index_[key] = id;
+  return HostHaloId{generation_, id};
+}
+
+realnum *HostHaloArrayTable::address(HostHaloId id) const {
+  if (!contains(id)) meep::abort("opaque host halo id is stale or out of range");
+  return addresses_[id.value];
+}
+
+const HostHaloKey &HostHaloArrayTable::key(HostHaloId id) const {
+  if (!contains(id)) meep::abort("opaque host halo key id is stale or out of range");
+  return keys_[id.value];
 }
 
 /* --- Slab coalescing ------------------------------------------------------ */
@@ -167,17 +206,113 @@ void expand_scatter(const HaloPlan &p, std::vector<ElementRef> &out) {
   expand_side(p.scatter_slabs, p.scatter, p.scatter_order, out);
 }
 
+static void expand_addresses(const std::vector<SlabRef> &slabs,
+                             const std::vector<ElementRef> &residue,
+                             const std::vector<HaloSegment> &order,
+                             const std::vector<HostElementRef> &host,
+                             const HaloArrayTable &arrays, const HostHaloArrayTable &host_arrays,
+                             std::vector<realnum *> &out) {
+  out.clear();
+  if (!host.empty()) {
+    out.reserve(host.size());
+    for (const HostElementRef &ref : host)
+      out.push_back(host_arrays.address(ref.id));
+    return;
+  }
+
+  std::vector<ElementRef> expanded;
+  expand_side(slabs, residue, order, expanded);
+  out.reserve(expanded.size());
+  for (const ElementRef &ref : expanded)
+    out.push_back(arrays.base(ref.array) + ref.index);
+}
+
+void expand_gather_addresses(const HaloPlan &p, const HaloArrayTable &arrays,
+                             const HostHaloArrayTable &host_arrays,
+                             std::vector<realnum *> &out) {
+  expand_addresses(p.gather_slabs, p.gather, p.gather_order, p.host_gather, arrays, host_arrays,
+                   out);
+}
+
+void expand_scatter_addresses(const HaloPlan &p, const HaloArrayTable &arrays,
+                              const HostHaloArrayTable &host_arrays,
+                              std::vector<realnum *> &out) {
+  expand_addresses(p.scatter_slabs, p.scatter, p.scatter_order, p.host_scatter, arrays,
+                   host_arrays, out);
+}
+
 CoalesceStats coalesce_stats(const std::vector<HaloPlan> &plans) {
   CoalesceStats st{0, 0, 0, 0};
   for (const HaloPlan &p : plans) {
-    for (const SlabRef &s : p.gather_slabs) {
-      st.slab_elements += s.elements();
-      ++st.slab_count;
+    if (!p.host_gather.empty()) {
+      st.residue_elements += p.host_gather.size();
     }
-    st.residue_elements += p.gather.size();
+    else {
+      for (const SlabRef &s : p.gather_slabs) {
+        st.slab_elements += s.elements();
+        ++st.slab_count;
+      }
+      st.residue_elements += p.gather.size();
+    }
   }
   st.total_elements = st.slab_elements + st.residue_elements;
   return st;
+}
+
+bool resolve_host_halo_count(bool have_in, int incoming, bool have_out, int outgoing,
+                             size_t &count, std::string &why) {
+  count = 0;
+  why.clear();
+  if (!have_in && !have_out) {
+    why = "internal halo has no live endpoint";
+    return false;
+  }
+  if ((have_in && incoming < 0) || (have_out && outgoing < 0)) {
+    why = "susceptibility returned a negative internal halo count";
+    return false;
+  }
+  if (have_in && have_out && incoming != outgoing) {
+    why = "susceptibility endpoints disagree on internal halo count";
+    return false;
+  }
+  count = size_t(have_in ? incoming : outgoing);
+  return true;
+}
+
+bool checked_add_halo_elements(size_t current, size_t added, size_t &result, std::string &why) {
+  if (added > std::numeric_limits<size_t>::max() - current) {
+    why = "internal halo element count overflow";
+    return false;
+  }
+  result = current + added;
+  why.clear();
+  return true;
+}
+
+bool checked_multiply_halo_elements(size_t count, size_t lanes, size_t &result,
+                                    std::string &why) {
+  if (count && lanes > std::numeric_limits<size_t>::max() / count) {
+    why = "internal halo lane count overflow";
+    return false;
+  }
+  result = count * lanes;
+  why.clear();
+  return true;
+}
+
+bool reconcile_host_halo_comm_size(int sender_rank, size_t sender_local,
+                                   int receiver_rank, size_t receiver_local,
+                                   std::string &why) {
+  size_t sender_count = sender_local;
+  size_t receiver_count = receiver_local;
+  broadcast(sender_rank, &sender_count, 1);
+  broadcast(receiver_rank, &receiver_count, 1);
+  if (sender_count != receiver_count) {
+    why = "polarization halo sender and receiver disagree on communication size";
+    return false;
+  }
+  why.clear();
+  return true;
 }
 
 } // namespace meep

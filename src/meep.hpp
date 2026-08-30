@@ -2352,8 +2352,12 @@ private:
 
   size_t comm_size_tot(field_type ft, const chunk_pair &pair) const {
     size_t sum = 0;
-    for (auto ip : all_connect_phases)
-      sum += get_comm_size({ft, ip, pair});
+    for (auto ip : all_connect_phases) {
+      const size_t phase_size = get_comm_size({ft, ip, pair});
+      if (phase_size > std::numeric_limits<size_t>::max() - sum)
+        meep::abort("communication block size overflow");
+      sum += phase_size;
+    }
     return sum;
   }
 

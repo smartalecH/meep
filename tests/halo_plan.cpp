@@ -32,6 +32,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits>
+#include <map>
+#include <set>
 #include <vector>
 
 #include <meep.hpp>
@@ -56,6 +59,39 @@ static int failures = 0;
 
 static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
+
+class opaque_custom_lorentzian : public lorentzian_susceptibility {
+public:
+  opaque_custom_lorentzian(realnum omega_0, realnum gamma)
+      : lorentzian_susceptibility(omega_0, gamma) {}
+  virtual susceptibility *clone() const { return new opaque_custom_lorentzian(*this); }
+
+  virtual int num_internal_notowned_needed(component c, void *data) const {
+    ++count_queries;
+    return lorentzian_susceptibility::num_cinternal_notowned_needed(c, data);
+  }
+  virtual realnum *internal_notowned_ptr(int internal_index, component c, int n,
+                                         void *data) const {
+    ++pointer_queries;
+    return lorentzian_susceptibility::cinternal_notowned_ptr(internal_index, c, 0, n, data);
+  }
+
+  virtual int num_cinternal_notowned_needed(component c, void *data) const {
+    ++count_queries;
+    return lorentzian_susceptibility::num_cinternal_notowned_needed(c, data);
+  }
+  virtual realnum *cinternal_notowned_ptr(int internal_index, component c, int cmp, int n,
+                                          void *data) const {
+    ++pointer_queries;
+    return lorentzian_susceptibility::cinternal_notowned_ptr(internal_index, c, cmp, n, data);
+  }
+
+  static int count_queries;
+  static int pointer_queries;
+};
+
+int opaque_custom_lorentzian::count_queries = 0;
+int opaque_custom_lorentzian::pointer_queries = 0;
 
 /* ------------------------------------------------------------------ */
 /* Coalescer unit tests                                               */
@@ -140,6 +176,42 @@ static void test_coalescer() {
       CHECK(back[i].array == in[i].array && back[i].index == in[i].index,
             "interleaved slab/residue expansion differs at %zu", i);
   }
+
+  {
+    size_t count = 999;
+    std::string why;
+    CHECK(!valid(invalid_host_halo()), "invalid host halo sentinel reports valid");
+    CHECK(resolve_host_halo_count(true, 2, true, 2, count, why) && count == 2 && why.empty(),
+          "matching endpoint counts were rejected");
+    CHECK(!resolve_host_halo_count(true, -1, false, 0, count, why) &&
+              why.find("negative") != std::string::npos,
+          "negative owned endpoint count was not rejected");
+    CHECK(!resolve_host_halo_count(true, 1, true, 2, count, why) &&
+              why.find("disagree") != std::string::npos,
+          "mismatched endpoint counts were not rejected");
+    CHECK(!resolve_host_halo_count(false, 0, false, 0, count, why),
+          "count with no live endpoint was not rejected");
+    CHECK(checked_add_halo_elements(4, 7, count, why) && count == 11,
+          "ordinary halo count addition failed");
+    CHECK(!checked_add_halo_elements(std::numeric_limits<size_t>::max(), 1, count, why) &&
+              why.find("overflow") != std::string::npos,
+          "halo count addition overflow was not rejected");
+    CHECK(checked_multiply_halo_elements(9, 2, count, why) && count == 18,
+          "ordinary halo lane multiplication failed");
+    CHECK(!checked_multiply_halo_elements(std::numeric_limits<size_t>::max(), 2, count, why) &&
+              why.find("overflow") != std::string::npos,
+          "halo lane multiplication overflow was not rejected");
+
+    const int receiver_rank = count_processors() > 1 ? 1 : 0;
+    CHECK(reconcile_host_halo_comm_size(0, 7, receiver_rank, 7, why) && why.empty(),
+          "matching cross-rank halo communication sizes were rejected");
+    if (count_processors() > 1) {
+      const size_t rank_dependent = size_t(11 + my_rank());
+      CHECK(!reconcile_host_halo_comm_size(0, rank_dependent, 1, rank_dependent, why) &&
+                why.find("sender and receiver") != std::string::npos,
+            "rank-dependent halo communication sizes were not collectively rejected");
+    }
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -163,16 +235,25 @@ static void test_coalescer() {
  */
 
 static void check_config(const char *name, structure &s, bool complex_fields, int steps,
-                         const vec &src_at, const vec *bloch_k = NULL) {
+                         const vec &src_at, const vec *bloch_k = NULL,
+                         bool expect_host_polarization = false,
+                         field_type expected_host_ft = field_type(NUM_FIELD_TYPES),
+                         unsigned expected_host_phases = 0, component source_component = Ez,
+                         bool expect_repeated_identity = false) {
   fields f(&s);
-  if (complex_fields && bloch_k) f.use_bloch(*bloch_k);
+  if (bloch_k) f.use_bloch(*bloch_k);
   gaussian_src_time src(0.3, 0.1);
-  f.add_point_source(Ez, src, src_at);
+  f.add_point_source(source_component, src, src_at);
   f.advance(steps);
 
   size_t checked_plans = 0;
   bool owns_chunk = false;
+  bool has_host_polarization = false;
+  bool has_scalar_host_row = false;
+  unsigned host_phases = 0;
+  std::map<int, std::set<int> > states_by_susceptibility;
   std::vector<ElementRef> refs;
+  std::vector<realnum *> addresses;
 
   for (int i = 0; i < f.num_chunks; ++i)
     owns_chunk = owns_chunk || f.chunks[i]->is_mine();
@@ -193,16 +274,66 @@ static void check_config(const char *name, structure &s, bool complex_fields, in
           expect_offset += p->block_elements;
 
           if (f.chunks[j]->is_mine()) {
-            expand_gather(*p, refs);
-            CHECK(refs.size() == p->block_elements,
-                  "%s: gather expands to %zu, block_elements %zu", name, refs.size(),
+            expand_gather_addresses(*p, f.halos->arrays, f.halos->host_arrays, addresses);
+            CHECK(addresses.size() == p->block_elements,
+                  "%s: gather expands to %zu, block_elements %zu", name, addresses.size(),
                   p->block_elements);
           }
           if (f.chunks[i]->is_mine()) {
-            expand_scatter(*p, refs);
-            CHECK(refs.size() == p->block_elements,
-                  "%s: scatter expands to %zu, block_elements %zu", name, refs.size(),
+            expand_scatter_addresses(*p, f.halos->arrays, f.halos->host_arrays, addresses);
+            CHECK(addresses.size() == p->block_elements,
+                  "%s: scatter expands to %zu, block_elements %zu", name, addresses.size(),
                   p->block_elements);
+          }
+          if ((ft == PE_stuff || ft == PH_stuff) &&
+              (!p->host_gather.empty() || !p->host_scatter.empty())) {
+            has_host_polarization = true;
+            if (ft == expected_host_ft && p->block_elements)
+              host_phases |= 1u << unsigned(p->phase);
+            if (f.chunks[j]->is_mine()) {
+              expand_gather(*p, refs);
+              CHECK(refs.size() == p->host_gather.size(),
+                    "%s: canonical/host gather mirror sizes differ (%zu != %zu)", name,
+                    refs.size(), p->host_gather.size());
+              for (size_t n = 0; n < refs.size() && n < p->host_gather.size(); ++n)
+                CHECK(f.halos->arrays.base(refs[n].array) + refs[n].index ==
+                          f.halos->host_arrays.address(p->host_gather[n].id),
+                      "%s: canonical/host gather mirror differs at %zu", name, n);
+              for (const HostElementRef &ref : p->host_gather) {
+                const HostHaloKey &key = f.halos->host_arrays.key(ref.id);
+                CHECK(key.chunk == p->chunks.first,
+                      "%s: host gather key chunk %d != sender %d", name, key.chunk,
+                      p->chunks.first);
+                CHECK(key.ft == int(p->ft == PE_stuff ? E_stuff : H_stuff),
+                      "%s: host gather key has wrong field family", name);
+                CHECK(key.state_index >= 0 && key.susceptibility_id >= 0,
+                      "%s: host gather key lacks stable state identity", name);
+                states_by_susceptibility[key.susceptibility_id].insert(key.state_index);
+                has_scalar_host_row = has_scalar_host_row || !key.complex_internal;
+              }
+            }
+            if (f.chunks[i]->is_mine()) {
+              expand_scatter(*p, refs);
+              CHECK(refs.size() == p->host_scatter.size(),
+                    "%s: canonical/host scatter mirror sizes differ (%zu != %zu)", name,
+                    refs.size(), p->host_scatter.size());
+              for (size_t n = 0; n < refs.size() && n < p->host_scatter.size(); ++n)
+                CHECK(f.halos->arrays.base(refs[n].array) + refs[n].index ==
+                          f.halos->host_arrays.address(p->host_scatter[n].id),
+                      "%s: canonical/host scatter mirror differs at %zu", name, n);
+              for (const HostElementRef &ref : p->host_scatter) {
+                const HostHaloKey &key = f.halos->host_arrays.key(ref.id);
+                CHECK(key.chunk == p->chunks.second,
+                      "%s: host scatter key chunk %d != receiver %d", name, key.chunk,
+                      p->chunks.second);
+                CHECK(key.ft == int(p->ft == PE_stuff ? E_stuff : H_stuff),
+                      "%s: host scatter key has wrong field family", name);
+                CHECK(key.state_index >= 0 && key.susceptibility_id >= 0,
+                      "%s: host scatter key lacks stable state identity", name);
+                states_by_susceptibility[key.susceptibility_id].insert(key.state_index);
+                has_scalar_host_row = has_scalar_host_row || !key.complex_internal;
+              }
+            }
           }
           /* Phases belong to the receiving side only: a rank that owns just
              the sending chunk has a gather list and a block size but no
@@ -228,9 +359,9 @@ static void check_config(const char *name, structure &s, bool complex_fields, in
     has_eligible_copy = true;
     std::vector<realnum> block(p.block_offset + p.block_elements, realnum(0));
     f.pack_halo(p, block.data());
-    expand_gather(p, refs);
-    for (size_t n = 0; n < refs.size(); ++n) {
-      const realnum want = *(f.halos->arrays.base(refs[n].array) + refs[n].index);
+    expand_gather_addresses(p, f.halos->arrays, f.halos->host_arrays, addresses);
+    for (size_t n = 0; n < addresses.size(); ++n) {
+      const realnum want = *addresses[n];
       CHECK(block[p.block_offset + n] == want, "%s: packed value %zu differs", name, n);
     }
     ++roundtrips;
@@ -238,9 +369,102 @@ static void check_config(const char *name, structure &s, bool complex_fields, in
   CHECK(roundtrips > 0 || !owns_chunk || !has_eligible_copy,
         "%s: an eligible local COPY plan was not round-tripped", name);
 
+  /* Exercise the actual host-owned scatter transform for every local opaque
+     plan.  This pins COPY, NEGATE, and complex PHASE arithmetic rather than
+     merely checking that metadata exists. */
+  bool saw_duplicate_host_destination = false;
+  for (const HaloPlan &p : f.halos->plans) {
+    if (p.host_gather.empty() || p.host_scatter.empty() || !p.block_elements) continue;
+    if (!f.chunks[p.chunks.first]->is_mine() || !f.chunks[p.chunks.second]->is_mine()) continue;
+    std::vector<realnum> block(p.block_offset + p.block_elements, realnum(0));
+    for (size_t n = 0; n < p.block_elements; ++n)
+      block[p.block_offset + n] = realnum(17 + n);
+    expand_scatter_addresses(p, f.halos->arrays, f.halos->host_arrays, addresses);
+    std::map<realnum *, realnum> expected;
+    if (p.phase == CONNECT_PHASE) {
+      CHECK((p.block_elements % 2) == 0, "%s: odd complex host halo size", name);
+      for (size_t n = 0; n < p.block_elements / 2; ++n) {
+        const complex<realnum> want =
+            p.phase_values[n] * complex<realnum>(block[p.block_offset + 2 * n],
+                                                  block[p.block_offset + 2 * n + 1]);
+        expected[addresses[2 * n]] = want.real();
+        expected[addresses[2 * n + 1]] = want.imag();
+      }
+    }
+    else {
+      for (size_t n = 0; n < p.block_elements; ++n) {
+        const realnum want = p.phase == CONNECT_NEGATE ? -block[p.block_offset + n]
+                                                       : block[p.block_offset + n];
+        expected[addresses[n]] = want;
+      }
+    }
+    saw_duplicate_host_destination =
+        saw_duplicate_host_destination || expected.size() < addresses.size();
+    f.unpack_halo(p, block.data());
+    for (const auto &entry : expected)
+      CHECK(*entry.first == entry.second, "%s: host %s last-write result differs", name,
+            p.phase == CONNECT_PHASE    ? "PHASE"
+            : p.phase == CONNECT_NEGATE ? "NEGATE"
+                                        : "COPY");
+  }
+
   const CoalesceStats st = coalesce_stats(f.halos->plans);
   master_printf("%s: %zu reals, %.1f%% in %zu slabs, %zu residue\n", name, st.total_elements,
                 100.0 * st.ratio(), st.slab_count, st.residue_elements);
+  if (expect_host_polarization)
+    CHECK(or_to_all(has_host_polarization), "%s: no opaque host-owned PE/PH halo was emitted",
+          name);
+  if (expect_host_polarization) {
+    CHECK(or_to_all(has_scalar_host_row), "%s: no scalar opaque halo row was emitted", name);
+    if (expect_repeated_identity) {
+      bool repeated = false;
+      for (const auto &entry : states_by_susceptibility)
+        repeated = repeated || entry.second.size() > 1;
+      CHECK(or_to_all(repeated), "%s: repeated susceptibility id lost its state ordinals", name);
+      CHECK(or_to_all(saw_duplicate_host_destination),
+            "%s: duplicate host destination ordering was not exercised", name);
+    }
+    for (connect_phase ip : all_connect_phases)
+      if (expected_host_phases & (1u << unsigned(ip)))
+        CHECK(or_to_all((host_phases & (1u << unsigned(ip))) != 0),
+              "%s: missing expected host-owned phase %d", name, int(ip));
+
+    HostHaloId old_host_id = invalid_host_halo();
+    for (const HaloPlan &p : f.halos->plans) {
+      if (!p.host_gather.empty()) {
+        old_host_id = p.host_gather.front().id;
+        break;
+      }
+      if (!p.host_scatter.empty()) {
+        old_host_id = p.host_scatter.front().id;
+        break;
+      }
+    }
+
+    /* Public topology mutation forces the same disconnect/reconnect path used
+       by callers without reaching through a private test seam. */
+    f.use_bloch(X, 0.0);
+    f.advance(1);
+    if (valid(old_host_id))
+      CHECK(!f.halos->host_arrays.contains(old_host_id),
+            "%s: reconnect accepted a stale host halo generation", name);
+    bool reconnected_host = false;
+    for (const HaloPlan &p : f.halos->plans) {
+      for (const HostElementRef &ref : p.host_gather) {
+        CHECK(valid(ref.id), "%s: reconnect produced an invalid host gather id", name);
+        CHECK(f.halos->host_arrays.address(ref.id) != NULL,
+              "%s: reconnect produced a null host gather address", name);
+        reconnected_host = true;
+      }
+      for (const HostElementRef &ref : p.host_scatter) {
+        CHECK(valid(ref.id), "%s: reconnect produced an invalid host scatter id", name);
+        CHECK(f.halos->host_arrays.address(ref.id) != NULL,
+              "%s: reconnect produced a null host scatter address", name);
+        reconnected_host = true;
+      }
+    }
+    CHECK(or_to_all(reconnected_host), "%s: reconnect lost all host-owned halo entries", name);
+  }
 }
 
 int main(int argc, char **argv) {
@@ -262,6 +486,25 @@ int main(int argc, char **argv) {
   }
   {
     grid_volume gv = vol2d(4.0, 4.0, 10.0);
+    structure s(gv, eps_slab, pml(0.5), identity(), 4);
+    opaque_custom_lorentzian repeated(0.7, 0.08);
+    s.add_susceptibility(one, E_stuff, repeated);
+    s.add_susceptibility(one, E_stuff, repeated);
+    const vec kpt(0.13, 0.07);
+    check_config("2d/opaque-custom-PE-host-halo", s, true, 6, vec(0.13, 0.11), &kpt, true,
+                 PE_stuff, (1u << unsigned(CONNECT_COPY)) | (1u << unsigned(CONNECT_PHASE)), Ez,
+                 true);
+  }
+  {
+    grid_volume gv = vol2d(4.0, 4.0, 10.0);
+    structure s(gv, eps_slab, pml(0.5), mirror(Y, gv), 4);
+    s.add_susceptibility(one, H_stuff, opaque_custom_lorentzian(0.9, 0.06));
+    const vec edge_k(0.125, 0.0);
+    check_config("2d/opaque-custom-PH-host-halo", s, false, 6, vec(0.13, 0.11), &edge_k, true,
+                 PH_stuff, (1u << unsigned(CONNECT_COPY)) | (1u << unsigned(CONNECT_NEGATE)), Hz);
+  }
+  {
+    grid_volume gv = vol2d(4.0, 4.0, 10.0);
     structure s(gv, eps_slab, pml(0.5), mirror(Y, gv), 2);
     check_config("2d/mirror", s, false, 6, vec(0.13, 0.11));
   }
@@ -272,6 +515,11 @@ int main(int argc, char **argv) {
     structure s(gv, one, pml(0.4), identity(), 4);
     check_config("3d/4chunks", s, false, 4, vec(0.13, 0.11, 0.07));
   }
+
+  CHECK(sum_to_all(opaque_custom_lorentzian::count_queries) > 0,
+        "custom halo count virtual was never invoked");
+  CHECK(sum_to_all(opaque_custom_lorentzian::pointer_queries) > 0,
+        "custom halo pointer virtual was never invoked");
 
   failures = sum_to_all(failures);
   if (failures) {
