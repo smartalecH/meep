@@ -752,6 +752,7 @@ geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
 
 // copy constructor
 geom_epsilon::geom_epsilon(const geom_epsilon &geps1) : captured_volume(geps1.captured_volume) {
+  u_p = geps1.u_p;
   captured_geometry_center = geps1.captured_geometry_center;
   captured_geometry_lattice = geps1.captured_geometry_lattice;
   captured_ensure_periodicity = geps1.captured_ensure_periodicity;

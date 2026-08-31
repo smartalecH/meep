@@ -130,6 +130,7 @@ struct MaterialIR {
   bool contains_host_callback;
   bool device_native_eligible;
   int dimensions;
+  double projection_offset;
   std::vector<double> cell;
   uint32_t default_material;
   std::vector<MaterialIRMaterial> materials;

@@ -24,7 +24,32 @@ struct material_fill_launch {
 
 enum class material_table_kind : uint32_t { file_scalar_epsilon = 1, material_grid = 2 };
 
-/* Pointer-free, versioned compact-table header reserved for PR5.2b.  Offsets
+enum class material_table_operation : uint32_t {
+  file_chi1inv = 1,
+  grid_chi1inv = 2,
+  grid_conductivity = 3,
+  grid_sigma = 4
+};
+
+struct material_susceptibility_record {
+  uint32_t version;
+  uint32_t identity;
+  int32_t field_type;
+  uint32_t material_ordinal;
+  double sigma_diagonal[3];
+  double sigma_offdiagonal[3];
+};
+
+struct material_medium_header {
+  uint32_t version;
+  uint32_t electric_susceptibility_count;
+  uint64_t electric_susceptibility_offset;
+  double epsilon_diagonal[3];
+  double epsilon_offdiagonal[3];
+  double conductivity[3];
+};
+
+/* Pointer-free, versioned compact-table header. Offsets
    are byte offsets in the one state-owned compact-input pack. */
 struct material_table_header {
   uint32_t version;
@@ -43,22 +68,34 @@ struct material_table_header {
   double projection_offset;
 };
 
-/* Extensible table launch record reserved for PR5.2b.  PR5.2a deliberately
-   creates no instances and has no table execution entry point. */
+/* Extensible table launch record for FILE and MaterialGrid execution. */
 struct material_table_launch {
   void *destination;
+  void *secondary_destination;
   const unsigned char *compact_inputs;
   size_t compact_input_bytes;
   size_t table_header_offset;
+  size_t absorber_header_offset;
+  size_t absorber_count;
   size_t elements;
   size_t loop_count;
+  material_table_kind table_kind;
+  material_table_operation operation;
+  uint32_t source_material_id;
+  uint32_t source_medium;
+  uint64_t source_susceptibility;
+  uint32_t susceptibility_identity;
+  int susceptibility_field_type;
+  int dimensions;
   int destination_component;
   int query_component;
+  int tensor_row;
   int tensor_column;
   int operation_family;
   int evaluation_shift[3];
   int axis_direction[3];
   int loop_begin[3];
+  int loop_end[3];
   int little_corner[3];
   size_t loop_base_offset[3];
   size_t loop_extent[3];
@@ -66,6 +103,7 @@ struct material_table_launch {
   double cell_center[3];
   double cell_size[3];
   double inva;
+  double dt;
   bool logical_single;
   scalar_precision precision;
 };
@@ -135,6 +173,15 @@ void validate_material_absorber_headers(const unsigned char *compact_inputs,
                                         size_t compact_input_bytes,
                                         size_t absorber_header_offset,
                                         size_t absorber_count);
+void validate_material_table_headers(const unsigned char *compact_inputs,
+                                     size_t compact_input_bytes,
+                                     const size_t *table_header_offsets,
+                                     size_t table_header_count);
+void validate_material_table_launch(const material_table_launch &launch,
+                                    const unsigned char *host_compact_inputs,
+                                    size_t host_compact_input_bytes);
+void launch_material_table(const material_table_launch &launch, const stream &stream);
+int material_table_mirror_index_for_testing(int i, int n);
 void launch_material_conductivity(const material_conductivity_launch &launch,
                                   const stream &stream);
 void launch_material_pml(const material_pml_launch &launch, const stream &stream);
@@ -143,6 +190,14 @@ static_assert(std::is_standard_layout<material_table_header>::value,
               "material table header must be standard layout");
 static_assert(std::is_trivially_copyable<material_table_header>::value,
               "material table header must be trivially copyable");
+static_assert(std::is_standard_layout<material_medium_header>::value,
+              "material medium header must be standard layout");
+static_assert(std::is_trivially_copyable<material_medium_header>::value,
+              "material medium header must be trivially copyable");
+static_assert(std::is_standard_layout<material_susceptibility_record>::value,
+              "material susceptibility record must be standard layout");
+static_assert(std::is_trivially_copyable<material_susceptibility_record>::value,
+              "material susceptibility record must be trivially copyable");
 static_assert(std::is_standard_layout<material_absorber_header>::value,
               "material absorber header must be standard layout");
 static_assert(std::is_trivially_copyable<material_absorber_header>::value,

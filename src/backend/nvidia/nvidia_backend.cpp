@@ -521,6 +521,13 @@ public:
   size_t final_dft_kernel_launches_;
 };
 
+struct NvidiaMaterialTableAuthority {
+  MaterialIRTopologyRow row;
+  ArrayId destination;
+  ArrayId secondary_destination;
+  size_t table_header_offset;
+};
+
 class NvidiaBackendState : public BackendState {
 public:
   NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device, uint64_t state_token)
@@ -583,6 +590,7 @@ public:
   nvidia::device_buffer material_ir_inputs_;
   std::vector<nvidia::material_fill_launch> material_fill_launches_;
   std::vector<nvidia::material_table_launch> material_table_launches_;
+  std::vector<NvidiaMaterialTableAuthority> material_table_authorities_;
   std::vector<nvidia::material_conductivity_launch> material_conductivity_launches_;
   std::vector<nvidia::material_pml_launch> material_pml_launches_;
   std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
@@ -3591,6 +3599,10 @@ NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int se
 
 NvidiaBackend::~NvidiaBackend() {}
 
+namespace {
+void preflight_native_table_ir(const MaterialIR &ir);
+}
+
 void NvidiaBackend::preflight_initialization(const InitializationPlan &initialization) const {
   if (initialization.materials.size() != 1)
     throw std::invalid_argument("NVIDIA initialization requires one frozen material recipe");
@@ -3608,13 +3620,12 @@ void NvidiaBackend::preflight_initialization(const InitializationPlan &initializ
   if (ir.default_material >= ir.materials.size())
     throw std::invalid_argument("NVIDIA native material root is absent");
   const int kind = ir.materials[ir.default_material].kind;
-  if (kind == meep_geom::material_data::MATERIAL_FILE ||
-      kind == meep_geom::material_data::MATERIAL_GRID)
-    throw std::invalid_argument(
-        "NVIDIA material opcode requires PR5.2b table execution support");
   if (kind != meep_geom::material_data::MEDIUM &&
-      kind != meep_geom::material_data::PERFECT_METAL)
-    throw std::invalid_argument("NVIDIA PR5.2a material opcode is unsupported");
+      kind != meep_geom::material_data::PERFECT_METAL &&
+      kind != meep_geom::material_data::MATERIAL_FILE &&
+      kind != meep_geom::material_data::MATERIAL_GRID)
+    throw std::invalid_argument("NVIDIA native material opcode is unsupported");
+  preflight_native_table_ir(ir);
 }
 
 void NvidiaBackend::validate_host_custom_rebuild() {
@@ -3671,6 +3682,8 @@ struct OwnedSusceptibilitySpan {
 
 struct OwnedMediumView {
   const std::vector<double> *values;
+  size_t base;
+  size_t end;
   std::vector<OwnedSusceptibilitySpan> susceptibilities[2];
 };
 
@@ -3716,26 +3729,74 @@ OwnedSusceptibilitySpan parse_owned_susceptibility(const std::vector<double> &va
   return OwnedSusceptibilitySpan{begin, offset};
 }
 
-OwnedMediumView parse_owned_medium(const MaterialIRMaterial &material) {
-  if (material.kind != meep_geom::material_data::MEDIUM)
-    throw std::invalid_argument("PR5.2a accepts only a homogeneous MEDIUM or perfect metal");
-  if (material.parameters.size() < 38)
-    throw std::invalid_argument("NVIDIA homogeneous medium payload is short");
+OwnedMediumView parse_owned_medium_at(const std::vector<double> &values, size_t &offset) {
+  if (offset > values.size() || values.size() - offset < 38)
+    throw std::invalid_argument("NVIDIA material medium payload is short");
   OwnedMediumView result;
-  result.values = &material.parameters;
-  size_t offset = 36;
+  result.values = &values;
+  result.base = offset;
+  offset += 36;
   for (int ft = 0; ft < 2; ++ft) {
-    if (offset >= material.parameters.size())
-      throw std::invalid_argument("NVIDIA homogeneous medium susceptibility count is missing");
-    const size_t count = owned_count(material.parameters[offset++], "susceptibility count");
+    if (offset >= values.size())
+      throw std::invalid_argument("NVIDIA material medium susceptibility count is missing");
+    const size_t count = owned_count(values[offset++], "susceptibility count");
     result.susceptibilities[ft].reserve(count);
     for (size_t i = 0; i < count; ++i)
-      result.susceptibilities[ft].push_back(
-          parse_owned_susceptibility(material.parameters, offset));
+      result.susceptibilities[ft].push_back(parse_owned_susceptibility(values, offset));
   }
+  result.end = offset;
+  return result;
+}
+
+OwnedMediumView parse_owned_medium(const MaterialIRMaterial &material) {
+  if (material.kind != meep_geom::material_data::MEDIUM)
+    throw std::invalid_argument("NVIDIA homogeneous initialization requires MEDIUM");
+  size_t offset = 0;
+  OwnedMediumView result = parse_owned_medium_at(material.parameters, offset);
   if (offset != material.parameters.size())
     throw std::invalid_argument("NVIDIA homogeneous medium payload has trailing values");
   return result;
+}
+
+void validate_table_medium_source(const OwnedMediumView &medium) {
+  const std::vector<double> &p = *medium.values;
+  for (int i = 0; i < 3; ++i)
+    if (p[medium.base + 4 + 2 * i] != 0.0)
+      throw std::invalid_argument(
+          "NVIDIA table material has a non-real electric offdiagonal");
+}
+
+void preflight_native_table_ir(const MaterialIR &ir) {
+  const MaterialIRMaterial &root = ir.materials[ir.default_material];
+  if (root.kind != meep_geom::material_data::MATERIAL_FILE &&
+      root.kind != meep_geom::material_data::MATERIAL_GRID)
+    return;
+  if (!ir.objects.empty() || root.host_callback ||
+      (root.kind == meep_geom::material_data::MATERIAL_GRID && root.do_averaging))
+    throw std::invalid_argument("NVIDIA table material route is not object-free native");
+  size_t offset = root.kind == meep_geom::material_data::MATERIAL_FILE ? 0 : 3;
+  const OwnedMediumView first = parse_owned_medium_at(root.parameters, offset);
+  if (root.kind == meep_geom::material_data::MATERIAL_GRID) {
+    const OwnedMediumView second = parse_owned_medium_at(root.parameters, offset);
+    validate_table_medium_source(first);
+    validate_table_medium_source(second);
+    if (root.parameters.size() - offset != 3)
+      throw std::invalid_argument("NVIDIA MaterialGrid payload tail is invalid");
+  }
+  else if (root.parameters.size() - offset != 3)
+    throw std::invalid_argument("NVIDIA FILE payload tail is invalid");
+  size_t product = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    const size_t extent = owned_count(
+        root.parameters[(root.kind == meep_geom::material_data::MATERIAL_FILE ? offset : 0) +
+                        axis],
+        "table dimension");
+    if (!extent || extent > size_t(INT_MAX))
+      throw std::invalid_argument("NVIDIA material table dimension is not positive int-sized");
+    product = material_checked_product(product, extent, "validating material table samples");
+  }
+  if (product != root.samples.size())
+    throw std::invalid_argument("NVIDIA material table sample count is inconsistent");
 }
 
 struct SymmetricMaterialTensor {
@@ -3744,12 +3805,12 @@ struct SymmetricMaterialTensor {
 
 SymmetricMaterialTensor inverse_owned_tensor(const OwnedMediumView &medium, field_type ft) {
   const std::vector<double> &p = *medium.values;
-  const size_t diagonal = ft == E_stuff ? 0 : 9;
-  const size_t offdiagonal = ft == E_stuff ? 3 : 12;
+  const size_t diagonal = medium.base + (ft == E_stuff ? 0 : 9);
+  const size_t offdiagonal = medium.base + (ft == E_stuff ? 3 : 12);
   if (p[offdiagonal + 1] != 0.0 || p[offdiagonal + 3] != 0.0 ||
       p[offdiagonal + 5] != 0.0)
     throw std::invalid_argument(
-        "PR5.2a does not support imaginary homogeneous material offdiagonals");
+        "NVIDIA native initialization does not support imaginary material offdiagonals");
   const double m00 = p[diagonal], m11 = p[diagonal + 1], m22 = p[diagonal + 2];
   const double m01 = p[offdiagonal], m02 = p[offdiagonal + 2],
                m12 = p[offdiagonal + 4];
@@ -3799,11 +3860,10 @@ int material_tensor_column(component c, int encoded_direction) {
 bool same_owned_susceptibility(const std::vector<double> &medium,
                                const OwnedSusceptibilitySpan &candidate,
                                const std::vector<double> &identity) {
-  /* susceptibility_equiv deliberately ignores the complete sigma tensor:
-     three off-diagonal and three diagonal values are serialized first,
-     followed by the three-value bias.  Dynamics therefore begin at 9. */
-  if (candidate.end - candidate.begin != identity.size() || identity.size() < 9) return false;
-  for (size_t i = 9; i < identity.size(); ++i)
+  /* susceptibility_equiv ignores only the six sigma values serialized first;
+     bias is part of recurrence identity and begins at offset 6. */
+  if (candidate.end - candidate.begin != identity.size() || identity.size() < 6) return false;
+  for (size_t i = 6; i < identity.size(); ++i)
     if (medium[candidate.begin + i] != identity[i]) return false;
   return true;
 }
@@ -3855,21 +3915,23 @@ double homogeneous_row_value(const MaterialIR &ir, const OwnedMediumView *medium
   }
   if (kind == array_kind::chi2 || kind == array_kind::chi3) {
     if (!medium || (!is_electric(c) && !is_magnetic(c))) return 0.0;
-    const size_t base = is_electric(c) ? (kind == array_kind::chi2 ? 18 : 21)
-                                       : (kind == array_kind::chi2 ? 24 : 27);
+    const size_t base = medium->base +
+                        (is_electric(c) ? (kind == array_kind::chi2 ? 18 : 21)
+                                        : (kind == array_kind::chi2 ? 24 : 27));
     return (*medium->values)[base + row];
   }
   if (kind == array_kind::conductivity) {
     if (!medium || direction(key.aux) != component_direction(c) ||
         (!is_D(c) && !is_B(c)))
       return 0.0;
-    return (*medium->values)[(is_D(c) ? 30 : 33) + row];
+    return (*medium->values)[medium->base + (is_D(c) ? 30 : 33) + row];
   }
   if (kind == array_kind::condinv) {
     if (!medium || direction(key.aux) != component_direction(c) ||
         (!is_D(c) && !is_B(c)))
       return 1.0;
-    const double conductivity = (*medium->values)[(is_D(c) ? 30 : 33) + row];
+    const double conductivity =
+        (*medium->values)[medium->base + (is_D(c) ? 30 : 33) + row];
     if (sizeof(realnum) == sizeof(float)) {
       const realnum stored_conductivity = realnum(conductivity);
       return double(realnum(1 / (1 + double(stored_conductivity) * dt * 0.5)));
@@ -3899,12 +3961,16 @@ ArrayId find_storage_key(const StoragePlan &plan, const StorageKey &key) {
 
 struct MaterialCompactPack {
   std::vector<unsigned char> bytes;
+  std::vector<size_t> table_header_offsets;
   size_t absorber_header_offset;
   size_t absorber_profile_bytes;
   size_t pml_profile_bytes;
+  size_t file_sample_bytes;
+  size_t grid_weight_bytes;
 
   MaterialCompactPack()
-      : absorber_header_offset(0), absorber_profile_bytes(0), pml_profile_bytes(0) {}
+      : absorber_header_offset(0), absorber_profile_bytes(0), pml_profile_bytes(0),
+        file_sample_bytes(0), grid_weight_bytes(0) {}
 
   size_t append_space(size_t count, size_t alignment, const char *what) {
     if (!alignment || (alignment & (alignment - 1)))
@@ -3922,7 +3988,75 @@ struct MaterialCompactPack {
     if (count) memcpy(bytes.data() + offset, values.data(), count);
     return offset;
   }
+
+  template <typename T>
+  size_t append_record(const T &value, const char *what) {
+    const size_t offset = append_space(sizeof(T), alignof(T), what);
+    memcpy(bytes.data() + offset, &value, sizeof(T));
+    return offset;
+  }
+
+  template <typename T>
+  size_t append_records(const std::vector<T> &values, const char *what) {
+    const size_t count = material_checked_product(values.size(), sizeof(T), what);
+    const size_t offset = append_space(count, alignof(T), what);
+    if (count) memcpy(bytes.data() + offset, values.data(), count);
+    return offset;
+  }
 };
+
+size_t pack_material_medium(MaterialCompactPack &compact, const OwnedMediumView &medium,
+                            const MaterialIR &ir) {
+  const std::vector<double> &p = *medium.values;
+  nvidia::material_medium_header header = {};
+  header.version = 1;
+  if (medium.susceptibilities[0].size() > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("NVIDIA material susceptibility count overflows");
+  header.electric_susceptibility_count =
+      uint32_t(medium.susceptibilities[0].size());
+  for (int i = 0; i < 3; ++i) {
+    header.epsilon_diagonal[i] = p[medium.base + i];
+    header.epsilon_offdiagonal[i] = p[medium.base + 3 + 2 * i];
+    if (p[medium.base + 4 + 2 * i] != 0.0)
+      throw std::invalid_argument(
+          "NVIDIA table material has a non-real electric offdiagonal");
+    header.conductivity[i] = p[medium.base + 30 + i];
+  }
+  std::vector<nvidia::material_susceptibility_record> records;
+  records.reserve(medium.susceptibilities[0].size());
+  for (size_t ordinal = 0; ordinal < medium.susceptibilities[0].size(); ++ordinal) {
+    const OwnedSusceptibilitySpan &span = medium.susceptibilities[0][ordinal];
+    nvidia::material_susceptibility_record record = {};
+    record.version = 1;
+    const MaterialIRSusceptibility *identity = NULL;
+    for (const MaterialIRSusceptibility &candidate : ir.susceptibilities)
+      if (candidate.field_type == E_stuff &&
+          same_owned_susceptibility(p, span, candidate.parameters)) {
+        identity = &candidate;
+        break;
+      }
+    if (!identity)
+      throw std::invalid_argument(
+          "NVIDIA material susceptibility has no canonical recurrence identity");
+    if (ordinal > std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("NVIDIA material susceptibility ordinal overflows");
+    record.identity = identity->identity;
+    record.field_type = int32_t(identity->field_type);
+    record.material_ordinal = uint32_t(ordinal);
+    for (int i = 0; i < 3; ++i) {
+      record.sigma_offdiagonal[i] = p[span.begin + i];
+      record.sigma_diagonal[i] = p[span.begin + 3 + i];
+    }
+    records.push_back(record);
+  }
+  const size_t header_offset = compact.append_space(
+      sizeof(header), alignof(decltype(header)), "packing material medium header");
+  if (!records.empty())
+    header.electric_susceptibility_offset = compact.append_records(
+        records, "packing material susceptibility records");
+  memcpy(compact.bytes.data() + header_offset, &header, sizeof(header));
+  return header_offset;
+}
 
 struct MaterialStorageKeyLess {
   bool operator()(const StorageKey &left, const StorageKey &right) const {
@@ -3950,6 +4084,298 @@ const MaterialIRChunk &material_chunk(const MaterialIR &ir, int chunk) {
   for (const MaterialIRChunk &candidate : ir.chunks)
     if (candidate.chunk == chunk) return candidate;
   throw std::invalid_argument("NVIDIA material topology references a missing chunk");
+}
+
+bool same_material_double(double left, double right) {
+  return memcmp(&left, &right, sizeof(double)) == 0;
+}
+
+const MaterialIRSusceptibility &canonical_material_susceptibility(
+    const MaterialIR &ir, const OwnedMediumView &medium,
+    const OwnedSusceptibilitySpan &span) {
+  for (const MaterialIRSusceptibility &candidate : ir.susceptibilities)
+    if (candidate.field_type == E_stuff &&
+        same_owned_susceptibility(*medium.values, span, candidate.parameters))
+      return candidate;
+  throw std::invalid_argument(
+      "NVIDIA table susceptibility has no canonical owned identity");
+}
+
+void validate_packed_material_medium(const MaterialIR &ir, const OwnedMediumView &expected,
+                                     const unsigned char *compact_inputs,
+                                     const nvidia::material_medium_header &observed) {
+  if (observed.version != 1 ||
+      observed.electric_susceptibility_count != expected.susceptibilities[0].size())
+    throw std::invalid_argument("NVIDIA packed table medium identity is stale");
+  const std::vector<double> &parameters = *expected.values;
+  for (int i = 0; i < 3; ++i)
+    if (!same_material_double(observed.epsilon_diagonal[i], parameters[expected.base + i]) ||
+        !same_material_double(observed.epsilon_offdiagonal[i],
+                              parameters[expected.base + 3 + 2 * i]) ||
+        !same_material_double(observed.conductivity[i],
+                              parameters[expected.base + 30 + i]))
+      throw std::invalid_argument("NVIDIA packed table medium values are stale");
+  const nvidia::material_susceptibility_record *records =
+      observed.electric_susceptibility_count
+          ? reinterpret_cast<const nvidia::material_susceptibility_record *>(
+                compact_inputs + observed.electric_susceptibility_offset)
+          : NULL;
+  for (size_t ordinal = 0; ordinal < expected.susceptibilities[0].size(); ++ordinal) {
+    const OwnedSusceptibilitySpan &span = expected.susceptibilities[0][ordinal];
+    const MaterialIRSusceptibility &identity =
+        canonical_material_susceptibility(ir, expected, span);
+    const nvidia::material_susceptibility_record &record = records[ordinal];
+    if (record.version != 1 || record.identity != identity.identity ||
+        record.field_type != identity.field_type || record.material_ordinal != ordinal)
+      throw std::invalid_argument("NVIDIA packed susceptibility identity is stale");
+    for (int i = 0; i < 3; ++i)
+      if (!same_material_double(record.sigma_offdiagonal[i], parameters[span.begin + i]) ||
+          !same_material_double(record.sigma_diagonal[i], parameters[span.begin + 3 + i]))
+        throw std::invalid_argument("NVIDIA packed susceptibility values are stale");
+  }
+}
+
+void validate_packed_material_table(const MaterialIR &ir,
+                                    const unsigned char *compact_inputs,
+                                    size_t compact_input_bytes, size_t table_header_offset) {
+  nvidia::validate_material_table_headers(compact_inputs, compact_input_bytes,
+                                           &table_header_offset, 1);
+  const MaterialIRMaterial &root = ir.materials[ir.default_material];
+  const bool file_table = root.kind == meep_geom::material_data::MATERIAL_FILE;
+  const bool grid_table = root.kind == meep_geom::material_data::MATERIAL_GRID;
+  if (!file_table && !grid_table)
+    throw std::invalid_argument("NVIDIA packed table has no authoritative table material");
+  const nvidia::material_table_header &header =
+      *reinterpret_cast<const nvidia::material_table_header *>(compact_inputs +
+                                                               table_header_offset);
+  const nvidia::material_table_kind expected_kind =
+      file_table ? nvidia::material_table_kind::file_scalar_epsilon
+                 : nvidia::material_table_kind::material_grid;
+  if (header.version != 1 || header.material_id != ir.default_material ||
+      header.kind != expected_kind ||
+      header.overlap_kind != uint32_t(file_table ? meep_geom::material_data::U_DEFAULT
+                                                 : root.material_grid_kind))
+    throw std::invalid_argument("NVIDIA packed table header identity is stale");
+  size_t parameter_offset = file_table ? 0 : 3;
+  OwnedMediumView first = parse_owned_medium_at(root.parameters, parameter_offset);
+  std::unique_ptr<OwnedMediumView> second;
+  if (grid_table) second.reset(new OwnedMediumView(parse_owned_medium_at(root.parameters,
+                                                                         parameter_offset)));
+  const size_t dimension_offset = file_table ? parameter_offset : 0;
+  size_t sample_count = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    const size_t extent = owned_count(root.parameters[dimension_offset + axis],
+                                      "validating material table dimensions");
+    sample_count = material_checked_product(sample_count, extent,
+                                            "validating material table sample count");
+    if (extent != header.dimensions[axis])
+      throw std::invalid_argument("NVIDIA packed table dimensions are stale");
+  }
+  if (sample_count != root.samples.size() || header.sample_count != root.samples.size())
+    throw std::invalid_argument("NVIDIA packed table sample count is stale");
+  const double *samples =
+      reinterpret_cast<const double *>(compact_inputs + size_t(header.sample_offset));
+  for (size_t i = 0; i < root.samples.size(); ++i)
+    if (!same_material_double(samples[i], root.samples[i]))
+      throw std::invalid_argument("NVIDIA packed table samples are stale");
+  if (file_table) {
+    if (header.medium_1_offset || header.medium_2_offset ||
+        !same_material_double(header.beta, 0.0) ||
+        !same_material_double(header.eta, 0.0) ||
+        !same_material_double(header.damping, 0.0) ||
+        !same_material_double(header.projection_offset, 0.0))
+      throw std::invalid_argument("NVIDIA packed FILE metadata is stale");
+  }
+  else {
+    if (root.parameters.size() - parameter_offset != 3 ||
+        !same_material_double(header.beta, root.parameters[parameter_offset]) ||
+        !same_material_double(header.eta, root.parameters[parameter_offset + 1]) ||
+        !same_material_double(header.damping, root.parameters[parameter_offset + 2]) ||
+        !same_material_double(header.projection_offset, ir.projection_offset))
+      throw std::invalid_argument("NVIDIA packed MaterialGrid metadata is stale");
+    const nvidia::material_medium_header &first_header =
+        *reinterpret_cast<const nvidia::material_medium_header *>(
+            compact_inputs + size_t(header.medium_1_offset));
+    const nvidia::material_medium_header &second_header =
+        *reinterpret_cast<const nvidia::material_medium_header *>(
+            compact_inputs + size_t(header.medium_2_offset));
+    validate_packed_material_medium(ir, first, compact_inputs, first_header);
+    validate_packed_material_medium(ir, *second, compact_inputs, second_header);
+  }
+}
+
+void validate_material_table_authority(const MaterialIR &ir, const NvidiaBackendState &state,
+                                       const MaterialCompactPack &compact, double dt,
+                                       const nvidia::material_table_launch &launch,
+                                       const NvidiaMaterialTableAuthority &authority,
+                                       bool require_device_pointer) {
+  if (authority.table_header_offset != launch.table_header_offset ||
+      authority.destination.value >= state.plan_.arrays.size() ||
+      !(state.plan_.keys[authority.destination.value] == authority.row.key))
+    throw std::invalid_argument("NVIDIA table launch has stale storage authority");
+  size_t row_matches = 0;
+  for (const MaterialIRTopologyRow &row : ir.topology)
+    if (row.key == authority.row.key) {
+      ++row_matches;
+      if (!(row == authority.row))
+        throw std::invalid_argument("NVIDIA table launch topology row is stale");
+    }
+  if (row_matches != 1)
+    throw std::invalid_argument("NVIDIA table launch topology authority is ambiguous");
+  const ArraySpec &destination_spec = state.plan_.arrays[authority.destination.value];
+  if (destination_spec.id != authority.destination ||
+      destination_spec.role != array_role::material ||
+      destination_spec.element_type != authority.row.element_type ||
+      destination_spec.elements != authority.row.elements ||
+      destination_spec.alignment != authority.row.alignment ||
+      is_valid(destination_spec.alias_of) || launch.elements != authority.row.elements ||
+      launch.destination != state.arenas_->resolve(authority.destination.value).address ||
+      launch.precision != scalar_precision_for(state.plan_, authority.destination,
+                                               "NVIDIA table authority destination"))
+    throw std::invalid_argument("NVIDIA table launch destination authority differs");
+  const MaterialIRChunk &chunk = material_chunk(ir, authority.row.key.chunk);
+  const component c = component(authority.row.key.component_);
+  if (authority.row.yee_component != int(c) || !chunk.owned ||
+      !(chunk.component_bits & (uint64_t(1) << int(c))) ||
+      launch.destination_component != int(c) || launch.query_component != int(c) ||
+      launch.tensor_row != component_index(c) || launch.dimensions != ir.dimensions)
+    throw std::invalid_argument("NVIDIA table launch component authority differs");
+  if (launch.loop_count != chunk.loop_count[c] ||
+      !same_material_double(launch.inva, chunk.inva) || !same_material_double(launch.dt, dt) ||
+      launch.logical_single != (sizeof(realnum) == sizeof(float)))
+    throw std::invalid_argument("NVIDIA table launch numeric chunk authority differs");
+  if (launch.compact_input_bytes != compact.bytes.size() ||
+      (require_device_pointer
+           ? launch.compact_inputs != static_cast<const unsigned char *>(
+                                         state.material_ir_inputs_.opaque_handle())
+           : launch.compact_inputs != NULL))
+    throw std::invalid_argument("NVIDIA table launch compact-input authority differs");
+  for (int axis = 0; axis < 3; ++axis) {
+    const int64_t stagger = int64_t(chunk.loop_begin[c][axis]) -
+                            int64_t(chunk.little_corner[axis]);
+    const int64_t doubled_extent = int64_t(chunk.loop_end[c][axis]) -
+                                   int64_t(chunk.loop_begin[c][axis]);
+    if (authority.row.extents[axis] != chunk.extents[axis] ||
+        authority.row.strides[axis] != chunk.strides[axis] ||
+        authority.row.stagger[axis] != chunk.stagger[c][axis] ||
+        launch.axis_direction[axis] != material_axis_direction(ir.dimensions, axis) ||
+        launch.loop_begin[axis] != chunk.loop_begin[c][axis] ||
+        launch.loop_end[axis] != chunk.loop_end[c][axis] ||
+        launch.little_corner[axis] != chunk.little_corner[axis] ||
+        launch.loop_base_offset[axis] !=
+            size_t(stagger / 2) * size_t(chunk.strides[axis]) ||
+        launch.loop_extent[axis] != size_t(doubled_extent / 2) + 1 ||
+        launch.strides[axis] != chunk.strides[axis] ||
+        !same_material_double(launch.cell_center[axis], ir.cell[axis]) ||
+        !same_material_double(launch.cell_size[axis], ir.cell[axis + 3]))
+      throw std::invalid_argument("NVIDIA table launch geometry authority differs");
+  }
+  validate_packed_material_table(ir, compact.bytes.data(), compact.bytes.size(),
+                                 authority.table_header_offset);
+  const MaterialIRMaterial &root = ir.materials[ir.default_material];
+  const bool file_table = root.kind == meep_geom::material_data::MATERIAL_FILE;
+  const nvidia::material_table_kind expected_kind =
+      file_table ? nvidia::material_table_kind::file_scalar_epsilon
+                 : nvidia::material_table_kind::material_grid;
+  if (launch.table_kind != expected_kind || launch.source_material_id != ir.default_material ||
+      launch.operation_family != 0)
+    throw std::invalid_argument("NVIDIA table launch source identity differs");
+  const array_kind row_kind = static_cast<array_kind>(authority.row.key.kind);
+  const int expected_column = material_tensor_column(c,
+      row_kind == array_kind::sigma ? authority.row.key.cmp : int(authority.row.key.aux));
+  nvidia::material_table_operation expected_operation;
+  ArrayId expected_secondary = invalid_array();
+  uint32_t expected_source_medium = 0;
+  size_t expected_source_ordinal = 0;
+  uint32_t expected_identity = 0;
+  int expected_field_type = int(NO_FIELD_TYPE);
+  size_t expected_absorber_count = 0;
+  size_t expected_absorber_offset = 0;
+  if (row_kind == array_kind::chi1inv && is_electric(c) && expected_column >= 0 &&
+      (!file_table || expected_column == component_index(c)))
+    expected_operation = file_table ? nvidia::material_table_operation::file_chi1inv
+                                    : nvidia::material_table_operation::grid_chi1inv;
+  else if (!file_table && row_kind == array_kind::conductivity && is_D(c) &&
+           direction(authority.row.key.aux) == component_direction(c)) {
+    expected_operation = nvidia::material_table_operation::grid_conductivity;
+    StorageKey inverse_key = authority.row.key;
+    inverse_key.kind = int(array_kind::condinv);
+    expected_secondary = find_storage_key(state.plan_, inverse_key);
+    expected_absorber_count = ir.absorbers.size();
+    expected_absorber_offset = compact.absorber_header_offset;
+  }
+  else if (!file_table && row_kind == array_kind::sigma && is_electric(c) &&
+           expected_column >= 0) {
+    expected_operation = nvidia::material_table_operation::grid_sigma;
+    const field_type ft = field_type(authority.row.key.aux % uint64_t(NUM_FIELD_TYPES));
+    const uint64_t identity_value = authority.row.key.aux / uint64_t(NUM_FIELD_TYPES);
+    if (ft != E_stuff || identity_value > std::numeric_limits<uint32_t>::max())
+      throw std::invalid_argument("NVIDIA table sigma topology identity is invalid");
+    const MaterialIRSusceptibility *identity = NULL;
+    for (const MaterialIRSusceptibility &candidate : ir.susceptibilities)
+      if (candidate.field_type == ft && candidate.identity == identity_value) {
+        identity = &candidate;
+        break;
+      }
+    if (!identity)
+      throw std::invalid_argument("NVIDIA table sigma identity is absent from owned IR");
+    size_t parameter_offset = 3;
+    OwnedMediumView first = parse_owned_medium_at(root.parameters, parameter_offset);
+    OwnedMediumView second = parse_owned_medium_at(root.parameters, parameter_offset);
+    const OwnedMediumView *ordered[2] = {&first, &second};
+    for (size_t medium_index = 0; medium_index < 2 && !expected_source_medium;
+         ++medium_index)
+      for (size_t ordinal = 0; ordinal < ordered[medium_index]->susceptibilities[0].size();
+           ++ordinal)
+        if (same_owned_susceptibility(*ordered[medium_index]->values,
+                                      ordered[medium_index]->susceptibilities[0][ordinal],
+                                      identity->parameters)) {
+          expected_source_medium = uint32_t(medium_index + 1);
+          expected_source_ordinal = ordinal;
+          break;
+        }
+    if (!expected_source_medium)
+      throw std::invalid_argument("NVIDIA table sigma has no first-equivalent source");
+    expected_identity = uint32_t(identity_value);
+    expected_field_type = int(ft);
+  }
+  else
+    throw std::invalid_argument("NVIDIA table launch is not authorized by its topology row");
+  if (launch.operation != expected_operation || launch.tensor_column != expected_column ||
+      launch.source_medium != expected_source_medium ||
+      launch.source_susceptibility != expected_source_ordinal ||
+      launch.susceptibility_identity != expected_identity ||
+      launch.susceptibility_field_type != expected_field_type ||
+      authority.secondary_destination != expected_secondary ||
+      launch.absorber_count != expected_absorber_count ||
+      launch.absorber_header_offset != expected_absorber_offset)
+    throw std::invalid_argument("NVIDIA table launch operation authority differs");
+  for (int axis = 0; axis < 3; ++axis) {
+    const int expected_shift = expected_column != component_index(c) &&
+                                       launch.axis_direction[axis] == int(component_direction(c))
+                                   ? -1
+                                   : 0;
+    if (launch.evaluation_shift[axis] != expected_shift)
+      throw std::invalid_argument("NVIDIA table launch evaluation authority differs");
+  }
+  if (is_valid(expected_secondary)) {
+    if (expected_secondary.value >= state.plan_.arrays.size() ||
+        launch.secondary_destination !=
+            state.arenas_->resolve(expected_secondary.value).address)
+      throw std::invalid_argument("NVIDIA table launch secondary destination differs");
+    const ArraySpec &secondary_spec = state.plan_.arrays[expected_secondary.value];
+    if (secondary_spec.role != array_role::material ||
+        secondary_spec.element_type != authority.row.element_type ||
+        secondary_spec.elements != authority.row.elements ||
+        secondary_spec.alignment != authority.row.alignment ||
+        is_valid(secondary_spec.alias_of) ||
+        scalar_precision_for(state.plan_, expected_secondary,
+                             "NVIDIA table authority secondary") != launch.precision)
+      throw std::invalid_argument("NVIDIA table secondary storage authority differs");
+  }
+  else if (launch.secondary_destination)
+    throw std::invalid_argument("NVIDIA table launch has an unauthorized secondary destination");
+  nvidia::validate_material_table_launch(launch, compact.bytes.data(), compact.bytes.size());
 }
 
 void validate_material_ir_against_live(const MaterialIR &ir, const fields &f, double dt) {
@@ -4084,19 +4510,18 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     throw std::invalid_argument("NVIDIA native material initialization requires owned native IR");
   const MaterialIR &ir = *recipe.ir();
   validate_material_ir(ir);
+  preflight_native_table_ir(ir);
   validate_material_ir_against_live(ir, f, dt);
   if (!ir.objects.empty())
-    throw std::invalid_argument("PR5.2a does not execute geometry-object material selection");
+    throw std::invalid_argument("NVIDIA table initialization does not execute geometry objects");
   const MaterialIRMaterial &root = ir.materials[ir.default_material];
-  /* PR5.1 intentionally classifies these owned table kinds as device-native.
-     This backend opcode/version gate fails closed until PR5.2b implements
-     their table descriptors; it must not silently relabel them as fallback. */
-  if (root.kind == meep_geom::material_data::MATERIAL_FILE ||
-      root.kind == meep_geom::material_data::MATERIAL_GRID)
-    throw std::invalid_argument("PR5.2a defers FILE and MaterialGrid evaluation to PR5.2b");
   if (root.kind != meep_geom::material_data::MEDIUM &&
-      root.kind != meep_geom::material_data::PERFECT_METAL)
-    throw std::invalid_argument("PR5.2a native material kind is unsupported");
+      root.kind != meep_geom::material_data::PERFECT_METAL &&
+      root.kind != meep_geom::material_data::MATERIAL_FILE &&
+      root.kind != meep_geom::material_data::MATERIAL_GRID)
+    throw std::invalid_argument("NVIDIA native material kind is unsupported");
+  if (root.kind == meep_geom::material_data::MATERIAL_GRID && root.do_averaging)
+    throw std::invalid_argument("NVIDIA table initialization does not support grid averaging");
   if (!std::isfinite(dt) || !(dt > 0.0))
     throw std::invalid_argument("NVIDIA native material initialization has an invalid timestep");
 
@@ -4107,9 +4532,14 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     tensors[0] = inverse_owned_tensor(*medium, E_stuff);
     tensors[1] = inverse_owned_tensor(*medium, H_stuff);
   }
+  const bool file_table = root.kind == meep_geom::material_data::MATERIAL_FILE;
+  const bool grid_table = root.kind == meep_geom::material_data::MATERIAL_GRID;
+  std::unique_ptr<OwnedMediumView> table_medium_1, table_medium_2;
+  size_t table_header_offset = size_t(-1);
 
   state.material_fill_launches_.clear();
   state.material_table_launches_.clear();
+  state.material_table_authorities_.clear();
   state.material_conductivity_launches_.clear();
   state.material_pml_launches_.clear();
   state.material_ir_inputs_.reset();
@@ -4148,6 +4578,58 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     if (state.plan_.arrays[i].role == array_role::material &&
         !is_valid(state.plan_.arrays[i].alias_of) && !rows.count(state.plan_.keys[i]))
       throw std::invalid_argument("NVIDIA material storage is absent from owned topology");
+
+  if (file_table || grid_table) {
+    nvidia::material_table_header header = {};
+    header.version = 1;
+    header.material_id = ir.default_material;
+    header.kind = file_table ? nvidia::material_table_kind::file_scalar_epsilon
+                             : nvidia::material_table_kind::material_grid;
+    header.overlap_kind = grid_table ? uint32_t(root.material_grid_kind)
+                                     : uint32_t(meep_geom::material_data::U_DEFAULT);
+    size_t parameter_offset = file_table ? 0 : 3;
+    OwnedMediumView first = parse_owned_medium_at(root.parameters, parameter_offset);
+    if (grid_table) {
+      OwnedMediumView second = parse_owned_medium_at(root.parameters, parameter_offset);
+      if (root.parameters.size() - parameter_offset != 3)
+        throw std::invalid_argument("NVIDIA material grid payload has the wrong tail");
+      header.beta = root.parameters[parameter_offset];
+      header.eta = root.parameters[parameter_offset + 1];
+      header.damping = root.parameters[parameter_offset + 2];
+      header.projection_offset = ir.projection_offset;
+      table_medium_1.reset(new OwnedMediumView(first));
+      table_medium_2.reset(new OwnedMediumView(second));
+    }
+    else if (root.parameters.size() - parameter_offset != 3)
+      throw std::invalid_argument("NVIDIA FILE payload has the wrong dimension tail");
+    size_t product = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      const size_t extent = owned_count(
+          root.parameters[(file_table ? parameter_offset : 0) + axis],
+          file_table ? "FILE dimension" : "MaterialGrid dimension");
+      if (!extent || extent > size_t(INT_MAX))
+        throw std::invalid_argument("NVIDIA material table dimension is not positive int-sized");
+      product = material_checked_product(product, extent, "sizing material table samples");
+      header.dimensions[axis] = uint32_t(extent);
+    }
+    if (product != root.samples.size())
+      throw std::invalid_argument("NVIDIA material table sample count is inconsistent");
+    table_header_offset = compact.append_space(sizeof(header), alignof(decltype(header)),
+                                               "packing material table header");
+    if (grid_table) {
+      header.medium_1_offset = pack_material_medium(compact, *table_medium_1, ir);
+      header.medium_2_offset = pack_material_medium(compact, *table_medium_2, ir);
+    }
+    header.sample_offset = compact.append_doubles(
+        root.samples, file_table ? "packing FILE samples" : "packing MaterialGrid weights");
+    header.sample_count = root.samples.size();
+    memcpy(compact.bytes.data() + table_header_offset, &header, sizeof(header));
+    compact.table_header_offsets.push_back(table_header_offset);
+    const size_t sample_bytes = material_checked_product(root.samples.size(), sizeof(double),
+                                                         "accounting table samples");
+    if (file_table) compact.file_sample_bytes = sample_bytes;
+    else compact.grid_weight_bytes = sample_bytes;
+  }
 
   /* Phase zero establishes every padding/default element before any
      dependency-bearing override. */
@@ -4219,8 +4701,9 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
   /* Constant overrides execute in the legacy dependency order.  Absorber
      conductivity and its derived inverse are emitted as one ordered kernel
      below, so their logical predecessor is never reread after narrowing. */
-  for (int phase = 1; phase <= 5; ++phase)
-    for (const MaterialIRTopologyRow &row_spec : ir.topology) {
+  if (!file_table && !grid_table)
+    for (int phase = 1; phase <= 5; ++phase)
+      for (const MaterialIRTopologyRow &row_spec : ir.topology) {
       const array_kind kind = static_cast<array_kind>(row_spec.key.kind);
       if (material_fill_phase(kind) != phase) continue;
       const component c = component(row_spec.key.component_);
@@ -4238,7 +4721,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       launch.phase = uint32_t(phase);
       launch.precision = scalar_precision_for(state.plan_, id, "NVIDIA material destination");
       state.material_fill_launches_.push_back(launch);
-    }
+      }
 
   if (!ir.absorbers.empty())
     for (const MaterialIRTopologyRow &row_spec : ir.topology) {
@@ -4246,6 +4729,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       const component c = component(row_spec.key.component_);
       if ((!is_D(c) && !is_B(c)) || direction(row_spec.key.aux) != component_direction(c))
         continue;
+      if (grid_table && is_D(c)) continue;
       StorageKey inverse_key = row_spec.key;
       inverse_key.kind = int(array_kind::condinv);
       const ArrayId conductivity = find_storage_key(state.plan_, row_spec.key);
@@ -4290,13 +4774,174 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       launch.cell_size[R] = ir.cell[3];
       launch.inva = chunk.inva;
       launch.base_conductivity = medium
-                                     ? (*medium->values)[(is_D(c) ? 30 : 33) + component_index(c)]
+                                     ? (*medium->values)[medium->base +
+                                                         (is_D(c) ? 30 : 33) +
+                                                         component_index(c)]
                                      : 0.0;
       launch.dt = dt;
       launch.logical_single = sizeof(realnum) == sizeof(float);
       launch.precision = precision;
       state.material_conductivity_launches_.push_back(launch);
     }
+
+  if (file_table || grid_table) {
+    const auto make_table_launch = [&](const MaterialIRTopologyRow &row_spec,
+                                       nvidia::material_table_operation operation) {
+      const component c = component(row_spec.key.component_);
+      const ArrayId destination = find_storage_key(state.plan_, row_spec.key);
+      nvidia::material_table_launch launch = {};
+      launch.destination = state.arenas_->resolve(destination.value).address;
+      launch.compact_inputs = NULL;
+      launch.compact_input_bytes = compact.bytes.size();
+      launch.table_header_offset = table_header_offset;
+      launch.elements = row_spec.elements;
+      const MaterialIRChunk &chunk = material_chunk(ir, row_spec.key.chunk);
+      launch.loop_count = chunk.loop_count[c];
+      launch.table_kind = file_table ? nvidia::material_table_kind::file_scalar_epsilon
+                                     : nvidia::material_table_kind::material_grid;
+      launch.operation = operation;
+      launch.source_material_id = ir.default_material;
+      launch.destination_component = int(c);
+      launch.query_component = int(c);
+      launch.tensor_row = component_index(c);
+      launch.tensor_column = -1;
+      launch.susceptibility_field_type = int(NO_FIELD_TYPE);
+      launch.dimensions = ir.dimensions;
+      for (int axis = 0; axis < 3; ++axis) {
+        launch.axis_direction[axis] = material_axis_direction(ir.dimensions, axis);
+        launch.loop_begin[axis] = chunk.loop_begin[c][axis];
+        launch.loop_end[axis] = chunk.loop_end[c][axis];
+        launch.little_corner[axis] = chunk.little_corner[axis];
+        const int64_t stagger = int64_t(chunk.loop_begin[c][axis]) -
+                                int64_t(chunk.little_corner[axis]);
+        const int64_t doubled_extent = int64_t(chunk.loop_end[c][axis]) -
+                                       int64_t(chunk.loop_begin[c][axis]);
+        if (stagger < 0 || stagger > 1 || doubled_extent < 0 || doubled_extent % 2)
+          throw std::invalid_argument("NVIDIA material table loop geometry is invalid");
+        launch.loop_base_offset[axis] =
+            size_t(stagger / 2) * size_t(chunk.strides[axis]);
+        launch.loop_extent[axis] = size_t(doubled_extent / 2) + 1;
+        launch.strides[axis] = chunk.strides[axis];
+        launch.evaluation_shift[axis] = 0;
+      }
+      launch.cell_center[0] = ir.cell[0];
+      launch.cell_center[1] = ir.cell[1];
+      launch.cell_center[2] = ir.cell[2];
+      launch.cell_size[0] = ir.cell[3];
+      launch.cell_size[1] = ir.cell[4];
+      launch.cell_size[2] = ir.cell[5];
+      launch.inva = chunk.inva;
+      launch.dt = dt;
+      launch.logical_single = sizeof(realnum) == sizeof(float);
+      launch.precision =
+          scalar_precision_for(state.plan_, destination, "NVIDIA material table destination");
+      return launch;
+    };
+    const auto add_table_launch = [&](const MaterialIRTopologyRow &row_spec,
+                                      const nvidia::material_table_launch &launch,
+                                      ArrayId secondary_destination = invalid_array()) {
+      const ArrayId destination = find_storage_key(state.plan_, row_spec.key);
+      if (!is_valid(destination))
+        throw std::invalid_argument("NVIDIA table authority destination is absent");
+      NvidiaMaterialTableAuthority authority;
+      authority.row = row_spec;
+      authority.destination = destination;
+      authority.secondary_destination = secondary_destination;
+      authority.table_header_offset = table_header_offset;
+      state.material_table_launches_.push_back(launch);
+      state.material_table_authorities_.push_back(authority);
+    };
+
+    for (const MaterialIRTopologyRow &row_spec : ir.topology) {
+      const array_kind kind = static_cast<array_kind>(row_spec.key.kind);
+      if (kind == array_kind::chi1inv) {
+        const component c = component(row_spec.key.component_);
+        const int column = material_tensor_column(c, int(row_spec.key.aux));
+        if (!is_electric(c) || column < 0 ||
+            (file_table && column != component_index(c)))
+          continue;
+        nvidia::material_table_launch launch = make_table_launch(
+            row_spec, file_table ? nvidia::material_table_operation::file_chi1inv
+                                 : nvidia::material_table_operation::grid_chi1inv);
+        launch.tensor_column = column;
+        if (column != launch.tensor_row)
+          for (int axis = 0; axis < 3; ++axis)
+            if (launch.axis_direction[axis] == int(component_direction(c)))
+              launch.evaluation_shift[axis] = -1;
+        add_table_launch(row_spec, launch);
+      }
+      else if (grid_table && kind == array_kind::conductivity) {
+        const component c = component(row_spec.key.component_);
+        if (!is_D(c) || direction(row_spec.key.aux) != component_direction(c)) continue;
+        StorageKey inverse_key = row_spec.key;
+        inverse_key.kind = int(array_kind::condinv);
+        const ArrayId inverse = find_storage_key(state.plan_, inverse_key);
+        if (!is_valid(inverse))
+          throw std::invalid_argument("NVIDIA grid conductivity inverse is absent");
+        nvidia::material_table_launch launch = make_table_launch(
+            row_spec, nvidia::material_table_operation::grid_conductivity);
+        launch.secondary_destination = state.arenas_->resolve(inverse.value).address;
+        launch.absorber_header_offset = compact.absorber_header_offset;
+        launch.absorber_count = absorber_headers.size();
+        require_same_precision(state.plan_, inverse, launch.precision,
+                               "NVIDIA grid conductivity inverse");
+        launch.tensor_column = launch.tensor_row;
+        add_table_launch(row_spec, launch, inverse);
+      }
+      else if (grid_table && kind == array_kind::sigma) {
+        const component c = component(row_spec.key.component_);
+        const field_type ft = field_type(row_spec.key.aux % uint64_t(NUM_FIELD_TYPES));
+        const uint64_t identity_value = row_spec.key.aux / uint64_t(NUM_FIELD_TYPES);
+        const int column = material_tensor_column(c, row_spec.key.cmp);
+        if (!is_electric(c) || ft != E_stuff || column < 0 ||
+            identity_value > std::numeric_limits<uint32_t>::max())
+          continue;
+        const MaterialIRSusceptibility *identity = NULL;
+        for (const MaterialIRSusceptibility &sus : ir.susceptibilities)
+          if (sus.field_type == ft && sus.identity == identity_value) {
+            identity = &sus;
+            break;
+          }
+        if (!identity)
+          throw std::invalid_argument("NVIDIA grid sigma identity is absent");
+        unsigned source_medium = 0;
+        size_t source_ordinal = 0;
+        for (size_t i = 0; i < table_medium_1->susceptibilities[0].size(); ++i)
+          if (same_owned_susceptibility(*table_medium_1->values,
+                                        table_medium_1->susceptibilities[0][i],
+                                        identity->parameters)) {
+            source_medium = 1;
+            source_ordinal = i;
+            break;
+          }
+        if (!source_medium)
+          for (size_t i = 0; i < table_medium_2->susceptibilities[0].size(); ++i)
+            if (same_owned_susceptibility(*table_medium_2->values,
+                                          table_medium_2->susceptibilities[0][i],
+                                          identity->parameters)) {
+              source_medium = 2;
+              source_ordinal = i;
+              break;
+            }
+        if (!source_medium) continue;
+        const OwnedMediumView &source =
+            source_medium == 1 ? *table_medium_1 : *table_medium_2;
+        if (owned_sigma_value(source, *identity, c, row_spec.key.cmp) == 0.0) continue;
+        nvidia::material_table_launch launch =
+            make_table_launch(row_spec, nvidia::material_table_operation::grid_sigma);
+        launch.source_medium = source_medium;
+        launch.source_susceptibility = source_ordinal;
+        launch.susceptibility_identity = uint32_t(identity_value);
+        launch.susceptibility_field_type = int(ft);
+        launch.tensor_column = column;
+        if (column != launch.tensor_row)
+          for (int axis = 0; axis < 3; ++axis)
+            if (launch.axis_direction[axis] == int(component_direction(c)))
+              launch.evaluation_shift[axis] = -1;
+        add_table_launch(row_spec, launch);
+      }
+    }
+  }
 
   std::vector<size_t> pml_profile_offsets(ir.pml_axes.size(), size_t(-1));
   for (size_t i = 0; i < ir.pml_axes.size(); ++i)
@@ -4369,6 +5014,87 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
 
   const size_t input_bytes = compact.bytes.size();
   if (input_bytes) {
+    for (nvidia::material_table_launch &launch : state.material_table_launches_)
+      launch.compact_input_bytes = input_bytes;
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_semantic_mutation))
+      state.material_table_launches_.front().axis_direction[0] = 2;
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_far_coordinate_mutation)) {
+      nvidia::material_table_launch &launch = state.material_table_launches_.front();
+      launch.loop_begin[2] += 1000000;
+      launch.loop_end[2] += 1000000;
+      launch.little_corner[2] += 1000000;
+    }
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_component_mutation)) {
+      nvidia::material_table_launch &launch = state.material_table_launches_.front();
+      launch.destination_component = launch.query_component =
+          launch.destination_component == int(Ex) ? int(Ey) : int(Ex);
+      launch.tensor_row = component_index(component(launch.destination_component));
+      launch.tensor_column = launch.tensor_row;
+    }
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_tensor_mutation))
+      state.material_table_launches_.front().tensor_column =
+          (state.material_table_launches_.front().tensor_column + 1) % 3;
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_loop_mutation)) {
+      nvidia::material_table_launch &launch = state.material_table_launches_.front();
+      launch.loop_begin[2] += 2;
+      launch.loop_end[2] += 2;
+      launch.little_corner[2] += 2;
+    }
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_shift_mutation))
+      state.material_table_launches_.front().evaluation_shift[2] = -1;
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_destination_mutation)) {
+      nvidia::material_table_launch &launch = state.material_table_launches_.front();
+      const size_t width = launch.precision == nvidia::scalar_precision::f32
+                               ? sizeof(float)
+                               : sizeof(double);
+      launch.destination = static_cast<unsigned char *>(launch.destination) + width;
+    }
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_source_mutation)) {
+      bool mutated = false;
+      for (nvidia::material_table_launch &launch : state.material_table_launches_)
+        if (launch.operation == nvidia::material_table_operation::grid_sigma) {
+          launch.source_medium = launch.source_medium == 1 ? 2 : 1;
+          launch.source_susceptibility = 0;
+          mutated = true;
+          break;
+        }
+      if (!mutated)
+        throw std::logic_error("NVIDIA table source mutation fixture has no sigma launch");
+    }
+    if (!state.material_table_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_table_header_mutation)) {
+      nvidia::material_table_header *header =
+          reinterpret_cast<nvidia::material_table_header *>(
+              compact.bytes.data() + compact.table_header_offsets.front());
+      ++header->material_id;
+      ++state.material_table_launches_.front().source_material_id;
+    }
+    if (!compact.table_header_offsets.empty())
+      nvidia::validate_material_table_headers(compact.bytes.data(), compact.bytes.size(),
+                                               compact.table_header_offsets.data(),
+                                               compact.table_header_offsets.size());
+    if (state.material_table_launches_.size() != state.material_table_authorities_.size())
+      throw std::logic_error("NVIDIA material table authority count differs");
+    for (size_t i = 0; i < state.material_table_launches_.size(); ++i)
+      validate_material_table_authority(ir, state, compact, dt,
+                                        state.material_table_launches_[i],
+                                        state.material_table_authorities_[i], false);
     if (!absorber_headers.empty())
       nvidia::validate_material_absorber_headers(compact.bytes.data(), compact.bytes.size(),
                                                   compact.absorber_header_offset,
@@ -4381,6 +5107,10 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     state.material_ir_inputs_.allocate(input_bytes, state.device_);
     const unsigned char *base = static_cast<const unsigned char *>(
         state.material_ir_inputs_.opaque_handle());
+    for (nvidia::material_table_launch &launch : state.material_table_launches_) {
+      launch.compact_inputs = base;
+      launch.compact_input_bytes = input_bytes;
+    }
     for (nvidia::material_conductivity_launch &launch :
          state.material_conductivity_launches_) {
       launch.compact_inputs = base;
@@ -4460,7 +5190,7 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
       }
     if (material.disposition() != MaterialRecipeDisposition::device_native &&
         material.disposition() != MaterialRecipeDisposition::host_reference)
-      throw std::invalid_argument("NVIDIA PR5.2a received an unsupported material route");
+      throw std::invalid_argument("NVIDIA native initialization received an unsupported route");
     const CpuArrayCatalog &catalog = *f_.array_catalog;
     if (catalog.size() > state.plan_.arrays.size())
       throw std::logic_error("CPU catalog exceeds the provisional NVIDIA storage plan");
@@ -4482,6 +5212,7 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
     else {
       state.material_fill_launches_.clear();
       state.material_table_launches_.clear();
+      state.material_table_authorities_.clear();
       state.material_conductivity_launches_.clear();
       state.material_pml_launches_.clear();
       state.material_ir_inputs_.reset();
@@ -4594,9 +5325,14 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
           compact_inputs.absorber_profile_bytes;
       state.material_initialization_statistics_.pml_profile_bytes =
           compact_inputs.pml_profile_bytes;
+      state.material_initialization_statistics_.file_sample_bytes =
+          compact_inputs.file_sample_bytes;
+      state.material_initialization_statistics_.grid_weight_bytes =
+          compact_inputs.grid_weight_bytes;
       state.material_initialization_statistics_.decoded_parameter_bytes =
           compact_input_bytes - compact_inputs.absorber_profile_bytes -
-          compact_inputs.pml_profile_bytes;
+          compact_inputs.pml_profile_bytes - compact_inputs.file_sample_bytes -
+          compact_inputs.grid_weight_bytes;
     }
     if (native_material) {
       for (uint32_t phase = 0; phase <= 5; ++phase) {
@@ -4617,6 +5353,40 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
                     state.material_initialization_statistics_.absorber_points_evaluated,
                     launch.loop_count, "accounting absorber points");
           }
+        for (size_t table_index = 0; table_index < state.material_table_launches_.size();
+             ++table_index) {
+          const nvidia::material_table_launch &launch =
+              state.material_table_launches_[table_index];
+          const uint32_t table_phase =
+              launch.operation == nvidia::material_table_operation::file_chi1inv ||
+                      launch.operation == nvidia::material_table_operation::grid_chi1inv
+                  ? 1
+                  : launch.operation == nvidia::material_table_operation::grid_conductivity
+                        ? 3
+                        : 5;
+          if (table_phase != phase) continue;
+          if (!material.ir() || table_index >= state.material_table_authorities_.size())
+            throw std::logic_error("NVIDIA material table authority is absent at launch");
+          validate_material_table_authority(*material.ir(), state, compact_inputs, double(f_.dt),
+                                            launch,
+                                            state.material_table_authorities_[table_index], true);
+          nvidia::launch_material_table(launch, *state.transfer_);
+          ++state.material_initialization_statistics_.pointwise_kernel_launches;
+          if (launch.table_kind == nvidia::material_table_kind::file_scalar_epsilon) {
+            ++state.material_initialization_statistics_.file_table_kernel_launches;
+            state.material_initialization_statistics_.file_points_evaluated =
+                material_checked_add(
+                    state.material_initialization_statistics_.file_points_evaluated,
+                    launch.loop_count, "accounting FILE table points");
+          }
+          else {
+            ++state.material_initialization_statistics_.grid_table_kernel_launches;
+            state.material_initialization_statistics_.grid_points_evaluated =
+                material_checked_add(
+                    state.material_initialization_statistics_.grid_points_evaluated,
+                    launch.loop_count, "accounting MaterialGrid table points");
+          }
+        }
       }
       for (const nvidia::material_pml_launch &launch : state.material_pml_launches_) {
         nvidia::launch_material_pml(launch, *state.transfer_);
@@ -4624,6 +5394,7 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
       }
       const bool submitted_work = !uploads.empty() || compact_input_bytes ||
                                   !state.material_fill_launches_.empty() ||
+                                  !state.material_table_launches_.empty() ||
                                   !state.material_conductivity_launches_.empty() ||
                                   !state.material_pml_launches_.empty();
       if (submitted_work) {

@@ -3,7 +3,10 @@
 #include "backend/nvidia/nvidia_initialization.hpp"
 #include "backend/nvidia/runtime.hpp"
 
+#include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <limits>
@@ -510,16 +513,755 @@ static void check_absorber(int device, scalar_precision precision,
                 "rejected conductivity descriptor changed inverse output");
 }
 
+static size_t aligned_offset(size_t offset, size_t alignment) {
+  return offset + (alignment - offset % alignment) % alignment;
+}
+
+static int mirror_index(int i, int n) {
+  return i >= n ? 2 * n - 1 - i : (i < 0 ? -1 - i : i);
+}
+
+static double scalar_interpolate(double r, const std::vector<double> &samples) {
+  r = r < 0 ? -r : (r > 1 ? 1 - r : r);
+  const int n = int(samples.size());
+  const int first = mirror_index(int(r * n), n);
+  double d = r * n - first - 0.5;
+  const int second = mirror_index(d >= 0 ? first + 1 : first - 1, n);
+  d = std::fabs(d);
+  return samples[first] * (1 - d) + samples[second] * d;
+}
+
+static double table_interpolate_3d(const double normalized[3], const uint32_t dimensions[3],
+                                   const std::vector<double> &samples) {
+  int first[3], second[3];
+  double fraction[3];
+  for (int axis = 0; axis < 3; ++axis) {
+    double r = normalized[axis];
+    r = r < 0 ? -r : (r > 1 ? 1 - r : r);
+    first[axis] = mirror_index(int(r * dimensions[axis]), int(dimensions[axis]));
+    double delta = r * dimensions[axis] - first[axis] - 0.5;
+    second[axis] = mirror_index(delta >= 0 ? first[axis] + 1 : first[axis] - 1,
+                                int(dimensions[axis]));
+    fraction[axis] = std::fabs(delta);
+  }
+  const auto at = [&](int x, int y, int z) {
+    return samples[(size_t(x) * dimensions[1] + size_t(y)) * dimensions[2] + size_t(z)];
+  };
+  const auto lerp = [](double a, double b, double t) { return a * (1 - t) + b * t; };
+  return lerp(lerp(lerp(at(first[0], first[1], first[2]),
+                         at(second[0], first[1], first[2]), fraction[0]),
+                   lerp(at(first[0], second[1], first[2]),
+                        at(second[0], second[1], first[2]), fraction[0]),
+                   fraction[1]),
+              lerp(lerp(at(first[0], first[1], second[2]),
+                         at(second[0], first[1], second[2]), fraction[0]),
+                   lerp(at(first[0], second[1], second[2]),
+                        at(second[0], second[1], second[2]), fraction[0]),
+                   fraction[1]),
+              fraction[2]);
+}
+
+template <typename T>
+static void check_table_length(int device, scalar_precision precision, size_t elements,
+                               material_table_kind kind) {
+  stream execution;
+  const T sentinel = T(-63.5);
+  const size_t leading_guards = 3, trailing_guards = 5;
+  const std::vector<double> samples = {0.2, 0.8};
+  material_table_header header = {};
+  header.version = 1;
+  header.material_id = 41;
+  header.kind = kind;
+  header.overlap_kind = 1;
+  header.dimensions[0] = header.dimensions[1] = 1;
+  header.dimensions[2] = 2;
+  size_t offset = sizeof(header);
+  material_medium_header medium1 = {}, medium2 = {};
+  if (kind == material_table_kind::material_grid) {
+    offset = aligned_offset(offset, alignof(material_medium_header));
+    header.medium_1_offset = offset;
+    offset += sizeof(material_medium_header);
+    offset = aligned_offset(offset, alignof(material_medium_header));
+    header.medium_2_offset = offset;
+    offset += sizeof(material_medium_header);
+    medium1.version = medium2.version = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      medium1.epsilon_diagonal[axis] = 2.0 + axis;
+      medium2.epsilon_diagonal[axis] = 5.0 + axis;
+    }
+  }
+  offset = aligned_offset(offset, alignof(double));
+  header.sample_offset = offset;
+  header.sample_count = samples.size();
+  std::vector<unsigned char> compact(offset + samples.size() * sizeof(double), 0);
+  std::memcpy(compact.data(), &header, sizeof(header));
+  if (kind == material_table_kind::material_grid) {
+    std::memcpy(compact.data() + header.medium_1_offset, &medium1, sizeof(medium1));
+    std::memcpy(compact.data() + header.medium_2_offset, &medium2, sizeof(medium2));
+  }
+  std::memcpy(compact.data() + header.sample_offset, samples.data(),
+              samples.size() * sizeof(double));
+
+  std::vector<T> guarded(leading_guards + elements + trailing_guards, sentinel), observed;
+  device_buffer device_compact(compact.size(), device);
+  device_buffer destination(guarded.size() * sizeof(T), device);
+  copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+  copy_host_to_device_async(destination, 0, guarded.data(), guarded.size() * sizeof(T), execution);
+  material_table_launch launch = {};
+  launch.destination = static_cast<unsigned char *>(destination.opaque_handle()) +
+                       leading_guards * sizeof(T);
+  launch.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
+  launch.compact_input_bytes = compact.size();
+  launch.elements = elements;
+  launch.loop_count = elements;
+  launch.table_kind = kind;
+  launch.operation = kind == material_table_kind::file_scalar_epsilon
+                         ? material_table_operation::file_chi1inv
+                         : material_table_operation::grid_chi1inv;
+  launch.source_material_id = header.material_id;
+  launch.destination_component = launch.query_component = 4;
+  launch.tensor_row = launch.tensor_column = 2;
+  launch.susceptibility_field_type = 8;
+  launch.dimensions = 0;
+  launch.axis_direction[0] = 0;
+  launch.axis_direction[1] = 1;
+  launch.axis_direction[2] = 2;
+  launch.loop_extent[0] = launch.loop_extent[1] = 1;
+  launch.loop_extent[2] = elements ? elements : 1;
+  launch.strides[2] = 1;
+  launch.loop_end[2] = elements ? int(2 * (elements - 1)) : 0;
+  launch.cell_size[2] = std::max(2.0, 2.0 * double(elements));
+  launch.inva = 1.0;
+  launch.dt = 0.0625;
+  launch.precision = precision;
+  if (elements) validate_material_table_launch(launch, compact.data(), compact.size());
+  launch_material_table(launch, execution);
+  observed.resize(guarded.size());
+  copy_device_to_host_async(observed.data(), destination, 0,
+                            observed.size() * sizeof(T), execution);
+  execution.synchronize();
+  for (size_t i = 0; i < leading_guards; ++i)
+    require(observed[i] == sentinel, "material table length launch overwrote a leading guard");
+  for (size_t i = leading_guards + elements; i < observed.size(); ++i)
+    require(observed[i] == sentinel, "material table length launch overwrote a trailing guard");
+  for (size_t i = 0; i < elements; ++i) {
+    const double normalized = 0.5 + double(i) / launch.cell_size[2];
+    const double weight = scalar_interpolate(normalized, samples);
+    const double epsilon = kind == material_table_kind::file_scalar_epsilon
+                               ? weight
+                               : medium1.epsilon_diagonal[2] +
+                                     weight * (medium2.epsilon_diagonal[2] -
+                                               medium1.epsilon_diagonal[2]);
+    require(observed[leading_guards + i] == T(1.0 / epsilon),
+            "material table length/tail interpolation differs");
+  }
+}
+
+template <typename T>
+static void check_table_materials(int device, scalar_precision precision,
+                                  bool logical_single = false) {
+  stream execution;
+  const size_t elements = 5;
+  const T sentinel = T(-41.25);
+  std::vector<T> guards(elements + 2, sentinel), observed(elements + 2), inverse(elements + 2);
+  device_buffer destination(guards.size() * sizeof(T), device);
+  device_buffer secondary(guards.size() * sizeof(T), device);
+
+  const auto make_launch = [&](device_buffer &compact, size_t compact_bytes,
+                               material_table_kind kind,
+                               material_table_operation operation) {
+    material_table_launch launch = {};
+    launch.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+    launch.secondary_destination = operation == material_table_operation::grid_conductivity
+                                       ? static_cast<unsigned char *>(secondary.opaque_handle()) +
+                                             sizeof(T)
+                                       : NULL;
+    launch.compact_inputs = static_cast<const unsigned char *>(compact.opaque_handle());
+    launch.compact_input_bytes = compact_bytes;
+    launch.table_header_offset = 0;
+    launch.elements = elements;
+    launch.loop_count = elements;
+    launch.table_kind = kind;
+    launch.operation = operation;
+    launch.source_material_id = 7;
+    launch.destination_component = operation == material_table_operation::grid_conductivity
+                                       ? 14
+                                       : 4;
+    launch.query_component = launch.destination_component;
+    launch.tensor_row = launch.tensor_column = 2;
+    launch.susceptibility_field_type = 8;
+    launch.dimensions = 0;
+    launch.axis_direction[0] = 0;
+    launch.axis_direction[1] = 1;
+    launch.axis_direction[2] = 2;
+    launch.loop_begin[0] = launch.loop_begin[1] = 0;
+    launch.loop_begin[2] = -4;
+    launch.loop_end[0] = launch.loop_end[1] = 0;
+    launch.loop_end[2] = 4;
+    launch.little_corner[0] = launch.little_corner[1] = 0;
+    launch.little_corner[2] = -4;
+    launch.loop_extent[0] = launch.loop_extent[1] = 1;
+    launch.loop_extent[2] = elements;
+    launch.strides[0] = launch.strides[1] = 0;
+    launch.strides[2] = 1;
+    launch.cell_size[2] = 4;
+    launch.inva = 1;
+    launch.dt = 0.0625;
+    launch.logical_single = logical_single;
+    launch.precision = precision;
+    return launch;
+  };
+
+  {
+    const std::vector<double> samples = {2.0, 4.0};
+    material_table_header header = {};
+    header.version = 1;
+    header.material_id = 7;
+    header.kind = material_table_kind::file_scalar_epsilon;
+    header.overlap_kind = 3;
+    header.dimensions[0] = header.dimensions[1] = 1;
+    header.dimensions[2] = 2;
+    header.sample_offset = aligned_offset(sizeof(header), alignof(double));
+    header.sample_count = samples.size();
+    std::vector<unsigned char> compact(size_t(header.sample_offset) +
+                                       samples.size() * sizeof(double), 0);
+    std::memcpy(compact.data(), &header, sizeof(header));
+    std::memcpy(compact.data() + header.sample_offset, samples.data(),
+                samples.size() * sizeof(double));
+    const size_t header_offset = 0;
+    validate_material_table_headers(compact.data(), compact.size(), &header_offset, 1);
+    std::vector<unsigned char> malformed = compact;
+    reinterpret_cast<material_table_header *>(malformed.data())->dimensions[2] = 0;
+    require_invalid(
+        [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+        "zero material table dimension was accepted");
+    malformed = compact;
+    reinterpret_cast<material_table_header *>(malformed.data())->sample_count = 1;
+    require_invalid(
+        [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+        "short material table sample span was accepted");
+
+    device_buffer device_compact(compact.size(), device);
+    copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+    copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T), execution);
+    material_table_launch launch = make_launch(
+        device_compact, compact.size(), material_table_kind::file_scalar_epsilon,
+        material_table_operation::file_chi1inv);
+    validate_material_table_launch(launch, compact.data(), compact.size());
+    material_table_launch malformed_launch = launch;
+    ++malformed_launch.source_material_id;
+    require_invalid(
+        [&]() { validate_material_table_launch(malformed_launch, compact.data(), compact.size()); },
+        "material table source/header ID mismatch was accepted");
+    malformed_launch = launch;
+    malformed_launch.table_kind = material_table_kind::material_grid;
+    require_invalid(
+        [&]() { validate_material_table_launch(malformed_launch, compact.data(), compact.size()); },
+        "material table source/header kind mismatch was accepted");
+    malformed_launch = launch;
+    malformed_launch.operation = static_cast<material_table_operation>(99);
+    require_invalid([&]() { launch_material_table(malformed_launch, execution); },
+                    "unknown material table operation was accepted");
+    malformed_launch = launch;
+    malformed_launch.axis_direction[0] = 2;
+    require_invalid(
+        [&]() { validate_material_table_launch(malformed_launch, compact.data(), compact.size()); },
+        "same-size material table axis mutation was accepted");
+    malformed_launch = launch;
+    malformed_launch.loop_begin[2] += 1000;
+    malformed_launch.loop_end[2] += 1000;
+    malformed_launch.little_corner[2] += 1000;
+    require_invalid(
+        [&]() { validate_material_table_launch(malformed_launch, compact.data(), compact.size()); },
+        "far-out material table coordinates were accepted");
+    copy_device_to_host_async(observed.data(), destination, 0,
+                              observed.size() * sizeof(T), execution);
+    execution.synchronize();
+    require_exact(observed, guards,
+                  "rejected material table descriptor changed guarded output");
+    launch_material_table(launch, execution);
+    copy_device_to_host_async(observed.data(), destination, 0,
+                              observed.size() * sizeof(T), execution);
+    execution.synchronize();
+    require(observed.front() == sentinel && observed.back() == sentinel,
+            "FILE table launch overwrote a guard");
+    for (size_t i = 0; i < elements; ++i) {
+      const double z = -2.0 + i;
+      const double epsilon = scalar_interpolate(0.5 + z / 4.0, samples);
+      require(observed[i + 1] == T(1.0 / epsilon), "FILE table interpolation differs");
+    }
+    copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T), execution);
+    execution.synchronize();
+    testing::fail_next(testing::failure_point::material_file_launch);
+    bool rejected = false;
+    try { launch_material_table(launch, execution); }
+    catch (const std::runtime_error &) { rejected = true; }
+    require(rejected, "FILE table failure injection was ignored");
+
+    material_table_header scalar_header = header;
+    scalar_header.dimensions[2] = 1;
+    scalar_header.sample_count = 1;
+    std::vector<unsigned char> scalar_compact(
+        size_t(scalar_header.sample_offset) + sizeof(double), 0);
+    std::memcpy(scalar_compact.data(), &scalar_header, sizeof(scalar_header));
+    device_buffer scalar_device_compact(scalar_compact.size(), device);
+    material_table_launch scalar_launch = launch;
+    scalar_launch.compact_inputs =
+        static_cast<const unsigned char *>(scalar_device_compact.opaque_handle());
+    scalar_launch.compact_input_bytes = scalar_compact.size();
+    for (double epsilon : {0.0, -2.0}) {
+      std::memcpy(scalar_compact.data() + scalar_header.sample_offset, &epsilon,
+                  sizeof(epsilon));
+      validate_material_table_launch(scalar_launch, scalar_compact.data(),
+                                     scalar_compact.size());
+      copy_host_to_device_async(scalar_device_compact, 0, scalar_compact.data(),
+                                scalar_compact.size(), execution);
+      copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T),
+                                execution);
+      launch_material_table(scalar_launch, execution);
+      copy_device_to_host_async(observed.data(), destination, 0,
+                                observed.size() * sizeof(T), execution);
+      execution.synchronize();
+      for (size_t i = 0; i < elements; ++i)
+        if (epsilon == 0.0)
+          require(std::isinf(double(observed[i + 1])) && observed[i + 1] > 0,
+                  "zero FILE epsilon did not preserve positive infinity");
+        else
+          require(observed[i + 1] == T(-0.5),
+                  "negative FILE epsilon inverse differs");
+    }
+  }
+
+  {
+    struct DimensionCase {
+      int dimensions;
+      size_t loop_extent[3];
+      uint32_t table_extent[3];
+      int axis_direction[3];
+    };
+    const DimensionCase cases[] = {
+        {0, {1, 1, 4}, {2, 3, 4}, {0, 1, 2}},
+        {1, {1, 2, 3}, {2, 3, 1}, {2, 0, 1}},
+        {2, {2, 3, 4}, {2, 3, 4}, {0, 1, 2}},
+        {3, {1, 2, 4}, {2, 3, 4}, {4, 3, 2}}};
+    for (const DimensionCase &dimension_case : cases) {
+      const size_t sample_count = size_t(dimension_case.table_extent[0]) *
+                                  dimension_case.table_extent[1] *
+                                  dimension_case.table_extent[2];
+      std::vector<double> samples(sample_count);
+      for (uint32_t x = 0; x < dimension_case.table_extent[0]; ++x)
+        for (uint32_t y = 0; y < dimension_case.table_extent[1]; ++y)
+          for (uint32_t z = 0; z < dimension_case.table_extent[2]; ++z)
+            samples[(size_t(x) * dimension_case.table_extent[1] + y) *
+                        dimension_case.table_extent[2] + z] =
+                2.0 + 100.0 * x + 10.0 * y + z;
+      material_table_header header = {};
+      header.version = 1;
+      header.material_id = 19;
+      header.kind = material_table_kind::file_scalar_epsilon;
+      header.overlap_kind = 3;
+      for (int axis = 0; axis < 3; ++axis) header.dimensions[axis] =
+          dimension_case.table_extent[axis];
+      header.sample_offset = aligned_offset(sizeof(header), alignof(double));
+      header.sample_count = samples.size();
+      std::vector<unsigned char> compact(size_t(header.sample_offset) +
+                                         samples.size() * sizeof(double), 0);
+      std::memcpy(compact.data(), &header, sizeof(header));
+      std::memcpy(compact.data() + header.sample_offset, samples.data(),
+                  samples.size() * sizeof(double));
+      const size_t point_count = dimension_case.loop_extent[0] *
+                                 dimension_case.loop_extent[1] *
+                                 dimension_case.loop_extent[2];
+      std::vector<T> guarded(point_count + 2, sentinel), values(point_count + 2);
+      device_buffer device_compact(compact.size(), device);
+      device_buffer device_values(guarded.size() * sizeof(T), device);
+      copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+      copy_host_to_device_async(device_values, 0, guarded.data(), guarded.size() * sizeof(T),
+                                execution);
+      material_table_launch launch = {};
+      launch.destination = static_cast<unsigned char *>(device_values.opaque_handle()) + sizeof(T);
+      launch.compact_inputs =
+          static_cast<const unsigned char *>(device_compact.opaque_handle());
+      launch.compact_input_bytes = compact.size();
+      launch.table_header_offset = 0;
+      launch.elements = point_count;
+      launch.loop_count = point_count;
+      launch.table_kind = material_table_kind::file_scalar_epsilon;
+      launch.operation = material_table_operation::file_chi1inv;
+      launch.source_material_id = 19;
+      launch.destination_component = launch.query_component = 4;
+      launch.tensor_row = launch.tensor_column = 2;
+      launch.susceptibility_field_type = 8;
+      launch.dimensions = dimension_case.dimensions;
+      launch.inva = 1.0;
+      launch.dt = 0.0625;
+      launch.logical_single = logical_single;
+      launch.precision = precision;
+      launch.strides[2] = 1;
+      launch.strides[1] = dimension_case.loop_extent[2];
+      launch.strides[0] = dimension_case.loop_extent[1] * launch.strides[1];
+      for (int axis = 0; axis < 3; ++axis) {
+        launch.axis_direction[axis] = dimension_case.axis_direction[axis];
+        launch.loop_extent[axis] = dimension_case.loop_extent[axis];
+        launch.loop_begin[axis] = 1 - int(dimension_case.loop_extent[axis]);
+        launch.loop_end[axis] = int(dimension_case.loop_extent[axis]) - 1;
+        launch.little_corner[axis] = launch.loop_begin[axis];
+        launch.cell_size[axis] = dimension_case.table_extent[axis];
+      }
+      validate_material_table_launch(launch, compact.data(), compact.size());
+      launch_material_table(launch, execution);
+      copy_device_to_host_async(values.data(), device_values, 0, values.size() * sizeof(T),
+                                execution);
+      execution.synchronize();
+      require(values.front() == sentinel && values.back() == sentinel,
+              "multidimensional FILE table overwrote a guard");
+      for (size_t point = 0; point < point_count; ++point) {
+        size_t remaining = point;
+        const size_t loop_index[3] = {
+            remaining / (dimension_case.loop_extent[1] * dimension_case.loop_extent[2]),
+            (remaining / dimension_case.loop_extent[2]) % dimension_case.loop_extent[1],
+            remaining % dimension_case.loop_extent[2]};
+        double coordinate[3] = {0, 0, 0};
+        for (int axis = 0; axis < 3; ++axis) {
+          const double physical = 0.5 *
+              (launch.loop_begin[axis] + 2.0 * loop_index[axis]);
+          const int direction = launch.axis_direction[axis];
+          if (direction == 0 || direction == 3) coordinate[0] = physical;
+          else if (direction == 1) coordinate[1] = physical;
+          else if (direction == 2) coordinate[2] = physical;
+        }
+        if (launch.dimensions == 0) coordinate[0] = coordinate[1] = 0;
+        else if (launch.dimensions == 1) coordinate[2] = 0;
+        else if (launch.dimensions == 3) coordinate[1] = 0;
+        double normalized[3];
+        for (int axis = 0; axis < 3; ++axis)
+          normalized[axis] = 0.5 + coordinate[axis] / launch.cell_size[axis];
+        const double expected = 1.0 /
+            table_interpolate_3d(normalized, dimension_case.table_extent, samples);
+        require(values[point + 1] == T(expected),
+                "multidimensional FILE row-major mapping differs");
+      }
+    }
+  }
+
+  for (uint32_t mode = 0; mode < 4; ++mode) {
+    const double raw = mode == 1 ? -0.25 : mode == 2 ? 0.4 : 1.25;
+    const std::vector<double> samples = mode == 2 ? std::vector<double>{0.15, 0.65}
+                                                   : std::vector<double>{raw};
+    material_table_header header = {};
+    header.version = 1;
+    header.material_id = 7;
+    header.kind = material_table_kind::material_grid;
+    header.overlap_kind = mode;
+    header.dimensions[0] = mode == 2 ? 2 : 1;
+    header.dimensions[1] = header.dimensions[2] = 1;
+    size_t offset = aligned_offset(sizeof(header), alignof(material_medium_header));
+    header.medium_1_offset = offset;
+    offset += sizeof(material_medium_header);
+    uint64_t susceptibility_offset = 0;
+    uint64_t second_susceptibility_offset = 0;
+    if (mode == 2) {
+      offset = aligned_offset(offset, alignof(material_susceptibility_record));
+      susceptibility_offset = offset;
+      offset += sizeof(material_susceptibility_record);
+    }
+    offset = aligned_offset(offset, alignof(material_medium_header));
+    header.medium_2_offset = offset;
+    offset += sizeof(material_medium_header);
+    if (mode == 2) {
+      offset = aligned_offset(offset, alignof(material_susceptibility_record));
+      second_susceptibility_offset = offset;
+      offset += sizeof(material_susceptibility_record);
+    }
+    offset = aligned_offset(offset, alignof(double));
+    header.sample_offset = offset;
+    header.sample_count = samples.size();
+    if (mode == 2) {
+      header.beta = 2.0;
+      header.eta = 0.4;
+    }
+    if (mode == 3) header.projection_offset = -0.25;
+    std::vector<unsigned char> compact(offset + samples.size() * sizeof(double), 0);
+    material_medium_header medium1 = {}, medium2 = {};
+    medium1.version = medium2.version = 1;
+    medium1.epsilon_diagonal[0] = medium1.epsilon_diagonal[1] =
+        medium1.epsilon_diagonal[2] = 2;
+    medium2.epsilon_diagonal[0] = medium2.epsilon_diagonal[1] =
+        medium2.epsilon_diagonal[2] = 5;
+    if (mode <= 1) {
+      medium1.epsilon_diagonal[2] = -2;
+      medium2.epsilon_diagonal[2] = 0;
+    }
+    medium1.conductivity[2] = 0.25;
+    medium2.conductivity[2] = 0.75;
+    material_susceptibility_record susceptibility = {};
+    if (mode == 2) {
+      medium1.electric_susceptibility_count = 1;
+      medium1.electric_susceptibility_offset = susceptibility_offset;
+      medium2.electric_susceptibility_count = 1;
+      medium2.electric_susceptibility_offset = second_susceptibility_offset;
+      susceptibility.version = 1;
+      susceptibility.identity = 17;
+      susceptibility.field_type = 0;
+      susceptibility.material_ordinal = 0;
+      susceptibility.sigma_diagonal[2] = 0.625;
+      susceptibility.sigma_offdiagonal[0] = 0.375;
+    }
+    header.damping = -0.125;
+    std::memcpy(compact.data(), &header, sizeof(header));
+    std::memcpy(compact.data() + header.medium_1_offset, &medium1, sizeof(medium1));
+    std::memcpy(compact.data() + header.medium_2_offset, &medium2, sizeof(medium2));
+    if (mode == 2)
+      std::memcpy(compact.data() + susceptibility_offset, &susceptibility,
+                  sizeof(susceptibility));
+    if (mode == 2) {
+      material_susceptibility_record duplicate = susceptibility;
+      duplicate.sigma_diagonal[2] = 9.0;
+      duplicate.sigma_offdiagonal[0] = 8.0;
+      std::memcpy(compact.data() + second_susceptibility_offset, &duplicate,
+                  sizeof(duplicate));
+    }
+    std::memcpy(compact.data() + header.sample_offset, samples.data(),
+                samples.size() * sizeof(double));
+    const size_t header_offset = 0;
+    validate_material_table_headers(compact.data(), compact.size(), &header_offset, 1);
+    std::vector<unsigned char> malformed = compact;
+    reinterpret_cast<material_table_header *>(malformed.data())->sample_offset = 0;
+    require_invalid(
+        [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+        "material table samples overlapping the header were accepted");
+    malformed = compact;
+    reinterpret_cast<material_table_header *>(malformed.data())->medium_2_offset =
+        header.medium_1_offset;
+    require_invalid(
+        [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+        "aliased MaterialGrid medium headers were accepted");
+    if (mode == 2) {
+      malformed = compact;
+      reinterpret_cast<material_medium_header *>(
+          malformed.data() + header.medium_1_offset)->electric_susceptibility_offset = 0;
+      require_invalid(
+          [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+          "MaterialGrid susceptibility overlapping its table header was accepted");
+      malformed = compact;
+      reinterpret_cast<material_medium_header *>(
+          malformed.data() + header.medium_1_offset)->electric_susceptibility_offset =
+          header.medium_1_offset;
+      require_invalid(
+          [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+          "MaterialGrid susceptibility overlapping its medium header was accepted");
+      malformed = compact;
+      reinterpret_cast<material_medium_header *>(
+          malformed.data() + header.medium_1_offset)->electric_susceptibility_offset =
+          header.sample_offset;
+      require_invalid(
+          [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+          "MaterialGrid susceptibility overlapping samples was accepted");
+    }
+    malformed = compact;
+    reinterpret_cast<material_table_header *>(malformed.data())->medium_2_offset =
+        header.sample_offset;
+    require_invalid(
+        [&]() { validate_material_table_headers(malformed.data(), malformed.size(), &header_offset, 1); },
+        "MaterialGrid medium overlapping samples was accepted");
+    device_buffer device_compact(compact.size(), device);
+    copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+    copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T), execution);
+    copy_host_to_device_async(secondary, 0, guards.data(), guards.size() * sizeof(T), execution);
+    material_table_launch launch = make_launch(
+        device_compact, compact.size(), material_table_kind::material_grid,
+        material_table_operation::grid_conductivity);
+    if (mode == 2) {
+      launch.dimensions = 2;
+      launch.loop_begin[0] = launch.little_corner[0] = -4;
+      launch.loop_end[0] = 4;
+      launch.loop_extent[0] = elements;
+      launch.strides[0] = 1;
+      launch.cell_size[0] = 4;
+      launch.loop_begin[2] = launch.loop_end[2] = launch.little_corner[2] = 0;
+      launch.loop_extent[2] = 1;
+      launch.strides[2] = 0;
+    }
+    const auto grid_weight = [&](size_t point, int x_shift) {
+      double normalized[3] = {0.5, 0.5, 0.5};
+      if (mode == 2) {
+        const double x =
+            0.5 * (launch.loop_begin[0] + 2.0 * point + x_shift) * launch.inva;
+        normalized[0] = 0.5 + x / launch.cell_size[0];
+      }
+      double u = table_interpolate_3d(normalized, header.dimensions, samples);
+      if (header.overlap_kind == 0) u = std::min(1.0, u);
+      u += header.projection_offset;
+      if (header.beta != 0)
+        u = u == header.eta
+                ? 0.5
+                : (std::tanh(header.beta * header.eta) +
+                   std::tanh(header.beta * (u - header.eta))) /
+                      (std::tanh(header.beta * header.eta) +
+                       std::tanh(header.beta * (1 - header.eta)));
+      return u;
+    };
+    const auto table_equal = [](T observed_value, T expected_value) {
+      const double scale = std::max(1.0, std::fabs(double(expected_value)));
+      return observed_value == expected_value ||
+             std::fabs(double(observed_value) - double(expected_value)) <=
+                 8.0 * std::numeric_limits<T>::epsilon() * scale;
+    };
+    validate_material_table_launch(launch, compact.data(), compact.size());
+    if (mode == 2) {
+      material_table_launch valid_sigma = launch;
+      valid_sigma.operation = material_table_operation::grid_sigma;
+      valid_sigma.secondary_destination = NULL;
+      valid_sigma.destination_component = valid_sigma.query_component = 4;
+      valid_sigma.source_medium = 1;
+      valid_sigma.source_susceptibility = 0;
+      valid_sigma.susceptibility_identity = 17;
+      valid_sigma.susceptibility_field_type = 0;
+      validate_material_table_launch(valid_sigma, compact.data(), compact.size());
+      launch_material_table(valid_sigma, execution);
+      copy_device_to_host_async(observed.data(), destination, 0,
+                                observed.size() * sizeof(T), execution);
+      execution.synchronize();
+      for (size_t i = 0; i < elements; ++i) {
+        const T expected_sigma = T(0.625 * (1.0 - grid_weight(i, 0)));
+        require(table_equal(observed[i + 1], expected_sigma),
+                "MaterialGrid diagonal sigma launch differs");
+      }
+      const std::vector<T> diagonal_sigma = observed;
+      copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T),
+                                execution);
+      valid_sigma.destination_component = valid_sigma.query_component = 0;
+      valid_sigma.tensor_row = 0;
+      valid_sigma.tensor_column = 1;
+      valid_sigma.evaluation_shift[0] = -1;
+      validate_material_table_launch(valid_sigma, compact.data(), compact.size());
+      launch_material_table(valid_sigma, execution);
+      copy_device_to_host_async(observed.data(), destination, 0,
+                                observed.size() * sizeof(T), execution);
+      execution.synchronize();
+      bool shift_observable = false;
+      for (size_t i = 0; i < elements; ++i) {
+        const T shifted = T(0.375 * (1.0 - grid_weight(i, -1)));
+        const T unshifted = T(0.375 * (1.0 - grid_weight(i, 0)));
+        require(table_equal(observed[i + 1], shifted),
+                "MaterialGrid offdiagonal Yee-shifted sigma launch differs");
+        shift_observable = shift_observable || shifted != unshifted;
+        require(table_equal(diagonal_sigma[i + 1],
+                            T(0.625 * (1.0 - grid_weight(i, 0)))),
+                "MaterialGrid diagonal sigma oracle changed after shifted launch");
+      }
+      require(shift_observable,
+              "MaterialGrid offdiagonal Yee shift is numerically vacuous");
+      material_table_launch wrong_identity = valid_sigma;
+      ++wrong_identity.susceptibility_identity;
+      require_invalid(
+          [&]() { validate_material_table_launch(wrong_identity, compact.data(), compact.size()); },
+          "MaterialGrid sigma identity substitution was accepted");
+      material_table_launch wrong_source = valid_sigma;
+      wrong_source.source_medium = 2;
+      wrong_source.source_susceptibility = 0;
+      require_invalid(
+          [&]() { validate_material_table_launch(wrong_source, compact.data(), compact.size()); },
+          "MaterialGrid non-first equivalent sigma source was accepted");
+      copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T),
+                                execution);
+    }
+    material_table_launch bad_sigma = launch;
+    bad_sigma.operation = material_table_operation::grid_sigma;
+    bad_sigma.secondary_destination = NULL;
+    bad_sigma.destination_component = bad_sigma.query_component = 4;
+    bad_sigma.source_medium = 1;
+    bad_sigma.susceptibility_field_type = 0;
+    bad_sigma.source_susceptibility = std::numeric_limits<uint64_t>::max();
+    require_invalid(
+        [&]() { validate_material_table_launch(bad_sigma, compact.data(), compact.size()); },
+        "overflowing MaterialGrid susceptibility ordinal was accepted");
+    launch_material_table(launch, execution);
+    copy_device_to_host_async(observed.data(), destination, 0,
+                              observed.size() * sizeof(T), execution);
+    copy_device_to_host_async(inverse.data(), secondary, 0,
+                              inverse.size() * sizeof(T), execution);
+    execution.synchronize();
+    for (size_t i = 0; i < elements; ++i) {
+      const double u = grid_weight(i, 0);
+      double expected = 0.25 + u * 0.5 + u * (1 - u) * header.damping;
+      double expected_inverse;
+      if (logical_single) {
+        expected = float(expected);
+        expected_inverse = float(1 / (1 + double(float(expected)) * launch.dt * 0.5));
+      }
+      else expected_inverse = 1 / (1 + expected * launch.dt * 0.5);
+      require(table_equal(observed[i + 1], T(expected)),
+              "MaterialGrid reducer/conductivity differs");
+      require(table_equal(inverse[i + 1], T(expected_inverse)),
+              "MaterialGrid condinv differs");
+    }
+    if (mode <= 1) {
+      copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T),
+                                execution);
+      material_table_launch chi_launch = make_launch(
+          device_compact, compact.size(), material_table_kind::material_grid,
+          material_table_operation::grid_chi1inv);
+      validate_material_table_launch(chi_launch, compact.data(), compact.size());
+      launch_material_table(chi_launch, execution);
+      copy_device_to_host_async(observed.data(), destination, 0,
+                                observed.size() * sizeof(T), execution);
+      execution.synchronize();
+      const double epsilon = -2.0 + grid_weight(0, 0) * 2.0;
+      for (size_t i = 0; i < elements; ++i)
+        if (epsilon == 0.0)
+          require(std::isinf(double(observed[i + 1])) && observed[i + 1] > 0,
+                  "zero MaterialGrid epsilon did not preserve positive infinity");
+        else
+          require(observed[i + 1] == T(1.0 / epsilon),
+                  "negative MaterialGrid epsilon inverse differs");
+    }
+    if (mode == 3) {
+      copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T), execution);
+      execution.synchronize();
+      testing::fail_next(testing::failure_point::material_grid_launch);
+      bool rejected = false;
+      try { launch_material_table(launch, execution); }
+      catch (const std::runtime_error &) { rejected = true; }
+      require(rejected, "MaterialGrid table failure injection was ignored");
+    }
+  }
+}
+
 int main() {
   try {
+    require(material_table_mirror_index_for_testing(INT_MAX, INT_MAX) == INT_MAX - 1,
+            "wide material mirror index overflowed");
     const std::vector<device_properties> devices = enumerate_devices();
     require(!devices.empty(), "no CUDA devices found");
     const size_t lengths[] = {0, 1, 255, 256, 257};
+    const bool table_tail_only = std::getenv("MEEP_NVIDIA_TABLE_TAIL_ONLY") != NULL;
     for (size_t di = 0; di < devices.size(); ++di) {
       device_scope scope(devices[di].id);
+      if (table_tail_only) {
+        check_table_length<float>(devices[di].id, scalar_precision::f32, 257,
+                                  material_table_kind::file_scalar_epsilon);
+        check_table_length<float>(devices[di].id, scalar_precision::f32, 257,
+                                  material_table_kind::material_grid);
+        check_table_length<double>(devices[di].id, scalar_precision::f64, 257,
+                                   material_table_kind::file_scalar_epsilon);
+        check_table_length<double>(devices[di].id, scalar_precision::f64, 257,
+                                   material_table_kind::material_grid);
+        std::cout << "device " << devices[di].id
+                  << ": NVIDIA material table 257-element tails PASS\n";
+        continue;
+      }
       for (size_t i = 0; i < sizeof(lengths) / sizeof(lengths[0]); ++i) {
         check_length<float>(devices[di].id, scalar_precision::f32, lengths[i]);
         check_length<double>(devices[di].id, scalar_precision::f64, lengths[i]);
+        check_table_length<float>(devices[di].id, scalar_precision::f32, lengths[i],
+                                  material_table_kind::file_scalar_epsilon);
+        check_table_length<float>(devices[di].id, scalar_precision::f32, lengths[i],
+                                  material_table_kind::material_grid);
+        check_table_length<double>(devices[di].id, scalar_precision::f64, lengths[i],
+                                   material_table_kind::file_scalar_epsilon);
+        check_table_length<double>(devices[di].id, scalar_precision::f64, lengths[i],
+                                   material_table_kind::material_grid);
       }
       check_length<float>(devices[di].id, scalar_precision::f32, 17, true);
       check_length<double>(devices[di].id, scalar_precision::f64, 17, true);
@@ -529,6 +1271,10 @@ int main() {
       check_absorber<double>(devices[di].id, scalar_precision::f64);
       check_absorber<float>(devices[di].id, scalar_precision::f32, true);
       check_absorber<double>(devices[di].id, scalar_precision::f64, true);
+      check_table_materials<float>(devices[di].id, scalar_precision::f32);
+      check_table_materials<double>(devices[di].id, scalar_precision::f64);
+      check_table_materials<float>(devices[di].id, scalar_precision::f32, true);
+      check_table_materials<double>(devices[di].id, scalar_precision::f64, true);
       std::cout << "device " << devices[di].id << " (" << devices[di].name
                 << "): NVIDIA material initialization kernels PASS\n";
     }

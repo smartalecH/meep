@@ -177,6 +177,7 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
   ADD_SCALAR(ir.contains_host_callback);
   ADD_SCALAR(ir.device_native_eligible);
   ADD_SCALAR(ir.dimensions);
+  ADD_SCALAR(ir.projection_offset);
   ADD_SCALAR(ir.default_material);
   ADD_SCALAR(ir.signature);
   ADD_SCALAR(ir.layout_signature);

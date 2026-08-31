@@ -386,7 +386,11 @@ static void compare_fields(fields &cpu, fields &gpu, double tolerance) {
     for (size_t j = 0; j < observed.size(); ++j) {
       const double error = fabs(double(observed[j]) - double(expected[j]));
       const double scale = 1.0 + fabs(double(expected[j]));
-      if (error > tolerance * scale) {
+      if (std::isnan(double(expected[j])) || std::isnan(double(observed[j])) ||
+          ((!std::isfinite(double(expected[j])) || !std::isfinite(double(observed[j]))) &&
+           double(expected[j]) != double(observed[j])) ||
+          (std::isfinite(double(expected[j])) && std::isfinite(double(observed[j])) &&
+           error > tolerance * scale)) {
         const StorageKey &key = cpu.array_catalog->key(id);
         fprintf(stderr,
                 "array %zu (%s,c=%d,cmp=%d,aux=%llu) element %zu differs: cpu=%.17g "
@@ -430,7 +434,11 @@ static void compare_live_fields_by_key(fields &cpu, fields &gpu, double toleranc
     for (size_t j = 0; j < observed.size(); ++j) {
       const double error = fabs(double(observed[j]) - double(expected[j]));
       const double scale = 1.0 + fabs(double(expected[j]));
-      if (error > tolerance * scale) {
+      if (std::isnan(double(expected[j])) || std::isnan(double(observed[j])) ||
+          ((!std::isfinite(double(expected[j])) || !std::isfinite(double(observed[j]))) &&
+           double(expected[j]) != double(observed[j])) ||
+          (std::isfinite(double(expected[j])) && std::isfinite(double(observed[j])) &&
+           error > tolerance * scale)) {
         fprintf(stderr,
                 "live array (%s,c=%d,cmp=%d,aux=%llu) element %zu differs: cpu=%.17g "
                 "nvidia=%.17g error=%.3g tol=%.3g\n",
@@ -494,7 +502,11 @@ static void compare_material_rows(fields &cpu, fields &gpu, double tolerance) {
     for (size_t j = 0; j < observed.size(); ++j) {
       const double error = fabs(double(observed[j]) - double(expected[j]));
       const double scale = 1.0 + fabs(double(expected[j]));
-      if (error > tolerance * scale) {
+      if (std::isnan(double(expected[j])) || std::isnan(double(observed[j])) ||
+          ((!std::isfinite(double(expected[j])) || !std::isfinite(double(observed[j]))) &&
+           double(expected[j]) != double(observed[j])) ||
+          (std::isfinite(double(expected[j])) && std::isfinite(double(observed[j])) &&
+           error > tolerance * scale)) {
         fprintf(stderr,
                 "material row (%s,c=%d,aux=%llu) element %zu differs: cpu=%.17g "
                 "nvidia=%.17g error=%.3g tol=%.3g\n",
@@ -528,7 +540,11 @@ static void compare_all_initialized_material_rows(fields &cpu, fields &gpu,
     for (size_t j = 0; j < observed.size(); ++j) {
       const double error = fabs(double(observed[j]) - double(expected[j]));
       const double scale = 1.0 + fabs(double(expected[j]));
-      if (error > tolerance * scale) {
+      if (std::isnan(double(expected[j])) || std::isnan(double(observed[j])) ||
+          ((!std::isfinite(double(expected[j])) || !std::isfinite(double(observed[j]))) &&
+           double(expected[j]) != double(observed[j])) ||
+          (std::isfinite(double(expected[j])) && std::isfinite(double(observed[j])) &&
+           error > tolerance * scale)) {
         fprintf(stderr,
                 "native material row (%s,c=%d,cmp=%d,aux=%llu) element %zu differs: "
                 "cpu=%.17g nvidia=%.17g\n",
@@ -2457,37 +2473,842 @@ static void test_native_material_initialization_retry() {
   master_printf("nvidia_timestep: native-material rollback/retry PASS\n");
 }
 
-static void test_native_table_gate_preallocation() {
+static void install_native_file_material(structure &s, bool periodicity = false,
+                                         double sample_delta = 0.0, int sample_axis = 2) {
   using namespace meep_geom;
-  const grid_volume gv = vol1d(1.0, 8.0);
-  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   material_type file_material = new material_data();
   file_material->which_subclass = material_data::MATERIAL_FILE;
-  file_material->medium = medium_struct(1.0);
-  file_material->epsilon_dims[0] = 2;
-  file_material->epsilon_dims[1] = file_material->epsilon_dims[2] = 1;
-  file_material->epsilon_data = new double[2]{1.5, 2.5};
+  file_material->medium = medium_struct(7.0);
+  file_material->medium.mu_diag = make_vector3(3.0, 4.0, 5.0);
+  file_material->medium.D_conductivity_diag = make_vector3(0.2, 0.3, 0.4);
+  file_material->medium.E_chi2_diag = make_vector3(0.1, 0.2, 0.3);
+  file_material->epsilon_dims[0] = file_material->epsilon_dims[1] =
+      file_material->epsilon_dims[2] = 1;
+  require(sample_axis >= 0 && sample_axis < 3, "FILE sample axis is invalid");
+  file_material->epsilon_dims[sample_axis] = 2;
+  file_material->epsilon_data = new double[2]{1.5 + sample_delta, 2.5 - 0.5 * sample_delta};
   geometric_object_list empty_geometry = {0, NULL};
-  set_materials_from_geometry(&s, empty_geometry, make_vector3(), false, 1e-5, 64, false,
+  set_materials_from_geometry(&s, empty_geometry, make_vector3(), false, 1e-5, 64, periodicity,
                               file_material);
   material_free(file_material);
+}
+
+static void install_native_grid_material(structure &s, meep_geom::absorber_list absorbers,
+                                         bool endpoint_conductivity = true,
+                                         bool periodicity = false,
+                                         bool dispersion = true, double weight_delta = 0.0,
+                                         double projection_offset = 0.0,
+                                         double damping_delta = 0.0,
+                                         double endpoint_delta = 0.0,
+                                         int sample_axis = 2) {
+  using namespace meep_geom;
+  material_type grid = make_material_grid(false, 3.5, 0.4, -0.125 + damping_delta);
+  grid->material_grid_kinds = material_data::U_MIN;
+  require(sample_axis >= 0 && sample_axis < 3, "MaterialGrid sample axis is invalid");
+  grid->grid_size = sample_axis == 0 ? make_vector3(2, 1, 1)
+                    : sample_axis == 1 ? make_vector3(1, 2, 1)
+                                       : make_vector3(1, 1, 2);
+  grid->weights = new double[2]{-0.25 + weight_delta, 1.25 - 0.5 * weight_delta};
+  grid->medium_1 = medium_struct(2.0);
+  grid->medium_2 = medium_struct(5.0);
+  grid->medium_1.epsilon_diag = make_vector3(2.0, 3.0, 4.0);
+  grid->medium_2.epsilon_diag =
+      make_vector3(5.0 + endpoint_delta, 6.0 - 0.5 * endpoint_delta,
+                   7.0 + 0.25 * endpoint_delta);
+  grid->medium_1.epsilon_offdiag.x.re = 0.1;
+  grid->medium_1.epsilon_offdiag.y.re = -0.05;
+  grid->medium_1.epsilon_offdiag.z.re = 0.08;
+  grid->medium_2.epsilon_offdiag.x.re = -0.07;
+  grid->medium_2.epsilon_offdiag.y.re = 0.04;
+  grid->medium_2.epsilon_offdiag.z.re = -0.03;
+  if (endpoint_conductivity) {
+    grid->medium_1.D_conductivity_diag = make_vector3(0.2, 0.3, 0.4);
+    grid->medium_2.D_conductivity_diag = make_vector3(0.7, 0.8, 0.9);
+  }
+  if (dispersion) {
+    meep_geom::susceptibility shared = meep_geom::susceptibility();
+    shared.frequency = 0.61;
+    shared.gamma = 0.07;
+    shared.sigma_diag = make_vector3(1.0, 0.5, 0.25);
+    meep_geom::susceptibility duplicate = shared;
+    duplicate.sigma_diag = make_vector3(9.0, 8.0, 7.0);
+    meep_geom::susceptibility distinct = meep_geom::susceptibility();
+    distinct.frequency = shared.frequency;
+    distinct.gamma = shared.gamma;
+    distinct.bias = make_vector3(0.0, 0.0, 0.125);
+    distinct.sigma_diag = make_vector3(0.2, 0.2, 0.2);
+    grid->medium_1.E_susceptibilities.push_back(shared);
+    grid->medium_2.E_susceptibilities.push_back(duplicate);
+    grid->medium_2.E_susceptibilities.push_back(distinct);
+    grid->medium.E_susceptibilities = grid->medium_1.E_susceptibilities;
+    grid->medium.E_susceptibilities.insert(grid->medium.E_susceptibilities.end(),
+                                           grid->medium_2.E_susceptibilities.begin(),
+                                           grid->medium_2.E_susceptibilities.end());
+  }
+  material_type endpoint_1 = new material_data();
+  material_type endpoint_2 = new material_data();
+  endpoint_1->medium = grid->medium_1;
+  endpoint_2->medium = grid->medium_2;
+  material_type extras_data[2] = {endpoint_1, endpoint_2};
+  material_type_list extras;
+  extras.items = extras_data;
+  extras.num_items = 2;
+  geometric_object_list empty_geometry = {0, NULL};
+  geom_epsilon *geps = make_geom_epsilon(&s, &empty_geometry, make_vector3(), periodicity,
+                                         grid, extras);
+  geps->u_p = projection_offset;
+  set_materials_from_geom_epsilon(&s, geps, false, 1e-5, 64, absorbers);
+  delete geps;
+  material_free(endpoint_1);
+  material_free(endpoint_2);
+  material_free(grid);
+}
+
+static bool same_material_initialization_statistics(
+    const NvidiaMaterialInitializationStatistics &a,
+    const NvidiaMaterialInitializationStatistics &b) {
+#define SAME_STAT(field) a.field == b.field
+  return SAME_STAT(compact_input_host_to_device_calls) &&
+         SAME_STAT(compact_input_host_to_device_bytes) && SAME_STAT(owned_ir_bytes) &&
+         SAME_STAT(dense_oracle_bytes) && SAME_STAT(dense_output_host_to_device_calls) &&
+         SAME_STAT(dense_output_host_to_device_bytes) && SAME_STAT(decoded_parameter_bytes) &&
+         SAME_STAT(absorber_profile_bytes) && SAME_STAT(pml_profile_bytes) &&
+         SAME_STAT(file_sample_bytes) && SAME_STAT(grid_weight_bytes) &&
+         SAME_STAT(constant_fill_kernel_launches) && SAME_STAT(conductivity_kernel_launches) &&
+         SAME_STAT(file_table_kernel_launches) && SAME_STAT(grid_table_kernel_launches) &&
+         SAME_STAT(pointwise_kernel_launches) && SAME_STAT(pml_kernel_launches) &&
+         SAME_STAT(absorber_points_evaluated) && SAME_STAT(file_points_evaluated) &&
+         SAME_STAT(grid_points_evaluated) && SAME_STAT(synchronizations) &&
+         SAME_STAT(device_native) && SAME_STAT(valid);
+#undef SAME_STAT
+}
+
+static void install_material_oracle_from(fields &source, fields &destination) {
+  require(source.array_catalog && destination.array_catalog,
+          "semantic material replacement requires prepared CPU catalogs");
+  for (size_t i = 0; i < source.array_catalog->size(); ++i) {
+    const ArrayId source_id{uint32_t(i)};
+    const ArraySpec &source_spec = source.array_catalog->spec(source_id);
+    if (source_spec.role != array_role::material || is_valid(source_spec.alias_of) ||
+        source_spec.classification_elided)
+      continue;
+    const StorageKey &key = source.array_catalog->key(source_id);
+    const ArrayId destination_id = destination.array_catalog->find(key);
+    require(is_valid(destination_id),
+            "semantic material replacement changed retained storage topology");
+    const ArraySpec &destination_spec = destination.array_catalog->spec(destination_id);
+    require(destination_spec.element_type == source_spec.element_type &&
+                destination_spec.elements == source_spec.elements,
+            "semantic material replacement changed retained storage shape");
+    memcpy(destination.array_catalog->resolve_untyped(destination_id),
+           source.array_catalog->resolve_untyped(source_id),
+           source_spec.elements * host_element_bytes(source_spec.element_type));
+  }
+  destination.material_ir = source.material_ir;
+}
+
+static void test_native_table_materials(precision_policy_kind precision, bool real_fields) {
+  using namespace meep_geom;
+  for (int table_kind = 0; table_kind < 2; ++table_kind) {
+    const grid_volume gv = table_kind ? vol3d(1.0, 1.0, 2.0, 4.0) : vol1d(2.0, 8.0);
+    structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    absorber_list absorbers = create_absorber_list();
+    if (table_kind) add_absorbing_layer(absorbers, 0.5, Z, ALL_SIDES, 1e-9, 1.0);
+    if (table_kind) {
+      install_native_grid_material(cpu_structure, absorbers);
+      install_native_grid_material(gpu_structure, absorbers);
+    }
+    else {
+      install_native_file_material(cpu_structure);
+      install_native_file_material(gpu_structure);
+    }
+    destroy_absorber_list(absorbers);
+    fields cpu(&cpu_structure);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    options.precision = precision;
+    fields gpu(&gpu_structure, options);
+    if (real_fields) {
+      cpu.use_real_fields();
+      gpu.use_real_fields();
+    }
+    else {
+      const vec k = table_kind ? vec(0.125, 0.0625, -0.03125) : vec(0.125);
+      cpu.use_bloch(k);
+      gpu.use_bloch(k);
+    }
+    FOR_E_AND_H(c) if (gv.has_field(c)) {
+        cpu.require_component(c);
+        gpu.require_component(c);
+      }
+    cpu.init_backend();
+    nvidia::testing::reset_material_transfer_accounting();
+    gpu.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    const NvidiaMaterialInitializationStatistics statistics =
+        backend ? backend->material_initialization_statistics_for_testing()
+                : NvidiaMaterialInitializationStatistics();
+    const nvidia::testing::material_transfer_accounting transfers =
+        nvidia::testing::current_material_transfer_accounting();
+    const MaterialIR *table_ir = material_ir_for(gpu);
+    require(table_ir, "table material fixture lost its owned IR");
+    const auto append_packed = [](size_t &offset, size_t bytes, size_t alignment) {
+      offset += (alignment - offset % alignment) % alignment;
+      offset += bytes;
+    };
+    size_t expected_compact = 0;
+    append_packed(expected_compact, sizeof(nvidia::material_table_header),
+                  alignof(nvidia::material_table_header));
+    if (table_kind) {
+      append_packed(expected_compact, sizeof(nvidia::material_medium_header),
+                    alignof(nvidia::material_medium_header));
+      append_packed(expected_compact, sizeof(nvidia::material_susceptibility_record),
+                    alignof(nvidia::material_susceptibility_record));
+      append_packed(expected_compact, sizeof(nvidia::material_medium_header),
+                    alignof(nvidia::material_medium_header));
+      append_packed(expected_compact, 2 * sizeof(nvidia::material_susceptibility_record),
+                    alignof(nvidia::material_susceptibility_record));
+    }
+    const size_t table_sample_bytes = 2 * sizeof(double);
+    append_packed(expected_compact, table_sample_bytes, alignof(double));
+    size_t absorber_bytes = 0, pml_bytes = 0;
+    if (!table_ir->absorbers.empty()) {
+      append_packed(expected_compact,
+                    table_ir->absorbers.size() * sizeof(nvidia::material_absorber_header),
+                    alignof(nvidia::material_absorber_header));
+      for (const MaterialIRPml &absorber : table_ir->absorbers) {
+        const size_t bytes = absorber.samples.size() * sizeof(double);
+        append_packed(expected_compact, bytes, alignof(double));
+        absorber_bytes += bytes;
+      }
+    }
+    for (const MaterialIRPmlAxis &axis : table_ir->pml_axes)
+      if (axis.profile_active) {
+        const size_t bytes = axis.profile_samples.size() * sizeof(double);
+        append_packed(expected_compact, bytes, alignof(double));
+        pml_bytes += bytes;
+      }
+    const size_t expected_decoded =
+        expected_compact - table_sample_bytes - absorber_bytes - pml_bytes;
+    const size_t candidate_attempts = 1 + gpu.classification_reentries;
+    require(backend && statistics.valid && statistics.device_native &&
+                statistics.synchronizations == 1 &&
+                statistics.dense_output_host_to_device_calls == 0 &&
+                statistics.dense_output_host_to_device_bytes == 0 &&
+                statistics.compact_input_host_to_device_calls == 1 &&
+                statistics.compact_input_host_to_device_bytes == expected_compact &&
+                statistics.decoded_parameter_bytes == expected_decoded &&
+                statistics.absorber_profile_bytes == absorber_bytes &&
+                statistics.pml_profile_bytes == pml_bytes &&
+                transfers.dense_output_calls == 0 && transfers.dense_output_bytes == 0 &&
+                transfers.compact_calls == candidate_attempts &&
+                transfers.compact_bytes == candidate_attempts * expected_compact,
+            "table material did not preserve native initialization accounting");
+    if (table_kind)
+      require(statistics.grid_table_kernel_launches > 0 &&
+                  statistics.file_table_kernel_launches == 0 &&
+                  statistics.grid_weight_bytes == 2 * sizeof(double),
+              "MaterialGrid table execution/accounting is absent");
+    else
+      require(statistics.file_table_kernel_launches > 0 &&
+                  statistics.grid_table_kernel_launches == 0 &&
+                  statistics.file_sample_bytes == 2 * sizeof(double),
+              "FILE table execution/accounting is absent");
+    if (!table_kind) {
+      bool saw_electric_diagonal = false;
+      for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+        const StorageKey &key = gpu.array_catalog->key(ArrayId{uint32_t(i)});
+        if (gpu.array_catalog->find(key) != ArrayId{uint32_t(i)}) continue;
+        if (key.kind != int(array_kind::chi1inv) &&
+            key.kind != int(array_kind::conductivity) && key.kind != int(array_kind::condinv) &&
+            key.kind != int(array_kind::chi2) && key.kind != int(array_kind::chi3) &&
+            key.kind != int(array_kind::sigma))
+          continue;
+        const component c = component(key.component_);
+        const bool electric_diagonal =
+            key.kind == int(array_kind::chi1inv) && is_electric(c) &&
+            direction(key.aux) == component_direction(c);
+        require(electric_diagonal,
+                "FILE retained a non-electric or non-diagonal material property row");
+        saw_electric_diagonal = true;
+      }
+      require(saw_electric_diagonal &&
+                  gpu_structure.get_chi1inv(Hx, X, gv.center(), 0, false) ==
+                      std::complex<double>(1.0, 0.0),
+              "FILE did not retain electric-only chi1 semantics with identity H");
+    }
+    if (table_kind) {
+      const MaterialIR *ir = material_ir_for(gpu);
+      require(ir, "MaterialGrid fixture lost its owned IR");
+      size_t retained_sigma = 0;
+      std::set<uint32_t> identities;
+      std::map<int, std::vector<uint32_t> > retained_identity_order;
+      for (const MaterialIRSusceptibility &sus : ir->susceptibilities)
+        if (sus.field_type == E_stuff) identities.insert(sus.identity);
+      for (size_t i = 0; i < gpu.array_catalog->size(); ++i) {
+        const ArrayId id{uint32_t(i)};
+        const StorageKey &key = gpu.array_catalog->key(id);
+        if (key.kind != int(array_kind::sigma)) continue;
+        const ArraySpec &spec = gpu.array_catalog->spec(id);
+        if (spec.classification_elided) continue;
+        const ArrayId canonical = gpu.array_catalog->find(key);
+        require(is_valid(canonical),
+                "retained MaterialGrid sigma key has no canonical catalog identity");
+        if (canonical != id) continue;
+        const field_type ft = field_type(key.aux % uint64_t(NUM_FIELD_TYPES));
+        const uint32_t identity = uint32_t(key.aux / uint64_t(NUM_FIELD_TYPES));
+        const MaterialIRSusceptibility *owned_identity = NULL;
+        for (const MaterialIRSusceptibility &sus : ir->susceptibilities)
+          if (sus.field_type == ft && sus.identity == identity) {
+            owned_identity = &sus;
+            break;
+          }
+        require(ft == E_stuff && owned_identity && key.cmp >= 0 && key.cmp < 5,
+                "retained MaterialGrid sigma row has stale identity/state metadata");
+        std::vector<uint32_t> &component_order = retained_identity_order[key.component_];
+        if (component_order.empty() || component_order.back() != identity)
+          component_order.push_back(identity);
+        std::vector<realnum> observed(spec.elements);
+        gpu.backend->read(ArrayRef{id, 0, spec.elements}, observed.data(),
+                          observed.size() * sizeof(realnum));
+        for (realnum value : observed)
+          require(std::isfinite(double(value)),
+                  "retained MaterialGrid sigma row contains a non-finite value");
+        ++retained_sigma;
+      }
+      bool ordered = !retained_identity_order.empty();
+      for (const std::pair<const int, std::vector<uint32_t> > &entry : retained_identity_order)
+        ordered = ordered && entry.second.size() == 2 && entry.second[0] == 0 &&
+                  entry.second[1] == 1;
+      require(ir && identities.size() == 2 && *identities.begin() == 0 &&
+                  *identities.rbegin() == 1 && retained_sigma > 0 && ordered,
+              "MaterialGrid recurrence identities or retained sigma rows are absent");
+    }
+    compare_all_initialized_material_rows(
+        cpu, gpu, sizeof(realnum) == sizeof(float) || precision != precision_policy_kind::native
+                      ? 8e-6
+                      : 2e-13);
+    gpu.init_backend();
+    const NvidiaMaterialInitializationStatistics reentered =
+        backend->material_initialization_statistics_for_testing();
+    require(reentered.file_table_kernel_launches == statistics.file_table_kernel_launches &&
+                reentered.grid_table_kernel_launches == statistics.grid_table_kernel_launches &&
+                reentered.compact_input_host_to_device_bytes ==
+                    statistics.compact_input_host_to_device_bytes &&
+                reentered.synchronizations == statistics.synchronizations,
+            "clean table-material re-entry repeated initialization work");
+    initialize_live_fields_by_key(cpu, gpu, precision != precision_policy_kind::native, 0.11);
+    cpu.advance(2);
+    gpu.advance(2);
+    compare_live_fields_by_key(
+        cpu, gpu, (sizeof(realnum) == sizeof(float) || precision != precision_policy_kind::native)
+                      ? 2e-4
+                      : 5e-12);
+  }
+  master_printf("nvidia_timestep: native FILE/MaterialGrid tables %s/%s PASS\n",
+                real_fields ? "real" : "complex", precision_policy_name(precision));
+}
+
+static void test_native_table_dimension_matrix(precision_policy_kind precision) {
+  using namespace meep_geom;
+  struct DimensionCase {
+    const char *name;
+    grid_volume volume;
+    int sample_axis;
+  };
+  const DimensionCase cases[] = {{"d1", vol1d(2.0, 8.0), 2},
+                                 {"d2", vol2d(2.0, 1.5, 6.0), 0},
+                                 {"d3", vol3d(2.0, 1.5, 1.25, 6.0), 1},
+                                 {"cyl", volcyl(2.0, 1.5, 6.0), 0}};
+  for (const DimensionCase &dimension_case : cases)
+    for (int grid_kind = 0; grid_kind < 2; ++grid_kind) {
+      structure cpu_structure(dimension_case.volume, isotropic_eps, no_pml(), identity(), 1);
+      structure gpu_structure(dimension_case.volume, isotropic_eps, no_pml(), identity(), 1);
+      absorber_list absorbers = create_absorber_list();
+      if (grid_kind) {
+        install_native_grid_material(cpu_structure, absorbers, true, false, false, 0.0, 0.0,
+                                     0.0, 0.0, dimension_case.sample_axis);
+        install_native_grid_material(gpu_structure, absorbers, true, false, false, 0.0, 0.0,
+                                     0.0, 0.0, dimension_case.sample_axis);
+      }
+      else {
+        install_native_file_material(cpu_structure, false, 0.0, dimension_case.sample_axis);
+        install_native_file_material(gpu_structure, false, 0.0, dimension_case.sample_axis);
+      }
+      destroy_absorber_list(absorbers);
+      fields cpu(&cpu_structure);
+      execution_options options;
+      options.backend = backend_kind::nvidia;
+      options.precision = precision;
+      fields gpu(&gpu_structure, options);
+      cpu.use_real_fields();
+      gpu.use_real_fields();
+      FOR_E_AND_H(c) if (dimension_case.volume.has_field(c)) {
+          cpu.require_component(c);
+          gpu.require_component(c);
+        }
+      cpu.init_backend();
+      gpu.init_backend();
+      NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+      const MaterialIR *ir = material_ir_for(gpu);
+      const NvidiaMaterialInitializationStatistics statistics =
+          backend ? backend->material_initialization_statistics_for_testing()
+                  : NvidiaMaterialInitializationStatistics();
+      const size_t launches = grid_kind ? statistics.grid_table_kernel_launches
+                                        : statistics.file_table_kernel_launches;
+      const size_t points = grid_kind ? statistics.grid_points_evaluated
+                                      : statistics.file_points_evaluated;
+      const bool varying_table = ir && ir->default_material < ir->materials.size() &&
+                                 ir->materials[ir->default_material].samples.size() >= 2 &&
+                                 ir->materials[ir->default_material].samples.front() !=
+                                     ir->materials[ir->default_material].samples.back();
+      require(ir && ir->dimensions == int(dimension_case.volume.dim) && backend &&
+                  statistics.valid && statistics.device_native && launches > 0 && points > 1 &&
+                  statistics.dense_output_host_to_device_calls == 0 &&
+                  varying_table,
+              "dimension table fixture did not execute a nonvacuous native table launch");
+      compare_all_initialized_material_rows(
+          cpu, gpu, sizeof(realnum) == sizeof(float) || precision != precision_policy_kind::native
+                        ? 8e-6
+                        : 2e-13);
+      master_printf("nvidia_timestep: native-%s-%s-dimension/%s PASS\n",
+                    grid_kind ? "grid" : "file", dimension_case.name,
+                    precision_policy_name(precision));
+    }
+}
+
+static void test_native_table_periodicity_invariance() {
+  using namespace meep_geom;
+  for (int table_kind = 0; table_kind < 2; ++table_kind) {
+    const grid_volume gv = table_kind ? vol3d(1.0, 1.0, 2.0, 4.0) : vol1d(2.0, 8.0);
+    structure nonperiodic(gv, isotropic_eps, no_pml(), identity(), 1);
+    structure periodic(gv, isotropic_eps, no_pml(), identity(), 1);
+    absorber_list absorbers = create_absorber_list();
+    if (table_kind) {
+      install_native_grid_material(nonperiodic, absorbers, true, false);
+      install_native_grid_material(periodic, absorbers, true, true);
+    }
+    else {
+      install_native_file_material(nonperiodic, false);
+      install_native_file_material(periodic, true);
+    }
+    destroy_absorber_list(absorbers);
+    fields cpu(&nonperiodic);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&periodic, options);
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+    FOR_E_AND_H(c) if (gv.has_field(c)) {
+        cpu.require_component(c);
+        gpu.require_component(c);
+      }
+    cpu.init_backend();
+    gpu.init_backend();
+    const MaterialIR *cpu_ir = material_ir_for(cpu);
+    const MaterialIR *gpu_ir = material_ir_for(gpu);
+    require(cpu_ir && gpu_ir && !cpu_ir->ensure_periodicity && gpu_ir->ensure_periodicity &&
+                cpu_ir->signature != gpu_ir->signature,
+            "table periodicity fixture did not preserve its semantic flag");
+    compare_all_initialized_material_rows(cpu, gpu,
+                                          sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+  }
+  master_printf("nvidia_timestep: native table periodicity invariance PASS\n");
+}
+
+static void test_native_table_retry() {
+  using namespace meep_geom;
+  const nvidia::testing::failure_point failures[2] = {
+      nvidia::testing::failure_point::material_file_launch,
+      nvidia::testing::failure_point::material_grid_launch};
+  for (int table_kind = 0; table_kind < 2; ++table_kind) {
+    const grid_volume gv = vol1d(2.0, 8.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    absorber_list absorbers = create_absorber_list();
+    if (table_kind) {
+      add_absorbing_layer(absorbers, 0.5, Z, ALL_SIDES, 1e-9, 1.0);
+      install_native_grid_material(s, absorbers);
+    }
+    else install_native_file_material(s);
+    destroy_absorber_list(absorbers);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ex);
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    nvidia::testing::fail_next(failures[table_kind]);
+    bool rejected = false;
+    try { gpu.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    require(rejected && !gpu.backend_state && !gpu.executable &&
+                before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current,
+            "failed table initialization published or leaked a candidate");
+    gpu.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    require(backend && gpu.backend_state && gpu.executable &&
+                backend->material_initialization_statistics_for_testing().valid,
+            "table initialization failure was not retryable");
+  }
+  master_printf("nvidia_timestep: native FILE/MaterialGrid retry PASS\n");
+}
+
+enum class NativeTableMutation {
+  file_sample,
+  grid_weight,
+  grid_projection,
+  grid_damping,
+  grid_endpoint
+};
+
+static bool native_table_mutation_is_grid(NativeTableMutation mutation) {
+  return mutation != NativeTableMutation::file_sample;
+}
+
+static void install_native_table_mutation(structure &s, NativeTableMutation mutation,
+                                          bool mutated) {
+  using namespace meep_geom;
+  if (!native_table_mutation_is_grid(mutation)) {
+    install_native_file_material(s, false, mutated ? 0.375 : 0.0);
+    return;
+  }
+  absorber_list absorbers = create_absorber_list();
+  install_native_grid_material(
+      s, absorbers, true, false, true,
+      mutated && mutation == NativeTableMutation::grid_weight ? 0.1875 : 0.0,
+      mutated && mutation == NativeTableMutation::grid_projection ? 0.125 : 0.0,
+      mutated && mutation == NativeTableMutation::grid_damping ? 0.0625 : 0.0,
+      mutated && mutation == NativeTableMutation::grid_endpoint ? 0.3125 : 0.0);
+  destroy_absorber_list(absorbers);
+}
+
+static void test_native_table_semantic_replacement() {
+  const NativeTableMutation mutations[] = {
+      NativeTableMutation::file_sample, NativeTableMutation::grid_weight,
+      NativeTableMutation::grid_projection, NativeTableMutation::grid_damping,
+      NativeTableMutation::grid_endpoint};
+  for (NativeTableMutation mutation : mutations) {
+    const grid_volume gv = vol1d(2.0, 8.0);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_native_table_mutation(gpu_structure, mutation, false);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&gpu_structure, options);
+    gpu.use_real_fields();
+    FOR_E_AND_H(c) if (gv.has_field(c)) gpu.require_component(c);
+    gpu.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    require(backend, "semantic table replacement fixture did not select NVIDIA");
+    BackendState *const old_state = gpu.backend_state;
+    Executable *const old_executable = gpu.executable;
+    const std::shared_ptr<const void> old_ir = gpu.material_ir;
+    const uint64_t old_signature = material_ir_for(gpu)->signature;
+    InitializationPlan *const old_initialization = gpu.initialization_plan;
+    const uint64_t old_recipe_signature =
+        old_initialization->materials[0].signature();
+    const NvidiaMaterialInitializationStatistics old_statistics =
+        backend->material_initialization_statistics_for_testing();
+
+    structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_native_table_mutation(cpu_structure, mutation, true);
+    fields cpu(&cpu_structure);
+    cpu.use_real_fields();
+    FOR_E_AND_H(c) if (gv.has_field(c)) cpu.require_component(c);
+    cpu.init_backend();
+    install_material_oracle_from(cpu, gpu);
+    invalidate(gpu, MutationKind::material_values,
+               "native FILE/MaterialGrid semantic replacement");
+    nvidia::testing::fail_next(native_table_mutation_is_grid(mutation)
+                                   ? nvidia::testing::failure_point::material_grid_launch
+                                   : nvidia::testing::failure_point::material_file_launch);
+    bool rejected = false;
+    try { gpu.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(rejected && gpu.backend_state == old_state && gpu.executable == old_executable &&
+                gpu.material_ir != old_ir && material_ir_for(gpu)->signature != old_signature &&
+                gpu.initialization_plan == old_initialization &&
+                gpu.initialization_plan->materials[0].signature() == old_recipe_signature &&
+                same_material_initialization_statistics(
+                    backend->material_initialization_statistics_for_testing(), old_statistics) &&
+                !gpu.backend->is_poisoned(),
+            "failed semantic table replacement changed the installed epoch or statistics");
+
+    gpu.init_backend();
+    require(gpu.backend_state != old_state && gpu.executable != old_executable &&
+                gpu.initialization_plan != old_initialization &&
+                gpu.initialization_plan->materials[0].signature() != old_recipe_signature,
+            "semantic table replacement retry did not publish the mutated epoch");
+    BackendState *const replacement_state = gpu.backend_state;
+    Executable *const replacement_executable = gpu.executable;
+    const NvidiaMaterialInitializationStatistics replacement_statistics =
+        backend->material_initialization_statistics_for_testing();
+    nvidia::testing::reset_transfer_accounting();
+    nvidia::testing::reset_material_transfer_accounting();
+    gpu.init_backend();
+    const nvidia::testing::transfer_accounting clean_transfers =
+        nvidia::testing::current_transfer_accounting();
+    const nvidia::testing::material_transfer_accounting clean_material =
+        nvidia::testing::current_material_transfer_accounting();
+    require(gpu.backend_state == replacement_state && gpu.executable == replacement_executable &&
+                same_material_initialization_statistics(
+                    backend->material_initialization_statistics_for_testing(),
+                    replacement_statistics) &&
+                clean_transfers.host_to_device_calls == 0 &&
+                clean_transfers.device_to_host_calls == 0 && clean_material.compact_calls == 0 &&
+                clean_material.dense_output_calls == 0,
+            "clean semantic table re-entry repeated initialization work");
+
+    compare_all_initialized_material_rows(cpu, gpu,
+                                          sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+    initialize_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float), 0.013);
+    int completed = 0;
+    const int checkpoints[] = {1, 2, 100};
+    for (int checkpoint : checkpoints) {
+      cpu.advance(checkpoint - completed);
+      gpu.advance(checkpoint - completed);
+      completed = checkpoint;
+      compare_live_fields_by_key(cpu, gpu,
+                                 sizeof(realnum) == sizeof(float) ? 4e-4 : 2e-10);
+    }
+  }
+  master_printf("nvidia_timestep: native table semantic replacement PASS\n");
+}
+
+static void test_native_table_mpi() {
+  using namespace meep_geom;
+  const int chunks = std::max(1, count_processors());
+  for (int table_kind = 0; table_kind < 2; ++table_kind) {
+    const grid_volume gv = table_kind ? vol3d(1.0, 1.0, 2.0, 4.0) : vol1d(2.0, 8.0);
+    structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), chunks);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), chunks);
+    absorber_list absorbers = create_absorber_list();
+    if (table_kind) {
+      install_native_grid_material(cpu_structure, absorbers);
+      install_native_grid_material(gpu_structure, absorbers);
+    }
+    else {
+      install_native_file_material(cpu_structure);
+      install_native_file_material(gpu_structure);
+    }
+    destroy_absorber_list(absorbers);
+    fields cpu(&cpu_structure);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&gpu_structure, options);
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+    FOR_E_AND_H(c) if (gv.has_field(c)) {
+        cpu.require_component(c);
+        gpu.require_component(c);
+      }
+    cpu.init_backend();
+    gpu.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    const NvidiaMaterialInitializationStatistics statistics =
+        backend ? backend->material_initialization_statistics_for_testing()
+                : NvidiaMaterialInitializationStatistics();
+    const bool local_work = table_kind ? statistics.grid_table_kernel_launches > 0
+                                       : statistics.file_table_kernel_launches > 0;
+    require(backend && statistics.valid && statistics.device_native &&
+                or_to_all(local_work) && statistics.dense_output_host_to_device_calls == 0,
+            "MPI table initialization did not preserve native split ownership");
+    compare_all_initialized_material_rows(cpu, gpu,
+                                          sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+    initialize_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float), 0.017);
+    cpu.advance(1);
+    gpu.advance(1);
+    compare_live_fields_by_key(cpu, gpu,
+                               sizeof(realnum) == sizeof(float) ? 4e-4 : 2e-10);
+    cpu.advance(1);
+    gpu.advance(1);
+    compare_live_fields_by_key(cpu, gpu,
+                               sizeof(realnum) == sizeof(float) ? 4e-4 : 2e-10);
+
+    structure failure_structure(gv, isotropic_eps, no_pml(), identity(), chunks);
+    absorbers = create_absorber_list();
+    if (table_kind) install_native_grid_material(failure_structure, absorbers);
+    else install_native_file_material(failure_structure);
+    destroy_absorber_list(absorbers);
+    fields failure(&failure_structure, options);
+    failure.use_real_fields();
+    failure.require_component(Ex);
+    if (my_rank() == 0)
+      nvidia::testing::fail_next(table_kind
+                                     ? nvidia::testing::failure_point::material_grid_launch
+                                     : nvidia::testing::failure_point::material_file_launch);
+    bool rejected = false;
+    try { failure.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(and_to_all(rejected) && !failure.backend_state && !failure.executable,
+            "rank-asymmetric table failure published a partial MPI epoch");
+    failure.init_backend();
+    require(failure.backend_state && failure.executable,
+            "rank-asymmetric table failure was not retryable");
+  }
+  master_printf("nvidia_timestep: native table MPI/split/asymmetric failure PASS\n");
+}
+
+static void test_native_table_preupload_rejection() {
+  using namespace meep_geom;
+  struct MutationCase {
+    nvidia::testing::failure_point point;
+    bool grid;
+  };
+  const MutationCase mutations[] = {
+      {nvidia::testing::failure_point::material_table_semantic_mutation, false},
+      {nvidia::testing::failure_point::material_table_far_coordinate_mutation, false},
+      {nvidia::testing::failure_point::material_table_component_mutation, false},
+      {nvidia::testing::failure_point::material_table_tensor_mutation, false},
+      {nvidia::testing::failure_point::material_table_loop_mutation, false},
+      {nvidia::testing::failure_point::material_table_shift_mutation, false},
+      {nvidia::testing::failure_point::material_table_destination_mutation, false},
+      {nvidia::testing::failure_point::material_table_source_mutation, true},
+      {nvidia::testing::failure_point::material_table_header_mutation, false}};
+  for (const MutationCase &mutation : mutations) {
+    const grid_volume gv = vol1d(2.0, 8.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    absorber_list absorbers = create_absorber_list();
+    if (mutation.grid) install_native_grid_material(s, absorbers);
+    else install_native_file_material(s);
+    destroy_absorber_list(absorbers);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ex);
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    require(backend, "table descriptor mutation fixture did not select NVIDIA");
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    nvidia::testing::reset_transfer_accounting();
+    nvidia::testing::reset_material_transfer_accounting();
+    nvidia::testing::fail_next(mutation.point);
+    bool rejected = false;
+    try { gpu.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    const nvidia::testing::transfer_accounting transfers =
+        nvidia::testing::current_transfer_accounting();
+    const nvidia::testing::material_transfer_accounting material_transfers =
+        nvidia::testing::current_material_transfer_accounting();
+    const NvidiaMaterialInitializationStatistics statistics =
+        backend->material_initialization_statistics_for_testing();
+    require(rejected && !gpu.backend_state && !gpu.executable &&
+                before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current &&
+                transfers.host_to_device_calls == 0 && transfers.host_to_device_bytes == 0 &&
+                material_transfers.compact_calls == 0 &&
+                material_transfers.compact_bytes == 0 &&
+                statistics.pointwise_kernel_launches == 0 &&
+                statistics.synchronizations == 0 && !statistics.valid,
+            "malformed table descriptor crossed the pre-upload transaction boundary");
+  }
+  master_printf("nvidia_timestep: native table pre-upload rejection PASS\n");
+}
+
+static void test_native_table_schema_preflight() {
+  using namespace meep_geom;
+  for (int malformed_case = 0; malformed_case < 4; ++malformed_case) {
+    const grid_volume gv = vol1d(2.0, 8.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    absorber_list absorbers = create_absorber_list();
+    if (malformed_case < 2)
+      install_native_file_material(s);
+    else
+      install_native_grid_material(s, absorbers, false);
+    destroy_absorber_list(absorbers);
+    MaterialIR *ir =
+        const_cast<MaterialIR *>(static_cast<const MaterialIR *>(s.material_ir.get()));
+    require(ir && ir->default_material < ir->materials.size(),
+            "table schema fixture lost its owned IR");
+    MaterialIRMaterial &material = ir->materials[ir->default_material];
+    if (malformed_case == 0)
+      material.parameters[material.parameters.size() - 3] = 0;
+    else if (malformed_case == 1)
+      material.samples.clear();
+    else if (malformed_case == 2)
+      material.parameters[0] = 0;
+    else
+      material.parameters[0] = double(std::numeric_limits<int>::max()) + 1.0;
+    refresh_material_ir_signatures_for_testing(*ir);
+
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ex);
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    require(backend, "table schema fixture did not select NVIDIA");
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    nvidia::testing::reset_transfer_accounting();
+    nvidia::testing::reset_material_transfer_accounting();
+    bool rejected = false;
+    try { gpu.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    const nvidia::testing::transfer_accounting transfers =
+        nvidia::testing::current_transfer_accounting();
+    const nvidia::testing::material_transfer_accounting material_transfers =
+        nvidia::testing::current_material_transfer_accounting();
+    const NvidiaMaterialInitializationStatistics statistics =
+        backend->material_initialization_statistics_for_testing();
+    require(and_to_all(rejected) && !gpu.backend_state && !gpu.executable &&
+                before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current &&
+                transfers.host_to_device_calls == 0 && transfers.host_to_device_bytes == 0 &&
+                material_transfers.compact_calls == 0 &&
+                material_transfers.compact_bytes == 0 &&
+                statistics.pointwise_kernel_launches == 0 &&
+                statistics.synchronizations == 0 && !statistics.valid,
+            "malformed table schema crossed native preflight");
+  }
+  master_printf("nvidia_timestep: native table schema preflight PASS\n");
+}
+
+static void test_native_grid_damping_only() {
+  using namespace meep_geom;
+  const grid_volume gv = vol1d(2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  absorber_list absorbers = create_absorber_list();
+  install_native_grid_material(cpu_structure, absorbers, false);
+  install_native_grid_material(gpu_structure, absorbers, false);
+  destroy_absorber_list(absorbers);
+  fields cpu(&cpu_structure);
   execution_options options;
   options.backend = backend_kind::nvidia;
-  fields f(&s, options);
-  f.use_real_fields();
-  f.require_component(Ex);
-  const nvidia::memory_accounting before = nvidia::current_memory_accounting();
-  bool rejected = false;
-  try { f.init_backend(); }
-  catch (const std::exception &error) {
-    rejected = std::string(error.what()).find("PR5.2b") != std::string::npos;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  cpu.require_component(Ex);
+  gpu.require_component(Ex);
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  require(ir, "damping-only MaterialGrid lost its owned IR");
+  bool topology_conductivity = false, topology_condinv = false;
+  for (const MaterialIRTopologyRow &row : ir->topology) {
+    const component c = component(row.key.component_);
+    if (!is_D(c) || direction(row.key.aux) != component_direction(c)) continue;
+    topology_conductivity = topology_conductivity ||
+                            row.key.kind == int(array_kind::conductivity);
+    topology_condinv = topology_condinv || row.key.kind == int(array_kind::condinv);
   }
-  const nvidia::memory_accounting after = nvidia::current_memory_accounting();
-  require(rejected && f.backend_state == NULL && f.executable == NULL &&
-              before.device_bytes_current == after.device_bytes_current &&
-              before.pinned_bytes_current == after.pinned_bytes_current,
-          "PR5.2b table opcode was not rejected before state allocation");
-  master_printf("nvidia_timestep: native table preallocation gate PASS\n");
+  require(ir && topology_conductivity && topology_condinv,
+          "damping-only MaterialGrid omitted D conductivity topology");
+  compare_all_initialized_material_rows(cpu, gpu,
+                                        sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+  initialize_live_fields_by_key(cpu, gpu, false, 0.07);
+  cpu.advance(1);
+  gpu.advance(1);
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 2e-4 : 5e-12);
+  master_printf("nvidia_timestep: native MaterialGrid damping-only PASS\n");
 }
 
 static void install_native_chi_only_material(structure &s, bool chi2) {
@@ -2626,8 +3447,8 @@ static void test_native_dimension_pml(const char *name, const grid_volume &gv) {
                   : pml(0.35, X, Low) + pml(0.35, Y, High);
   structure cpu_structure(gv, isotropic_eps, boundaries, identity(), 1);
   structure gpu_structure(gv, isotropic_eps, boundaries, identity(), 1);
-  install_native_homogeneous_material(cpu_structure);
-  install_native_homogeneous_material(gpu_structure);
+  install_native_chi_only_material(cpu_structure, true);
+  install_native_chi_only_material(gpu_structure, true);
   fields cpu(&cpu_structure);
   execution_options options;
   options.backend = backend_kind::nvidia;
@@ -2665,6 +3486,48 @@ static void test_native_dimension_pml(const char *name, const grid_volume &gv) {
   compare_all_initialized_material_rows(cpu, gpu,
                                         sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
   master_printf("nvidia_timestep: native-%s-pml PASS\n", name);
+}
+
+static void test_native_table_dimension_pml(const char *name, const grid_volume &gv) {
+  using namespace meep_geom;
+  const bool cylindrical = gv.dim == Dcyl;
+  const boundary_region boundaries =
+      cylindrical ? pml(0.35, R, High) + pml(0.35, Z, Low)
+                  : pml(0.35, X, Low) + pml(0.35, Y, High);
+  structure cpu_structure(gv, isotropic_eps, boundaries, identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, boundaries, identity(), 1);
+  absorber_list absorbers = create_absorber_list();
+  add_absorbing_layer(absorbers, 0.35, cylindrical ? R : X,
+                      cylindrical ? High : ALL_SIDES, 1e-9, 1.0);
+  install_native_grid_material(cpu_structure, absorbers, true, false, false);
+  install_native_grid_material(gpu_structure, absorbers, true, false, false);
+  destroy_absorber_list(absorbers);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  FOR_E_AND_H(c) if (gv.has_field(c)) {
+      cpu.require_component(c);
+      gpu.require_component(c);
+    }
+  cpu.init_backend();
+  gpu.init_backend();
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  const MaterialIR *ir = material_ir_for(gpu);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  require(ir && ir->dimensions == int(gv.dim) && backend && statistics.valid &&
+              statistics.device_native && statistics.grid_table_kernel_launches > 0 &&
+              statistics.pml_kernel_launches > 0 &&
+              statistics.absorber_points_evaluated > 0 &&
+              statistics.dense_output_host_to_device_calls == 0,
+          "table dimension/PML fixture did not execute native table/PML initialization");
+  compare_all_initialized_material_rows(cpu, gpu,
+                                        sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+  master_printf("nvidia_timestep: native-table-%s-pml PASS\n", name);
 }
 
 static void test_native_pml_rounding_association() {
@@ -6195,6 +7058,11 @@ int main(int argc, char **argv) {
     test_material_collective_preflight();
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_TABLE_MPI_ONLY")) {
+    test_native_table_mpi();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
     require(sizeof(realnum) == sizeof(float),
@@ -6258,6 +7126,21 @@ int main(int argc, char **argv) {
     test_material_cpu_setup_to_nvidia();
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_TABLE_PREFLIGHT_ONLY")) {
+    test_native_table_schema_preflight();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_TABLE_REPLACEMENT_ONLY")) {
+    test_native_table_semantic_replacement();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_TABLE_DIMENSIONS_ONLY")) {
+    test_native_table_dimension_matrix(precision_policy_kind::native);
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
   if (getenv("MEEP_NVIDIA_MATERIAL_RECIPE_ONLY")) {
     const precision_policy_kind policies[] = {precision_policy_kind::native,
                                               precision_policy_kind::mixed,
@@ -6277,13 +7160,23 @@ int main(int argc, char **argv) {
       test_native_material_initialization(policy, true);
       test_native_material_initialization(policy, false);
       test_native_absorber_initialization(policy);
+      test_native_table_materials(policy, true);
+      test_native_table_materials(policy, false);
     }
     test_native_material_initialization_retry();
-    test_native_table_gate_preallocation();
+    test_native_table_retry();
+    test_native_table_semantic_replacement();
+    test_native_table_preupload_rejection();
+    test_native_table_schema_preflight();
+    test_native_table_periodicity_invariance();
+    test_native_table_dimension_matrix(precision_policy_kind::native);
+    test_native_grid_damping_only();
     test_native_dimension_and_chi_pair("d2", vol2d(1.5, 1.25, 6.0), true);
     test_native_dimension_and_chi_pair("cyl", volcyl(1.5, 1.25, 6.0), false);
     test_native_dimension_pml("d2", vol2d(1.5, 1.25, 6.0));
     test_native_dimension_pml("cyl", volcyl(1.5, 1.25, 6.0));
+    test_native_table_dimension_pml("d2", vol2d(1.5, 1.25, 6.0));
+    test_native_table_dimension_pml("cyl", volcyl(1.5, 1.25, 6.0));
     test_native_pml_rounding_association();
     test_native_perfect_metal_signed_zero();
     master_printf("nvidia_timestep: PASS\n");

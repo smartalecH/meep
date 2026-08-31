@@ -7187,6 +7187,7 @@ static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
   ADD_IR_SCALAR(ir.contains_host_callback);
   ADD_IR_SCALAR(ir.device_native_eligible);
   ADD_IR_SCALAR(ir.dimensions);
+  ADD_IR_SCALAR(ir.projection_offset);
   ADD_IR_SCALAR(ir.default_material);
   ADD_IR_SCALAR(ir.signature);
   ADD_IR_SCALAR(ir.layout_signature);
@@ -7373,6 +7374,7 @@ static void test_geometry_backed_material_ir() {
   const MaterialIR *ir = static_cast<const MaterialIR *>(retained.get());
   validate_material_ir(*ir);
   CHECK(ir->eps_averaging && ir->subpixel_maxeval == 4321 && ir->ensure_periodicity &&
+            ir->projection_offset == 0.0 &&
             ir->roots.size() == 4 && ir->objects.size() == 6 &&
             ir->objects[ir->roots[0]].children.size() == 1 &&
             ir->objects[ir->objects[ir->roots[0]].children[0]].children.size() == 1 &&
@@ -7515,6 +7517,9 @@ static void test_geometry_backed_material_ir() {
       expect_material_ir_rejected(malformed, "overflowing material IR PML integer extent");
     }
     malformed = *ir;
+    malformed.projection_offset = std::numeric_limits<double>::quiet_NaN();
+    expect_material_ir_rejected(malformed, "nonfinite material IR projection offset");
+    malformed = *ir;
     --malformed.version;
     expect_material_ir_rejected(malformed, "stale material IR schema version");
     malformed = *ir;
@@ -7590,6 +7595,15 @@ static void test_geometry_backed_material_ir() {
         "material IR susceptibility identities do not preserve CPU state-index order");
   const uint64_t signature = ir->signature;
   const uint64_t layout_signature = ir->layout_signature;
+  {
+    MaterialIR projected = *ir;
+    projected.projection_offset = 0.125;
+    refresh_material_ir_signatures_for_testing(projected);
+    validate_material_ir(projected);
+    CHECK(projected.signature != signature && projected.layout_signature != layout_signature &&
+              !material_ir_equal(projected, *ir),
+          "material IR projection offset did not affect both immutable signatures");
+  }
   std::vector<double> frozen_file_samples, frozen_grid_samples;
   for (const MaterialIRMaterial &material : ir->materials) {
     if (material.kind == material_data::MATERIAL_FILE) frozen_file_samples = material.samples;

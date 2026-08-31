@@ -18,7 +18,7 @@
 namespace meep {
 namespace {
 
-const uint32_t material_ir_version = 2;
+const uint32_t material_ir_version = 3;
 int material_ir_capture_failure_rank = -1;
 int material_ir_capture_failure_mode = 0;
 
@@ -142,6 +142,7 @@ uint32_t capture_material(MaterialIR &ir, const meep_geom::material_data *md,
     note_medium(record, md->medium_1); note_medium(record, md->medium_2);
     record.parameters.push_back(md->beta); record.parameters.push_back(md->eta);
     record.parameters.push_back(md->damping);
+    record.has_conductivity = record.has_conductivity || md->damping != 0.0;
     size_t n = 1;
     const double dims[3] = {md->grid_size.x, md->grid_size.y, md->grid_size.z};
     for (int d = 0; d < 3; ++d) {
@@ -270,7 +271,8 @@ uint64_t signature(const MaterialIR &ir, bool include_rank_layout) {
   mix_bool(h, ir.eps_averaging); mix_double(h, ir.subpixel_tol);
   mix_i64(h, ir.subpixel_maxeval); mix_bool(h, ir.ensure_periodicity);
   mix_bool(h, ir.contains_host_callback); mix_bool(h, ir.device_native_eligible);
-  mix_i64(h, ir.dimensions); mix_values(h, ir.cell); mix_u64(h, ir.default_material);
+  mix_i64(h, ir.dimensions); mix_double(h, ir.projection_offset);
+  mix_values(h, ir.cell); mix_u64(h, ir.default_material);
   mix_u64(h, ir.materials.size());
   for (const MaterialIRMaterial &m : ir.materials) {
     mix_tag(h, "material"); mix_i64(h, m.kind); mix_bool(h, m.host_callback);
@@ -425,6 +427,7 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
   if (s.num_chunks <= 0 || !s.chunks[0])
     throw std::invalid_argument("material IR has no live chunk dimension authority");
   ir->dimensions = int(s.chunks[0]->gv.dim);
+  ir->projection_offset = geps.u_p;
   ir->signature = 0; ir->layout_signature = 0;
   append_vec(ir->cell, geps.captured_geometry_center);
   append_vec(ir->cell, geps.captured_geometry_lattice.size);
@@ -680,6 +683,7 @@ void validate_material_ir(const MaterialIR &ir) {
   if (ir.version != material_ir_version || !std::isfinite(ir.subpixel_tol) || ir.subpixel_tol <= 0 ||
       (ir.eps_averaging ? ir.subpixel_maxeval <= 0 : ir.subpixel_maxeval != 0) ||
       ir.dimensions < D1 || ir.dimensions > Dcyl ||
+      !std::isfinite(ir.projection_offset) ||
       ir.signature != signature(ir, false) ||
       ir.layout_signature != signature(ir, true))
     throw std::invalid_argument("material IR is malformed or stale");
@@ -1092,6 +1096,7 @@ bool material_ir_equal(const MaterialIR &a, const MaterialIR &b) {
       a.ensure_periodicity != b.ensure_periodicity ||
       a.contains_host_callback != b.contains_host_callback ||
       a.device_native_eligible != b.device_native_eligible || a.dimensions != b.dimensions ||
+      a.projection_offset != b.projection_offset ||
       a.cell != b.cell || a.default_material != b.default_material || a.roots != b.roots ||
       a.extra_materials != b.extra_materials || a.signature != b.signature ||
       a.layout_signature != b.layout_signature || a.topology != b.topology ||
