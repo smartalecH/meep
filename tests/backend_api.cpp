@@ -7173,6 +7173,17 @@ static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
     ADD_IR_SCALAR(p.chunk);
     ADD_IR_SCALAR(p.direction);
     ADD_IR_SCALAR(p.elements);
+    ADD_IR_SCALAR(p.little_corner);
+    ADD_IR_SCALAR(p.resolution);
+    ADD_IR_SCALAR(p.profile_active);
+    ADD_IR_SCALAR(p.analytic_quadratic);
+    ADD_IR_SCALAR(p.thickness);
+    ADD_IR_SCALAR(p.boundary_location);
+    ADD_IR_SCALAR(p.r_asymptotic);
+    ADD_IR_SCALAR(p.mean_stretch);
+    ADD_IR_SCALAR(p.profile_integral);
+    ADD_IR_SCALAR(p.profile_integral_u);
+    add(p.profile_samples.size(), sizeof(double));
     add(p.sigma.size(), sizeof(double));
     add(p.kappa.size(), sizeof(double));
     add(p.sigma_inv.size(), sizeof(double));
@@ -7207,6 +7218,7 @@ static void test_geometry_backed_material_ir() {
   e1.frequency = 0.83; e1.gamma = 0.09; e1.sigma_diag = make_vector3(0.0, 1.0, 0.0);
   meep_geom::susceptibility e0_duplicate = e0;
   e0_duplicate.sigma_diag = make_vector3(0.0, 0.0, 2.0);
+  e0_duplicate.sigma_offdiag = make_vector3(0.25, 0.5, 0.75);
   dielectric->medium.E_susceptibilities.push_back(e0);
   dielectric->medium.E_susceptibilities.push_back(e1);
   dielectric->medium.E_susceptibilities.push_back(e0_duplicate);
@@ -7216,6 +7228,7 @@ static void test_geometry_backed_material_ir() {
   h1.frequency = 0.72; h1.gamma = 0.06; h1.sigma_diag = make_vector3(0.0, 1.0, 0.0);
   meep_geom::susceptibility h0_duplicate = h0;
   h0_duplicate.sigma_diag = make_vector3(0.0, 0.0, 3.0);
+  h0_duplicate.sigma_offdiag = make_vector3(0.35, 0.55, 0.85);
   dielectric->medium.H_susceptibilities.push_back(h0);
   dielectric->medium.H_susceptibilities.push_back(h1);
   dielectric->medium.H_susceptibilities.push_back(h0_duplicate);
@@ -7401,6 +7414,16 @@ static void test_geometry_backed_material_ir() {
       malformed.pml_axes[0].sigma.pop_back();
       expect_material_ir_rejected(malformed, "short material IR PML profile");
       malformed = *ir;
+      malformed.pml_axes[0].profile_samples.pop_back();
+      expect_material_ir_rejected(malformed, "short material IR raw PML profile");
+      malformed = *ir;
+      malformed.pml_axes[0].profile_integral = 0.0;
+      expect_material_ir_rejected(malformed, "zero material IR PML profile integral");
+      malformed = *ir;
+      malformed.pml_axes[0].boundary_location =
+          std::numeric_limits<double>::quiet_NaN();
+      expect_material_ir_rejected(malformed, "nonfinite material IR PML boundary location");
+      malformed = *ir;
       ++malformed.pml_axes[0].elements;
       expect_material_ir_rejected(malformed, "wrong material IR PML extent");
       malformed = *ir;
@@ -7410,6 +7433,15 @@ static void test_geometry_backed_material_ir() {
       malformed.pml_axes[0].elements = size_t(std::numeric_limits<int>::max()) + 1;
       expect_material_ir_rejected(malformed, "overflowing material IR PML integer extent");
     }
+    malformed = *ir;
+    --malformed.version;
+    expect_material_ir_rejected(malformed, "stale material IR schema version");
+    malformed = *ir;
+    malformed.dimensions = D3;
+    expect_material_ir_rejected(malformed, "D2/D3 material IR dimension mismatch");
+    malformed = *ir;
+    malformed.dimensions = Dcyl;
+    expect_material_ir_rejected(malformed, "D2/cylindrical material IR dimension mismatch");
     if (!ir->chunks.empty()) {
       malformed = *ir;
       malformed.chunks[0].resolution = 0.0;
@@ -7474,7 +7506,7 @@ static void test_geometry_backed_material_ir() {
   CHECK(ir_frequencies[0].size() == 2 && ir_frequencies[0][0] == e0.frequency &&
             ir_frequencies[0][1] == e1.frequency && ir_frequencies[1].size() == 2 &&
             ir_frequencies[1][0] == h0.frequency && ir_frequencies[1][1] == h1.frequency,
-        "material IR susceptibility identities do not preserve first-occurrence E/H order");
+        "material IR susceptibility identities do not preserve CPU state-index order");
   const uint64_t signature = ir->signature;
   const uint64_t layout_signature = ir->layout_signature;
   std::vector<double> frozen_file_samples, frozen_grid_samples;
@@ -7669,7 +7701,10 @@ static void test_geometry_backed_material_ir() {
   for (int slot = 0; slot < 2; ++slot) {
     CHECK(or_to_all(!live_frequencies[slot].empty()),
           "geometry-backed susceptibility fixture has no live descriptor");
-    CHECK(live_frequencies[slot].empty() || live_frequencies[slot] == ir_frequencies[slot],
+    bool same_order = live_frequencies[slot].size() == ir_frequencies[slot].size();
+    for (size_t i = 0; same_order && i < live_frequencies[slot].size(); ++i)
+      same_order = live_frequencies[slot][i] == double(realnum(ir_frequencies[slot][i]));
+    CHECK(live_frequencies[slot].empty() || same_order,
           "material IR susceptibility order differs from live descriptor state_index order");
   }
   uint64_t reference_signature = signature;
@@ -7686,10 +7721,20 @@ static void test_geometry_backed_material_ir() {
   const MaterialIR *d1_ir = static_cast<const MaterialIR *>(d1_structure.material_ir.get());
   validate_material_ir(*d1_ir);
   CHECK(or_to_all(!d1_ir->pml_axes.empty()), "D1 material IR omitted its PML axis");
-  for (const MaterialIRPmlAxis &axis : d1_ir->pml_axes)
+  for (const MaterialIRPmlAxis &axis : d1_ir->pml_axes) {
     CHECK(axis.elements > 0 && axis.sigma.size() == axis.elements &&
               axis.kappa.size() == axis.elements && axis.sigma_inv.size() == axis.elements,
-          "D1 material IR PML recipe has the wrong one-dimensional extent");
+          "D1 material IR PML recipe has the wrong extent");
+    if (axis.profile_active)
+      CHECK(axis.analytic_quadratic && axis.thickness == 0.25 &&
+                axis.profile_integral == 1.0 / 3.0 &&
+                axis.profile_integral_u == 1.0 / 4.0 &&
+                axis.profile_samples.size() == axis.elements,
+            "D1 material IR PML recipe omitted compact analytic provenance");
+    else
+      CHECK(!axis.analytic_quadratic && axis.profile_samples.empty(),
+            "inactive D1 PML axis retained an executable profile");
+  }
   {
     fields native_fields(&d1_structure);
     lifetime_counts native_counts;

@@ -1887,7 +1887,10 @@ std::vector<susceptibility> geom_epsilon::owned_unique_susceptibilities(meep::fi
       bool found = false;
       for (const susceptibility &existing : result)
         found = found || susceptibility_equiv(candidate, existing);
-      if (!found) result.push_back(candidate);
+      /* add_pol(), which defines the CPU polarization-state order, prepends
+         each newly discovered equivalence class.  Preserve that exact order
+         in the owned snapshot so MaterialIR state identities are identical. */
+      if (!found) result.insert(result.begin(), candidate);
     }
   };
   medium_struct *medium = NULL;

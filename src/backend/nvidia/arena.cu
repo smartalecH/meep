@@ -372,13 +372,14 @@ const arena_accounting &device_arenas::accounting() const {
 
 void device_arenas::copy_from_host_async(allocation_id destination, size_t destination_offset,
                                          const void *source, size_t bytes,
-                                         const stream &on_stream) {
+                                         const stream &on_stream,
+                                         host_to_device_copy_kind kind) {
   if (!impl_) throw std::logic_error("copy on moved-from NVIDIA arenas");
   const allocation_layout &layout = impl_->plan.layout(destination);
   check_subrange(layout.bytes, destination_offset, bytes, "arena host-to-device copy");
   impl::role_storage &owned = impl_->storage_for(layout.role);
   nvidia::copy_host_to_device_async(owned.buffer, impl_->buffer_offset(layout, destination_offset),
-                                    source, bytes, on_stream);
+                                    source, bytes, on_stream, kind);
 }
 
 void device_arenas::copy_to_host_async(void *destination, allocation_id source,

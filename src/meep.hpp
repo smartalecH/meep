@@ -643,6 +643,22 @@ class structure;
 
 class structure_chunk {
 public:
+  struct pml_initialization_recipe {
+    bool active;
+    bool analytic_quadratic;
+    double thickness;
+    double boundary_location;
+    double r_asymptotic;
+    double mean_stretch;
+    double profile_integral;
+    double profile_integral_u;
+    std::vector<double> profile_samples;
+
+    pml_initialization_recipe()
+        : active(false), analytic_quadratic(false), thickness(0), boundary_location(0),
+          r_asymptotic(0), mean_stretch(1), profile_integral(0), profile_integral_u(0) {}
+  };
+
   double a, Courant, dt; // resolution a, Courant number, and timestep dt=Courant/a
   realnum *chi3[NUM_FIELD_COMPONENTS], *chi2[NUM_FIELD_COMPONENTS];
   realnum *chi1inv[NUM_FIELD_COMPONENTS][5];
@@ -652,6 +668,7 @@ public:
   bool condinv_stale;                        // true if condinv needs to be recomputed
   realnum *sig[6], *kap[6], *siginv[6];      // conductivity array for uPML
   int sigsize[6];                            // conductivity array size
+  pml_initialization_recipe pml_recipe[6];   // exact owned profile input, no callback pointers
   grid_volume gv; // integer grid_volume that could be bigger than non-overlapping v below
   volume v;
   susceptibility *chiP[NUM_FIELD_TYPES]; // only E_stuff and H_stuff are used

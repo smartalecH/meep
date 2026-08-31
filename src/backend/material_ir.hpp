@@ -61,6 +61,19 @@ struct MaterialIRPmlAxis {
   int chunk;
   int direction;
   size_t elements;
+  int little_corner;
+  double resolution;
+  bool profile_active;
+  bool analytic_quadratic;
+  double thickness;
+  double boundary_location;
+  double r_asymptotic;
+  double mean_stretch;
+  double profile_integral;
+  double profile_integral_u;
+  std::vector<double> profile_samples;
+  /* CPU-oracle snapshots. Device-native initialization must not consume
+     these dense output arrays. */
   std::vector<double> sigma;
   std::vector<double> kappa;
   std::vector<double> sigma_inv;

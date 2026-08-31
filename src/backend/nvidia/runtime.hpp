@@ -191,8 +191,15 @@ private:
   impl *impl_;
 };
 
+enum class host_to_device_copy_kind {
+  general,
+  material_compact_input,
+  material_dense_output
+};
+
 void copy_host_to_device_async(device_buffer &destination, size_t destination_offset,
-                               const void *source, size_t bytes, const stream &on_stream);
+                               const void *source, size_t bytes, const stream &on_stream,
+                               host_to_device_copy_kind kind = host_to_device_copy_kind::general);
 void copy_device_to_host_async(void *destination, const device_buffer &source,
                                size_t source_offset, size_t bytes, const stream &on_stream);
 void copy_device_to_device_async(device_buffer &destination, size_t destination_offset,
@@ -221,6 +228,12 @@ struct transfer_accounting {
   size_t device_to_device_calls;
   size_t device_to_device_bytes;
 };
+struct material_transfer_accounting {
+  size_t compact_calls;
+  size_t compact_bytes;
+  size_t dense_output_calls;
+  size_t dense_output_bytes;
+};
 
 enum class failure_point {
   none,
@@ -245,6 +258,13 @@ enum class failure_point {
   host_segment_after_download,
   host_segment_after_callback,
   host_segment_after_upload,
+  material_compact_allocate,
+  material_ir_upload,
+  material_pointwise_launch,
+  material_file_launch,
+  material_grid_launch,
+  material_pml_launch,
+  material_initialization_sync,
   state_rebuild_sync
 };
 void fail_next(failure_point point);
@@ -252,6 +272,8 @@ void clear_failure();
 bool consume_failure_for_testing(failure_point point);
 transfer_accounting current_transfer_accounting();
 void reset_transfer_accounting();
+material_transfer_accounting current_material_transfer_accounting();
+void reset_material_transfer_accounting();
 } // namespace testing
 
 } // namespace nvidia

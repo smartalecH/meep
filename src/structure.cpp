@@ -673,6 +673,7 @@ void structure_chunk::use_pml(direction d, double dx, double bloc, double Rasymp
       sig[d] = kap[d] = NULL;
       siginv[d] = NULL;
     }
+    pml_recipe[d] = pml_initialization_recipe();
     LOOP_OVER_FIELD_DIRECTIONS(gv.dim, dd) {
       if (!sig[dd]) {
         int spml = (dd == d) ? (2 * gv.num_direction(d) + 2) : 1;
@@ -688,17 +689,29 @@ void structure_chunk::use_pml(direction d, double dx, double bloc, double Rasymp
       }
     }
 
+    pml_initialization_recipe recipe;
+    recipe.active = true;
+    recipe.analytic_quadratic = pml_profile == pml_quadratic_profile;
+    recipe.thickness = dx;
+    recipe.boundary_location = bloc;
+    recipe.r_asymptotic = Rasymptotic;
+    recipe.mean_stretch = mean_stretch;
+    recipe.profile_integral = pml_profile_integral;
+    recipe.profile_integral_u = pml_profile_integral_u;
+    recipe.profile_samples.assign(size_t(sigsize[d]), 0.0);
     for (int i = gv.little_corner().in_direction(d); i <= gv.big_corner().in_direction(d) + 1;
          ++i) {
       int idx = i - gv.little_corner().in_direction(d);
       double x = pml_x(i, dx, bloc, a);
       if (x > 0) {
         double s = pml_profile(x / dx, pml_profile_data);
+        recipe.profile_samples[size_t(idx)] = s;
         sig[d][idx] = 0.5 * dt * prefac * s;
         kap[d][idx] = 1 + kappa_prefac * s * (x / dx);
         siginv[d][idx] = 1 / (kap[d][idx] + sig[d][idx]);
       }
     }
+    pml_recipe[d] = std::move(recipe);
   }
   condinv_stale = true;
 }
@@ -734,6 +747,7 @@ structure_chunk::structure_chunk(const structure_chunk *o) : v(o->v) {
     kap[d] = NULL;
     siginv[d] = NULL;
     sigsize[d] = 0;
+    pml_recipe[d] = pml_initialization_recipe();
   }
   try {
     FOR_FIELD_TYPES(ft) {
@@ -789,6 +803,7 @@ structure_chunk::structure_chunk(const structure_chunk *o) : v(o->v) {
       }
     }
     condinv_stale = o->condinv_stale;
+    for (int d = 0; d < 6; ++d) pml_recipe[d] = o->pml_recipe[d];
     if (is_mine()) FOR_DIRECTIONS(d) {
         if (o->sig[d]) {
           sigsize[d] = o->sigsize[d];
@@ -951,6 +966,7 @@ structure_chunk::structure_chunk(const grid_volume &thegv, const volume &vol_lim
     kap[d] = NULL;
     siginv[d] = NULL;
     sigsize[d] = 0;
+    pml_recipe[d] = pml_initialization_recipe();
   }
 }
 

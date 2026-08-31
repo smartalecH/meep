@@ -1822,6 +1822,7 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
   }
 
   try {
+    f.backend->preflight_initialization(*candidate.initialization);
     candidate.state.reset(f.backend->create_state(candidate.allocation_storage));
     if (!candidate.state) throw std::runtime_error("backend returned no candidate state");
     candidate.state->host_custom_local_presence = local_custom;

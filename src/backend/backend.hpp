@@ -243,6 +243,7 @@ public:
         host_custom_next_operation_(0), host_custom_claimed_sessions_(0) {}
   virtual ~ExecutionBackend() {}
 
+  virtual void preflight_initialization(const InitializationPlan &) const {}
   virtual BackendState *create_state(const StoragePlan &) = 0;
   virtual void initialize(const InitializationPlan &, BackendState &) = 0;
 

@@ -167,7 +167,7 @@ endif
 if HAVE_NVIDIA_BACKEND
 NVIDIA_CUDA_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
 NVIDIA_CUDA_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
-NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke
+NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke
 if WITH_MPI
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
 endif
@@ -198,6 +198,7 @@ nvidia-runtime-check: $(NVIDIA_RUNTIME_TESTS)
 	./nvidia_dft_reduction_smoke
 	./nvidia_flux_smoke
 	./nvidia_cw_smoke
+	./nvidia_initialization_smoke
 if WITH_MPI
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=staged
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=auto
@@ -250,6 +251,11 @@ nvidia_flux_smoke: $(srcdir)/nvidia_flux_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
 	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
 
 nvidia_cw_smoke: $(srcdir)/nvidia_cw_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 --fmad=false $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
+	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
+	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+
+nvidia_initialization_smoke: $(srcdir)/nvidia_initialization_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
 	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 --fmad=false $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
 	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
 	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@

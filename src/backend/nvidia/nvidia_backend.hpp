@@ -23,6 +23,44 @@ namespace meep {
 class NvidiaBackendState;
 class NvidiaExecutable;
 
+struct NvidiaMaterialInitializationStatistics {
+  size_t compact_input_host_to_device_calls;
+  size_t compact_input_host_to_device_bytes;
+  size_t owned_ir_bytes;
+  size_t dense_oracle_bytes;
+  size_t dense_output_host_to_device_calls;
+  size_t dense_output_host_to_device_bytes;
+  size_t decoded_parameter_bytes;
+  size_t absorber_profile_bytes;
+  size_t pml_profile_bytes;
+  size_t file_sample_bytes;
+  size_t grid_weight_bytes;
+  size_t constant_fill_kernel_launches;
+  size_t conductivity_kernel_launches;
+  size_t file_table_kernel_launches;
+  size_t grid_table_kernel_launches;
+  size_t pointwise_kernel_launches;
+  size_t pml_kernel_launches;
+  size_t absorber_points_evaluated;
+  size_t file_points_evaluated;
+  size_t grid_points_evaluated;
+  size_t synchronizations;
+  bool device_native;
+  bool valid;
+
+  NvidiaMaterialInitializationStatistics()
+      : compact_input_host_to_device_calls(0), compact_input_host_to_device_bytes(0),
+        owned_ir_bytes(0), dense_oracle_bytes(0), dense_output_host_to_device_calls(0),
+        dense_output_host_to_device_bytes(0),
+        decoded_parameter_bytes(0), absorber_profile_bytes(0), pml_profile_bytes(0),
+        file_sample_bytes(0), grid_weight_bytes(0), constant_fill_kernel_launches(0),
+        conductivity_kernel_launches(0), file_table_kernel_launches(0),
+        grid_table_kernel_launches(0), pointwise_kernel_launches(0), pml_kernel_launches(0),
+        absorber_points_evaluated(0), file_points_evaluated(0), grid_points_evaluated(0),
+        synchronizations(0),
+        device_native(false), valid(false) {}
+};
+
 struct NvidiaHostFallbackStatistics {
   size_t segment_executions;
   size_t callback_resolutions;
@@ -162,6 +200,7 @@ public:
   NvidiaBackend(fields &f, const execution_options &options, int selected_device);
   ~NvidiaBackend() override;
 
+  void preflight_initialization(const InitializationPlan &plan) const override;
   BackendState *create_state(const StoragePlan &plan) override;
   void initialize(const InitializationPlan &plan, BackendState &state) override;
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &state) override;
@@ -204,6 +243,8 @@ public:
   bool accepts(const execution_options &options, std::string &why) const override;
   NvidiaCwStatistics cw_statistics_for_testing() const;
   NvidiaHostFallbackStatistics host_fallback_statistics_for_testing() const;
+  NvidiaMaterialInitializationStatistics material_initialization_statistics_for_testing() const;
+  int device_ordinal_for_testing() const { return device_; }
 
 private:
   friend class NvidiaBackendState;

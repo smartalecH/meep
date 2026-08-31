@@ -32,6 +32,8 @@ std::atomic<size_t> pinned_peak(0);
 std::atomic<size_t> host_to_device_calls(0), host_to_device_bytes(0);
 std::atomic<size_t> device_to_host_calls(0), device_to_host_bytes(0);
 std::atomic<size_t> device_to_device_calls(0), device_to_device_bytes(0);
+std::atomic<size_t> material_compact_calls(0), material_compact_bytes(0);
+std::atomic<size_t> material_dense_calls(0), material_dense_bytes(0);
 std::atomic<int> injected_failure(static_cast<int>(testing::failure_point::none));
 
 void update_peak(std::atomic<size_t> &peak, size_t value) {
@@ -570,7 +572,12 @@ void *pinned_buffer::data() { return impl_ ? impl_->address : NULL; }
 const void *pinned_buffer::data() const { return impl_ ? impl_->address : NULL; }
 
 void copy_host_to_device_async(device_buffer &destination, size_t destination_offset,
-                               const void *source, size_t bytes, const stream &on_stream) {
+                               const void *source, size_t bytes, const stream &on_stream,
+                               host_to_device_copy_kind kind) {
+  if (kind != host_to_device_copy_kind::general &&
+      kind != host_to_device_copy_kind::material_compact_input &&
+      kind != host_to_device_copy_kind::material_dense_output)
+    throw std::invalid_argument("invalid NVIDIA host-to-device copy kind");
   check_range(destination.size(), destination_offset, bytes, "copy_host_to_device_async");
   if (!bytes) return;
   if (destination.device() != on_stream.device())
@@ -587,6 +594,18 @@ void copy_host_to_device_async(device_buffer &destination, size_t destination_of
         "cudaMemcpyAsync(host-to-device)");
   host_to_device_calls.fetch_add(1, std::memory_order_relaxed);
   host_to_device_bytes.fetch_add(bytes, std::memory_order_relaxed);
+  switch (kind) {
+    case host_to_device_copy_kind::general: break;
+    case host_to_device_copy_kind::material_compact_input:
+      material_compact_calls.fetch_add(1, std::memory_order_relaxed);
+      material_compact_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      break;
+    case host_to_device_copy_kind::material_dense_output:
+      material_dense_calls.fetch_add(1, std::memory_order_relaxed);
+      material_dense_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      break;
+    default: break;
+  }
 }
 
 void copy_device_to_host_async(void *destination, const device_buffer &source,
@@ -679,6 +698,22 @@ void reset_transfer_accounting() {
   device_to_host_bytes.store(0, std::memory_order_relaxed);
   device_to_device_calls.store(0, std::memory_order_relaxed);
   device_to_device_bytes.store(0, std::memory_order_relaxed);
+}
+
+material_transfer_accounting current_material_transfer_accounting() {
+  material_transfer_accounting result;
+  result.compact_calls = material_compact_calls.load(std::memory_order_relaxed);
+  result.compact_bytes = material_compact_bytes.load(std::memory_order_relaxed);
+  result.dense_output_calls = material_dense_calls.load(std::memory_order_relaxed);
+  result.dense_output_bytes = material_dense_bytes.load(std::memory_order_relaxed);
+  return result;
+}
+
+void reset_material_transfer_accounting() {
+  material_compact_calls.store(0, std::memory_order_relaxed);
+  material_compact_bytes.store(0, std::memory_order_relaxed);
+  material_dense_calls.store(0, std::memory_order_relaxed);
+  material_dense_bytes.store(0, std::memory_order_relaxed);
 }
 
 } // namespace testing

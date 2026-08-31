@@ -244,6 +244,17 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
     ADD_SCALAR(p.chunk);
     ADD_SCALAR(p.direction);
     ADD_SCALAR(p.elements);
+    ADD_SCALAR(p.little_corner);
+    ADD_SCALAR(p.resolution);
+    ADD_SCALAR(p.profile_active);
+    ADD_SCALAR(p.analytic_quadratic);
+    ADD_SCALAR(p.thickness);
+    ADD_SCALAR(p.boundary_location);
+    ADD_SCALAR(p.r_asymptotic);
+    ADD_SCALAR(p.mean_stretch);
+    ADD_SCALAR(p.profile_integral);
+    ADD_SCALAR(p.profile_integral_u);
+    add_compact_bytes(total, p.profile_samples.size(), sizeof(double));
     add_compact_bytes(total, p.sigma.size(), sizeof(double));
     add_compact_bytes(total, p.kappa.size(), sizeof(double));
     add_compact_bytes(total, p.sigma_inv.size(), sizeof(double));

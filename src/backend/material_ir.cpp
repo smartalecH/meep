@@ -18,7 +18,7 @@
 namespace meep {
 namespace {
 
-const uint32_t material_ir_version = 1;
+const uint32_t material_ir_version = 2;
 int material_ir_capture_failure_rank = -1;
 int material_ir_capture_failure_mode = 0;
 
@@ -327,7 +327,13 @@ uint64_t signature(const MaterialIR &ir, bool include_rank_layout) {
     mix_u64(h, ir.pml_axes.size());
     for (const MaterialIRPmlAxis &p : ir.pml_axes) {
       mix_tag(h, "pml-axis"); mix_i64(h, p.chunk); mix_i64(h, p.direction);
-      mix_u64(h, p.elements); mix_values(h, p.sigma); mix_values(h, p.kappa);
+      mix_u64(h, p.elements); mix_i64(h, p.little_corner); mix_double(h, p.resolution);
+      mix_bool(h, p.profile_active);
+      mix_bool(h, p.analytic_quadratic); mix_double(h, p.thickness);
+      mix_double(h, p.boundary_location); mix_double(h, p.r_asymptotic);
+      mix_double(h, p.mean_stretch); mix_double(h, p.profile_integral);
+      mix_double(h, p.profile_integral_u); mix_values(h, p.profile_samples);
+      mix_values(h, p.sigma); mix_values(h, p.kappa);
       mix_values(h, p.sigma_inv);
     }
   }
@@ -416,7 +422,10 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
   ir->version = material_ir_version; ir->eps_averaging = eps_averaging;
   ir->subpixel_tol = tol; ir->subpixel_maxeval = eps_averaging ? maxeval : 0;
   ir->ensure_periodicity = geps.captured_ensure_periodicity; ir->contains_host_callback = false;
-  ir->dimensions = geps.captured_dimensions; ir->signature = 0; ir->layout_signature = 0;
+  if (s.num_chunks <= 0 || !s.chunks[0])
+    throw std::invalid_argument("material IR has no live chunk dimension authority");
+  ir->dimensions = int(s.chunks[0]->gv.dim);
+  ir->signature = 0; ir->layout_signature = 0;
   append_vec(ir->cell, geps.captured_geometry_center);
   append_vec(ir->cell, geps.captured_geometry_lattice.size);
   append_vec(ir->cell, geps.captured_geometry_lattice.basis1);
@@ -439,11 +448,14 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
         geps.owned_unique_susceptibilities(ft);
     if (unique.size() > std::numeric_limits<uint32_t>::max())
       throw std::overflow_error("material IR susceptibility count overflow");
+    /* geom_epsilon builds the CPU's temporary unique list by prepending, then
+       structure_chunk prepends each created state once more.  Reverse the
+       owned temporary order here so identity matches the final CPU state_index. */
     for (uint32_t si = 0; si < unique.size(); ++si) {
       MaterialIRSusceptibility sus;
       sus.identity = si; sus.material = std::numeric_limits<uint32_t>::max();
       sus.field_type = ft; sus.material_ordinal = si;
-      append_susceptibility(sus.parameters, unique[si]);
+      append_susceptibility(sus.parameters, unique[unique.size() - 1 - si]);
       ir->susceptibilities.push_back(sus);
     }
   }
@@ -528,6 +540,18 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
         throw std::invalid_argument("material IR PML axis has a null source");
       MaterialIRPmlAxis axis;
       axis.chunk = i; axis.direction = d; axis.elements = n;
+      axis.little_corner = s.chunks[i]->gv.little_corner().in_direction(direction(d));
+      axis.resolution = s.chunks[i]->a;
+      const structure_chunk::pml_initialization_recipe &recipe = s.chunks[i]->pml_recipe[d];
+      axis.profile_active = recipe.active;
+      axis.analytic_quadratic = recipe.analytic_quadratic;
+      axis.thickness = recipe.thickness;
+      axis.boundary_location = recipe.boundary_location;
+      axis.r_asymptotic = recipe.r_asymptotic;
+      axis.mean_stretch = recipe.mean_stretch;
+      axis.profile_integral = recipe.profile_integral;
+      axis.profile_integral_u = recipe.profile_integral_u;
+      axis.profile_samples = recipe.profile_samples;
       axis.sigma.assign(s.chunks[i]->sig[d], s.chunks[i]->sig[d] + n);
       axis.kappa.assign(s.chunks[i]->kap[d], s.chunks[i]->kap[d] + n);
       axis.sigma_inv.assign(s.chunks[i]->siginv[d], s.chunks[i]->siginv[d] + n);
@@ -600,10 +624,12 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
                        c, chunk.elements);
         }
       }
-      if (chi2) add_topology(chunk, {chunk.chunk, int(array_kind::chi2), int(c), -1, 0}, c,
-                             chunk.elements);
-      if (chi3) add_topology(chunk, {chunk.chunk, int(array_kind::chi3), int(c), -1, 0}, c,
-                             chunk.elements);
+      if (chi2 || chi3) {
+        add_topology(chunk, {chunk.chunk, int(array_kind::chi2), int(c), -1, 0}, c,
+                     chunk.elements);
+        add_topology(chunk, {chunk.chunk, int(array_kind::chi3), int(c), -1, 0}, c,
+                     chunk.elements);
+      }
       for (const MaterialIRSusceptibility &sus : ir->susceptibilities) {
         if (sus.field_type != type(c)) continue;
         for (int d = 0; d < 5; ++d)
@@ -653,6 +679,7 @@ int get_material_ir_capture_failure_mode_for_testing() {
 void validate_material_ir(const MaterialIR &ir) {
   if (ir.version != material_ir_version || !std::isfinite(ir.subpixel_tol) || ir.subpixel_tol <= 0 ||
       (ir.eps_averaging ? ir.subpixel_maxeval <= 0 : ir.subpixel_maxeval != 0) ||
+      ir.dimensions < D1 || ir.dimensions > Dcyl ||
       ir.signature != signature(ir, false) ||
       ir.layout_signature != signature(ir, true))
     throw std::invalid_argument("material IR is malformed or stale");
@@ -844,6 +871,7 @@ void validate_material_ir(const MaterialIR &ir) {
   for (const MaterialIRChunk &chunk : ir.chunks) {
     if (chunk.chunk < 0 || !chunks.insert(chunk.chunk).second ||
         chunk.dimensions < D1 || chunk.dimensions > Dcyl ||
+        chunk.dimensions != ir.dimensions ||
         !std::isfinite(chunk.resolution) || !(chunk.resolution > 0) ||
         !std::isfinite(chunk.inva) || !(chunk.inva > 0) ||
         chunk.inva != 1.0 / chunk.resolution || !chunk.elements ||
@@ -917,6 +945,19 @@ void validate_material_ir(const MaterialIR &ir) {
   for (const MaterialIRPmlAxis &p : ir.pml_axes)
     if (p.chunk < 0 || !chunks.count(p.chunk) || p.direction < 0 || p.direction >= 6 ||
         !p.elements || p.elements > size_t(std::numeric_limits<int>::max()) ||
+        !std::isfinite(p.resolution) || !(p.resolution > 0) ||
+        (p.profile_active &&
+         (!std::isfinite(p.thickness) || !(p.thickness > 0) ||
+          !std::isfinite(p.boundary_location) || !std::isfinite(p.r_asymptotic) ||
+          !(p.r_asymptotic > 0) || !(p.r_asymptotic < 1) ||
+          !std::isfinite(p.mean_stretch) || p.mean_stretch < 1 ||
+          !std::isfinite(p.profile_integral) || !(p.profile_integral > 0) ||
+          !std::isfinite(p.profile_integral_u) || !(p.profile_integral_u > 0) ||
+          p.profile_samples.size() != p.elements || !finite(p.profile_samples))) ||
+        (!p.profile_active &&
+         (p.analytic_quadratic || p.thickness != 0 || p.boundary_location != 0 ||
+          p.r_asymptotic != 0 || p.mean_stretch != 1 || p.profile_integral != 0 ||
+          p.profile_integral_u != 0 || !p.profile_samples.empty())) ||
         p.sigma.size() != p.elements || p.kappa.size() != p.elements ||
         p.sigma_inv.size() != p.elements || !finite(p.sigma) || !finite(p.kappa) ||
         !finite(p.sigma_inv))
@@ -1011,8 +1052,10 @@ void validate_material_ir(const MaterialIR &ir) {
           expected_keys.insert({chunk.chunk, int(array_kind::condinv), int(c), -1, uint64_t(d)});
         }
       }
-      if (chi2) expected_keys.insert({chunk.chunk, int(array_kind::chi2), int(c), -1, 0});
-      if (chi3) expected_keys.insert({chunk.chunk, int(array_kind::chi3), int(c), -1, 0});
+      if (chi2 || chi3) {
+        expected_keys.insert({chunk.chunk, int(array_kind::chi2), int(c), -1, 0});
+        expected_keys.insert({chunk.chunk, int(array_kind::chi3), int(c), -1, 0});
+      }
       for (const MaterialIRSusceptibility &sus : ir.susceptibilities) {
         if (sus.field_type != type(c)) continue;
         for (int d = 0; d < 5; ++d)
@@ -1112,6 +1155,13 @@ bool material_ir_equal(const MaterialIR &a, const MaterialIR &b) {
   for (size_t i = 0; i < a.pml_axes.size(); ++i) {
     const MaterialIRPmlAxis &x = a.pml_axes[i], &y = b.pml_axes[i];
     if (x.chunk != y.chunk || x.direction != y.direction || x.elements != y.elements ||
+        x.little_corner != y.little_corner || x.resolution != y.resolution ||
+        x.profile_active != y.profile_active ||
+        x.analytic_quadratic != y.analytic_quadratic || x.thickness != y.thickness ||
+        x.boundary_location != y.boundary_location || x.r_asymptotic != y.r_asymptotic ||
+        x.mean_stretch != y.mean_stretch || x.profile_integral != y.profile_integral ||
+        x.profile_integral_u != y.profile_integral_u ||
+        x.profile_samples != y.profile_samples ||
         x.sigma != y.sigma || x.kappa != y.kappa || x.sigma_inv != y.sigma_inv)
       return false;
   }

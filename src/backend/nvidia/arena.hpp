@@ -173,7 +173,8 @@ public:
   const arena_accounting &accounting() const;
 
   void copy_from_host_async(allocation_id destination, size_t destination_offset,
-                            const void *source, size_t bytes, const stream &on_stream);
+                            const void *source, size_t bytes, const stream &on_stream,
+                            host_to_device_copy_kind kind = host_to_device_copy_kind::general);
   void copy_to_host_async(void *destination, allocation_id source, size_t source_offset,
                           size_t bytes, const stream &on_stream) const;
   void copy_from_device_async(allocation_id destination, size_t destination_offset,
