@@ -240,7 +240,7 @@ static void test_coalescer() {
 static void check_config(const char *name, structure &s, bool complex_fields, int steps,
                          const vec &src_at, const vec *bloch_k = NULL,
                          bool expect_host_polarization = false,
-                         field_type expected_host_ft = field_type(NUM_FIELD_TYPES),
+                         field_type expected_host_ft = NO_FIELD_TYPE,
                          unsigned expected_host_phases = 0, component source_component = Ez,
                          bool expect_repeated_identity = false) {
   fields f(&s);

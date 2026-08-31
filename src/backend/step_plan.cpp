@@ -1138,7 +1138,7 @@ public:
     }
   }
 
-  Operation &add(OpKind k, field_type ft = field_type(NUM_FIELD_TYPES), Guard g = guard_always(),
+  Operation &add(OpKind k, field_type ft = NO_FIELD_TYPE, Guard g = guard_always(),
                  double src_offset = 0.0) {
     Operation op;
     op.kind = k;
@@ -1245,7 +1245,7 @@ public:
   }
 
   Operation &add_material_refresh(OpKind op_kind) {
-    Operation &op = add(op_kind, field_type(NUM_FIELD_TYPES),
+    Operation &op = add(op_kind, NO_FIELD_TYPE,
                         op_kind == OpKind::phase_material ? guard_static(true) : guard_always());
     op.material_refresh_index = uint32_t(plan_.material_refresh_arrays.size());
     if (f_.phasein_time <= 0) return op;
@@ -1301,7 +1301,7 @@ public:
   uint32_t operation_count() const { return uint32_t(plan_.operations.size()); }
 
   Operation &add_magnetic_marker(OpKind kind, AccessMode mode) {
-    Operation &op = add(kind, field_type(NUM_FIELD_TYPES), guard_variant(0));
+    Operation &op = add(kind, NO_FIELD_TYPE, guard_variant(0));
     if (plan_.magnetic_state_arrays.empty()) build_magnetic_state_arrays();
     op.magnetic_state_index = 0;
     op.magnetic_state_count = uint32_t(plan_.magnetic_state_arrays.size());
@@ -1369,7 +1369,7 @@ public:
                                              : plan_.cw_state_layout.unpack_accesses;
   }
 
-  void add_if(bool present, OpKind k, field_type ft = field_type(NUM_FIELD_TYPES),
+  void add_if(bool present, OpKind k, field_type ft = NO_FIELD_TYPE,
               double src_offset = 0.0) {
     if (present) add(k, ft, guard_static(true), src_offset);
   }
@@ -1406,7 +1406,7 @@ public:
                                  : 0});
       }
     }
-    Operation &op = add(kind, field_type(NUM_FIELD_TYPES), guard_static(true));
+    Operation &op = add(kind, NO_FIELD_TYPE, guard_static(true));
     op.legacy_flux_index = 0;
     op.legacy_flux_count = uint32_t(plan_.legacy_flux_updates.size());
     for (const LegacyFluxTerm &term : plan_.legacy_flux_terms) {
@@ -2099,7 +2099,7 @@ private:
 
 void StepPlanBuilder::add_source_evaluation(Guard guard, double src_offset) {
   Operation &op =
-      add(OpKind::evaluate_source_scalars, field_type(NUM_FIELD_TYPES), guard, src_offset);
+      add(OpKind::evaluate_source_scalars, NO_FIELD_TYPE, guard, src_offset);
   if (f_.descriptors) op.descriptor_count = uint32_t(f_.descriptors->sources.source_times.size());
 }
 
@@ -2109,7 +2109,7 @@ void StepPlanBuilder::add_sources(field_type ft) {
 }
 
 void StepPlanBuilder::add_dfts() {
-  Operation &op = add(OpKind::update_dft, field_type(NUM_FIELD_TYPES), guard_device(0));
+  Operation &op = add(OpKind::update_dft, NO_FIELD_TYPE, guard_device(0));
   op.descriptor_index = uint32_t(plan_.dft_updates.size());
   if (f_.descriptors) {
     for (size_t i = 0; i < f_.descriptors->dfts.size(); ++i) {
@@ -4632,7 +4632,7 @@ void format_step_plan(const StepPlan &p, std::vector<std::string> &out) {
                segment.callback_count, segment.host_halo_plan_index,
                segment.host_halo_plan_count);
     }
-    else if (op.ft == field_type(NUM_FIELD_TYPES))
+    else if (op.ft == NO_FIELD_TYPE)
       snprintf(buf, sizeof buf, "%s", op_kind_name(op.kind));
     else
       snprintf(buf, sizeof buf, "%s(%s)", op_kind_name(op.kind), ft_name(op.ft));

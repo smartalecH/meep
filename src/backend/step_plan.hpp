@@ -660,9 +660,8 @@ struct CwUnpackPrelude {
   bool invalidate_field_values;
 
   CwUnpackPrelude()
-      : first_boundary(field_type(NUM_FIELD_TYPES)),
-        constitutive(field_type(NUM_FIELD_TYPES)),
-        second_boundary(field_type(NUM_FIELD_TYPES)), skip_w_components(false),
+      : first_boundary(NO_FIELD_TYPE), constitutive(NO_FIELD_TYPE),
+        second_boundary(NO_FIELD_TYPE), skip_w_components(false),
         invalidate_field_values(false) {}
 };
 
@@ -884,7 +883,7 @@ struct CwStepOperationRef {
 
   CwStepOperationRef()
       : operation_index(UINT32_MAX), kind(OpKind::num_kinds),
-        ft(field_type(NUM_FIELD_TYPES)), descriptor_index(0), descriptor_count(0),
+        ft(NO_FIELD_TYPE), descriptor_index(0), descriptor_count(0),
         polarization_subtraction_index(0), polarization_subtraction_count(0) {}
 };
 

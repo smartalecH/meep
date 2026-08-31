@@ -73,7 +73,8 @@ enum field_type {
   PE_stuff = 4,
   PH_stuff = 5,
   WE_stuff = 6,
-  WH_stuff = 7
+  WH_stuff = 7,
+  NO_FIELD_TYPE = NUM_FIELD_TYPES
 };
 enum boundary_side { High = 0, Low };
 enum direction { X = 0, Y, Z, R, P, NO_DIRECTION };

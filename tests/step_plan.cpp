@@ -92,6 +92,50 @@ static double zero(const vec &) { return 0.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static double magnetic_conductivity(const vec &) { return 0.07; }
 
+static void test_no_field_type_sentinel() {
+  static_assert(int(E_stuff) == 0 && int(H_stuff) == 1 && int(D_stuff) == 2 &&
+                    int(B_stuff) == 3 && int(PE_stuff) == 4 && int(PH_stuff) == 5 &&
+                    int(WE_stuff) == 6 && int(WH_stuff) == 7,
+                "field_type numeric compatibility changed");
+  static_assert(int(NO_FIELD_TYPE) == NUM_FIELD_TYPES,
+                "no-field sentinel must follow the real field types");
+
+  const field_type sentinel = NO_FIELD_TYPE;
+  const field_type copied_sentinel = sentinel;
+  CHECK(copied_sentinel == NO_FIELD_TYPE && int(copied_sentinel) == NUM_FIELD_TYPES,
+        "no-field sentinel did not survive construction and copy");
+
+  CwUnpackPrelude prelude;
+  CwStepOperationRef ref;
+  CHECK(prelude.first_boundary == NO_FIELD_TYPE && prelude.constitutive == NO_FIELD_TYPE &&
+            prelude.second_boundary == NO_FIELD_TYPE && ref.ft == NO_FIELD_TYPE,
+        "default operation-reference markers did not use the no-field sentinel");
+
+  StepPlan marker_plan;
+  Operation marker = {};
+  marker.kind = OpKind::increment_time;
+  marker.ft = sentinel;
+  marker.guard = guard_always();
+  marker_plan.operations.push_back(marker);
+  const uint64_t sentinel_signature = compute_step_plan_signature(marker_plan);
+
+  const StepPlan copied_plan = marker_plan;
+  CHECK(copied_plan.operations.size() == 1 && copied_plan.operations[0].ft == NO_FIELD_TYPE &&
+            compute_step_plan_signature(copied_plan) == sentinel_signature,
+        "no-field operation marker changed during copy or signature hashing");
+
+  StepPlan real_field_plan = marker_plan;
+  real_field_plan.operations[0].ft = E_stuff;
+  CHECK(compute_step_plan_signature(real_field_plan) != sentinel_signature,
+        "operation signature did not distinguish no-field from a real field type");
+
+  std::vector<std::string> formatted;
+  format_step_plan(marker_plan, formatted);
+  CHECK(formatted.size() == 1 && formatted[0] == "increment_time",
+        "no-field operation marker formatting changed: %s",
+        formatted.empty() ? "<empty>" : formatted[0].c_str());
+}
+
 class multitile_anisotropic_material : public material_function {
 public:
   void eff_chi1inv_row(component c, double row[3], const volume &, double, int) override {
@@ -613,8 +657,8 @@ static void test_full_plan() {
                                    OpKind::evaluate_source_scalars,
                                    OpKind::update_eh,
                                    OpKind::transfer_halo};
-  const field_type schedule_types[] = {field_type(NUM_FIELD_TYPES), B_stuff, B_stuff, B_stuff,
-                                       field_type(NUM_FIELD_TYPES), H_stuff, H_stuff};
+  const field_type schedule_types[] = {NO_FIELD_TYPE, B_stuff, B_stuff, B_stuff,
+                                       NO_FIELD_TYPE, H_stuff, H_stuff};
   for (size_t i = 0; i < sizeof(schedule) / sizeof(schedule[0]); ++i) {
     CHECK(schedule[i] < p.operations.size(), "magnetic half-step slot %zu is out of range", i);
     if (schedule[i] >= p.operations.size()) continue;
@@ -771,8 +815,8 @@ static void test_empty_plan() {
                           OpKind::evaluate_source_scalars,
                           OpKind::update_eh,
                           OpKind::transfer_halo};
-  const field_type types[] = {field_type(NUM_FIELD_TYPES), B_stuff, B_stuff, B_stuff,
-                              field_type(NUM_FIELD_TYPES), H_stuff, H_stuff};
+  const field_type types[] = {NO_FIELD_TYPE, B_stuff, B_stuff, B_stuff,
+                              NO_FIELD_TYPE, H_stuff, H_stuff};
   uint32_t previous = 0;
   for (int i = 0; i < 7; ++i) {
     if (i == 0 || i == 4) continue;
@@ -4338,7 +4382,7 @@ static void test_live_noisy_polarization_plan(bool complex_fields) {
   for (const PolarizationSubtraction &subtraction : plan.polarization_subtractions) {
     for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
       if (descriptor.kind != SusceptibilityKind::noisy_lorentzian ||
-          descriptor.chunk != subtraction.chunk || descriptor.ft == field_type(NUM_FIELD_TYPES) ||
+          descriptor.chunk != subtraction.chunk || descriptor.ft == NO_FIELD_TYPE ||
           descriptor.state_index != subtraction.state_index)
         continue;
       for (const LorentzianStateArrays &state : descriptor.lorentzian_states)
@@ -4717,7 +4761,7 @@ static void test_legacy_flux_schema_signature() {
   StepPlan plan;
   Operation op = {};
   op.kind = OpKind::update_flux_half;
-  op.ft = field_type(NUM_FIELD_TYPES);
+  op.ft = NO_FIELD_TYPE;
   op.guard = guard_static(true);
   op.legacy_flux_index = 0;
   op.legacy_flux_count = 1;
@@ -6250,6 +6294,15 @@ int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
 
+  test_no_field_type_sentinel();
+  if (argc == 2 && strcmp(argv[1], "--field-type-sentinel-only") == 0) {
+    if (failures) {
+      master_printf("step_plan field_type sentinel: %d FAILURE(S)\n", failures);
+      return 1;
+    }
+    master_printf("step_plan field_type sentinel: all checks passed\n");
+    return 0;
+  }
   test_full_plan();
   test_empty_plan();
   test_cw_state_layout();
