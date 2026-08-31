@@ -25,6 +25,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <typeinfo>
 #include <unistd.h>
 #include <vector>
 
@@ -106,6 +107,86 @@ private:
 int lifecycle_custom_susceptibility::allocations = 0;
 int lifecycle_custom_susceptibility::initializations = 0;
 int lifecycle_custom_susceptibility::layout_queries = 0;
+
+template <typename T> static void check_susceptibility_clone(T &source, const char *name) {
+  source.ntot = 3;
+  source.sigma[Ex][X] = new realnum[source.ntot];
+  source.sigma[Ex][X][0] = realnum(0.25);
+  source.sigma[Ex][X][1] = realnum(-0.5);
+  source.sigma[Ex][X][2] = realnum(0.75);
+  source.trivial_sigma[Ex][X] = false;
+  source.trivial_sigma[Ey][Y] = false;
+  source.next = new susceptibility;
+  std::unique_ptr<susceptibility> clone(source.clone());
+  CHECK(clone && typeid(*clone) == typeid(source), "%s clone changed dynamic type", name);
+  CHECK(clone && clone->get_id() == source.get_id() && clone->ntot == source.ntot &&
+            clone->next == NULL,
+        "%s clone changed identity, extent, or list ownership", name);
+  FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+    CHECK(clone->trivial_sigma[c][d] == source.trivial_sigma[c][d],
+          "%s clone changed trivial-sigma flags", name);
+    CHECK((clone->sigma[c][d] == NULL) == (source.sigma[c][d] == NULL),
+          "%s clone changed sigma nullability", name);
+    if (source.sigma[c][d]) {
+      CHECK(clone->sigma[c][d] != source.sigma[c][d], "%s clone aliased sigma storage", name);
+      for (size_t i = 0; i < source.ntot; ++i)
+        CHECK(clone->sigma[c][d][i] == source.sigma[c][d][i],
+              "%s clone changed sigma values", name);
+    }
+  }
+  clone->sigma[Ex][X][1] = realnum(9.5);
+  CHECK(source.sigma[Ex][X][1] == realnum(-0.5), "%s clone mutation aliased source", name);
+}
+
+static void test_susceptibility_clone_coefficients() {
+  susceptibility base;
+  lorentzian_susceptibility lorentz(realnum(0.51), realnum(0.07));
+  noisy_lorentzian_susceptibility noisy(realnum(0.02), realnum(0.53), realnum(0.08));
+  gyrotropic_susceptibility gyro(vec(0.1, -0.2, 0.3), realnum(0.61), realnum(0.09));
+  const realnum Gamma[4] = {realnum(0.01), realnum(0.02), realnum(0.03), realnum(0.04)};
+  const realnum N0[2] = {realnum(0.7), realnum(0.3)};
+  const realnum alpha[2] = {realnum(-0.5), realnum(0.5)};
+  const realnum omega[1] = {realnum(0.73)};
+  const realnum gamma[1] = {realnum(0.06)};
+  const realnum sigmat[5] = {realnum(1), realnum(0), realnum(0), realnum(1), realnum(0)};
+  multilevel_susceptibility multilevel(2, 1, Gamma, N0, alpha, omega, gamma, sigmat);
+  check_susceptibility_clone(base, "base susceptibility");
+  check_susceptibility_clone(lorentz, "Lorentz susceptibility");
+  check_susceptibility_clone(noisy, "noisy susceptibility");
+  check_susceptibility_clone(gyro, "gyrotropic susceptibility");
+  check_susceptibility_clone(multilevel, "multilevel susceptibility");
+
+  const grid_volume gv = vol1d(1.0, 4.0);
+  structure owner(gv, unit_epsilon, no_pml(), identity(), 1);
+  lorentzian_susceptibility resident(realnum(0.47), realnum(0.05));
+  gyrotropic_susceptibility resident_gyro(vec(0, 0, 0.11), realnum(0.63),
+                                          realnum(0.04));
+  owner.add_susceptibility(unit_epsilon, E_stuff, resident);
+  owner.add_susceptibility(unit_epsilon, E_stuff, resident_gyro);
+  structure_chunk *source = owner.chunks[0];
+  std::unique_ptr<structure_chunk> copy(new structure_chunk(source));
+  const susceptibility *left = source->chiP[E_stuff];
+  const susceptibility *right = copy->chiP[E_stuff];
+  size_t nodes = 0;
+  for (; left && right; left = left->next, right = right->next, ++nodes) {
+    CHECK(typeid(*left) == typeid(*right) && left->get_id() == right->get_id(),
+          "structure COW changed susceptibility type, identity, or list order");
+    FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+      CHECK(left->trivial_sigma[c][d] == right->trivial_sigma[c][d],
+            "structure COW changed trivial-sigma flags");
+      CHECK((left->sigma[c][d] == NULL) == (right->sigma[c][d] == NULL),
+            "structure COW changed sigma nullability");
+      if (left->sigma[c][d]) {
+        CHECK(left->sigma[c][d] != right->sigma[c][d],
+              "structure COW aliased susceptibility sigma storage");
+        for (size_t i = 0; i < left->ntot; ++i)
+          CHECK(left->sigma[c][d][i] == right->sigma[c][d][i],
+                "structure COW changed susceptibility sigma values");
+      }
+    }
+  }
+  CHECK(!left && !right && nodes == 2, "structure COW changed susceptibility list length");
+}
 
 class lifecycle_stateless_custom_susceptibility : public susceptibility {
 public:
@@ -9302,6 +9383,7 @@ int main(int argc, char **argv) {
   }
 
   test_selection();
+  test_susceptibility_clone_coefficients();
   test_construction_equivalence();
   test_read_write_roundtrip();
   test_precision_policy();

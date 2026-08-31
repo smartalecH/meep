@@ -37,22 +37,7 @@ namespace meep {
 
 int susceptibility::cur_id = 0;
 
-susceptibility *susceptibility::clone() const {
-  susceptibility *sus = new susceptibility(*this);
-  sus->next = 0;
-  sus->ntot = ntot;
-  sus->id = id;
-  FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
-    if (sigma[c][d]) {
-      sus->sigma[c][d] = new realnum[ntot];
-      memcpy(sus->sigma[c][d], sigma[c][d], sizeof(realnum) * ntot);
-    }
-    else
-      sus->sigma[c][d] = NULL;
-    sus->trivial_sigma[c][d] = trivial_sigma[c][d];
-  }
-  return sus;
-}
+susceptibility *susceptibility::clone() const { return new susceptibility(*this); }
 
 // generic base class definition.
 std::complex<realnum> susceptibility::chi1(realnum freq, realnum sigma) {

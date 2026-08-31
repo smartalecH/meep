@@ -113,7 +113,20 @@ public:
     next = NULL;
     FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
       sigma[c][d] = NULL;
-      trivial_sigma[c][d] = true;
+      trivial_sigma[c][d] = s.trivial_sigma[c][d];
+    }
+    try {
+      FOR_COMPONENTS(c) FOR_DIRECTIONS(d) if (s.sigma[c][d]) {
+        sigma[c][d] = new realnum[ntot];
+        for (size_t i = 0; i < ntot; ++i) sigma[c][d][i] = s.sigma[c][d][i];
+      }
+    }
+    catch (...) {
+      FOR_COMPONENTS(c) FOR_DIRECTIONS(d) {
+        delete[] sigma[c][d];
+        sigma[c][d] = NULL;
+      }
+      throw;
     }
   }
   virtual susceptibility *clone() const;
