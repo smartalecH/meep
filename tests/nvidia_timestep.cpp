@@ -34,6 +34,7 @@
 #include "backend/material_recipe.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/nvidia/nvidia_initialization.hpp"
+#include "backend/nvidia/nvidia_materials.hpp"
 #include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "backend/precision.hpp"
@@ -2261,23 +2262,25 @@ static void require_native_ir_preflight_rejected(NvidiaBackend &backend,
           "native IR mutation fixture has no canonical material recipe");
   refresh_material_ir_signatures_for_testing(mutated);
   const MaterialRecipe &canonical = canonical_plan.materials[0];
-  MaterialRecipeInput input;
-  input.disposition = canonical.disposition();
-  input.description = canonical.description();
-  input.eps_averaging = canonical.eps_averaging();
-  input.subpixel_tol = canonical.subpixel_tol();
-  input.subpixel_maxeval = canonical.subpixel_maxeval();
-  input.host_callback_id = canonical.host_callback_id();
-  input.from_host_callback = canonical.from_host_callback();
-  input.support_reason_bits = canonical.support_reason_bits();
-  input.rows = canonical.rows();
-  input.topology = canonical.topology();
-  input.ir.reset(new MaterialIR(mutated));
-  InitializationPlan plan = canonical_plan;
-  plan.materials.clear();
-  plan.materials.push_back(MaterialRecipe(input));
   bool rejected = false;
-  try { backend.preflight_initialization(plan); }
+  try {
+    MaterialRecipeInput input;
+    input.disposition = canonical.disposition();
+    input.description = canonical.description();
+    input.eps_averaging = canonical.eps_averaging();
+    input.subpixel_tol = canonical.subpixel_tol();
+    input.subpixel_maxeval = canonical.subpixel_maxeval();
+    input.host_callback_id = canonical.host_callback_id();
+    input.from_host_callback = canonical.from_host_callback();
+    input.support_reason_bits = canonical.support_reason_bits();
+    input.rows = canonical.rows();
+    input.topology = canonical.topology();
+    input.ir.reset(new MaterialIR(mutated));
+    InitializationPlan plan = canonical_plan;
+    plan.materials.clear();
+    plan.materials.push_back(MaterialRecipe(input));
+    backend.preflight_initialization(plan);
+  }
   catch (const std::invalid_argument &error) {
     rejected = std::string(error.what()).find("canonical owned snapshot") != std::string::npos;
   }
@@ -2332,6 +2335,7 @@ static void test_native_absorber_initialization(precision_policy_kind precision)
           "absorber/PML native fixture lost its initialization plan");
   MaterialIR mutated = *ir;
   mutated.materials[mutated.default_material].parameters[0] += 0.125;
+  mutated.materials[mutated.default_material].comparison_medium[0] += 0.125;
   require_native_ir_preflight_rejected(*backend, *gpu.initialization_plan, mutated,
                                        "re-signed medium mutation passed native preflight");
   mutated = *ir;
@@ -2574,11 +2578,19 @@ static bool same_material_initialization_statistics(
          SAME_STAT(dense_output_host_to_device_bytes) && SAME_STAT(decoded_parameter_bytes) &&
          SAME_STAT(absorber_profile_bytes) && SAME_STAT(pml_profile_bytes) &&
          SAME_STAT(file_sample_bytes) && SAME_STAT(grid_weight_bytes) &&
+         SAME_STAT(geometry_object_bytes) && SAME_STAT(geometry_image_bytes) &&
+         SAME_STAT(geometry_value_bytes) && SAME_STAT(geometry_analytic_bytes) &&
+         SAME_STAT(geometry_patch_bytes) &&
          SAME_STAT(constant_fill_kernel_launches) && SAME_STAT(conductivity_kernel_launches) &&
          SAME_STAT(file_table_kernel_launches) && SAME_STAT(grid_table_kernel_launches) &&
+         SAME_STAT(geometry_bulk_kernel_launches) &&
+         SAME_STAT(geometry_analytic_kernel_launches) &&
+         SAME_STAT(geometry_patch_kernel_launches) &&
          SAME_STAT(pointwise_kernel_launches) && SAME_STAT(pml_kernel_launches) &&
          SAME_STAT(absorber_points_evaluated) && SAME_STAT(file_points_evaluated) &&
-         SAME_STAT(grid_points_evaluated) && SAME_STAT(synchronizations) &&
+         SAME_STAT(grid_points_evaluated) && SAME_STAT(geometry_bulk_points) &&
+         SAME_STAT(geometry_analytic_points) && SAME_STAT(geometry_patch_points) &&
+         SAME_STAT(synchronizations) &&
          SAME_STAT(device_native) && SAME_STAT(valid);
 #undef SAME_STAT
 }
@@ -3288,8 +3300,8 @@ static void test_native_grid_damping_only() {
   gpu.use_real_fields();
   cpu.require_component(Ex);
   gpu.require_component(Ex);
-  cpu.init_backend();
-  gpu.init_backend();
+  cpu.advance(1);
+  gpu.advance(1);
   const MaterialIR *ir = material_ir_for(gpu);
   require(ir, "damping-only MaterialGrid lost its owned IR");
   bool topology_conductivity = false, topology_condinv = false;
@@ -3695,6 +3707,1211 @@ static void test_native_material_initialization(precision_policy_kind precision,
           "steady stepping repeated native material initialization work");
   master_printf("nvidia_timestep: native-material-%s/%s PASS\n",
                 real_fields ? "real" : "complex", precision_policy_name(precision));
+}
+
+static void install_geometry_block_material(structure &s) {
+  using namespace meep_geom;
+  material_type medium = make_dielectric(5.0);
+  medium->medium.epsilon_diag = make_vector3(5.0, 4.0, 3.0);
+  medium->medium.epsilon_offdiag.x.re = 0.07;
+  medium->medium.epsilon_offdiag.y.re = -0.05;
+  medium->medium.epsilon_offdiag.z.re = 0.03;
+  medium->medium.mu_diag = make_vector3(1.7, 1.5, 1.3);
+  medium->medium.mu_offdiag.x.re = -0.04;
+  medium->medium.mu_offdiag.y.re = 0.025;
+  medium->medium.mu_offdiag.z.re = 0.015;
+  medium->medium.D_conductivity_diag = make_vector3(0.02, 0.03, 0.04);
+  medium->medium.B_conductivity_diag = make_vector3(0.012, 0.022, 0.032);
+  medium->medium.E_chi2_diag = make_vector3(0.11, -0.07, 0.05);
+  medium->medium.E_chi3_diag = make_vector3(0.013, 0.017, -0.019);
+  medium->medium.H_chi2_diag = make_vector3(-0.09, 0.08, 0.06);
+  medium->medium.H_chi3_diag = make_vector3(0.009, -0.008, 0.007);
+  meep_geom::susceptibility electric = meep_geom::susceptibility();
+  electric.frequency = 0.43;
+  electric.gamma = 0.037;
+  electric.sigma_diag = make_vector3(0.6, 0.5, 0.4);
+  electric.sigma_offdiag = make_vector3(0.03, -0.02, 0.01);
+  medium->medium.E_susceptibilities.push_back(electric);
+  meep_geom::susceptibility magnetic = meep_geom::susceptibility();
+  magnetic.frequency = 0.31;
+  magnetic.gamma = 0.027;
+  magnetic.sigma_diag = make_vector3(0.35, 0.3, 0.25);
+  magnetic.sigma_offdiag = make_vector3(-0.018, 0.014, 0.009);
+  medium->medium.H_susceptibilities.push_back(magnetic);
+  geometric_object object =
+      make_block(medium, make_vector3(0.03, -0.02, 0.0), make_vector3(1, 0, 0),
+                 make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                 make_vector3(0.63, 0.61, 1.0));
+  geometric_object_list geometry = {1, &object};
+  material_type extras_data[1] = {medium};
+  material_type_list extras;
+  extras.num_items = 1;
+  extras.items = extras_data;
+  set_materials_from_geometry(&s, geometry, make_vector3(), true, 1e-5, 256, false,
+                              vacuum, 0, extras);
+  geometric_object_destroy(object);
+  material_free(medium);
+}
+
+static void test_native_material_geometry(precision_policy_kind precision) {
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  install_geometry_block_material(cpu_structure);
+  install_geometry_block_material(gpu_structure);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  FOR_E_AND_H(c) if (gv.has_field(c)) {
+      cpu.require_component(c);
+      gpu.require_component(c);
+    }
+  cpu.init_backend();
+  nvidia::testing::reset_transfer_accounting();
+  nvidia::testing::reset_material_transfer_accounting();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  size_t bulk_points = 0;
+  if (ir)
+    for (const MaterialIRBulkSpan &span : ir->bulk_spans) bulk_points += span.count;
+  require(ir && backend && ir->requires_hybrid && !ir->bulk_spans.empty() &&
+              !ir->analytic_interfaces.empty() && !ir->hybrid_patches.empty() &&
+              gpu.initialization_plan && gpu.initialization_plan->materials.size() == 1 &&
+              gpu.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::hybrid_interface,
+          "geometry block fixture did not retain the native/hybrid partition");
+  require(statistics.valid && statistics.device_native &&
+              statistics.geometry_bulk_points == bulk_points &&
+              statistics.geometry_analytic_points == ir->analytic_interfaces.size() &&
+              statistics.geometry_patch_points == ir->hybrid_patches.size() &&
+              statistics.geometry_bulk_kernel_launches > 0 &&
+              statistics.geometry_analytic_kernel_launches > 0 &&
+              statistics.geometry_patch_kernel_launches > 0 &&
+              statistics.geometry_patch_bytes ==
+                  ir->hybrid_patches.size() * sizeof(nvidia::geometry_patch_record) &&
+              statistics.dense_output_host_to_device_calls == 0 &&
+              statistics.dense_output_host_to_device_bytes == 0 &&
+              statistics.synchronizations == 1,
+          "geometry block initialization accounting is inconsistent");
+  compare_all_initialized_material_rows(
+      cpu, gpu, sizeof(realnum) == sizeof(float) || precision != precision_policy_kind::native
+                    ? 8e-5
+                    : 5e-12);
+  master_printf("nvidia_timestep: material-geometry/%s PASS\n",
+                precision_policy_name(precision));
+}
+
+enum driven_geometry_route { driven_bulk, driven_analytic, driven_patch };
+
+static void install_driven_geometry(structure &s, driven_geometry_route route) {
+  using namespace meep_geom;
+  material_type medium = make_dielectric(4.0);
+  meep_geom::susceptibility oscillator = meep_geom::susceptibility();
+  oscillator.frequency = 0.47;
+  oscillator.gamma = 0.035;
+  oscillator.sigma_diag = make_vector3(0.35, 0.25, 0.15);
+  medium->medium.E_susceptibilities.push_back(oscillator);
+  geometric_object object =
+      route == driven_patch
+          ? make_sphere(medium, make_vector3(0.03, -0.02), 0.37)
+          : make_block(medium, make_vector3(0.03, -0.02), make_vector3(1, 0, 0),
+                       make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                       make_vector3(0.63, 0.61, 1.0));
+  geometric_object_list geometry = {1, &object};
+  set_materials_from_geometry(&s, geometry, make_vector3(), route != driven_bulk, 1e-5, 256,
+                              false, vacuum);
+  geometric_object_destroy(object);
+  material_free(medium);
+}
+
+static void compare_geometry_dft(fields &cpu, fields &gpu, const dft_fields &cpu_monitor,
+                                 const dft_fields &gpu_monitor, component c,
+                                 double tolerance) {
+  int cpu_rank = 0, gpu_rank = 0;
+  size_t cpu_dims[3] = {0, 0, 0}, gpu_dims[3] = {0, 0, 0};
+  std::unique_ptr<std::complex<realnum>[]> expected(
+      cpu.get_dft_array(cpu_monitor, c, 0, &cpu_rank, cpu_dims));
+  std::unique_ptr<std::complex<realnum>[]> observed(
+      gpu.get_dft_array(gpu_monitor, c, 0, &gpu_rank, gpu_dims));
+  require(expected && observed && cpu_rank == gpu_rank,
+          "driven geometry DFT metadata differs");
+  size_t count = 1;
+  for (int axis = 0; axis < cpu_rank; ++axis) {
+    require(cpu_dims[axis] == gpu_dims[axis], "driven geometry DFT dimensions differ");
+    count *= cpu_dims[axis];
+  }
+  for (size_t i = 0; i < count; ++i)
+    require(std::abs(expected[i] - observed[i]) <=
+                tolerance * (1.0 + std::abs(expected[i])),
+            "driven geometry DFT values differ");
+}
+
+static void test_driven_material_geometry(driven_geometry_route route) {
+  const char *name = route == driven_bulk ? "bulk" : route == driven_analytic ? "analytic"
+                                                                           : "patch";
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  install_driven_geometry(cpu_structure, route);
+  install_driven_geometry(gpu_structure, route);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  gaussian_src_time cpu_time(0.31, 0.14), gpu_time(0.31, 0.14);
+  cpu.add_point_source(Ez, cpu_time, vec(-0.31, 0.27), std::complex<double>(0.37, 0.0));
+  gpu.add_point_source(Ez, gpu_time, vec(-0.31, 0.27), std::complex<double>(0.37, 0.0));
+  component monitor_component = Ez;
+  dft_fields cpu_monitor =
+      cpu.add_dft_fields(&monitor_component, 1, cpu.v, 0.31, 0.31, 1);
+  dft_fields gpu_monitor =
+      gpu.add_dft_fields(&monitor_component, 1, gpu.v, 0.31, 0.31, 1);
+  flux_vol *cpu_flux =
+      cpu.add_flux_vol(X, volume(vec(0.0, -0.45), vec(0.0, 0.45)));
+  flux_vol *gpu_flux =
+      gpu.add_flux_vol(X, volume(vec(0.0, -0.45), vec(0.0, 0.45)));
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  require(ir && !ir->bulk_spans.empty(), "driven geometry fixture has no bulk work");
+  require((route == driven_bulk && ir->analytic_interfaces.empty() &&
+           ir->hybrid_patches.empty()) ||
+              (route == driven_analytic && !ir->analytic_interfaces.empty()) ||
+              (route == driven_patch && !ir->hybrid_patches.empty()),
+          "driven geometry fixture did not exercise its requested route");
+  size_t polarization_arrays = 0;
+  for (size_t i = 0; i < gpu.array_catalog->size(); ++i)
+    polarization_arrays += gpu.array_catalog->spec(ArrayId{uint32_t(i)}).role ==
+                           array_role::polarization;
+  const StepPlan plan = build_step_plan(gpu, StepProgram::ordinary);
+  bool polarization = false, dft = false, flux_half = false, flux_full = false;
+  for (const Operation &operation : plan.operations) {
+    polarization = polarization || operation.kind == OpKind::update_polarization;
+    dft = dft || operation.kind == OpKind::update_dft;
+    flux_half = flux_half || operation.kind == OpKind::update_flux_half;
+    flux_full = flux_full || operation.kind == OpKind::update_flux;
+  }
+  require(polarization_arrays && polarization && dft && flux_half && flux_full,
+          "driven geometry fixture omitted polarization/DFT/flux state");
+  const double tolerance = sizeof(realnum) == sizeof(float) ? 2e-4 : 2e-11;
+  int completed = 0;
+  const int checkpoints[] = {1, 2, 100};
+  for (int checkpoint : checkpoints) {
+    cpu.advance(checkpoint - completed);
+    gpu.advance(checkpoint - completed);
+    completed = checkpoint;
+    compare_live_fields_by_key(cpu, gpu, tolerance);
+    require(std::fabs(cpu_flux->flux() - gpu_flux->flux()) <=
+                tolerance * (1.0 + std::fabs(cpu_flux->flux())),
+            "driven geometry flux differs");
+    compare_geometry_dft(cpu, gpu, cpu_monitor, gpu_monitor, monitor_component, tolerance);
+  }
+  master_printf("nvidia_timestep: material-geometry-driven-%s PASS\n", name);
+}
+
+static void test_native_mesh_geometry() {
+  using namespace meep_geom;
+  const grid_volume gv = vol3d(3.0, 3.0, 3.0, 4.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  material_type cpu_medium = make_dielectric(6.0);
+  material_type gpu_medium = make_dielectric(6.0);
+  const vector3 vertices[8] = {
+      make_vector3(-1, -1, -1), make_vector3(1, -1, -1),
+      make_vector3(1, 1, -1), make_vector3(-1, 1, -1),
+      make_vector3(-1, -1, 1), make_vector3(1, -1, 1),
+      make_vector3(1, 1, 1), make_vector3(-1, 1, 1)};
+  const int triangles[36] = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+                             0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
+                             2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7};
+  geometric_object cpu_object = make_mesh(cpu_medium, vertices, 8, triangles, 12);
+  geometric_object gpu_object = make_mesh(gpu_medium, vertices, 8, triangles, 12);
+  geometric_object_list cpu_geometry = {1, &cpu_object};
+  geometric_object_list gpu_geometry = {1, &gpu_object};
+  set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  geometric_object_destroy(cpu_object);
+  geometric_object_destroy(gpu_object);
+  material_free(cpu_medium);
+  material_free(gpu_medium);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  require(ir && ir->objects.size() == 1 && ir->objects[0].bvh_count > 1 &&
+              !ir->bulk_spans.empty() && ir->analytic_interfaces.empty() &&
+              ir->hybrid_patches.empty() && statistics.geometry_object_bytes > 0,
+          "mesh geometry fixture did not execute the packed BVH bulk path");
+  compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+  master_printf("nvidia_timestep: material-geometry-mesh PASS\n");
+}
+
+enum geometry_shape_case {
+  geometry_sphere,
+  geometry_ellipsoid,
+  geometry_cylinder,
+  geometry_cone,
+  geometry_wedge,
+  geometry_negative_wedge,
+  geometry_transformed_block,
+  geometry_prism
+};
+
+static geometric_object make_geometry_shape(meep_geom::material_type material,
+                                            geometry_shape_case shape) {
+  using namespace meep_geom;
+  switch (shape) {
+    case geometry_sphere: return make_sphere(material, make_vector3(), 0.8);
+    case geometry_ellipsoid:
+      return make_ellipsoid(material, make_vector3(), make_vector3(1, 0, 0),
+                            make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                            make_vector3(1.6, 1.0, 1.4));
+    case geometry_cylinder:
+      return make_cylinder(material, make_vector3(), 0.7, 1.5, make_vector3(0, 0, 1));
+    case geometry_cone:
+      return make_cone(material, make_vector3(), 0.8, 1.5, make_vector3(0, 0, 1), 0.35);
+    case geometry_wedge:
+      return make_wedge(material, make_vector3(), 0.8, 1.5, make_vector3(0, 0, 1),
+                        0.5 * M_PI, make_vector3(1, 0, 0));
+    case geometry_negative_wedge:
+      return make_wedge(material, make_vector3(), 0.8, 1.5, make_vector3(0, 0, 1),
+                        -0.5 * M_PI, make_vector3(1, 0, 0));
+    case geometry_transformed_block:
+      return make_block(material, make_vector3(0.25, -0.5, 0.125), make_vector3(0, 1, 0),
+                        make_vector3(-1, 0, 0), make_vector3(0, 0, 1),
+                        make_vector3(1.4, 0.8, 1.2));
+    case geometry_prism: {
+      const vector3 square[4] = {make_vector3(-0.7, -0.7), make_vector3(0.7, -0.7),
+                                 make_vector3(0.7, 0.7), make_vector3(-0.7, 0.7)};
+      return make_prism_with_center(material, make_vector3(), square, 4, 1.4,
+                                    make_vector3(0, 0, 1));
+    }
+  }
+  throw std::logic_error("unknown geometry shape fixture");
+}
+
+static void test_native_geometry_shapes() {
+  using namespace meep_geom;
+  const geometry_shape_case shapes[] = {
+      geometry_sphere, geometry_ellipsoid, geometry_cylinder, geometry_cone,
+      geometry_wedge, geometry_negative_wedge, geometry_transformed_block,
+      geometry_prism};
+  const char *names[] = {"sphere", "ellipsoid", "cylinder", "cone", "wedge",
+                         "negative-wedge", "transformed-block", "prism"};
+  for (size_t shape = 0; shape < sizeof(shapes) / sizeof(shapes[0]); ++shape) {
+    const grid_volume gv = vol3d(3.0, 3.0, 3.0, 4.0);
+    structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    meep_geom::material_type cpu_medium = meep_geom::make_dielectric(3.25);
+    meep_geom::material_type gpu_medium = meep_geom::make_dielectric(3.25);
+    geometric_object cpu_object = make_geometry_shape(cpu_medium, shapes[shape]);
+    geometric_object gpu_object = make_geometry_shape(gpu_medium, shapes[shape]);
+    geometric_object_list cpu_geometry = {1, &cpu_object};
+    geometric_object_list gpu_geometry = {1, &gpu_object};
+    set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                                false, vacuum);
+    set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                                false, vacuum);
+    geometric_object_destroy(cpu_object);
+    geometric_object_destroy(gpu_object);
+    material_free(cpu_medium);
+    material_free(gpu_medium);
+    fields cpu(&cpu_structure);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&gpu_structure, options);
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+    for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) {
+      cpu.require_component(c);
+      gpu.require_component(c);
+    }
+    cpu.init_backend();
+    gpu.init_backend();
+    compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+    master_printf("nvidia_timestep: material-geometry-%s PASS\n", names[shape]);
+  }
+}
+
+static meep_geom::material_type make_geometry_grid_material(bool averaging, int reducer) {
+  using namespace meep_geom;
+  material_type grid = new material_data();
+  grid->which_subclass = material_data::MATERIAL_GRID;
+  grid->do_averaging = averaging;
+  grid->material_grid_kinds = static_cast<decltype(grid->material_grid_kinds)>(reducer);
+  grid->grid_size = make_vector3(2, 2, 1);
+  grid->weights = new double[4]{0.15, 0.35, 0.65, 0.85};
+  grid->medium_1 = medium_struct(2.0);
+  grid->medium_2 = medium_struct(6.0);
+  grid->medium_1.D_conductivity_diag = make_vector3(0.01, 0.02, 0.03);
+  grid->medium_2.D_conductivity_diag = make_vector3(0.05, 0.06, 0.07);
+  meep_geom::susceptibility first = meep_geom::susceptibility();
+  first.frequency = 0.53;
+  first.gamma = 0.041;
+  first.sigma_diag = make_vector3(0.2, 0.3, 0.4);
+  first.sigma_offdiag = make_vector3(0.015, -0.012, 0.009);
+  meep_geom::susceptibility second = first;
+  second.sigma_diag = make_vector3(0.7, 0.8, 0.9);
+  second.sigma_offdiag = make_vector3(-0.025, 0.021, -0.017);
+  grid->medium_1.E_susceptibilities.push_back(first);
+  grid->medium_2.E_susceptibilities.push_back(second);
+  grid->medium.E_susceptibilities.push_back(first);
+  grid->medium.E_susceptibilities.push_back(second);
+  grid->beta = 1.7;
+  grid->eta = 0.43;
+  grid->damping = 0.09;
+  return grid;
+}
+
+static void test_native_geometry_grid(bool object_grid, bool averaging) {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  material_type cpu_grid = make_geometry_grid_material(averaging, material_data::U_MEAN);
+  material_type gpu_grid = make_geometry_grid_material(averaging, material_data::U_MEAN);
+  geometric_object cpu_object = {}, gpu_object = {};
+  geometric_object_list cpu_geometry = {0, NULL}, gpu_geometry = {0, NULL};
+  if (object_grid) {
+    cpu_object = make_block(cpu_grid, make_vector3(), make_vector3(1, 0, 0),
+                            make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                            make_vector3(0.72, 0.68, 1.0));
+    gpu_object = make_block(gpu_grid, make_vector3(), make_vector3(1, 0, 0),
+                            make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                            make_vector3(0.72, 0.68, 1.0));
+    cpu_geometry = geometric_object_list{1, &cpu_object};
+    gpu_geometry = geometric_object_list{1, &gpu_object};
+  }
+  set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), averaging, 1e-5, 256,
+                              false, object_grid ? vacuum : cpu_grid);
+  set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), averaging, 1e-5, 256,
+                              false, object_grid ? vacuum : gpu_grid);
+  if (object_grid) {
+    geometric_object_destroy(cpu_object);
+    geometric_object_destroy(gpu_object);
+  }
+  material_free(cpu_grid);
+  material_free(gpu_grid);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  require(ir && backend && statistics.valid && statistics.device_native &&
+              statistics.grid_weight_bytes == 4 * sizeof(double) &&
+              statistics.dense_output_host_to_device_calls == 0 &&
+              (averaging ? !ir->hybrid_patches.empty() : ir->hybrid_patches.empty()),
+          "geometry MaterialGrid did not take the expected compact route");
+  compare_all_initialized_material_rows(cpu, gpu, 5e-11);
+  master_printf("nvidia_timestep: material-geometry-%s-grid-%s PASS\n",
+                object_grid ? "object" : "default", averaging ? "hybrid" : "bulk");
+}
+
+static meep_geom::material_type make_geometry_file_material() {
+  using namespace meep_geom;
+  material_type file = new material_data();
+  file->which_subclass = material_data::MATERIAL_FILE;
+  file->medium = medium_struct(1.0);
+  file->epsilon_dims[0] = 2;
+  file->epsilon_dims[1] = 2;
+  file->epsilon_dims[2] = 1;
+  file->epsilon_data = new double[4]{2.0, 3.0, 5.0, 7.0};
+  return file;
+}
+
+static void test_native_object_file_geometry() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  material_type cpu_file = make_geometry_file_material();
+  material_type gpu_file = make_geometry_file_material();
+  geometric_object cpu_object = make_sphere(cpu_file, make_vector3(), 0.42);
+  geometric_object gpu_object = make_sphere(gpu_file, make_vector3(), 0.42);
+  geometric_object_list cpu_geometry = {1, &cpu_object};
+  geometric_object_list gpu_geometry = {1, &gpu_object};
+  set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  geometric_object_destroy(cpu_object);
+  geometric_object_destroy(gpu_object);
+  material_free(cpu_file);
+  material_free(gpu_file);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.init_backend();
+  gpu.init_backend();
+  const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  require(backend && statistics.valid && statistics.file_sample_bytes == 4 * sizeof(double) &&
+              statistics.dense_output_host_to_device_calls == 0,
+          "object FILE material did not execute the compact geometry path");
+  compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+  master_printf("nvidia_timestep: material-geometry-object-file PASS\n");
+}
+
+static void test_native_geometry_grid_absorber() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.5, 1.25, 8.0);
+  structure cpu_structure(gv, isotropic_eps, pml(0.25), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, pml(0.25), identity(), 1);
+  material_type cpu_grid = make_geometry_grid_material(false, material_data::U_DEFAULT);
+  material_type gpu_grid = make_geometry_grid_material(false, material_data::U_DEFAULT);
+  geometric_object cpu_object =
+      make_block(cpu_grid, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 1), make_vector3(0.9, 0.8, 1.0));
+  geometric_object gpu_object =
+      make_block(gpu_grid, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 1), make_vector3(0.9, 0.8, 1.0));
+  geometric_object_list cpu_geometry = {1, &cpu_object};
+  geometric_object_list gpu_geometry = {1, &gpu_object};
+  absorber_list absorbers = create_absorber_list();
+  add_absorbing_layer(absorbers, 0.5, ALL_DIRECTIONS, ALL_SIDES, 1e-9, 1.0);
+  set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum, absorbers);
+  set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum, absorbers);
+  destroy_absorber_list(absorbers);
+  geometric_object_destroy(cpu_object);
+  geometric_object_destroy(gpu_object);
+  material_free(cpu_grid);
+  material_free(gpu_grid);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.init_backend();
+  gpu.init_backend();
+  const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  require(backend && statistics.valid && statistics.absorber_profile_bytes > 0 &&
+              statistics.pml_profile_bytes > 0 && statistics.geometry_bulk_points > 0 &&
+              statistics.pml_kernel_launches > 0,
+          "geometry MaterialGrid absorber/PML path was not executed");
+  compare_all_initialized_material_rows(cpu, gpu, 8e-11);
+  master_printf("nvidia_timestep: material-geometry-grid-absorber PASS\n");
+}
+
+static meep_geom::material_type make_geometry_constant_grid(double weight, int reducer) {
+  using namespace meep_geom;
+  material_type grid = new material_data();
+  grid->which_subclass = material_data::MATERIAL_GRID;
+  grid->do_averaging = false;
+  grid->material_grid_kinds = static_cast<decltype(grid->material_grid_kinds)>(reducer);
+  grid->grid_size = make_vector3(1, 1, 1);
+  grid->weights = new double[1]{weight};
+  grid->medium_1 = medium_struct(2.0);
+  grid->medium_2 = medium_struct(6.0);
+  grid->medium = grid->medium_1;
+  grid->beta = 0.0;
+  grid->eta = 0.5;
+  grid->damping = 0.0;
+  return grid;
+}
+
+static void test_native_geometry_grid_reducers() {
+  using namespace meep_geom;
+  const int reducers[4] = {material_data::U_DEFAULT, material_data::U_MIN,
+                           material_data::U_PROD, material_data::U_MEAN};
+  for (int reducer : reducers) {
+    const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+    structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    material_type cpu_materials[3] = {make_geometry_constant_grid(0.2, reducer),
+                                      make_geometry_constant_grid(0.8, reducer),
+                                      make_geometry_constant_grid(0.4, reducer)};
+    material_type gpu_materials[3] = {make_geometry_constant_grid(0.2, reducer),
+                                      make_geometry_constant_grid(0.8, reducer),
+                                      make_geometry_constant_grid(0.4, reducer)};
+    geometric_object cpu_objects[2] = {
+        make_block(cpu_materials[0], make_vector3(), make_vector3(1, 0, 0),
+                   make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                   make_vector3(0.85, 0.85, 1.0)),
+        make_block(cpu_materials[1], make_vector3(), make_vector3(1, 0, 0),
+                   make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                   make_vector3(0.55, 0.55, 1.0))};
+    geometric_object gpu_objects[2] = {
+        make_block(gpu_materials[0], make_vector3(), make_vector3(1, 0, 0),
+                   make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                   make_vector3(0.85, 0.85, 1.0)),
+        make_block(gpu_materials[1], make_vector3(), make_vector3(1, 0, 0),
+                   make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                   make_vector3(0.55, 0.55, 1.0))};
+    geometric_object_list cpu_geometry = {2, cpu_objects};
+    geometric_object_list gpu_geometry = {2, gpu_objects};
+    set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                                false, cpu_materials[2]);
+    set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                                false, gpu_materials[2]);
+    for (int i = 1; i >= 0; --i) {
+      geometric_object_destroy(cpu_objects[i]);
+      geometric_object_destroy(gpu_objects[i]);
+    }
+    for (int i = 0; i < 3; ++i) {
+      material_free(cpu_materials[i]);
+      material_free(gpu_materials[i]);
+    }
+    fields cpu(&cpu_structure);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&gpu_structure, options);
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+    for (component c : {Ex, Ey, Ez}) {
+      cpu.require_component(c);
+      gpu.require_component(c);
+    }
+    cpu.init_backend();
+    gpu.init_backend();
+    compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+    master_printf("nvidia_timestep: material-geometry-grid-reducer-%d PASS\n", reducer);
+  }
+}
+
+static void test_native_geometry_retry() {
+  const nvidia::testing::failure_point failures[] = {
+      nvidia::testing::failure_point::material_geometry_descriptor_mutation,
+      nvidia::testing::failure_point::material_geometry_compact_mutation,
+      nvidia::testing::failure_point::material_compact_allocate,
+      nvidia::testing::failure_point::material_ir_upload,
+      nvidia::testing::failure_point::material_geometry_bulk_launch,
+      nvidia::testing::failure_point::material_geometry_analytic_launch,
+      nvidia::testing::failure_point::material_geometry_patch_launch,
+      nvidia::testing::failure_point::material_initialization_sync};
+  for (nvidia::testing::failure_point failure : failures) {
+    structure s(vol2d(1.0, 1.0, 8.0), isotropic_eps, no_pml(), identity(), 1);
+    install_geometry_block_material(s);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields f(&s, options);
+    f.use_real_fields();
+    for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) f.require_component(c);
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    nvidia::testing::fail_next(failure);
+    bool rejected = false;
+    try { f.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    require(rejected && f.backend_state == NULL && f.executable == NULL &&
+                before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current,
+            "failed cold geometry initialization published or leaked a candidate");
+    f.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(f.backend);
+    require(backend && f.backend_state && f.executable &&
+                backend->material_initialization_statistics_for_testing().valid,
+            "cold geometry initialization failure was not retryable");
+  }
+
+  structure s(vol2d(1.0, 1.0, 8.0), isotropic_eps, no_pml(), identity(), 1);
+  install_geometry_block_material(s);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields f(&s, options);
+  f.use_real_fields();
+  for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) f.require_component(c);
+  f.init_backend();
+  BackendState *const live_state = f.backend_state;
+  Executable *const live_executable = f.executable;
+  invalidate(f, MutationKind::material_values, "geometry initialization replacement retry");
+  nvidia::testing::fail_next(nvidia::testing::failure_point::material_geometry_patch_launch);
+  bool rejected = false;
+  try { f.init_backend(); }
+  catch (const std::exception &) { rejected = true; }
+  nvidia::testing::clear_failure();
+  require(rejected && f.backend_state == live_state && f.executable == live_executable &&
+              !f.backend->is_poisoned(),
+          "failed geometry replacement did not preserve the live epoch");
+  f.init_backend();
+  require(f.backend_state != live_state && f.executable != live_executable,
+          "geometry replacement retry did not publish a new epoch");
+  master_printf("nvidia_timestep: material-geometry rollback/retry PASS\n");
+}
+
+static void test_native_geometry_tensor_preflight() {
+  using namespace meep_geom;
+  const auto singularize = [](std::vector<double> &values, size_t base, bool magnetic) {
+    const size_t diagonal = base + (magnetic ? 9 : 0);
+    const size_t offdiagonal = base + (magnetic ? 12 : 3);
+    values[diagonal] = values[diagonal + 1] = values[diagonal + 2] = 1.0;
+    for (size_t i = 0; i < 6; ++i) values[offdiagonal + i] = 0.0;
+    values[offdiagonal] = 1.0;
+  };
+  const auto reject = [&](bool grid) {
+    structure s(vol2d(1.0, 1.0, 8.0), isotropic_eps, no_pml(), identity(), 1);
+    if (grid) {
+      material_type material = make_geometry_grid_material(false, material_data::U_DEFAULT);
+      geometric_object object =
+          make_block(material, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                     make_vector3(0, 0, 1), make_vector3(0.75, 0.75, 1.0));
+      geometric_object_list geometry = {1, &object};
+      set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 128, false,
+                                  vacuum);
+      geometric_object_destroy(object);
+      material_free(material);
+    }
+    else
+      install_geometry_block_material(s);
+    std::shared_ptr<MaterialIR> malformed(
+        new MaterialIR(*static_cast<const MaterialIR *>(s.material_ir.get())));
+    bool changed = false;
+    for (MaterialIRMaterial &material : malformed->materials) {
+      if (!grid && material.kind == material_data::MEDIUM && !material.parameters.empty() &&
+          material.comparison_medium.size() >= 18) {
+        singularize(material.parameters, 0, false);
+        singularize(material.comparison_medium, 0, false);
+        changed = true;
+        break;
+      }
+      if (grid && material.kind == material_data::MATERIAL_GRID &&
+          material.parameters.size() >= 21) {
+        singularize(material.parameters, 3, false);
+        changed = true;
+        break;
+      }
+    }
+    require(changed, "singular geometry preflight fixture found no target material");
+    refresh_material_ir_signatures_for_testing(*malformed);
+    s.material_ir = std::static_pointer_cast<const void>(malformed);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields f(&s, options);
+    f.use_real_fields();
+    for (component c : {Ex, Ey, Ez}) f.require_component(c);
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    nvidia::testing::reset_transfer_accounting();
+    bool rejected = false;
+    try { f.init_backend(); }
+    catch (const std::exception &error) {
+      rejected = std::string(error.what()).find("tensor is singular") != std::string::npos;
+    }
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    const nvidia::testing::transfer_accounting transfers =
+        nvidia::testing::current_transfer_accounting();
+    require(rejected && f.backend_state == NULL && f.executable == NULL &&
+                before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current &&
+                transfers.host_to_device_calls == 0 && transfers.device_to_host_calls == 0 &&
+                transfers.device_to_device_calls == 0,
+            grid ? "singular MaterialGrid tensor crossed preflight"
+                 : "singular object medium tensor crossed preflight");
+  };
+  reject(false);
+  reject(true);
+  master_printf("nvidia_timestep: material-geometry tensor preflight PASS\n");
+}
+
+static void install_geometry_admission_stress_material(structure &s) {
+  using namespace meep_geom;
+  const int material_count = 18;
+  std::vector<material_type> materials;
+  std::vector<geometric_object> objects;
+  materials.reserve(material_count);
+  objects.reserve(material_count);
+  for (int i = 0; i < material_count; ++i) {
+    material_type medium = make_dielectric(2.0 + 0.07 * i);
+    medium->medium.epsilon_diag =
+        make_vector3(2.0 + 0.07 * i, 2.3 + 0.05 * i, 2.6 + 0.03 * i);
+    medium->medium.mu_diag =
+        make_vector3(1.1 + 0.01 * i, 1.2 + 0.01 * i, 1.3 + 0.01 * i);
+    medium->medium.D_conductivity_diag =
+        make_vector3(0.001 * (i + 1), 0.0015 * (i + 1), 0.002 * (i + 1));
+    medium->medium.B_conductivity_diag =
+        make_vector3(0.0007 * (i + 1), 0.0009 * (i + 1), 0.0011 * (i + 1));
+    medium->medium.E_chi2_diag = make_vector3(0.01, -0.008, 0.006);
+    medium->medium.E_chi3_diag = make_vector3(0.002, 0.003, -0.001);
+    medium->medium.H_chi2_diag = make_vector3(-0.007, 0.005, 0.004);
+    medium->medium.H_chi3_diag = make_vector3(0.001, -0.0015, 0.0025);
+    materials.push_back(medium);
+    const int x = i % 6, y = i / 6;
+    objects.push_back(make_block(
+        medium, make_vector3(-1.25 + 0.5 * x, -0.5 + 0.5 * y, 0.0),
+        make_vector3(1, 0, 0), make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+        make_vector3(0.375, 0.375, 1.0)));
+  }
+  geometric_object_list geometry = {int(objects.size()), objects.data()};
+  material_type_list extras;
+  extras.items = materials.data();
+  extras.num_items = int(materials.size());
+  set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 256, false,
+                              vacuum, 0, extras);
+  for (int i = material_count - 1; i >= 0; --i) geometric_object_destroy(objects[size_t(i)]);
+  for (material_type material : materials) material_free(material);
+}
+
+static size_t parse_initialization_peak(const std::string &message) {
+  const std::string marker = "NVIDIA initialization peak requires ";
+  const size_t begin = message.find(marker);
+  if (begin == std::string::npos) return 0;
+  char *end = NULL;
+  const unsigned long long value =
+      std::strtoull(message.c_str() + begin + marker.size(), &end, 10);
+  if (!end || end == message.c_str() + begin + marker.size() ||
+      value > std::numeric_limits<size_t>::max())
+    return 0;
+  return size_t(value);
+}
+
+static void test_native_geometry_memory_admission() {
+  structure s(vol2d(3.0, 2.0, 8.0), isotropic_eps, pml(0.2), identity(), 4);
+  install_geometry_admission_stress_material(s);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields f(&s, options);
+  f.use_real_fields();
+  for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) f.require_component(c);
+  const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_transfer_accounting();
+  nvidia::testing::set_initialization_memory_budget_for_testing(1);
+  bool rejected = false;
+  size_t exact_peak = 0;
+  try { f.init_backend(); }
+  catch (const std::exception &error) {
+    exact_peak = parse_initialization_peak(error.what());
+    rejected = exact_peak != 0;
+  }
+  nvidia::testing::set_initialization_memory_budget_for_testing(
+      std::numeric_limits<size_t>::max());
+  const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(rejected && f.backend_state == NULL && f.executable == NULL &&
+              before.device_bytes_current == after.device_bytes_current &&
+              before.pinned_bytes_current == after.pinned_bytes_current &&
+              transfers.host_to_device_calls == 0 && transfers.device_to_host_calls == 0 &&
+              transfers.device_to_device_calls == 0,
+          "combined geometry memory admission allocated, transferred, or published");
+  f.init_backend();
+  require(f.backend_state && f.executable,
+          "geometry memory-admission rejection was not retryable");
+  const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(f.backend);
+  const MaterialIR *ir = material_ir_for(f);
+  require(backend && ir, "geometry admission retry lost its backend or owned IR");
+  const size_t actual_compact =
+      backend->material_initialization_statistics_for_testing()
+          .compact_input_host_to_device_bytes;
+  require(f.initialization_plan && f.initialization_plan->materials.size() == 1,
+          "geometry admission retry lost its initialization recipe");
+  const uint64_t logical_u64 =
+      classify_material_support(f.initialization_plan->materials[0]).compact_input_bytes;
+  require(logical_u64 <= uint64_t(std::numeric_limits<size_t>::max()) &&
+              actual_compact > size_t(logical_u64),
+          "geometry admission stress did not exceed the old logical IR estimate");
+  const nvidia::memory_accounting retry_memory = nvidia::current_memory_accounting();
+  require(retry_memory.pinned_bytes_current >= after.pinned_bytes_current &&
+              exact_peak > retry_memory.pinned_bytes_current - after.pinned_bytes_current +
+                               actual_compact,
+          "geometry admission stress cannot reconstruct the old peak estimate");
+  const size_t retry_pinned =
+      retry_memory.pinned_bytes_current - after.pinned_bytes_current;
+  const size_t old_peak = exact_peak - retry_pinned - actual_compact + size_t(logical_u64);
+  require(old_peak < exact_peak - 1,
+          "geometry admission stress left no threshold between old and exact peaks");
+  const size_t threshold = old_peak + (exact_peak - old_peak) / 2;
+  master_printf(
+      "nvidia_timestep: material-geometry admission old=%zu exact=%zu threshold=%zu "
+      "logical=%zu packed=%zu staging=%zu\n",
+      old_peak, exact_peak, threshold, size_t(logical_u64), actual_compact, retry_pinned);
+
+  structure threshold_structure(vol2d(3.0, 2.0, 8.0), isotropic_eps, pml(0.2), identity(), 4);
+  install_geometry_admission_stress_material(threshold_structure);
+  fields threshold_fields(&threshold_structure, options);
+  threshold_fields.use_real_fields();
+  for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) threshold_fields.require_component(c);
+  const nvidia::memory_accounting threshold_before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_transfer_accounting();
+  nvidia::testing::set_initialization_memory_budget_for_testing(threshold);
+  rejected = false;
+  try { threshold_fields.init_backend(); }
+  catch (const std::exception &error) {
+    rejected = parse_initialization_peak(error.what()) == exact_peak;
+  }
+  nvidia::testing::set_initialization_memory_budget_for_testing(
+      std::numeric_limits<size_t>::max());
+  const nvidia::memory_accounting threshold_after = nvidia::current_memory_accounting();
+  const nvidia::testing::transfer_accounting threshold_transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(rejected && threshold_fields.backend_state == NULL &&
+              threshold_fields.executable == NULL &&
+              threshold_before.device_bytes_current == threshold_after.device_bytes_current &&
+              threshold_before.pinned_bytes_current == threshold_after.pinned_bytes_current &&
+              threshold_transfers.host_to_device_calls == 0 &&
+              threshold_transfers.device_to_host_calls == 0 &&
+              threshold_transfers.device_to_device_calls == 0,
+          "between-estimates geometry budget allocated, transferred, launched, or published");
+  threshold_fields.init_backend();
+  require(threshold_fields.backend_state && threshold_fields.executable,
+          "between-estimates geometry budget rejection was not retryable");
+  master_printf("nvidia_timestep: material-geometry memory admission PASS\n");
+}
+
+static void test_native_geometry_periodic() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  material_type cpu_medium = make_dielectric(4.25);
+  material_type gpu_medium = make_dielectric(4.25);
+  geometric_object cpu_object =
+      make_sphere(cpu_medium, make_vector3(0.43, 0.0, 0.0), 0.31);
+  geometric_object gpu_object =
+      make_sphere(gpu_medium, make_vector3(0.43, 0.0, 0.0), 0.31);
+  geometric_object_list cpu_geometry = {1, &cpu_object};
+  geometric_object_list gpu_geometry = {1, &gpu_object};
+  set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                              true, vacuum);
+  set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                              true, vacuum);
+  geometric_object_destroy(cpu_object);
+  geometric_object_destroy(gpu_object);
+  material_free(cpu_medium);
+  material_free(gpu_medium);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  require(ir && ir->ensure_periodicity && ir->images.size() > ir->objects.size() &&
+              ir->active_images.size() > ir->objects.size(),
+          "periodic geometry fixture did not retain ordered periodic images");
+  for (size_t i = 1; i < ir->active_images.size(); ++i)
+    require(ir->images[ir->active_images[i - 1]].ordinal <
+                ir->images[ir->active_images[i]].ordinal,
+            "periodic geometry active image order changed during packing");
+  compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+  master_printf("nvidia_timestep: material-geometry-periodic PASS\n");
+}
+
+static void test_native_geometry_skew_lattice() {
+  using namespace meep_geom;
+  geom_initialize();
+  dimensions = 3;
+  geometry_center = make_vector3();
+  ensure_periodicity = false;
+  set_default_material(vacuum);
+  geometry_lattice.size = make_vector3(3, 3, 3);
+  geometry_lattice.basis_size = make_vector3(1.0, 1.0, 1.0);
+  geometry_lattice.basis1 = make_vector3(1, 0, 0);
+  geometry_lattice.basis2 = make_vector3(0.5, sqrt(3.0) * 0.5, 0);
+  geometry_lattice.basis3 = make_vector3(0, 0, 1);
+  geom_fix_lattice();
+  const grid_volume gv = vol3d(3.0, 3.0, 3.0, 4.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  material_type cpu_medium = make_dielectric(5.5);
+  material_type gpu_medium = make_dielectric(5.5);
+  geometric_object cpu_object = make_sphere(cpu_medium, make_vector3(), 0.83);
+  geometric_object gpu_object = make_sphere(gpu_medium, make_vector3(), 0.83);
+  geometric_object_list cpu_geometry = {1, &cpu_object};
+  geometric_object_list gpu_geometry = {1, &gpu_object};
+  material_type_list no_extra;
+  no_extra.num_items = 0;
+  no_extra.items = NULL;
+  geom_epsilon cpu_geps(cpu_geometry, no_extra, cpu_structure.gv.pad().surroundings());
+  geom_epsilon gpu_geps(gpu_geometry, no_extra, gpu_structure.gv.pad().surroundings());
+  set_materials_from_geom_epsilon(&cpu_structure, &cpu_geps, false, 1e-5, 128);
+  set_materials_from_geom_epsilon(&gpu_structure, &gpu_geps, false, 1e-5, 128);
+  geometric_object_destroy(cpu_object);
+  geometric_object_destroy(gpu_object);
+  material_free(cpu_medium);
+  material_free(gpu_medium);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez}) {
+    cpu.require_component(c);
+    gpu.require_component(c);
+  }
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialIR *ir = material_ir_for(gpu);
+  require(ir && ir->lattice_metric[3] != 0.0,
+          "skew geometry fixture lost its nonorthogonal metric");
+  compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+  geom_initialize();
+  master_printf("nvidia_timestep: material-geometry-skew-lattice PASS\n");
+}
+
+static void test_native_geometry_dimensions() {
+  using namespace meep_geom;
+  struct DimensionCase {
+    const char *name;
+    grid_volume volume;
+  };
+  const DimensionCase cases[] = {{"d1", vol1d(1.5, 8.0)},
+                                 {"cyl", volcyl(1.5, 1.25, 6.0)}};
+  for (const DimensionCase &test : cases) {
+    structure cpu_structure(test.volume, isotropic_eps, no_pml(), identity(), 1);
+    structure gpu_structure(test.volume, isotropic_eps, no_pml(), identity(), 1);
+    material_type cpu_medium = make_dielectric(3.75);
+    material_type gpu_medium = make_dielectric(3.75);
+    geometric_object cpu_object = make_sphere(cpu_medium, make_vector3(), 0.42);
+    geometric_object gpu_object = make_sphere(gpu_medium, make_vector3(), 0.42);
+    geometric_object_list cpu_geometry = {1, &cpu_object};
+    geometric_object_list gpu_geometry = {1, &gpu_object};
+    set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                                false, vacuum);
+    set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                                false, vacuum);
+    geometric_object_destroy(cpu_object);
+    geometric_object_destroy(gpu_object);
+    material_free(cpu_medium);
+    material_free(gpu_medium);
+    fields cpu(&cpu_structure);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    fields gpu(&gpu_structure, options);
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+    FOR_E_AND_H(c) if (test.volume.has_field(c)) {
+        cpu.require_component(c);
+        gpu.require_component(c);
+      }
+    cpu.init_backend();
+    gpu.init_backend();
+    const MaterialIR *ir = material_ir_for(gpu);
+    require(ir && ir->dimensions == int(test.volume.dim),
+            "geometry dimension fixture captured the wrong dimensional enum");
+    compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+    master_printf("nvidia_timestep: material-geometry-%s PASS\n", test.name);
+  }
+}
+
+static void test_native_geometry_field_growth() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  material_type cpu_medium = make_dielectric(4.5);
+  material_type gpu_medium = make_dielectric(4.5);
+  geometric_object cpu_object =
+      make_block(cpu_medium, make_vector3(), make_vector3(1, 0, 0),
+                 make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                 make_vector3(0.63, 0.61, 1.0));
+  geometric_object gpu_object =
+      make_block(gpu_medium, make_vector3(), make_vector3(1, 0, 0),
+                 make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                 make_vector3(0.63, 0.61, 1.0));
+  geometric_object_list cpu_geometry = {1, &cpu_object};
+  geometric_object_list gpu_geometry = {1, &gpu_object};
+  set_materials_from_geometry(&cpu_structure, cpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  set_materials_from_geometry(&gpu_structure, gpu_geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  geometric_object_destroy(cpu_object);
+  geometric_object_destroy(gpu_object);
+  material_free(cpu_medium);
+  material_free(gpu_medium);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  cpu.require_component(Ez);
+  gpu.require_component(Ez);
+  cpu.init_backend();
+  gpu.init_backend();
+  const size_t first_catalog = gpu.array_catalog->size();
+  const uint64_t first_layout_generation =
+      gpu.mutation_generation[size_t(MutationKind::field_layout)];
+  cpu.require_component(Ex);
+  gpu.require_component(Ex);
+  cpu.advance(1);
+  gpu.advance(1);
+  const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+  const NvidiaMaterialInitializationStatistics statistics =
+      backend ? backend->material_initialization_statistics_for_testing()
+              : NvidiaMaterialInitializationStatistics();
+  require(backend && statistics.valid && gpu.array_catalog->size() > first_catalog &&
+              gpu.mutation_generation[size_t(MutationKind::field_layout)] >
+                  first_layout_generation &&
+              statistics.geometry_bulk_kernel_launches > 0,
+          "geometry field growth did not rebind and replace the resident epoch");
+  compare_all_initialized_material_rows(cpu, gpu, 5e-12);
+  master_printf("nvidia_timestep: material-geometry-field-growth PASS\n");
+}
+
+static void test_native_geometry_mpi() {
+  const int ranks = count_processors();
+  require(ranks == 2 || ranks == 4,
+          "geometry MPI validation requires exactly two or four ranks");
+  const grid_volume gv = vol2d(2.0, 1.0, 8.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), ranks);
+  install_geometry_block_material(s);
+  const MaterialIR *ir = static_cast<const MaterialIR *>(s.material_ir.get());
+  const bool local_patch_empty = ir && ir->hybrid_patches.empty();
+  const bool local_patch_nonempty = ir && !ir->hybrid_patches.empty();
+  const size_t signature_low = ir ? uint32_t(ir->signature) : 0;
+  const size_t signature_high = ir ? uint32_t(ir->signature >> 32) : 0;
+  const bool same_semantic_signature =
+      ir && sum_to_all(signature_low) == signature_low * size_t(ranks) &&
+      sum_to_all(signature_high) == signature_high * size_t(ranks);
+  require(and_to_all(same_semantic_signature) && or_to_all(local_patch_empty) &&
+              or_to_all(local_patch_nonempty),
+          "geometry MPI split did not preserve a global hybrid route with asymmetric patches");
+  master_printf("nvidia_timestep: material-geometry collective partition np%d PASS\n", ranks);
+}
+
+static void test_native_geometry_cuda_mpi_initialization() {
+  const int ranks = count_processors();
+  require(ranks == 2,
+          "CUDA geometry initialization validation requires exactly two ranks");
+  backend_set_initialization_only_for_testing(true);
+  const grid_volume gv = vol2d(2.0, 1.0, 8.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+
+  {
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), ranks);
+    install_geometry_block_material(gpu_structure);
+    fields gpu(&gpu_structure, options);
+    gpu.use_real_fields();
+    for (component c : {Ex, Ey, Ez, Hx, Hy, Hz}) gpu.require_component(c);
+    nvidia::testing::reset_transfer_accounting();
+    nvidia::testing::reset_material_transfer_accounting();
+    gpu.init_backend();
+    const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+    const nvidia::testing::transfer_accounting transfers =
+        nvidia::testing::current_transfer_accounting();
+    const nvidia::testing::material_transfer_accounting material =
+        nvidia::testing::current_material_transfer_accounting();
+    require(backend && backend->device_ordinal_for_testing() == my_global_rank() &&
+                !gpu.backend_state && !gpu.executable && material.compact_calls != 0 &&
+                material.dense_output_calls == 0 && transfers.host_to_device_calls != 0,
+            "CUDA MPI geometry initialization did not map one rank per GPU");
+  }
+
+  {
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_geometry_block_material(gpu_structure);
+    fields gpu(&gpu_structure, options);
+    gpu.use_real_fields();
+    for (component c : {Ex, Ey, Ez}) gpu.require_component(c);
+    nvidia::testing::reset_material_transfer_accounting();
+    gpu.init_backend();
+    const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(gpu.backend);
+    const nvidia::testing::material_transfer_accounting material =
+        nvidia::testing::current_material_transfer_accounting();
+    const bool local_work = material.compact_calls != 0;
+    require(backend && !gpu.backend_state && !gpu.executable &&
+                or_to_all(local_work) && !and_to_all(local_work),
+            "CUDA MPI geometry initialization did not preserve an idle rank");
+  }
+
+  {
+    structure failure_structure(gv, isotropic_eps, no_pml(), identity(), ranks);
+    install_geometry_block_material(failure_structure);
+    fields failure(&failure_structure, options);
+    failure.use_real_fields();
+    for (component c : {Ex, Ey, Ez}) failure.require_component(c);
+    if (my_rank() == 0)
+      nvidia::testing::fail_next(
+          nvidia::testing::failure_point::material_geometry_bulk_launch);
+    bool rejected = false;
+    try { failure.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(and_to_all(rejected) && !failure.backend_state && !failure.executable,
+            "rank-asymmetric CUDA geometry failure published a partial MPI epoch");
+    failure.init_backend();
+    require(!failure.backend_state && !failure.executable &&
+                nvidia::testing::current_material_transfer_accounting().compact_calls != 0,
+            "rank-asymmetric CUDA geometry failure was not retryable");
+  }
+
+  divide_parallel_processes(ranks);
+  require(count_processors() == 1 && my_rank() == 0,
+          "CUDA geometry split communicator did not contain one local rank");
+  {
+    structure split_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_geometry_block_material(split_structure);
+    execution_options split_options = options;
+    split_options.device_id = my_global_rank();
+    fields split(&split_structure, split_options);
+    split.use_real_fields();
+    for (component c : {Ex, Ey, Ez}) split.require_component(c);
+    split.init_backend();
+    const NvidiaBackend *backend = dynamic_cast<const NvidiaBackend *>(split.backend);
+    require(backend && backend->device_ordinal_for_testing() == my_global_rank() &&
+                !split.backend_state && !split.executable,
+            "CUDA geometry split communicator selected the wrong GPU or failed init");
+  }
+  end_divide_parallel();
+  backend_set_initialization_only_for_testing(false);
+  master_printf("nvidia_timestep: material-geometry CUDA MPI init/rollback PASS\n");
 }
 
 static void test_material_copy_after_compile_rejected() {
@@ -7063,6 +8280,16 @@ int main(int argc, char **argv) {
     master_printf("nvidia_timestep: PASS\n");
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_MATERIAL_GEOMETRY_CUDA_MPI_ONLY")) {
+    test_native_geometry_cuda_mpi_initialization();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MATERIAL_GEOMETRY_MPI_ONLY")) {
+    test_native_geometry_mpi();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
     require(sizeof(realnum) == sizeof(float),
@@ -7179,6 +8406,44 @@ int main(int argc, char **argv) {
     test_native_table_dimension_pml("cyl", volcyl(1.5, 1.25, 6.0));
     test_native_pml_rounding_association();
     test_native_perfect_metal_signed_zero();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MATERIAL_GEOMETRY_ADMISSION_ONLY")) {
+    test_native_geometry_memory_admission();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (const char *geometry_case = getenv("MEEP_NVIDIA_MATERIAL_GEOMETRY_CASE")) {
+    if (!strcmp(geometry_case, "bulk")) test_driven_material_geometry(driven_bulk);
+    else if (!strcmp(geometry_case, "analytic")) test_driven_material_geometry(driven_analytic);
+    else if (!strcmp(geometry_case, "patch")) test_driven_material_geometry(driven_patch);
+    else throw std::invalid_argument("unknown NVIDIA material geometry case");
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MATERIAL_GEOMETRY_ONLY")) {
+    test_native_material_geometry(precision_policy_kind::native);
+    test_native_material_geometry(precision_policy_kind::mixed);
+    test_native_material_geometry(precision_policy_kind::f32);
+    test_driven_material_geometry(driven_bulk);
+    test_driven_material_geometry(driven_analytic);
+    test_driven_material_geometry(driven_patch);
+    test_native_mesh_geometry();
+    test_native_geometry_shapes();
+    test_native_geometry_grid(true, false);
+    test_native_geometry_grid(true, true);
+    test_native_geometry_grid(false, true);
+    test_native_object_file_geometry();
+    test_native_geometry_grid_absorber();
+    test_native_geometry_grid_reducers();
+    test_native_geometry_retry();
+    test_native_geometry_tensor_preflight();
+    test_native_geometry_memory_admission();
+    test_native_geometry_periodic();
+    test_native_geometry_dimensions();
+    test_native_geometry_field_growth();
+    test_native_geometry_skew_lattice();
     master_printf("nvidia_timestep: PASS\n");
     return 0;
   }

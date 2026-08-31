@@ -64,7 +64,9 @@ static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; 
 static double unit_epsilon(const vec &) { return 1.0; }
 static double phase_conductivity(const vec &);
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
+static int material_ir_user_calls = 0;
 static void material_ir_user_function(vector3, void *, meep_geom::medium_struct *medium) {
+  ++material_ir_user_calls;
   medium->epsilon_diag = meep_geom::make_vector3(2.0, 2.0, 2.0);
 }
 
@@ -7186,13 +7188,21 @@ static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
   ADD_IR_SCALAR(ir.ensure_periodicity);
   ADD_IR_SCALAR(ir.contains_host_callback);
   ADD_IR_SCALAR(ir.device_native_eligible);
+  ADD_IR_SCALAR(ir.requires_hybrid);
+  ADD_IR_SCALAR(ir.prism_include_boundaries);
   ADD_IR_SCALAR(ir.dimensions);
   ADD_IR_SCALAR(ir.projection_offset);
   ADD_IR_SCALAR(ir.default_material);
+  ADD_IR_SCALAR(ir.root_count);
   ADD_IR_SCALAR(ir.signature);
   ADD_IR_SCALAR(ir.layout_signature);
   add(ir.cell.size(), sizeof(double));
-  add(ir.roots.size(), sizeof(uint32_t));
+  add(6, sizeof(ir.captured_volume[0]));
+  add(3, sizeof(ir.lattice_basis_size[0]));
+  add(9, sizeof(ir.lattice_basis[0]));
+  add(9, sizeof(ir.lattice_metric[0]));
+  add(9, sizeof(ir.lattice_inverse[0]));
+  add(9, sizeof(ir.lattice_inverse_transpose[0]));
   add(ir.extra_materials.size(), sizeof(uint32_t));
   for (const MaterialIRMaterial &m : ir.materials) {
     ADD_IR_SCALAR(m.kind);
@@ -7205,17 +7215,46 @@ static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
     ADD_IR_SCALAR(m.has_chi3);
     ADD_IR_SCALAR(m.e_susceptibilities);
     ADD_IR_SCALAR(m.h_susceptibilities);
+    add(m.comparison_medium.size(), sizeof(double));
     add(m.parameters.size(), sizeof(double));
     add(m.samples.size(), sizeof(double));
   }
   for (const MaterialIRObject &o : ir.objects) {
     ADD_IR_SCALAR(o.kind);
     ADD_IR_SCALAR(o.material);
-    add(o.children.size(), sizeof(uint32_t));
+    ADD_IR_SCALAR(o.source_identity);
+    ADD_IR_SCALAR(o.root_identity);
+    ADD_IR_SCALAR(o.leaf_ordinal);
+    add(3, sizeof(o.parent_shift[0]));
+    add(3, sizeof(o.low[0]));
+    add(3, sizeof(o.high[0]));
+    ADD_IR_SCALAR(o.fixed_vertex_count);
+    ADD_IR_SCALAR(o.vertex_offset);
+    ADD_IR_SCALAR(o.vertex_count);
+    ADD_IR_SCALAR(o.triangle_offset);
+    ADD_IR_SCALAR(o.triangle_count);
+    ADD_IR_SCALAR(o.bvh_offset);
+    ADD_IR_SCALAR(o.bvh_count);
+    ADD_IR_SCALAR(o.mesh_lengthscale);
     add(o.parameters.size(), sizeof(double));
     add(o.vertices.size(), sizeof(double));
     add(o.indices.size(), sizeof(double));
+    add(o.auxiliary.size(), sizeof(double));
   }
+  add(ir.geometry_vertices.size(), sizeof(double));
+  add(ir.geometry_triangles.size(), sizeof(MaterialIRTriangle));
+  add(ir.geometry_bvh.size(), sizeof(MaterialIRBvhNode));
+  add(ir.geometry_bvh_face_ids.size(), sizeof(uint32_t));
+  for (const MaterialIRGeometryImage &image : ir.images) {
+    ADD_IR_SCALAR(image.object);
+    ADD_IR_SCALAR(image.ordinal);
+    ADD_IR_SCALAR(image.precedence);
+    add(3, sizeof(image.image[0]));
+    add(3, sizeof(image.shift[0]));
+    add(3, sizeof(image.low[0]));
+    add(3, sizeof(image.high[0]));
+  }
+  add(ir.active_images.size(), sizeof(uint32_t));
   for (const MaterialIRSusceptibility &s : ir.susceptibilities) {
     ADD_IR_SCALAR(s.identity);
     ADD_IR_SCALAR(s.material);
@@ -7285,6 +7324,51 @@ static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
     add(3, sizeof(row.strides[0]));
     add(3, sizeof(row.stagger[0]));
   }
+  for (const MaterialIRDestination &destination : ir.destinations) {
+    ADD_IR_SCALAR(destination.key.chunk);
+    ADD_IR_SCALAR(destination.key.kind);
+    ADD_IR_SCALAR(destination.key.component_);
+    ADD_IR_SCALAR(destination.key.cmp);
+    ADD_IR_SCALAR(destination.key.aux);
+    ADD_IR_SCALAR(destination.topology_index);
+    ADD_IR_SCALAR(destination.chunk_index);
+    ADD_IR_SCALAR(destination.property);
+    ADD_IR_SCALAR(destination.component);
+    ADD_IR_SCALAR(destination.tensor_direction);
+    ADD_IR_SCALAR(destination.tensor_column);
+    ADD_IR_SCALAR(destination.offdiagonal);
+    ADD_IR_SCALAR(destination.point_count);
+  }
+  for (const MaterialIRBulkSpan &span : ir.bulk_spans) {
+    ADD_IR_SCALAR(span.destination);
+    ADD_IR_SCALAR(span.first_point);
+    ADD_IR_SCALAR(span.count);
+  }
+  for (const MaterialIRAnalyticInterface &job : ir.analytic_interfaces) {
+    ADD_IR_SCALAR(job.destination);
+    ADD_IR_SCALAR(job.point);
+    ADD_IR_SCALAR(job.front_material);
+    ADD_IR_SCALAR(job.behind_material);
+    ADD_IR_SCALAR(job.object);
+    ADD_IR_SCALAR(job.image);
+    add(3, sizeof(job.normal[0]));
+    ADD_IR_SCALAR(job.fill);
+  }
+  for (const MaterialIRHybridPatch &patch : ir.hybrid_patches) {
+    ADD_IR_SCALAR(patch.destination);
+    ADD_IR_SCALAR(patch.point);
+    ADD_IR_SCALAR(patch.value);
+    ADD_IR_SCALAR(patch.front_material);
+    ADD_IR_SCALAR(patch.behind_material);
+    ADD_IR_SCALAR(patch.object);
+    ADD_IR_SCALAR(patch.image);
+    ADD_IR_SCALAR(patch.ambiguous);
+    ADD_IR_SCALAR(patch.variable_material);
+    ADD_IR_SCALAR(patch.variable_causes);
+    ADD_IR_SCALAR(patch.adaptive_fallback);
+    ADD_IR_SCALAR(patch.negative_fallback);
+    ADD_IR_SCALAR(patch.reason);
+  }
 #undef ADD_IR_SCALAR
   return total;
 }
@@ -7316,16 +7400,19 @@ static void test_geometry_backed_material_ir() {
   dielectric->medium.H_susceptibilities.push_back(h0_duplicate);
   geometric_object object = make_block(dielectric, make_vector3(), make_vector3(1, 0, 0),
                                        make_vector3(0, 1, 0), make_vector3(0, 0, 1),
-                                       make_vector3(0.75, 0.5, 1.0));
+                                       make_vector3(0.7, 0.5, 1.0));
   geometric_object inner = make_geometric_object(dielectric, make_vector3());
   inner.which_subclass = geometric_object::COMPOUND_GEOMETRIC_OBJECT;
   inner.subclass.compound_geometric_object_data =
       static_cast<compound_geometric_object *>(calloc(1, sizeof(compound_geometric_object)));
-  inner.subclass.compound_geometric_object_data->component_objects.num_items = 1;
+  inner.subclass.compound_geometric_object_data->component_objects.num_items = 2;
   inner.subclass.compound_geometric_object_data->component_objects.items =
-      static_cast<geometric_object *>(calloc(1, sizeof(geometric_object)));
+      static_cast<geometric_object *>(calloc(2, sizeof(geometric_object)));
   geometric_object_copy(&object,
                         inner.subclass.compound_geometric_object_data->component_objects.items);
+  geometric_object_copy(&object,
+                        inner.subclass.compound_geometric_object_data->component_objects.items + 1);
+  inner.subclass.compound_geometric_object_data->component_objects.items[1].center.x += 0.125;
   geometric_object outer = make_geometric_object(dielectric, make_vector3());
   outer.which_subclass = geometric_object::COMPOUND_GEOMETRIC_OBJECT;
   outer.subclass.compound_geometric_object_data =
@@ -7375,11 +7462,35 @@ static void test_geometry_backed_material_ir() {
   validate_material_ir(*ir);
   CHECK(ir->eps_averaging && ir->subpixel_maxeval == 4321 && ir->ensure_periodicity &&
             ir->projection_offset == 0.0 &&
-            ir->roots.size() == 4 && ir->objects.size() == 6 &&
-            ir->objects[ir->roots[0]].children.size() == 1 &&
-            ir->objects[ir->objects[ir->roots[0]].children[0]].children.size() == 1 &&
+            ir->root_count == 4 && ir->objects.size() == 5 &&
+            ir->objects[0].root_identity == 0 && ir->objects[0].leaf_ordinal == 0 &&
+            !ir->images.empty() &&
             !ir->absorbers.empty(),
         "geometry-backed IR omitted geometry or absorber input");
+  {
+    int root_precedence = -1;
+    int periodic_groups = 0;
+    for (size_t i = 0; i + 1 < ir->images.size(); ++i) {
+      const MaterialIRGeometryImage &first = ir->images[i];
+      const MaterialIRGeometryImage &second = ir->images[i + 1];
+      if (ir->objects[first.object].root_identity != 0 ||
+          ir->objects[second.object].root_identity != 0 || first.object != 0 ||
+          second.object != 1)
+        continue;
+      bool same_image = true;
+      for (int axis = 0; axis < 3; ++axis)
+        same_image = same_image && first.image[axis] == second.image[axis];
+      if (!same_image) continue;
+      CHECK(second.precedence == first.precedence - 1,
+            "compound leaf precedence did not decrement within a periodic image");
+      if (root_precedence < 0) root_precedence = first.precedence;
+      CHECK(first.precedence == root_precedence,
+            "compound root precedence did not reset across periodic images");
+      ++periodic_groups;
+    }
+    CHECK(periodic_groups > 1,
+          "multi-leaf compound fixture did not retain multiple periodic image groups");
+  }
   bool saw_infinite_block = false;
   for (const MaterialIRObject &captured : ir->objects) {
     saw_infinite_block =
@@ -7389,28 +7500,51 @@ static void test_geometry_backed_material_ir() {
   }
   CHECK(saw_infinite_block, "material IR rejected or altered a legal infinite block extent");
   {
+    MaterialIR malformed = *ir;
+    bool found = false;
+    for (size_t object_index = 0; object_index < malformed.objects.size(); ++object_index) {
+      MaterialIRObject &captured = malformed.objects[object_index];
+      if (captured.kind != geometric_object::BLOCK || captured.parameters.size() < 15 ||
+          !std::isinf(captured.parameters[12]))
+        continue;
+      captured.low[1] = -0.09375;
+      captured.high[1] = 0.125;
+      for (MaterialIRGeometryImage &image : malformed.images)
+        if (image.object == object_index)
+          image.low[1] = -0.09375 + image.shift[1],
+          image.high[1] = 0.125 + image.shift[1];
+      found = true;
+      break;
+    }
+    CHECK(found, "material IR infinite-AABB mutation fixture has no infinite block");
+    if (found)
+      expect_material_ir_rejected(malformed, "coordinated infinite-shape transverse AABB");
+  }
+  {
     MaterialIR legal = *ir;
     bool found = false;
-    for (MaterialIRObject &captured : legal.objects)
+    for (size_t object_index = 0; object_index < legal.objects.size(); ++object_index) {
+      MaterialIRObject &captured = legal.objects[object_index];
       if (captured.kind == geometric_object::PRISM) {
         captured.parameters[3] = infinite_extent;
         found = true;
         break;
       }
+    }
     CHECK(found, "material IR infinity fixture has no prism");
-    refresh_material_ir_signatures_for_testing(legal);
-    validate_material_ir(legal);
+    if (found) expect_material_ir_rejected(legal, "stale infinite prism fixed state");
     legal = *ir;
     found = false;
-    for (MaterialIRObject &captured : legal.objects)
+    for (size_t object_index = 0; object_index < legal.objects.size(); ++object_index) {
+      MaterialIRObject &captured = legal.objects[object_index];
       if (captured.kind == geometric_object::CYLINDER) {
         captured.parameters[7] = infinite_extent;
         found = true;
         break;
       }
+    }
     CHECK(found, "material IR infinity fixture has no cylinder");
-    refresh_material_ir_signatures_for_testing(legal);
-    validate_material_ir(legal);
+    if (found) expect_material_ir_rejected(legal, "stale infinite cylinder fixed state");
   }
   bool saw_file = false, saw_grid = false, saw_user = false;
   for (const MaterialIRMaterial &material : ir->materials) {
@@ -7423,8 +7557,8 @@ static void test_geometry_backed_material_ir() {
                (material.kind == material_data::MATERIAL_USER && material.host_callback &&
                 material.do_averaging);
   }
-  CHECK(saw_file && saw_grid && saw_user && ir->contains_host_callback &&
-            !ir->device_native_eligible,
+  CHECK(saw_file && saw_grid && saw_user && !ir->contains_host_callback &&
+            ir->device_native_eligible,
         "material IR omitted or altered FILE/GRID/USER variant metadata");
   CHECK(or_to_all(!ir->pml_axes.empty()) && or_to_all(!ir->topology.empty()),
         "geometry-backed IR omitted distributed PML or topology input");
@@ -7452,11 +7586,11 @@ static void test_geometry_backed_material_ir() {
   }
   {
     MaterialIR malformed = *ir;
-    malformed.roots.push_back(malformed.roots[0]);
-    expect_material_ir_rejected(malformed, "duplicate material IR root");
+    malformed.objects[0].root_identity = malformed.root_count;
+    expect_material_ir_rejected(malformed, "out-of-range material IR root identity");
     malformed = *ir;
-    malformed.objects[malformed.roots[0]].children.push_back(malformed.roots[0]);
-    expect_material_ir_rejected(malformed, "cyclic/non-compound material IR child");
+    ++malformed.objects[0].leaf_ordinal;
+    expect_material_ir_rejected(malformed, "noncanonical material IR leaf ordinal");
     malformed = *ir;
     malformed.materials[malformed.default_material].kind = 999;
     expect_material_ir_rejected(malformed, "invalid material IR variant tag");
@@ -7467,6 +7601,65 @@ static void test_geometry_backed_material_ir() {
         break;
       }
     expect_material_ir_rejected(malformed, "short material IR medium schema");
+    const auto make_singular_tensor = [](std::vector<double> &values, size_t base,
+                                         bool magnetic) {
+      const size_t diagonal = base + (magnetic ? 9 : 0);
+      const size_t offdiagonal = base + (magnetic ? 12 : 3);
+      values[diagonal] = values[diagonal + 1] = values[diagonal + 2] = 1.0;
+      for (size_t i = 0; i < 6; ++i) values[offdiagonal + i] = 0.0;
+      values[offdiagonal] = 1.0;
+    };
+    malformed = *ir;
+    for (MaterialIRMaterial &material : malformed.materials)
+      if (material.kind == material_data::MEDIUM && !material.parameters.empty()) {
+        make_singular_tensor(material.parameters, 0, false);
+        make_singular_tensor(material.comparison_medium, 0, false);
+        break;
+      }
+    expect_material_ir_rejected(malformed, "singular ordinary geometry tensor");
+    malformed = *ir;
+    for (MaterialIRMaterial &material : malformed.materials)
+      if (material.kind == material_data::MATERIAL_GRID && material.parameters.size() >= 41) {
+        make_singular_tensor(material.parameters, 3, false);
+        break;
+      }
+    expect_material_ir_rejected(malformed, "singular MaterialGrid endpoint tensor");
+    malformed = *ir;
+    for (MaterialIRMaterial &material : malformed.materials)
+      if (material.kind == material_data::MATERIAL_GRID &&
+          material.comparison_medium.size() >= 18) {
+        make_singular_tensor(material.comparison_medium, 0, true);
+        break;
+      }
+    expect_material_ir_rejected(malformed, "singular MaterialGrid comparison tensor");
+    malformed = *ir;
+    for (MaterialIRMaterial &material : malformed.materials)
+      if (material.kind == material_data::MATERIAL_FILE && material.parameters.size() >= 18) {
+        make_singular_tensor(material.parameters, 0, true);
+        break;
+      }
+    expect_material_ir_rejected(malformed, "singular FILE magnetic tensor");
+    {
+      MaterialIR allowed = *ir;
+      for (MaterialIRMaterial &material : allowed.materials)
+        if (material.kind == material_data::MEDIUM && !material.parameters.empty()) {
+          material.parameters[0] = 0.0;
+          material.comparison_medium[0] = 0.0;
+          break;
+        }
+      refresh_material_ir_signatures_for_testing(allowed);
+      validate_material_ir(allowed);
+    }
+    {
+      MaterialIR allowed = *ir;
+      for (MaterialIRMaterial &material : allowed.materials)
+        if (material.kind == material_data::MATERIAL_FILE && material.parameters.size() >= 9) {
+          make_singular_tensor(material.parameters, 0, false);
+          break;
+        }
+      refresh_material_ir_signatures_for_testing(allowed);
+      validate_material_ir(allowed);
+    }
     malformed = *ir;
     malformed.susceptibilities[0].parameters.resize(8);
     expect_material_ir_rejected(malformed, "short material IR susceptibility schema");
@@ -7549,7 +7742,6 @@ static void test_geometry_backed_material_ir() {
     malformed = *ir;
     MaterialIRObject &mesh = malformed.objects.back();
     mesh.kind = geometric_object::MESH;
-    mesh.children.clear();
     mesh.parameters.assign(4, 0.0);
     mesh.vertices = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
     mesh.indices = {0.0, 1.0, 3.0};
@@ -7562,11 +7754,11 @@ static void test_geometry_backed_material_ir() {
       }
     expect_material_ir_rejected(malformed, "overflowing material IR block subtype");
     malformed = *ir;
-    malformed.objects[ir->roots[0]].parameters[0] =
+    malformed.objects[0].parameters[0] =
         std::numeric_limits<double>::quiet_NaN();
     expect_material_ir_rejected(malformed, "NaN material IR object center");
     malformed = *ir;
-    malformed.objects[ir->roots[0]].parameters[0] = infinite_extent;
+    malformed.objects[0].parameters[0] = infinite_extent;
     expect_material_ir_rejected(malformed, "illegal infinite material IR object center");
     malformed = *ir;
     for (MaterialIRObject &candidate : malformed.objects)
@@ -7595,6 +7787,76 @@ static void test_geometry_backed_material_ir() {
         "material IR susceptibility identities do not preserve CPU state-index order");
   const uint64_t signature = ir->signature;
   const uint64_t layout_signature = ir->layout_signature;
+  {
+    MaterialIR route_only = *ir;
+    route_only.requires_hybrid = !route_only.requires_hybrid;
+    refresh_material_ir_signatures_for_testing(route_only);
+    CHECK(route_only.signature == signature && route_only.layout_signature != layout_signature,
+          "rank/layout-derived hybrid route polluted the semantic signature");
+  }
+  {
+    const double point[3] = {0.0, 0.0, 0.0};
+    uint32_t image = std::numeric_limits<uint32_t>::max();
+    const uint32_t material = material_ir_material_at_point(*ir, point, &image);
+    const bool selected = material < ir->materials.size() && image < ir->images.size() &&
+                          material == uint32_t(ir->objects[ir->images[image].object].material);
+    CHECK(or_to_all(selected),
+          "pointer-free material evaluator did not select a live geometry image");
+    MaterialIR default_grid = *ir;
+    default_grid.default_material = default_grid.extra_materials[1];
+    const double grid_value = material_ir_grid_value_at_point(
+        default_grid, point, std::numeric_limits<uint32_t>::max());
+    const double raw = 0.5;
+    const double expected_grid =
+        (tanh(8.0 * 0.45) + tanh(8.0 * (raw - 0.45))) /
+        (tanh(8.0 * 0.45) + tanh(8.0 * (1.0 - 0.45)));
+    CHECK(fabs(grid_value - expected_grid) < 1e-14,
+          "pointer-free default MaterialGrid evaluator changed interpolation/projection");
+  }
+  CHECK(or_to_all(!ir->bulk_spans.empty()),
+        "geometry partition fixture did not exercise bulk work");
+  CHECK(or_to_all(!ir->hybrid_patches.empty()),
+        "geometry partition fixture did not exercise patch work");
+  const int patch_ranks = sum_to_all(int(!ir->hybrid_patches.empty()));
+  CHECK(ir->requires_hybrid && patch_ranks > 0,
+        "global hybrid route did not reconcile a rank-local patch");
+  if (count_processors() >= 4)
+    CHECK(patch_ranks < count_processors(),
+          "rank-asymmetric fixture unexpectedly gave every rank a local patch");
+  {
+    MaterialIR malformed = *ir;
+    bool swapped = false;
+    for (size_t i = 1; i < malformed.images.size(); ++i)
+      if (malformed.images[i - 1].precedence == malformed.images[i].precedence) {
+        std::swap(malformed.images[i - 1], malformed.images[i]);
+        malformed.images[i - 1].ordinal = uint32_t(i - 1);
+        malformed.images[i].ordinal = uint32_t(i);
+        swapped = true;
+        break;
+      }
+    CHECK(swapped, "periodic image fixture has no equal-precedence tie");
+    if (swapped) expect_material_ir_rejected(malformed, "re-signed equal-precedence image swap");
+    malformed = *ir;
+    malformed.objects[0].low[0] += 0.03125;
+    for (MaterialIRGeometryImage &candidate : malformed.images)
+      if (candidate.object == 0) candidate.low[0] += 0.03125;
+    expect_material_ir_rejected(malformed, "coordinated stale object/image AABB");
+    if (!ir->bulk_spans.empty() && ir->bulk_spans[0].count > 1) {
+      malformed = *ir;
+      MaterialIRBulkSpan tail = malformed.bulk_spans[0];
+      tail.first_point += 1;
+      --tail.count;
+      malformed.bulk_spans[0].count = 1;
+      malformed.bulk_spans.insert(malformed.bulk_spans.begin() + 1, tail);
+      expect_material_ir_rejected(malformed, "nonmaximal material IR bulk spans");
+    }
+    if (!ir->hybrid_patches.empty()) {
+      malformed = *ir;
+      malformed.hybrid_patches[0].reason = MaterialIRPatchReason::negative_material_fallback;
+      malformed.hybrid_patches[0].negative_fallback = false;
+      expect_material_ir_rejected(malformed, "re-signed hybrid patch reason");
+    }
+  }
   {
     MaterialIR projected = *ir;
     projected.projection_offset = 0.125;
@@ -7661,39 +7923,15 @@ static void test_geometry_backed_material_ir() {
     uint64_t exact_dense_bytes = 0;
     for (const MaterialRecipeRow &row : geometry_recipe.rows())
       exact_dense_bytes += row.values.size();
-    CHECK(geometry_recipe.disposition() == MaterialRecipeDisposition::host_reference &&
-              support.disposition == MaterialRecipeDisposition::host_reference &&
-              support.reason_bits == material_support_object_lookup &&
+    CHECK(geometry_recipe.disposition() == MaterialRecipeDisposition::hybrid_interface &&
+              support.disposition == MaterialRecipeDisposition::hybrid_interface &&
+              support.reason_bits == material_support_none &&
               support.compact_input_bytes == expected_compact_material_ir_bytes(*ir) &&
               support.dense_fallback_bytes == exact_dense_bytes,
-          "geometry-backed recipe did not freeze its host-reference support route");
-    CHECK(ir->extra_materials.size() == 3 && ir->contains_host_callback,
+          "geometry-backed recipe did not freeze its hybrid support route");
+    CHECK(ir->extra_materials.size() == 3 && !ir->contains_host_callback,
           "support fixture lost its unused extra material variants");
 
-    MaterialRecipeInput referenced = material_recipe_input(geometry_recipe);
-    std::shared_ptr<MaterialIR> referenced_ir(new MaterialIR(*ir));
-    referenced_ir->objects[referenced_ir->roots[0]].material =
-        int(referenced_ir->extra_materials[1]);
-    refresh_material_ir_signatures_for_testing(*referenced_ir);
-    referenced.ir = referenced_ir;
-    referenced.support_reason_bits =
-        material_support_object_lookup | material_support_adaptive_averaging;
-    MaterialRecipe referenced_grid(referenced);
-    CHECK(classify_material_support(referenced_grid).reason_bits ==
-              referenced.support_reason_bits,
-          "support classification ignored averaging on an object-referenced material");
-
-    referenced = material_recipe_input(geometry_recipe);
-    referenced_ir.reset(new MaterialIR(*ir));
-    referenced_ir->default_material = referenced_ir->extra_materials[2];
-    refresh_material_ir_signatures_for_testing(*referenced_ir);
-    referenced.ir = referenced_ir;
-    referenced.support_reason_bits =
-        material_support_object_lookup | material_support_unowned_callback;
-    MaterialRecipe referenced_user(referenced);
-    CHECK(classify_material_support(referenced_user).reason_bits ==
-              referenced.support_reason_bits,
-          "support classification ignored the referenced default callback material");
     MaterialRecipeInput malformed_recipe = material_recipe_input(geometry_recipe);
     malformed_recipe.support_reason_bits ^= material_support_unowned_callback;
     expect_material_recipe_rejected(malformed_recipe,
@@ -7843,6 +8081,521 @@ static void test_geometry_backed_material_ir() {
               or_to_all(support.native_points > 0) &&
               support.compact_input_bytes > 0,
           "uniform owned material IR was not classified device-native before allocation");
+  }
+  {
+    material_type lower_grid = new material_data();
+    material_type upper_grid = new material_data();
+    material_type default_grid = new material_data();
+    material_type grids[3] = {lower_grid, upper_grid, default_grid};
+    const double weights[3] = {0.2, 0.8, 0.4};
+    for (int i = 0; i < 3; ++i) {
+      grids[i]->which_subclass = material_data::MATERIAL_GRID;
+      grids[i]->do_averaging = true;
+      grids[i]->material_grid_kinds = material_data::U_MEAN;
+      grids[i]->grid_size = make_vector3(1, 1, 1);
+      grids[i]->weights = new double[1]{weights[i]};
+      grids[i]->medium_1 = medium_struct(1.0);
+      grids[i]->medium_2 = medium_struct(4.0);
+      grids[i]->beta = 0.0;
+      grids[i]->eta = 0.5;
+      grids[i]->damping = 0.0;
+    }
+    geometric_object grid_objects[2] = {
+        make_block(lower_grid, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                   make_vector3(0, 0, 1), make_vector3(0.75, 0.75, 1.0)),
+        make_block(upper_grid, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                   make_vector3(0, 0, 1), make_vector3(0.5, 0.5, 1.0))};
+    geometric_object_list grid_geometry = {2, grid_objects};
+    structure grid_structure(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+    set_materials_from_geometry(&grid_structure, grid_geometry, make_vector3(), true, 1e-5,
+                                128, false, default_grid);
+    const MaterialIR &grid_ir =
+        *static_cast<const MaterialIR *>(grid_structure.material_ir.get());
+    const double point[3] = {0.0, 0.0, 0.0};
+    uint32_t winner = std::numeric_limits<uint32_t>::max();
+    material_ir_material_at_point(grid_ir, point, &winner);
+    const bool local_grid_match = winner < grid_ir.images.size() &&
+                                  fabs(material_ir_grid_value_at_point(grid_ir, point, winner) -
+                                       (weights[1] + weights[0] + weights[2]) / 3.0) < 1e-14;
+    CHECK(or_to_all(local_grid_match),
+          "ordered overlapping/default MaterialGrid mean composition changed");
+    const bool local_grid_patch = !grid_ir.hybrid_patches.empty() &&
+                                  grid_ir.hybrid_patches[0].reason ==
+                                      MaterialIRPatchReason::material_grid_averaging &&
+                                  grid_ir.hybrid_patches[0].variable_material;
+    CHECK(or_to_all(local_grid_patch),
+          "MaterialGrid patch lost variable-material provenance");
+    {
+      geometric_object_list object_grid_geometry = {1, &grid_objects[0]};
+      structure object_grid_structure(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(),
+                                      identity(), 1);
+      set_materials_from_geometry(&object_grid_structure, object_grid_geometry, make_vector3(),
+                                  true, 1e-5, 128, false, vacuum);
+      const MaterialIR &object_grid_ir =
+          *static_cast<const MaterialIR *>(object_grid_structure.material_ir.get());
+      bool local_object_grid_patch = false;
+      for (const MaterialIRHybridPatch &patch : object_grid_ir.hybrid_patches)
+        local_object_grid_patch = local_object_grid_patch ||
+                                  (patch.variable_causes & material_variable_grid) != 0 &&
+                                      patch.variable_material &&
+                                      patch.reason ==
+                                          MaterialIRPatchReason::material_grid_averaging;
+      CHECK(or_to_all(local_object_grid_patch),
+            "object MaterialGrid over constant default lost its exact grid cause");
+    }
+    {
+      const int kinds[4] = {material_data::U_DEFAULT, material_data::U_MIN,
+                            material_data::U_PROD, material_data::U_MEAN};
+      material_type_list no_extra;
+      no_extra.num_items = 0;
+      no_extra.items = NULL;
+      for (int kind : kinds) {
+        for (material_type grid : grids)
+          grid->material_grid_kinds =
+              static_cast<decltype(grid->material_grid_kinds)>(kind);
+        structure reducer_structure(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+        set_materials_from_geometry(&reducer_structure, grid_geometry, make_vector3(), false,
+                                    1e-5, 128, false, default_grid);
+        const MaterialIR &reducer_ir =
+            *static_cast<const MaterialIR *>(reducer_structure.material_ir.get());
+        geom_epsilon oracle(grid_geometry, no_extra,
+                            reducer_structure.gv.pad().surroundings());
+        int object_index = -1;
+        geom_box_tree tree = geom_tree_search(make_vector3(), oracle.geometry_tree,
+                                              &object_index);
+        CHECK(tree && object_index >= 0, "MaterialGrid CPU oracle found no winning object");
+        const double cpu_value =
+            matgrid_val(make_vector3(), tree, object_index,
+                        static_cast<material_data *>(tree->objects[object_index].o->material));
+        uint32_t reducer_winner = std::numeric_limits<uint32_t>::max();
+        material_ir_material_at_point(reducer_ir, point, &reducer_winner);
+        const bool local_reducer_match =
+            reducer_winner < reducer_ir.images.size() &&
+            fabs(material_ir_grid_value_at_point(reducer_ir, point, reducer_winner) - cpu_value) <=
+                16.0 * std::numeric_limits<double>::epsilon() *
+                    std::max(1.0, fabs(cpu_value));
+        CHECK(or_to_all(local_reducer_match),
+              "MaterialGrid reducer %d diverged from the CPU contributor walk", kind);
+        CHECK(reducer_ir.hybrid_patches.empty() && reducer_ir.analytic_interfaces.empty(),
+              "non-averaged MaterialGrid reducer %d produced interface work", kind);
+      }
+      for (material_type grid : grids) grid->material_grid_kinds = material_data::U_MEAN;
+    }
+    geometric_object_destroy(grid_objects[1]);
+    geometric_object_destroy(grid_objects[0]);
+    for (material_type grid : grids) material_free(grid);
+  }
+  {
+    material_type block_medium = make_dielectric(5.0);
+    geometric_object analytic_block =
+        make_block(block_medium, make_vector3(0.03, -0.02, 0.0), make_vector3(1, 0, 0),
+                   make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                   make_vector3(0.63, 0.61, 1.0));
+    geometric_object_list analytic_geometry = {1, &analytic_block};
+    structure analytic_structure(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+    set_materials_from_geometry(&analytic_structure, analytic_geometry, make_vector3(), true,
+                                1e-5, 256, false, vacuum);
+    const MaterialIR &analytic_ir =
+        *static_cast<const MaterialIR *>(analytic_structure.material_ir.get());
+    size_t eligible_destinations = 0;
+    for (const MaterialIRDestination &destination : analytic_ir.destinations)
+      eligible_destinations += destination.property == MaterialIRProperty::chi1inv &&
+                               destination.tensor_column >= 0;
+    const double inside_point[3] = {0.0, 0.0, 0.0};
+    const double outside_point[3] = {0.49, 0.49, 0.0};
+    CHECK(analytic_ir.eps_averaging && or_to_all(eligible_destinations > 0),
+          "axis-aligned block fixture has no averaging-eligible destination");
+    const uint32_t inside_material = material_ir_material_at_point(analytic_ir, inside_point);
+    const uint32_t outside_material = material_ir_material_at_point(analytic_ir, outside_point);
+    const bool local_interface = inside_material != outside_material;
+    CHECK(or_to_all(local_interface),
+          "axis-aligned block fixture did not preserve its material interface");
+    const bool local_distinct_payloads =
+        local_interface && inside_material < analytic_ir.materials.size() &&
+        outside_material < analytic_ir.materials.size() &&
+        analytic_ir.materials[inside_material].comparison_medium !=
+            analytic_ir.materials[outside_material].comparison_medium;
+    CHECK(or_to_all(local_distinct_payloads),
+          "axis-aligned block fixture collapsed distinct CPU medium equality payloads");
+    CHECK(or_to_all(local_interface &&
+                    !material_ir_materials_equal(analytic_ir, inside_material,
+                                                 outside_material)),
+          "axis-aligned block fixture compared distinct CPU media equal");
+    CHECK(or_to_all(!analytic_ir.bulk_spans.empty()),
+          "axis-aligned block fixture omitted bulk work");
+    CHECK(or_to_all(!analytic_ir.analytic_interfaces.empty()),
+          "axis-aligned block fixture omitted planar-face analytic work (count=%zu)",
+          analytic_ir.analytic_interfaces.size());
+    CHECK(or_to_all(!analytic_ir.hybrid_patches.empty()),
+          "axis-aligned block fixture omitted edge/corner patch work (count=%zu)",
+          analytic_ir.hybrid_patches.size());
+    if (!analytic_ir.analytic_interfaces.empty()) {
+      const MaterialIRAnalyticInterface &job = analytic_ir.analytic_interfaces[0];
+      int nonzero = 0;
+      for (int axis = 0; axis < 3; ++axis) nonzero += job.normal[axis] != 0.0;
+      CHECK(nonzero == 1 && job.fill > 0.0 && job.fill < 1.0,
+            "analytic block face record has a non-planar normal/fill");
+      MaterialIR malformed = analytic_ir;
+      malformed.analytic_interfaces[0].fill = 0.25;
+      expect_material_ir_rejected(malformed, "re-signed analytic fill");
+    }
+    geometric_object_destroy(analytic_block);
+    material_free(block_medium);
+  }
+  {
+    material_type mesh_medium = make_dielectric(6.0);
+    const vector3 vertices[8] = {
+        make_vector3(-1, -1, -1), make_vector3(1, -1, -1),
+        make_vector3(1, 1, -1), make_vector3(-1, 1, -1),
+        make_vector3(-1, -1, 1), make_vector3(1, -1, 1),
+        make_vector3(1, 1, 1), make_vector3(-1, 1, 1)};
+    const int triangles[36] = {0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7,
+                               0, 1, 5, 0, 5, 4, 1, 2, 6, 1, 6, 5,
+                               2, 3, 7, 2, 7, 6, 3, 0, 4, 3, 4, 7};
+    geometric_object mesh_object = make_mesh(mesh_medium, vertices, 8, triangles, 12);
+    geom_fix_object_ptr(&mesh_object);
+    geometric_object_list mesh_geometry = {1, &mesh_object};
+    structure mesh_structure(vol3d(3.0, 3.0, 3.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+    set_materials_from_geometry(&mesh_structure, mesh_geometry, make_vector3(), false, 1e-5,
+                                128, false, vacuum);
+    const MaterialIR &mesh_ir =
+        *static_cast<const MaterialIR *>(mesh_structure.material_ir.get());
+    CHECK(mesh_ir.objects.size() == 1 && mesh_ir.objects[0].kind == geometric_object::MESH &&
+              mesh_ir.objects[0].triangle_count == 12 && mesh_ir.objects[0].bvh_count > 1 &&
+              mesh_ir.geometry_bvh_face_ids.size() == 12 &&
+              fabs(mesh_ir.objects[0].mesh_lengthscale - sqrt(12.0)) <=
+                  4.0 * std::numeric_limits<double>::epsilon() * sqrt(12.0),
+          "fixed cube mesh triangles/BVH/lengthscale were not captured");
+    size_t internal_nodes = 0, leaf_nodes = 0, covered_faces = 0;
+    for (size_t i = 0; i < mesh_ir.objects[0].bvh_count; ++i) {
+      const MaterialIRBvhNode &node =
+          mesh_ir.geometry_bvh[mesh_ir.objects[0].bvh_offset + i];
+      if (node.leaf) {
+        ++leaf_nodes;
+        covered_faces += node.triangle_count;
+        CHECK(node.triangle_count >= 1 && node.triangle_count <= 4,
+              "mesh BVH leaf has a noncanonical face count");
+      }
+      else {
+        ++internal_nodes;
+        CHECK(node.triangle_count == 0 && node.first_triangle == 0,
+              "mesh BVH internal node retained a leaf span");
+      }
+    }
+    CHECK(internal_nodes > 0 && leaf_nodes > 1 && covered_faces == 12,
+          "cube mesh did not force a complete multi-node BVH");
+    MaterialIR global_mesh_ir = mesh_ir;
+    global_mesh_ir.active_images.clear();
+    for (uint32_t image = 0; image < global_mesh_ir.images.size(); ++image)
+      global_mesh_ir.active_images.push_back(image);
+    const double mesh_points[][3] = {{0, 0, 0},
+                                     {1.25, 0, 0},
+                                     {1, 0.125, -0.25},
+                                     {std::nextafter(1.0, 0.0), 0.125, -0.25},
+                                     {1.0 - 1e-10, 0.125, -0.25},
+                                     {std::nextafter(1.0, infinite_extent), 0.125, -0.25},
+                                     {-1, 0.125, -0.25}};
+    for (const auto &point_values : mesh_points) {
+      const vector3 point = make_vector3(point_values[0], point_values[1], point_values[2]);
+      const bool cpu_inside = point_in_fixed_objectp(point, mesh_object);
+      const bool ir_inside =
+          material_ir_material_at_point(global_mesh_ir, point_values) ==
+          uint32_t(global_mesh_ir.objects[0].material);
+      CHECK(ir_inside == cpu_inside,
+            "pointer-free cube mesh containment diverged at (%g,%g,%g)", point_values[0],
+            point_values[1], point_values[2]);
+    }
+    const double inside[3] = {0.0, 0.0, 0.0};
+    const bool local_mesh_inside = material_ir_material_at_point(global_mesh_ir, inside) ==
+                                   uint32_t(global_mesh_ir.objects[0].material);
+    MaterialIR open_mesh = mesh_ir;
+    open_mesh.active_images = global_mesh_ir.active_images;
+    open_mesh.objects[0].parameters[3] = 0.0;
+    CHECK(local_mesh_inside && material_ir_material_at_point(open_mesh, inside) ==
+                                   open_mesh.default_material,
+          "pointer-free mesh evaluator did not preserve open-mesh non-containment");
+    geometric_object_destroy(mesh_object);
+    material_free(mesh_medium);
+  }
+  {
+    material_type atlas_medium = make_dielectric(7.0);
+    const auto check_shape = [&](const char *label, geometric_object &shape,
+                                 const std::vector<vector3> &points) {
+      geom_fix_object_ptr(&shape);
+      geometric_object_list atlas_geometry = {1, &shape};
+      structure atlas_structure(vol3d(8.0, 8.0, 8.0, 4.0), unit_epsilon, no_pml(),
+                                identity(), 1);
+      set_materials_from_geometry(&atlas_structure, atlas_geometry, make_vector3(), false,
+                                  1e-5, 128, false, vacuum);
+      MaterialIR atlas_ir =
+          *static_cast<const MaterialIR *>(atlas_structure.material_ir.get());
+      atlas_ir.active_images.clear();
+      for (uint32_t image = 0; image < atlas_ir.images.size(); ++image)
+        atlas_ir.active_images.push_back(image);
+      bool saw_inside = false, saw_outside = false;
+      for (const vector3 &point : points) {
+        const bool cpu_inside = point_in_fixed_objectp(point, shape);
+        const double encoded[3] = {point.x, point.y, point.z};
+        const bool ir_inside = material_ir_material_at_point(atlas_ir, encoded) ==
+                               uint32_t(atlas_ir.objects[0].material);
+        CHECK(ir_inside == cpu_inside,
+              "%s pointer-free containment diverged at (%.17g,%.17g,%.17g)", label, point.x,
+              point.y, point.z);
+        saw_inside = saw_inside || cpu_inside;
+        saw_outside = saw_outside || !cpu_inside;
+      }
+      CHECK(saw_inside && saw_outside, "%s containment oracle was vacuous", label);
+      CHECK(atlas_ir.hybrid_patches.empty() && atlas_ir.analytic_interfaces.empty() &&
+                or_to_all(!atlas_ir.bulk_spans.empty()),
+            "%s non-averaged geometry did not remain bulk-only", label);
+    };
+    geometric_object sphere = make_sphere(atlas_medium, make_vector3(), 1.0);
+    check_shape("sphere", sphere,
+                {make_vector3(), make_vector3(1, 0, 0),
+                 make_vector3(std::nextafter(1.0, 0.0), 0, 0),
+                 make_vector3(std::nextafter(1.0, infinite_extent), 0, 0)});
+    geometric_object_destroy(sphere);
+    geometric_object ellipsoid =
+        make_ellipsoid(atlas_medium, make_vector3(), make_vector3(1, 0, 0),
+                       make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                       make_vector3(4, 2, 6));
+    check_shape("ellipsoid", ellipsoid,
+                {make_vector3(), make_vector3(2, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 3),
+                 make_vector3(std::nextafter(2.0, infinite_extent), 0, 0)});
+    geometric_object_destroy(ellipsoid);
+    geometric_object cylinder =
+        make_cylinder(atlas_medium, make_vector3(), 1.0, 2.0, make_vector3(0, 0, 1));
+    check_shape("cylinder", cylinder,
+                {make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 0, 1),
+                 make_vector3(std::nextafter(1.0, infinite_extent), 0, 0),
+                 make_vector3(0, 0, 1.01)});
+    geometric_object_destroy(cylinder);
+    geometric_object cone =
+        make_cone(atlas_medium, make_vector3(), 1.0, 2.0, make_vector3(0, 0, 1), 0.5);
+    check_shape("cone", cone,
+                {make_vector3(1, 0, -1), make_vector3(0.75, 0, 0),
+                 make_vector3(0.5, 0, 1),
+                 make_vector3(std::nextafter(0.75, infinite_extent), 0, 0)});
+    geometric_object_destroy(cone);
+    geometric_object wedge = make_wedge(atlas_medium, make_vector3(), 1.0, 2.0,
+                                         make_vector3(0, 0, 1), 0.5 * M_PI,
+                                         make_vector3(1, 0, 0));
+    check_shape("wedge", wedge,
+                {make_vector3(0.5, 0.5, 0), make_vector3(-0.5, 0.5, 0),
+                 make_vector3(0.5, -0.5, 0), make_vector3(0, 0.5, 0)});
+    geometric_object_destroy(wedge);
+    geometric_object negative_wedge =
+        make_wedge(atlas_medium, make_vector3(), 1.0, 2.0, make_vector3(0, 0, 1),
+                   -0.5 * M_PI, make_vector3(1, 0, 0));
+    check_shape("negative wedge", negative_wedge,
+                {make_vector3(0.5, -0.5, 0), make_vector3(0.5, 0.5, 0),
+                 make_vector3(0, -0.5, 0), make_vector3(-1e-12, -0.5, 0)});
+    geometric_object_destroy(negative_wedge);
+    geometric_object transformed_block =
+        make_block(atlas_medium, make_vector3(0.25, -0.5, 0.125), make_vector3(0, 1, 0),
+                   make_vector3(-1, 0, 0), make_vector3(0, 0, 1), make_vector3(2, 1, 3));
+    check_shape("transformed block", transformed_block,
+                {make_vector3(0.25, -0.5, 0.125), make_vector3(-0.15, 0.4, 1.525),
+                 make_vector3(0.25, 0.51, 0.125)});
+    geometric_object_destroy(transformed_block);
+    const vector3 square[4] = {make_vector3(-1, -1), make_vector3(1, -1),
+                               make_vector3(1, 1), make_vector3(-1, 1)};
+    geometric_object square_prism =
+        make_prism_with_center(atlas_medium, make_vector3(), square, 4, 2.0,
+                               make_vector3(0, 0, 1));
+    check_shape("prism", square_prism,
+                {make_vector3(), make_vector3(1, 0, 0), make_vector3(1.01, 0, 0)});
+    {
+      geometric_object_list prism_geometry = {1, &square_prism};
+      structure prism_structure(vol3d(4.0, 4.0, 4.0, 4.0), unit_epsilon, no_pml(),
+                                identity(), 1);
+      set_materials_from_geometry(&prism_structure, prism_geometry, make_vector3(), false,
+                                  1e-5, 128, false, vacuum);
+      MaterialIR include_ir =
+          *static_cast<const MaterialIR *>(prism_structure.material_ir.get());
+      include_ir.active_images.clear();
+      for (uint32_t image = 0; image < include_ir.images.size(); ++image)
+        include_ir.active_images.push_back(image);
+      MaterialIR exclude_ir = include_ir;
+      include_ir.prism_include_boundaries = true;
+      exclude_ir.prism_include_boundaries = false;
+      const double edge[3] = {1.0, 0.0, 0.0};
+      CHECK(material_ir_material_at_point(include_ir, edge) ==
+                uint32_t(include_ir.objects[0].material) &&
+                material_ir_material_at_point(exclude_ir, edge) == exclude_ir.default_material,
+            "prism side-boundary include/exclude policy diverged");
+      const prism &fixed_prism = *square_prism.subclass.prism_data;
+      CHECK(node_in_or_on_polygon(make_vector3(1, 0, 0), fixed_prism.vertices_p.items,
+                                  fixed_prism.vertices_p.num_items, true) &&
+                !node_in_or_on_polygon(make_vector3(1, 0, 0), fixed_prism.vertices_p.items,
+                                       fixed_prism.vertices_p.num_items, false),
+            "libctl prism boundary oracle did not distinguish include/exclude");
+    }
+    geometric_object_destroy(square_prism);
+    material_free(atlas_medium);
+  }
+  {
+    material_type periodic_media[3] = {make_dielectric(2.0), make_dielectric(3.0),
+                                       make_dielectric(3.0)};
+    geometric_object periodic_objects[3] = {
+        make_sphere(periodic_media[0], make_vector3(), 1.3),
+        make_sphere(periodic_media[1], make_vector3(), 0.25),
+        make_sphere(periodic_media[2], make_vector3(), 0.10)};
+    geometric_object_list periodic_geometry = {3, periodic_objects};
+    grid_volume periodic_volume = vol2d(2.0, 2.0, 8.0);
+    periodic_volume.center_origin();
+    structure periodic_structure(periodic_volume, unit_epsilon, no_pml(), identity(), 1);
+    geom_epsilon *periodic_oracle =
+        make_geom_epsilon(&periodic_structure, &periodic_geometry, make_vector3(), true, vacuum);
+    const double tie_x = -0.8;
+    const vector3 tie_point = make_vector3(tie_x, 0, 0);
+    vector3 cpu_shift = make_vector3();
+    bool cpu_object = false;
+    for (int ix = -1; ix <= 1 && !cpu_object; ++ix)
+      for (int iy = -1; iy <= 1 && !cpu_object; ++iy) {
+        const vector3 shift = make_vector3(ix * geometry_lattice.size.x,
+                                           iy * geometry_lattice.size.y, 0);
+        if (point_in_fixed_objectp(vector3_minus(tie_point, shift),
+                                   periodic_oracle->geometry.items[0]))
+          cpu_shift = shift, cpu_object = true;
+      }
+    MaterialIR periodic_ir = *static_cast<const MaterialIR *>(
+        capture_material_ir(periodic_structure, *periodic_oracle, false, 1e-5, 128, NULL).get());
+    periodic_ir.active_images.clear();
+    for (uint32_t image = 0; image < periodic_ir.images.size(); ++image)
+      periodic_ir.active_images.push_back(image);
+    const double selection_points[3][3] = {{0, 0, 0}, {0.20, 0, 0}, {0.50, 0, 0}};
+    const uint32_t expected_roots[3] = {2, 1, 0};
+    for (int i = 0; i < 3; ++i) {
+      uint32_t image = std::numeric_limits<uint32_t>::max();
+      material_ir_material_at_point(periodic_ir, selection_points[i], &image);
+      CHECK(image < periodic_ir.images.size() &&
+                periodic_ir.objects[periodic_ir.images[image].object].root_identity ==
+                    expected_roots[i],
+            "periodic overlap precedence selected the wrong root at sample %d", i);
+    }
+    const double encoded_tie[3] = {tie_x, 0, 0};
+    uint32_t tie_image = std::numeric_limits<uint32_t>::max();
+    material_ir_material_at_point(periodic_ir, encoded_tie, &tie_image);
+    uint32_t first_tie_image = std::numeric_limits<uint32_t>::max();
+    bool first_tie_contains = false;
+    for (uint32_t image = 0; image < periodic_ir.images.size(); ++image)
+      if (periodic_ir.objects[periodic_ir.images[image].object].root_identity == 0 &&
+          periodic_ir.images[image].shift[0] == cpu_shift.x &&
+          periodic_ir.images[image].shift[1] == cpu_shift.y) {
+        first_tie_image = image;
+        MaterialIR one_image = periodic_ir;
+        one_image.active_images.assign(1, image);
+        first_tie_contains = material_ir_material_at_point(one_image, encoded_tie) ==
+                             uint32_t(one_image.objects[one_image.images[image].object].material);
+        break;
+      }
+    CHECK(cpu_object && tie_image < periodic_ir.images.size() &&
+              periodic_ir.objects[periodic_ir.images[tie_image].object].root_identity == 0 &&
+              periodic_ir.images[tie_image].shift[0] == cpu_shift.x &&
+              periodic_ir.images[tie_image].shift[1] == cpu_shift.y &&
+              periodic_ir.images[tie_image].shift[2] == cpu_shift.z &&
+              periodic_ir.images[tie_image].image[0] == -1,
+          "equal-precedence periodic tie diverged: image=%u integer=%d shift=%g cpu_shift=%g "
+          "precedence=%d cpu_object=%d first=%u first_contains=%d images=%zu cell=%g bounds=%g,%g",
+          tie_image,
+          tie_image < periodic_ir.images.size() ? periodic_ir.images[tie_image].image[0] : 99,
+          tie_image < periodic_ir.images.size() ? periodic_ir.images[tie_image].shift[0] : 99.0,
+          cpu_shift.x,
+          tie_image < periodic_ir.images.size() ? periodic_ir.images[tie_image].precedence : -99,
+          cpu_object, first_tie_image, first_tie_contains, periodic_ir.images.size(),
+          periodic_ir.cell[3], periodic_ir.captured_volume[0], periodic_ir.captured_volume[3]);
+    delete periodic_oracle;
+    for (int i = 2; i >= 0; --i) {
+      geometric_object_destroy(periodic_objects[i]);
+      material_free(periodic_media[i]);
+    }
+  }
+  {
+    geom_initialize();
+    dimensions = 3;
+    geometry_center = make_vector3();
+    ensure_periodicity = false;
+    set_default_material(vacuum);
+    geometry_lattice.size = make_vector3(4, 4, 4);
+    geometry_lattice.basis_size = make_vector3(1, 1, 1);
+    geometry_lattice.basis1 = make_vector3(1, 0, 0);
+    geometry_lattice.basis2 = make_vector3(0.5, sqrt(3.0) * 0.5, 0);
+    geometry_lattice.basis3 = make_vector3(0, 0, 1);
+    geom_fix_lattice();
+    material_type skew_medium = make_dielectric(8.0);
+    geometric_object skew_sphere = make_sphere(skew_medium, make_vector3(), 1.0);
+    geometric_object_list skew_geometry = {1, &skew_sphere};
+    material_type_list no_extra;
+    no_extra.num_items = 0;
+    no_extra.items = NULL;
+    structure skew_structure(vol3d(4.0, 4.0, 4.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+    geom_epsilon skew_oracle(skew_geometry, no_extra,
+                             skew_structure.gv.pad().surroundings());
+    MaterialIR skew_ir = *static_cast<const MaterialIR *>(
+        capture_material_ir(skew_structure, skew_oracle, false, 1e-5, 128, NULL).get());
+    skew_ir.active_images.clear();
+    for (uint32_t image = 0; image < skew_ir.images.size(); ++image)
+      skew_ir.active_images.push_back(image);
+    const vector3 skew_points[5] = {
+        make_vector3(-0.5, 1, 0), make_vector3(0, 1, 0), make_vector3(0.5, 1, 0),
+        make_vector3(std::nextafter(1.0, 0.0), 0, 0),
+        make_vector3(std::nextafter(1.0, infinite_extent), 0, 0)};
+    for (const vector3 &point : skew_points) {
+      const bool cpu_inside = point_in_fixed_objectp(point, skew_oracle.geometry.items[0]);
+      const double encoded[3] = {point.x, point.y, point.z};
+      const bool ir_inside = material_ir_material_at_point(skew_ir, encoded) ==
+                             uint32_t(skew_ir.objects[0].material);
+      CHECK(ir_inside == cpu_inside,
+            "skew-lattice sphere containment diverged at (%g,%g,%g)", point.x, point.y,
+            point.z);
+    }
+    CHECK(skew_ir.lattice_metric[1] == geometry_lattice.metric.c0.y &&
+              skew_ir.lattice_metric[3] == geometry_lattice.metric.c1.x &&
+              skew_ir.lattice_metric[3] != 0.0,
+          "skew-lattice metric was not frozen into the material IR");
+    geometric_object_destroy(skew_sphere);
+    material_free(skew_medium);
+    geom_initialize();
+  }
+  {
+    geometric_object callback_block =
+        make_block(user_material, make_vector3(), make_vector3(1, 0, 0),
+                   make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                   make_vector3(2, 2, 1));
+    geometric_object_list callback_geometry = {1, &callback_block};
+    structure callback_structure(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+    geom_epsilon *callback_oracle = make_geom_epsilon(
+        &callback_structure, &callback_geometry, make_vector3(), false, vacuum);
+    material_ir_user_calls = 0;
+    std::shared_ptr<const void> callback_capture =
+        capture_material_ir(callback_structure, *callback_oracle, false, 1e-5, 128, NULL);
+    const MaterialIR &callback_ir =
+        *static_cast<const MaterialIR *>(callback_capture.get());
+    CHECK(material_ir_user_calls == 0 && callback_ir.contains_host_callback &&
+              !callback_ir.device_native_eligible && callback_ir.hybrid_patches.empty() &&
+              callback_ir.analytic_interfaces.empty(),
+          "reachable callback was evaluated during capture or entered geometry work");
+    set_materials_from_geom_epsilon(&callback_structure, callback_oracle, false, 1e-5, 128);
+    fields callback_fields(&callback_structure);
+    lifetime_counts callback_counts;
+    callback_fields.backend = new tracking_backend(callback_fields, callback_counts);
+    callback_fields.advance(1);
+    CHECK(callback_fields.initialization_plan &&
+              callback_fields.initialization_plan->materials.size() == 1,
+          "reachable callback fixture produced no material recipe");
+    if (callback_fields.initialization_plan &&
+        callback_fields.initialization_plan->materials.size() == 1) {
+      const MaterialRecipe &recipe = callback_fields.initialization_plan->materials[0];
+      const MaterialSupportDecision support = classify_material_support(recipe);
+      CHECK(recipe.disposition() == MaterialRecipeDisposition::host_reference &&
+                support.disposition == MaterialRecipeDisposition::host_reference &&
+                support.reason_bits == material_support_unowned_callback,
+            "reachable callback did not select the exact PR5.3 host-reference route");
+    }
+    delete callback_oracle;
+    geometric_object_destroy(callback_block);
   }
   destroy_absorber_list(absorbers);
   material_free(file_material);

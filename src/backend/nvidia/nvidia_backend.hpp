@@ -35,15 +35,26 @@ struct NvidiaMaterialInitializationStatistics {
   size_t pml_profile_bytes;
   size_t file_sample_bytes;
   size_t grid_weight_bytes;
+  size_t geometry_object_bytes;
+  size_t geometry_image_bytes;
+  size_t geometry_value_bytes;
+  size_t geometry_analytic_bytes;
+  size_t geometry_patch_bytes;
   size_t constant_fill_kernel_launches;
   size_t conductivity_kernel_launches;
   size_t file_table_kernel_launches;
   size_t grid_table_kernel_launches;
+  size_t geometry_bulk_kernel_launches;
+  size_t geometry_analytic_kernel_launches;
+  size_t geometry_patch_kernel_launches;
   size_t pointwise_kernel_launches;
   size_t pml_kernel_launches;
   size_t absorber_points_evaluated;
   size_t file_points_evaluated;
   size_t grid_points_evaluated;
+  size_t geometry_bulk_points;
+  size_t geometry_analytic_points;
+  size_t geometry_patch_points;
   size_t synchronizations;
   bool device_native;
   bool valid;
@@ -53,10 +64,15 @@ struct NvidiaMaterialInitializationStatistics {
         owned_ir_bytes(0), dense_oracle_bytes(0), dense_output_host_to_device_calls(0),
         dense_output_host_to_device_bytes(0),
         decoded_parameter_bytes(0), absorber_profile_bytes(0), pml_profile_bytes(0),
-        file_sample_bytes(0), grid_weight_bytes(0), constant_fill_kernel_launches(0),
+        file_sample_bytes(0), grid_weight_bytes(0), geometry_object_bytes(0),
+        geometry_image_bytes(0), geometry_value_bytes(0), geometry_analytic_bytes(0),
+        geometry_patch_bytes(0), constant_fill_kernel_launches(0),
         conductivity_kernel_launches(0), file_table_kernel_launches(0),
-        grid_table_kernel_launches(0), pointwise_kernel_launches(0), pml_kernel_launches(0),
+        grid_table_kernel_launches(0), geometry_bulk_kernel_launches(0),
+        geometry_analytic_kernel_launches(0), geometry_patch_kernel_launches(0),
+        pointwise_kernel_launches(0), pml_kernel_launches(0),
         absorber_points_evaluated(0), file_points_evaluated(0), grid_points_evaluated(0),
+        geometry_bulk_points(0), geometry_analytic_points(0), geometry_patch_points(0),
         synchronizations(0),
         device_native(false), valid(false) {}
 };
@@ -193,6 +209,14 @@ gyrotropic_coefficients derive_gyrotropic_coefficients(double omega_0, double ga
    enters host material mixing. */
 void validate_material_phase_state(const fields &f, uint64_t expected_target_signature);
 
+namespace testing {
+/* A process-local ceiling used only by the CUDA integration tests to prove
+   that the combined resident-plus-initialization peak is rejected before the
+   first candidate allocation. SIZE_MAX restores the physical-device budget. */
+void set_initialization_memory_budget_for_testing(size_t bytes);
+size_t initialization_memory_budget_for_testing();
+} // namespace testing
+
 } // namespace nvidia
 
 class NvidiaBackend : public ExecutionBackend {
@@ -261,6 +285,10 @@ private:
   int device_;
   size_t device_memory_bytes_;
   uint64_t next_state_token_;
+  mutable size_t pending_initialization_reserve_bytes_;
+  mutable size_t pending_initialization_compact_bytes_;
+  mutable bool pending_initialization_native_;
+  mutable bool pending_initialization_reserve_valid_;
 };
 
 /* Device selection must already be resolved and collectively validated. This

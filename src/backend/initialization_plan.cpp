@@ -127,6 +127,18 @@ InitializationPlan build_initialization_plan(fields &f) {
                    key.kind == int(array_kind::pml_siginv))
                       ? InitKind::pml_profile
                       : InitKind::material_geometry;
+        if (op.kind == InitKind::material_geometry && ir) {
+          bool found = false;
+          for (uint32_t destination = 0; destination < ir->destinations.size(); ++destination)
+            if (ir->destinations[destination].key == key) {
+              op.descriptor_index = destination;
+              found = true;
+              break;
+            }
+          if (!found)
+            throw std::logic_error(
+                "material initialization destination is absent from the immutable IR");
+        }
         break;
       case array_role::dft: op.kind = InitKind::zero; break;
       default: op.kind = InitKind::zero; break;

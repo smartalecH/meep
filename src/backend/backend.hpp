@@ -575,6 +575,7 @@ void backend_set_cw_clone_fail_after_for_testing(int checkpoints);
 void backend_cw_clone_checkpoint();
 void backend_set_cw_plan_corruption_for_testing(bool enabled);
 void backend_set_material_candidate_plan_failure_for_testing(int rank, int mode);
+void backend_set_initialization_only_for_testing(bool enabled);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI

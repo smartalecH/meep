@@ -52,6 +52,7 @@ static size_t host_custom_presence_scan_count_for_testing = 0;
 static bool host_custom_mpi_override_for_testing = false;
 static int material_candidate_plan_failure_rank_for_testing = -1;
 static int material_candidate_plan_failure_mode_for_testing = 0;
+static bool initialization_only_for_testing = false;
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
   ++host_custom_presence_scan_count_for_testing;
@@ -82,6 +83,10 @@ void backend_set_cw_plan_corruption_for_testing(bool enabled) {
 void backend_set_material_candidate_plan_failure_for_testing(int rank, int mode) {
   material_candidate_plan_failure_rank_for_testing = rank;
   material_candidate_plan_failure_mode_for_testing = mode;
+}
+
+void backend_set_initialization_only_for_testing(bool enabled) {
+  initialization_only_for_testing = enabled;
 }
 
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank) {
@@ -1851,6 +1856,7 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     local_error = "unknown resident candidate initialization failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate initialize");
+  if (initialization_only_for_testing) return true;
 
   try {
     ScopedArtifactBuildView view(f, candidate);
@@ -3105,6 +3111,7 @@ void fields::init_backend() {
     BackendState *replacement = NULL;
     std::string state_error;
     try {
+      backend->preflight_initialization(*staged_initialization);
       replacement = backend->create_state(provisional_storage);
     }
     catch (const std::exception &e) {

@@ -1,6 +1,7 @@
 /* Copyright (C) 2005-2026 Massachusetts Institute of Technology */
 
 #include "backend/nvidia/nvidia_initialization.hpp"
+#include "backend/nvidia/nvidia_materials.hpp"
 #include "backend/nvidia/runtime.hpp"
 
 #include <algorithm>
@@ -34,6 +35,730 @@ static void require_exact(const std::vector<T> &observed, const std::vector<T> &
   require(observed.size() == expected.size(), message);
   for (size_t i = 0; i < observed.size(); ++i)
     if (observed[i] != expected[i]) throw std::runtime_error(message);
+}
+
+static size_t append_aligned(std::vector<unsigned char> &bytes, const void *source,
+                             size_t count, size_t alignment) {
+  const size_t padding = (alignment - bytes.size() % alignment) % alignment;
+  bytes.insert(bytes.end(), padding, 0);
+  const size_t offset = bytes.size();
+  if (count) {
+    const unsigned char *begin = static_cast<const unsigned char *>(source);
+    bytes.insert(bytes.end(), begin, begin + count);
+  }
+  return offset;
+}
+
+template <typename T>
+static size_t append_record(std::vector<unsigned char> &bytes, const T &record) {
+  return append_aligned(bytes, &record, sizeof(record), alignof(T));
+}
+
+template <typename T>
+static void check_geometry_kernels(int device, scalar_precision precision) {
+  const size_t points = 257;
+  std::vector<unsigned char> compact;
+  const double parameters[4] = {0.0, 0.0, 0.0, 0.25};
+  const size_t parameter_offset =
+      append_aligned(compact, parameters, sizeof(parameters), alignof(double));
+  geometry_object_record object = {};
+  object.kind = 4;
+  object.material = 1;
+  object.parameter_offset = parameter_offset;
+  object.parameter_count = 4;
+  object.low[0] = object.low[1] = object.low[2] = -0.25;
+  object.high[0] = object.high[1] = object.high[2] = 0.25;
+  const size_t object_offset = append_record(compact, object);
+  geometry_image_record image = {};
+  image.object = 0;
+  image.ordinal = 0;
+  image.precedence = 1;
+  for (int axis = 0; axis < 3; ++axis) {
+    image.low[axis] = -0.25;
+    image.high[axis] = 0.25;
+  }
+  const size_t image_offset = append_record(compact, image);
+  geometry_value_record values[2] = {};
+  for (int material = 0; material < 2; ++material) {
+    values[material].kind = geometry_value_kind::constant;
+    values[material].tensor_1[0] = values[material].tensor_1[1] =
+        values[material].tensor_1[2] = material ? 4.0 : 1.0;
+  }
+  const size_t value_offset =
+      append_aligned(compact, values, sizeof(values), alignof(geometry_value_record));
+  geometry_analytic_record analytic = {};
+  analytic.point = 64;
+  analytic.front_material = 1;
+  analytic.behind_material = 0;
+  analytic.normal[0] = 1.0;
+  analytic.fill = 0.5;
+  const size_t analytic_offset = append_record(compact, analytic);
+  geometry_patch_record patches[2] = {{65, 0.625}, {192, 0.12345678901234567}};
+  const size_t patch_offset =
+      append_aligned(compact, patches, sizeof(patches), alignof(geometry_patch_record));
+
+  stream execution;
+  device_buffer device_compact(compact.size(), device);
+  std::vector<T> host(points + 2, T(-17.0));
+  device_buffer destination(host.size() * sizeof(T), device);
+  copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+  copy_host_to_device_async(destination, 0, host.data(), host.size() * sizeof(T), execution);
+  geometry_launch_common common = {};
+  common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+  common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
+  common.compact_input_bytes = compact.size();
+  common.object_offset = object_offset;
+  common.object_count = 1;
+  common.image_offset = image_offset;
+  common.image_count = 1;
+  common.value_offset = value_offset;
+  common.material_count = 2;
+  common.default_material = 0;
+  common.elements = points;
+  common.point_count = points;
+  common.dimensions = 2;
+  common.component = 0;
+  common.tensor_row = 0;
+  common.tensor_column = 0;
+  common.property = 0;
+  common.axis_direction[0] = 0;
+  common.axis_direction[1] = 1;
+  common.axis_direction[2] = 2;
+  common.loop_begin[0] = -256;
+  common.loop_extent[0] = points;
+  common.loop_extent[1] = common.loop_extent[2] = 1;
+  common.strides[0] = 1;
+  common.cell_size[0] = common.cell_size[1] = common.cell_size[2] = 1.0;
+  common.metric[0] = common.metric[4] = common.metric[8] = 1.0;
+  common.inva = 1.0 / 256.0;
+  common.dt = 0.1;
+  common.precision = precision;
+  geometry_bulk_launch bulk = {common, 0, points};
+  geometry_analytic_launch analytic_launch = {common, analytic_offset, 1};
+  geometry_patch_launch patch_launch = {common, patch_offset, 2};
+  validate_geometry_bulk_launch(bulk, compact.data(), compact.size());
+  validate_geometry_analytic_launch(analytic_launch, compact.data(), compact.size());
+  validate_geometry_patch_launch(patch_launch, compact.data(), compact.size());
+  launch_material_geometry_bulk(bulk, execution);
+  launch_material_geometry_analytic(analytic_launch, execution);
+  launch_material_geometry_patch(patch_launch, execution);
+  copy_device_to_host_async(host.data(), destination, 0, host.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(host.front() == T(-17.0) && host.back() == T(-17.0),
+          "material geometry kernels overwrote guard elements");
+  for (size_t point = 0; point < points; ++point) {
+    double expected = point >= 64 && point <= 192 ? 0.25 : 1.0;
+    if (point == 64) expected = 0.625;
+    if (point == 65) expected = patches[0].value;
+    if (point == 192) expected = patches[1].value;
+    require(host[point + 1] == T(expected), "material geometry kernel value differs");
+  }
+  require(host[65] == host[66],
+          "analytic Kottke result differs from its independently supplied patch oracle");
+
+  /* The shared point/address helper must be invariant under split launches,
+     including both sides of the 256-thread block boundary and a nonzero
+     destination base. */
+  const size_t leading = 3, trailing = 2;
+  std::vector<T> split_host(leading + points + trailing, T(-29.0));
+  device_buffer split_destination(split_host.size() * sizeof(T), device);
+  copy_host_to_device_async(split_destination, 0, split_host.data(),
+                            split_host.size() * sizeof(T), execution);
+  geometry_launch_common split_common = common;
+  split_common.destination =
+      static_cast<unsigned char *>(split_destination.opaque_handle()) + leading * sizeof(T);
+  const geometry_bulk_launch zero = {split_common, 0, 0};
+  launch_material_geometry_bulk(zero, execution);
+  const geometry_bulk_launch split[] = {{split_common, 0, 1},
+                                        {split_common, 1, 255},
+                                        {split_common, 256, 1}};
+  for (const geometry_bulk_launch &part : split) {
+    validate_geometry_bulk_launch(part, compact.data(), compact.size());
+    launch_material_geometry_bulk(part, execution);
+  }
+  copy_device_to_host_async(split_host.data(), split_destination, 0,
+                            split_host.size() * sizeof(T), execution);
+  execution.synchronize();
+  for (size_t i = 0; i < leading; ++i)
+    require(split_host[i] == T(-29.0), "split geometry launch overwrote a leading guard");
+  for (size_t point = 0; point < points; ++point) {
+    const double expected = point >= 64 && point <= 192 ? 0.25 : 1.0;
+    require(split_host[leading + point] == T(expected),
+            "split geometry bulk launch differs from whole launch");
+  }
+  for (size_t i = leading + points; i < split_host.size(); ++i)
+    require(split_host[i] == T(-29.0), "split geometry launch overwrote a trailing guard");
+
+  std::fill(split_host.begin(), split_host.end(), T(-29.0));
+  copy_host_to_device_async(split_destination, 0, split_host.data(),
+                            split_host.size() * sizeof(T), execution);
+  geometry_bulk_launch block_boundary = {split_common, 0, 256};
+  validate_geometry_bulk_launch(block_boundary, compact.data(), compact.size());
+  launch_material_geometry_bulk(block_boundary, execution);
+  copy_device_to_host_async(split_host.data(), split_destination, 0,
+                            split_host.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(split_host[leading + 256] == T(-29.0),
+          "256-element geometry launch wrote its excluded tail");
+
+  /* Pin perfect-metal signed zero and CPU-compatible diagonal-zero inverse
+     semantics in the geometry kernel itself. */
+  std::vector<unsigned char> semantic_compact = compact;
+  geometry_value_record *semantic_values = reinterpret_cast<geometry_value_record *>(
+      semantic_compact.data() + value_offset);
+  semantic_values[1].flags = 1u;
+  semantic_values[1].value_1 = -0.0;
+  copy_host_to_device_async(device_compact, 0, semantic_compact.data(),
+                            semantic_compact.size(), execution);
+  std::fill(host.begin(), host.end(), T(-17.0));
+  copy_host_to_device_async(destination, 0, host.data(), host.size() * sizeof(T), execution);
+  launch_material_geometry_bulk(bulk, execution);
+  copy_device_to_host_async(host.data(), destination, 0, host.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(host[65] == T(0) && std::signbit(host[65]),
+          "geometry perfect-metal value lost negative zero");
+
+  semantic_compact = compact;
+  semantic_values = reinterpret_cast<geometry_value_record *>(
+      semantic_compact.data() + value_offset);
+  semantic_values[1].tensor_1[0] = 0.0;
+  validate_geometry_bulk_launch(bulk, semantic_compact.data(), semantic_compact.size());
+  copy_host_to_device_async(device_compact, 0, semantic_compact.data(),
+                            semantic_compact.size(), execution);
+  std::fill(host.begin(), host.end(), T(-17.0));
+  copy_host_to_device_async(destination, 0, host.data(), host.size() * sizeof(T), execution);
+  launch_material_geometry_bulk(bulk, execution);
+  copy_device_to_host_async(host.data(), destination, 0, host.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(std::isinf(double(host[65])) && host[65] > 0,
+          "geometry diagonal zero did not preserve positive infinity");
+  copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+
+  testing::fail_next(testing::failure_point::material_geometry_patch_launch);
+  bool rejected = false;
+  try { launch_material_geometry_patch(patch_launch, execution); }
+  catch (const std::runtime_error &) { rejected = true; }
+  require(rejected, "material geometry patch failure injection was ignored");
+  geometry_patch_launch malformed = patch_launch;
+  malformed.patch_offset = compact.size();
+  require_invalid([&]() { validate_geometry_patch_launch(malformed, compact.data(), compact.size()); },
+                  "out-of-range material geometry patch was accepted");
+
+  std::vector<unsigned char> malformed_compact = compact;
+  geometry_value_record *malformed_value = reinterpret_cast<geometry_value_record *>(
+      malformed_compact.data() + value_offset + sizeof(geometry_value_record));
+  malformed_value->kind = geometry_value_kind::grid_tensor;
+  malformed_value->overlap_kind = 4;
+  malformed_value->dimensions[0] = malformed_value->dimensions[1] =
+      malformed_value->dimensions[2] = 1;
+  malformed_value->sample_offset = parameter_offset;
+  malformed_value->sample_count = 1;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(bulk, malformed_compact.data(),
+                                             malformed_compact.size()); },
+      "invalid material geometry overlap mode was accepted");
+  malformed_value->overlap_kind = 0;
+  malformed_value->dimensions[0] = 0;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(bulk, malformed_compact.data(),
+                                             malformed_compact.size()); },
+      "zero material geometry grid dimension was accepted");
+  malformed_value->dimensions[0] = uint32_t(INT_MAX) + 1u;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(bulk, malformed_compact.data(),
+                                             malformed_compact.size()); },
+      "oversized material geometry grid dimension was accepted");
+  malformed_compact = compact;
+  malformed_value = reinterpret_cast<geometry_value_record *>(
+      malformed_compact.data() + value_offset + sizeof(geometry_value_record));
+  malformed_value->tensor_1[0] = std::numeric_limits<double>::quiet_NaN();
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(bulk, malformed_compact.data(),
+                                             malformed_compact.size()); },
+      "non-finite material geometry tensor was accepted");
+  malformed_compact = compact;
+  malformed_value = reinterpret_cast<geometry_value_record *>(
+      malformed_compact.data() + value_offset + sizeof(geometry_value_record));
+  malformed_value->tensor_1[0] = malformed_value->tensor_1[1] =
+      malformed_value->tensor_1[2] = 1.0;
+  malformed_value->tensor_1[3] = 1.0;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(bulk, malformed_compact.data(),
+                                             malformed_compact.size()); },
+      "singular non-diagonal material geometry tensor was accepted");
+
+  geometry_analytic_launch malformed_analytic = analytic_launch;
+  malformed_analytic.count = 2;
+  require_invalid(
+      [&]() { validate_geometry_analytic_launch(malformed_analytic, compact.data(),
+                                                 compact.size()); },
+      "out-of-range material geometry analytic span was accepted");
+  geometry_bulk_launch malformed_bulk = bulk;
+  malformed_bulk.first_point = points;
+  malformed_bulk.count = 1;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(malformed_bulk, compact.data(), compact.size()); },
+      "out-of-range material geometry bulk span was accepted");
+  malformed_bulk = bulk;
+  malformed_bulk.common.object_offset += 1;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(malformed_bulk, compact.data(), compact.size()); },
+      "misaligned material geometry object table was accepted");
+  malformed_bulk = bulk;
+  malformed_bulk.common.destination =
+      const_cast<unsigned char *>(malformed_bulk.common.compact_inputs);
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(malformed_bulk, compact.data(), compact.size()); },
+      "material geometry destination/compact alias was accepted");
+  malformed_bulk = bulk;
+  malformed_bulk.common.loop_extent[0] = std::numeric_limits<size_t>::max();
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(malformed_bulk, compact.data(), compact.size()); },
+      "overflowing material geometry loop was accepted");
+  malformed_analytic = analytic_launch;
+  malformed_compact = compact;
+  reinterpret_cast<geometry_analytic_record *>(
+      malformed_compact.data() + analytic_offset)->normal[0] = 0.0;
+  require_invalid(
+      [&]() { validate_geometry_analytic_launch(malformed_analytic, malformed_compact.data(),
+                                                 malformed_compact.size()); },
+      "zero material geometry analytic normal was accepted");
+}
+
+template <typename T>
+static void check_geometry_precedence(int device, scalar_precision precision) {
+  std::vector<unsigned char> compact;
+  const double local_parameters[4] = {0.0, 0.0, 0.0, 0.2};
+  const double periodic_parameters[4] = {-1.0, 0.0, 0.0, 0.2};
+  geometry_object_record objects[2] = {};
+  objects[0].kind = objects[1].kind = 4;
+  objects[0].material = 1;
+  objects[1].material = 2;
+  objects[0].parameter_offset =
+      append_aligned(compact, local_parameters, sizeof(local_parameters), alignof(double));
+  objects[1].parameter_offset =
+      append_aligned(compact, periodic_parameters, sizeof(periodic_parameters), alignof(double));
+  objects[0].parameter_count = objects[1].parameter_count = 4;
+  for (int axis = 0; axis < 3; ++axis) {
+    objects[0].low[axis] = objects[1].low[axis] = -0.2;
+    objects[0].high[axis] = objects[1].high[axis] = 0.2;
+  }
+  objects[1].low[0] = -1.2;
+  objects[1].high[0] = -0.8;
+  const size_t object_offset =
+      append_aligned(compact, objects, sizeof(objects), alignof(geometry_object_record));
+  geometry_image_record images[2] = {};
+  images[0].object = 1;
+  images[0].ordinal = 0;
+  images[0].precedence = 2;
+  images[0].image[0] = 1;
+  images[0].shift[0] = 1.0;
+  images[1].object = 0;
+  images[1].ordinal = 1;
+  images[1].precedence = 1;
+  for (int image = 0; image < 2; ++image)
+    for (int axis = 0; axis < 3; ++axis) {
+      images[image].low[axis] = objects[images[image].object].low[axis] +
+                                images[image].shift[axis];
+      images[image].high[axis] = objects[images[image].object].high[axis] +
+                                 images[image].shift[axis];
+    }
+  const size_t image_offset =
+      append_aligned(compact, images, sizeof(images), alignof(geometry_image_record));
+  geometry_value_record values[3] = {};
+  for (int material = 0; material < 3; ++material) {
+    values[material].kind = geometry_value_kind::constant;
+    values[material].flags = 1;
+    values[material].value_1 = material == 0 ? 1.0 : material == 1 ? 0.25 : 0.125;
+  }
+  const size_t value_offset =
+      append_aligned(compact, values, sizeof(values), alignof(geometry_value_record));
+  stream execution;
+  device_buffer device_compact(compact.size(), device);
+  device_buffer destination(3 * sizeof(T), device);
+  std::vector<T> output(3, T(-37.0));
+  copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+  copy_host_to_device_async(destination, 0, output.data(), output.size() * sizeof(T), execution);
+  geometry_launch_common common = {};
+  common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+  common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
+  common.compact_input_bytes = compact.size();
+  common.object_offset = object_offset;
+  common.object_count = 2;
+  common.image_offset = image_offset;
+  common.image_count = 2;
+  common.value_offset = value_offset;
+  common.material_count = 3;
+  common.default_material = 0;
+  common.elements = common.point_count = 1;
+  common.dimensions = 2;
+  common.component = common.tensor_row = common.tensor_column = common.property = 0;
+  common.axis_direction[0] = 0;
+  common.axis_direction[1] = 1;
+  common.axis_direction[2] = 2;
+  common.loop_extent[0] = common.loop_extent[1] = common.loop_extent[2] = 1;
+  common.cell_size[0] = common.cell_size[1] = common.cell_size[2] = 1.0;
+  common.metric[0] = common.metric[4] = common.metric[8] = 1.0;
+  common.inva = common.dt = 1.0;
+  common.precision = precision;
+  geometry_bulk_launch launch = {common, 0, 1};
+  validate_geometry_bulk_launch(launch, compact.data(), compact.size());
+  launch_material_geometry_bulk(launch, execution);
+  copy_device_to_host_async(output.data(), destination, 0, output.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(output[0] == T(-37.0) && output[1] == T(0.125) && output[2] == T(-37.0),
+          "periodic geometry image did not win in canonical precedence order");
+
+  std::vector<unsigned char> malformed = compact;
+  geometry_image_record *bad_images = reinterpret_cast<geometry_image_record *>(
+      malformed.data() + image_offset);
+  bad_images[1].precedence = 3;
+  require_invalid(
+      [&]() { validate_geometry_bulk_launch(launch, malformed.data(), malformed.size()); },
+      "out-of-order material geometry precedence was accepted");
+}
+
+template <typename T>
+static void check_geometry_fixed_shapes(int device, scalar_precision precision) {
+  struct ShapePayload {
+    const char *name;
+    geometry_object_record object;
+    std::vector<double> parameters;
+    std::vector<double> vertices;
+    std::vector<double> indices;
+    std::vector<double> auxiliary;
+    std::vector<geometry_triangle_record> triangles;
+    std::vector<geometry_bvh_record> bvh;
+    std::vector<uint32_t> faces;
+    int varying_direction;
+    int loop_begin;
+    double inva;
+    bool first_inside;
+    bool second_inside;
+  };
+
+  const auto run = [&](ShapePayload shape) {
+    std::vector<unsigned char> compact;
+    shape.object.parameter_offset = append_aligned(
+        compact, shape.parameters.data(), shape.parameters.size() * sizeof(double),
+        alignof(double));
+    shape.object.parameter_count = shape.parameters.size();
+    shape.object.vertex_offset = append_aligned(
+        compact, shape.vertices.data(), shape.vertices.size() * sizeof(double),
+        alignof(double));
+    shape.object.vertex_count = shape.vertices.size() / 3;
+    shape.object.index_offset = append_aligned(
+        compact, shape.indices.data(), shape.indices.size() * sizeof(double), alignof(double));
+    shape.object.index_count = shape.indices.size();
+    shape.object.auxiliary_offset = append_aligned(
+        compact, shape.auxiliary.data(), shape.auxiliary.size() * sizeof(double),
+        alignof(double));
+    shape.object.auxiliary_count = shape.auxiliary.size();
+    shape.object.triangle_offset = append_aligned(
+        compact, shape.triangles.data(),
+        shape.triangles.size() * sizeof(geometry_triangle_record),
+        alignof(geometry_triangle_record));
+    shape.object.triangle_count = shape.triangles.size();
+    shape.object.face_id_offset = append_aligned(
+        compact, shape.faces.data(), shape.faces.size() * sizeof(uint32_t), alignof(uint32_t));
+    shape.object.face_id_count = shape.faces.size();
+    shape.object.bvh_offset = append_aligned(
+        compact, shape.bvh.data(), shape.bvh.size() * sizeof(geometry_bvh_record),
+        alignof(geometry_bvh_record));
+    shape.object.bvh_count = shape.bvh.size();
+    const size_t object_offset = append_record(compact, shape.object);
+    geometry_image_record image = {};
+    image.object = 0;
+    image.ordinal = 0;
+    image.precedence = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      image.low[axis] = shape.object.low[axis];
+      image.high[axis] = shape.object.high[axis];
+    }
+    const size_t image_offset = append_record(compact, image);
+    geometry_value_record values[2] = {};
+    for (int material = 0; material < 2; ++material) {
+      values[material].kind = geometry_value_kind::constant;
+      values[material].flags = 1u;
+      values[material].value_1 = material ? 0.25 : 1.0;
+    }
+    const size_t value_offset =
+        append_aligned(compact, values, sizeof(values), alignof(geometry_value_record));
+
+    stream execution;
+    device_buffer device_compact(compact.size(), device);
+    std::vector<T> output(4, T(-91.0));
+    device_buffer destination(output.size() * sizeof(T), device);
+    copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+    copy_host_to_device_async(destination, 0, output.data(), output.size() * sizeof(T), execution);
+    geometry_launch_common common = {};
+    common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+    common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
+    common.compact_input_bytes = compact.size();
+    common.object_offset = object_offset;
+    common.object_count = 1;
+    common.image_offset = image_offset;
+    common.image_count = 1;
+    common.value_offset = value_offset;
+    common.material_count = 2;
+    common.default_material = 0;
+    common.elements = common.point_count = 2;
+    common.dimensions = 2;
+    common.component = common.tensor_row = common.tensor_column = common.property = 0;
+    common.axis_direction[0] = shape.varying_direction;
+    common.axis_direction[1] = shape.varying_direction == 0 ? 1 : 0;
+    common.axis_direction[2] = 2;
+    common.loop_begin[0] = shape.loop_begin;
+    common.loop_extent[0] = 2;
+    common.loop_extent[1] = common.loop_extent[2] = 1;
+    common.strides[0] = 1;
+    common.cell_size[0] = common.cell_size[1] = common.cell_size[2] = 4.0;
+    common.metric[0] = common.metric[4] = common.metric[8] = 1.0;
+    common.inva = shape.inva;
+    common.dt = 0.1;
+    common.precision = precision;
+    geometry_bulk_launch launch = {common, 0, 2};
+    validate_geometry_bulk_launch(launch, compact.data(), compact.size());
+    launch_material_geometry_bulk(launch, execution);
+    copy_device_to_host_async(output.data(), destination, 0, output.size() * sizeof(T), execution);
+    execution.synchronize();
+    require(output.front() == T(-91.0) && output.back() == T(-91.0),
+            "fixed-shape geometry KAT overwrote an address guard");
+    require(output[1] == T(shape.first_inside ? 0.25 : 1.0) &&
+                output[2] == T(shape.second_inside ? 0.25 : 1.0),
+            shape.name);
+  };
+
+  const auto bounds = [](geometry_object_record &object, double radius) {
+    for (int axis = 0; axis < 3; ++axis) {
+      object.low[axis] = -radius;
+      object.high[axis] = radius;
+    }
+    object.material = 1;
+  };
+
+  ShapePayload sphere = {};
+  sphere.name = "sphere containment KAT differs";
+  sphere.object.kind = 4;
+  bounds(sphere.object, 0.5);
+  sphere.parameters = {0, 0, 0, 0.5};
+  sphere.varying_direction = 0; sphere.loop_begin = 0; sphere.inva = 2.0;
+  sphere.first_inside = true; sphere.second_inside = false;
+  run(sphere);
+
+  ShapePayload block = sphere;
+  block.name = "block containment KAT differs";
+  block.object.kind = 3; block.object.subtype = 0;
+  bounds(block.object, 0.5);
+  block.parameters.assign(25, 0.0);
+  block.parameters[3] = block.parameters[7] = block.parameters[11] = 1.0;
+  block.parameters[12] = block.parameters[13] = block.parameters[14] = 1.0;
+  block.parameters[15] = block.parameters[19] = block.parameters[23] = 1.0;
+  run(block);
+
+  ShapePayload ellipsoid = block;
+  ellipsoid.name = "ellipsoid containment KAT differs";
+  ellipsoid.object.subtype = 1;
+  ellipsoid.parameters.resize(28, 0.0);
+  ellipsoid.parameters[24] = 1.0;
+  ellipsoid.parameters[25] = ellipsoid.parameters[26] = ellipsoid.parameters[27] = 2.0;
+  run(ellipsoid);
+
+  ShapePayload transformed = block;
+  transformed.name = "transformed block containment KAT differs";
+  transformed.parameters[12] = 0.5;
+  transformed.parameters[13] = 2.0;
+  transformed.parameters[15] = transformed.parameters[19] = 0.0;
+  transformed.parameters[16] = transformed.parameters[18] = 1.0;
+  transformed.object.low[0] = -1.0; transformed.object.high[0] = 1.0;
+  transformed.object.low[1] = -0.25; transformed.object.high[1] = 0.25;
+  transformed.loop_begin = 2; transformed.inva = 0.75;
+  run(transformed);
+
+  ShapePayload cylinder = sphere;
+  cylinder.name = "cylinder containment KAT differs";
+  cylinder.object.kind = 5; cylinder.object.subtype = 0;
+  cylinder.parameters = {0, 0, 0, 0, 0, 1, 0.5, 1.0, 0};
+  run(cylinder);
+
+  ShapePayload cone = cylinder;
+  cone.name = "cone containment KAT differs";
+  cone.object.subtype = 2;
+  cone.parameters.push_back(0.25);
+  run(cone);
+
+  ShapePayload wedge = cylinder;
+  wedge.name = "positive wedge containment KAT differs";
+  wedge.object.subtype = 1;
+  wedge.parameters = {0, 0, 0, 0, 0, 1, 0.5, 1.0, 1, 1.5707963267948966,
+                      1, 0, 0, 1, 0, 0, 0, 1, 0};
+  wedge.varying_direction = 1; wedge.loop_begin = -1; wedge.inva = 0.5;
+  wedge.first_inside = false; wedge.second_inside = true;
+  run(wedge);
+  wedge.name = "negative wedge containment KAT differs";
+  wedge.parameters[9] = -1.5707963267948966;
+  wedge.first_inside = true; wedge.second_inside = false;
+  run(wedge);
+
+  ShapePayload prism = sphere;
+  prism.name = "prism containment KAT differs";
+  prism.object.kind = 2; prism.object.subtype = 0; prism.object.closed = 1;
+  prism.object.fixed_vertex_count = 4;
+  prism.parameters.assign(29, 0.0);
+  prism.parameters[3] = 1.0;
+  prism.parameters[6] = 1.0;
+  prism.parameters[11] = prism.parameters[15] = prism.parameters[19] = 1.0;
+  prism.parameters[20] = prism.parameters[24] = prism.parameters[28] = 1.0;
+  prism.vertices = {-0.5, -0.5, 0, 0.5, -0.5, 0, 0.5, 0.5, 0, -0.5, 0.5, 0};
+  prism.auxiliary = prism.vertices;
+  prism.auxiliary.insert(prism.auxiliary.end(), 12, 0.0);
+  const double prism_top[] = {-0.5, -0.5, 1, 0.5, -0.5, 1,
+                               0.5, 0.5, 1, -0.5, 0.5, 1};
+  prism.auxiliary.insert(prism.auxiliary.end(), prism_top, prism_top + 12);
+  run(prism);
+
+  ShapePayload mesh = sphere;
+  mesh.name = "mesh containment KAT differs";
+  mesh.object.kind = 1; mesh.object.subtype = 1; mesh.object.closed = 1;
+  mesh.object.mesh_lengthscale = 2.0;
+  bounds(mesh.object, 1.0);
+  mesh.parameters = {0, 0, 0, 1};
+  mesh.vertices = {1, 1, 1, -1, -1, 1, -1, 1, -1, 1, -1, -1};
+  mesh.indices = {0, 1, 2, 0, 3, 1, 0, 2, 3, 1, 3, 2};
+  const uint32_t triangle_vertices[4][3] = {{0, 1, 2}, {0, 3, 1}, {0, 2, 3}, {1, 3, 2}};
+  for (int triangle = 0; triangle < 4; ++triangle) {
+    geometry_triangle_record record = {};
+    for (int vertex = 0; vertex < 3; ++vertex)
+      record.vertex[vertex] = triangle_vertices[triangle][vertex];
+    for (int axis = 0; axis < 3; ++axis) {
+      record.low[axis] = -1.0;
+      record.high[axis] = 1.0;
+    }
+    mesh.triangles.push_back(record);
+  }
+  geometry_bvh_record node = {};
+  for (int axis = 0; axis < 3; ++axis) {
+    node.low[axis] = -1.0;
+    node.high[axis] = 1.0;
+  }
+  node.left = node.right = UINT32_MAX;
+  node.first_face = 0; node.face_count = 4; node.escape = 1; node.leaf = 1;
+  mesh.bvh.push_back(node);
+  mesh.faces = {0, 1, 2, 3};
+  run(mesh);
+}
+
+static double inverse_tensor_member_for_testing(const double tensor[6], int row, int column) {
+  const double determinant =
+      tensor[0] * tensor[1] * tensor[2] - tensor[4] * tensor[1] * tensor[4] +
+      2.0 * tensor[3] * tensor[5] * tensor[4] - tensor[3] * tensor[3] * tensor[2] -
+      tensor[5] * tensor[5] * tensor[0];
+  if (row == 0 && column == 0)
+    return (tensor[1] * tensor[2] - tensor[5] * tensor[5]) / determinant;
+  if (row == 0 && column == 1)
+    return (tensor[5] * tensor[4] - tensor[3] * tensor[2]) / determinant;
+  throw std::logic_error("unsupported geometry tensor oracle member");
+}
+
+template <typename T>
+static void check_geometry_file_grid_values(int device, scalar_precision precision) {
+  const auto run = [&](geometry_value_kind kind, int row, int column) {
+    std::vector<unsigned char> compact;
+    const double parameters[4] = {0, 0, 0, 1.0};
+    const size_t parameter_offset =
+        append_aligned(compact, parameters, sizeof(parameters), alignof(double));
+    geometry_object_record object = {};
+    object.kind = 4;
+    object.material = 1;
+    object.parameter_offset = parameter_offset;
+    object.parameter_count = 4;
+    for (int axis = 0; axis < 3; ++axis) {
+      object.low[axis] = -1.0;
+      object.high[axis] = 1.0;
+    }
+    const size_t object_offset = append_record(compact, object);
+    geometry_image_record image = {};
+    image.object = 0; image.ordinal = 0; image.precedence = 1;
+    for (int axis = 0; axis < 3; ++axis) {
+      image.low[axis] = -1.0;
+      image.high[axis] = 1.0;
+    }
+    const size_t image_offset = append_record(compact, image);
+    const double samples[3] = {kind == geometry_value_kind::file_epsilon ? 2.0 : 0.0,
+                               kind == geometry_value_kind::file_epsilon ? 3.0 : 0.5,
+                               kind == geometry_value_kind::file_epsilon ? 4.0 : 1.0};
+    const size_t sample_offset =
+        append_aligned(compact, samples, sizeof(samples), alignof(double));
+    geometry_value_record values[2] = {};
+    values[0].kind = geometry_value_kind::constant;
+    values[0].flags = 1u;
+    values[0].value_1 = 1.0;
+    values[1].kind = kind;
+    values[1].overlap_kind = kind == geometry_value_kind::file_epsilon ? 0 : 3;
+    values[1].dimensions[0] = 3;
+    values[1].dimensions[1] = values[1].dimensions[2] = 1;
+    values[1].sample_offset = sample_offset;
+    values[1].sample_count = 3;
+    const double first[6] = {2.0, 3.0, 4.0, 0.25, 0.1, -0.2};
+    const double second[6] = {5.0, 6.0, 7.0, -0.3, 0.2, 0.15};
+    for (int i = 0; i < 6; ++i) {
+      values[1].tensor_1[i] = first[i];
+      values[1].tensor_2[i] = second[i];
+    }
+    const size_t value_offset =
+        append_aligned(compact, values, sizeof(values), alignof(geometry_value_record));
+
+    stream execution;
+    device_buffer device_compact(compact.size(), device);
+    std::vector<T> output(5, T(-73.0));
+    device_buffer destination(output.size() * sizeof(T), device);
+    copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
+    copy_host_to_device_async(destination, 0, output.data(), output.size() * sizeof(T), execution);
+    geometry_launch_common common = {};
+    common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+    common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
+    common.compact_input_bytes = compact.size();
+    common.object_offset = object_offset; common.object_count = 1;
+    common.image_offset = image_offset; common.image_count = 1;
+    common.value_offset = value_offset; common.material_count = 2;
+    common.default_material = 0; common.elements = common.point_count = 3;
+    common.dimensions = 2; common.component = 0;
+    common.tensor_row = row; common.tensor_column = column; common.property = 0;
+    common.axis_direction[0] = 0; common.axis_direction[1] = 1; common.axis_direction[2] = 2;
+    common.loop_begin[0] = -2;
+    common.loop_extent[0] = 3;
+    common.loop_extent[1] = common.loop_extent[2] = 1;
+    common.strides[0] = 1;
+    common.cell_size[0] = common.cell_size[1] = common.cell_size[2] = 2.0;
+    common.metric[0] = common.metric[4] = common.metric[8] = 1.0;
+    common.inva = 1.0; common.dt = 0.1; common.precision = precision;
+    geometry_bulk_launch launch = {common, 0, 3};
+    validate_geometry_bulk_launch(launch, compact.data(), compact.size());
+    launch_material_geometry_bulk(launch, execution);
+    copy_device_to_host_async(output.data(), destination, 0, output.size() * sizeof(T), execution);
+    execution.synchronize();
+    require(output.front() == T(-73.0) && output.back() == T(-73.0),
+            "geometry FILE/Grid value KAT overwrote an address guard");
+    for (int point = 0; point < 3; ++point) {
+      double expected = 0.0;
+      if (kind == geometry_value_kind::file_epsilon)
+        expected = row == column ? 1.0 / samples[point] : 0.0;
+      else {
+        const double weight = samples[point];
+        double tensor[6];
+        for (int i = 0; i < 6; ++i)
+          tensor[i] = first[i] * (1.0 - weight) + second[i] * weight;
+        expected = inverse_tensor_member_for_testing(tensor, row, column);
+      }
+      const double tolerance = sizeof(T) == sizeof(float) ? 2e-7 : 2e-15;
+      require(std::fabs(double(output[size_t(point) + 1]) - expected) <= tolerance,
+              "geometry FILE/Grid endpoint or fill value differs");
+    }
+  };
+  run(geometry_value_kind::file_epsilon, 0, 0);
+  run(geometry_value_kind::file_epsilon, 0, 1);
+  run(geometry_value_kind::grid_tensor, 0, 0);
+  run(geometry_value_kind::grid_tensor, 0, 1);
 }
 
 template <typename T>
@@ -1236,8 +1961,17 @@ int main() {
     require(!devices.empty(), "no CUDA devices found");
     const size_t lengths[] = {0, 1, 255, 256, 257};
     const bool table_tail_only = std::getenv("MEEP_NVIDIA_TABLE_TAIL_ONLY") != NULL;
+    const bool geometry_profile_only =
+        std::getenv("MEEP_NVIDIA_GEOMETRY_PROFILE_ONLY") != NULL;
     for (size_t di = 0; di < devices.size(); ++di) {
       device_scope scope(devices[di].id);
+      if (geometry_profile_only) {
+        check_geometry_kernels<float>(devices[di].id, scalar_precision::f32);
+        check_geometry_kernels<double>(devices[di].id, scalar_precision::f64);
+        std::cout << "device " << devices[di].id
+                  << ": NVIDIA geometry bulk/analytic/patch profile PASS\n";
+        continue;
+      }
       if (table_tail_only) {
         check_table_length<float>(devices[di].id, scalar_precision::f32, 257,
                                   material_table_kind::file_scalar_epsilon);
@@ -1275,6 +2009,14 @@ int main() {
       check_table_materials<double>(devices[di].id, scalar_precision::f64);
       check_table_materials<float>(devices[di].id, scalar_precision::f32, true);
       check_table_materials<double>(devices[di].id, scalar_precision::f64, true);
+      check_geometry_kernels<float>(devices[di].id, scalar_precision::f32);
+      check_geometry_kernels<double>(devices[di].id, scalar_precision::f64);
+      check_geometry_precedence<float>(devices[di].id, scalar_precision::f32);
+      check_geometry_precedence<double>(devices[di].id, scalar_precision::f64);
+      check_geometry_fixed_shapes<float>(devices[di].id, scalar_precision::f32);
+      check_geometry_fixed_shapes<double>(devices[di].id, scalar_precision::f64);
+      check_geometry_file_grid_values<float>(devices[di].id, scalar_precision::f32);
+      check_geometry_file_grid_values<double>(devices[di].id, scalar_precision::f64);
       std::cout << "device " << devices[di].id << " (" << devices[di].name
                 << "): NVIDIA material initialization kernels PASS\n";
     }

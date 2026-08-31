@@ -206,6 +206,9 @@ public:
   virtual double chi1p1(meep::field_type ft, const meep::vec &r);
   virtual void eff_chi1inv_row(meep::component c, double chi1inv_row[3], const meep::volume &v,
                                double tol, int maxeval);
+  void eff_chi1inv_row_with_outcome(meep::component c, double chi1inv_row[3],
+                                    const meep::volume &v, double tol, int maxeval,
+                                    bool &adaptive_fallback, bool &negative_fallback);
 
   // Thread-safe for standard C++ geometry (no Python callbacks).
   // Only unsafe when MATERIAL_USER materials are present.
@@ -221,7 +224,7 @@ public:
                           double tol, int maxeval, bool &fallback);
 
   void fallback_chi1inv_row(meep::component c, double chi1inv_row[3], const meep::volume &v,
-                            double tol, int maxeval);
+                            double tol, int maxeval, bool *negative_fallback = NULL);
 
   virtual void sigma_row(meep::component c, double sigrow[3], const meep::vec &r);
   void add_susceptibilities(meep::structure *s);

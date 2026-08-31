@@ -1095,11 +1095,24 @@ static bool get_front_object(const meep::volume &v, geom_box_tree geometry_tree,
 
 void geom_epsilon::eff_chi1inv_row(meep::component c, double chi1inv_row[3], const meep::volume &v,
                                    double tol, int maxeval) {
+  bool adaptive_fallback = false, negative_fallback = false;
+  eff_chi1inv_row_with_outcome(c, chi1inv_row, v, tol, maxeval, adaptive_fallback,
+                              negative_fallback);
+}
+
+void geom_epsilon::eff_chi1inv_row_with_outcome(meep::component c, double chi1inv_row[3],
+                                                const meep::volume &v, double tol, int maxeval,
+                                                bool &adaptive_fallback,
+                                                bool &negative_fallback) {
   symm_matrix meps_inv;
   bool fallback;
   eff_chi1inv_matrix(c, &meps_inv, v, tol, maxeval, fallback);
+  adaptive_fallback = fallback;
+  negative_fallback = false;
 
-  if (fallback) { fallback_chi1inv_row(c, chi1inv_row, v, tol, maxeval); }
+  if (fallback) {
+    fallback_chi1inv_row(c, chi1inv_row, v, tol, maxeval, &negative_fallback);
+  }
   else {
     switch (component_direction(c)) {
       case meep::X:
@@ -1376,7 +1389,10 @@ static number inveps_func(int n, number *x, void *geomeps_) {
 
 // fallback meaneps using libctl's adaptive cubature routine
 void geom_epsilon::fallback_chi1inv_row(meep::component c, double chi1inv_row[3],
-                                        const meep::volume &v, double tol, int maxeval) {
+                                        const meep::volume &v, double tol, int maxeval,
+                                        bool *negative_fallback) {
+
+  if (negative_fallback) *negative_fallback = false;
 
   symm_matrix chi1p1, chi1p1_inv;
   material_type material;
@@ -1497,8 +1513,10 @@ void geom_epsilon::fallback_chi1inv_row(meep::component c, double chi1inv_row[3]
               vol;
 #endif
   }
-  if (eps_ever_negative) // averaging negative eps causes instability
+  if (eps_ever_negative) { // averaging negative eps causes instability
+    if (negative_fallback) *negative_fallback = true;
     minveps = 1.0 / (meps = eps(v.center()));
+  }
   {
     double n[3] = {0, 0, 0};
     double nabsinv = 1.0 / meep::abs(gradient);
@@ -2146,8 +2164,11 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
     capture_error = "unknown material IR capture failure";
   }
   meep::backend_reconcile_host_access(capture_error, "set_materials material IR capture");
+  meep::MaterialIR *captured_ir =
+      const_cast<meep::MaterialIR *>(static_cast<const meep::MaterialIR *>(staged_material_ir.get()));
+  meep::finalize_material_ir_collective(*captured_ir);
   uint64_t local_signature =
-      static_cast<const meep::MaterialIR *>(staged_material_ir.get())->signature;
+      captured_ir->signature;
   if (meep::get_material_ir_capture_failure_rank_for_testing() == meep::my_rank() &&
       meep::get_material_ir_capture_failure_mode_for_testing() == 3)
     local_signature ^= UINT64_C(1);

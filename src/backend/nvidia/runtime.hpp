@@ -272,6 +272,11 @@ enum class failure_point {
   material_pointwise_launch,
   material_file_launch,
   material_grid_launch,
+  material_geometry_bulk_launch,
+  material_geometry_analytic_launch,
+  material_geometry_patch_launch,
+  material_geometry_descriptor_mutation,
+  material_geometry_compact_mutation,
   material_pml_launch,
   material_initialization_sync,
   state_rebuild_sync

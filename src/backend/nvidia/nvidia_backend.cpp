@@ -15,6 +15,7 @@
 #include <dlfcn.h>
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <complex>
@@ -40,6 +41,7 @@
 #include "backend/nvidia/nvidia_flux.hpp"
 #include "backend/nvidia/nvidia_magnetic.hpp"
 #include "backend/nvidia/nvidia_initialization.hpp"
+#include "backend/nvidia/nvidia_materials.hpp"
 #include "backend/nvidia/nvidia_multilevel.hpp"
 #include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
@@ -51,6 +53,20 @@
 namespace meep {
 
 namespace nvidia {
+
+namespace {
+std::atomic<size_t> initialization_memory_budget_override(
+    std::numeric_limits<size_t>::max());
+}
+
+namespace testing {
+void set_initialization_memory_budget_for_testing(size_t bytes) {
+  initialization_memory_budget_override.store(bytes, std::memory_order_relaxed);
+}
+size_t initialization_memory_budget_for_testing() {
+  return initialization_memory_budget_override.load(std::memory_order_relaxed);
+}
+} // namespace testing
 
 polarization_coefficients derive_polarization_coefficients(double omega_0, double gamma,
                                                            double dt_value, bool drude) {
@@ -528,19 +544,45 @@ struct NvidiaMaterialTableAuthority {
   size_t table_header_offset;
 };
 
+enum class NvidiaMaterialGeometryKind { bulk, analytic, patch };
+
+struct NvidiaMaterialGeometryAuthority {
+  NvidiaMaterialGeometryKind kind;
+  uint32_t destination;
+  size_t source_index;
+  size_t source_count;
+  ArrayId array;
+  MaterialIRTopologyRow topology;
+  size_t object_offset;
+  size_t object_count;
+  size_t image_offset;
+  size_t image_count;
+  size_t value_offset;
+  size_t absorber_header_offset;
+  size_t absorber_count;
+  uint64_t first_point;
+  size_t record_offset;
+};
+
 class NvidiaBackendState : public BackendState {
 public:
-  NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device, uint64_t state_token)
+  NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device, uint64_t state_token,
+                     size_t initialization_reserve_bytes,
+                     size_t initialization_compact_input_bytes,
+                     size_t initialization_staging_bytes)
       : owner_(owner), plan_(plan), layout_(allocation_requests_for(plan_)), device_(device),
         state_token_(state_token), fingerprint_(storage_fingerprint(plan_)), initialized_(false),
         transfer_failed_(false),
         device_authoritative_(false), magnetic_snapshot_bytes_(0),
         magnetic_snapshot_layout_fingerprint_(0), magnetic_snapshot_valid_(false),
         cw_skip_source_evaluation_(false), cw_workspace_allocations_(0),
-        noisy_seed_active_slot_(-1), noisy_seed_staged_slot_(-1) {
+        material_geometry_compact_hash_(0),
+        initialization_compact_input_bytes_(initialization_compact_input_bytes),
+        initialization_staging_bytes_(initialization_staging_bytes), noisy_seed_active_slot_(-1),
+        noisy_seed_staged_slot_(-1) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
-    arenas_.reset(new nvidia::device_arenas(layout_, device_));
+    arenas_.reset(new nvidia::device_arenas(layout_, device_, initialization_reserve_bytes));
     noisy_seed_slots_.allocate(2 * sizeof(nvidia::noisy_seed_block), device_);
   }
 
@@ -593,6 +635,13 @@ public:
   std::vector<NvidiaMaterialTableAuthority> material_table_authorities_;
   std::vector<nvidia::material_conductivity_launch> material_conductivity_launches_;
   std::vector<nvidia::material_pml_launch> material_pml_launches_;
+  std::vector<nvidia::geometry_bulk_launch> material_geometry_bulk_launches_;
+  std::vector<nvidia::geometry_analytic_launch> material_geometry_analytic_launches_;
+  std::vector<nvidia::geometry_patch_launch> material_geometry_patch_launches_;
+  std::vector<NvidiaMaterialGeometryAuthority> material_geometry_authorities_;
+  uint64_t material_geometry_compact_hash_;
+  size_t initialization_compact_input_bytes_;
+  size_t initialization_staging_bytes_;
   std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
   nvidia::device_buffer noisy_seed_slots_;
   int noisy_seed_active_slot_;
@@ -3592,7 +3641,9 @@ void set_reason(std::string &why, size_t operation, const char *detail) {
 
 NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int selected_device)
     : f_(f), options_(options), device_(selected_device), device_memory_bytes_(0),
-      next_state_token_(1) {
+      next_state_token_(1), pending_initialization_reserve_bytes_(0),
+      pending_initialization_compact_bytes_(0), pending_initialization_native_(false),
+      pending_initialization_reserve_valid_(false) {
   if (device_ < 0) throw std::invalid_argument("NVIDIA backend requires a resolved device ID");
   device_memory_bytes_ = nvidia::properties_for_device(device_).total_memory;
 }
@@ -3601,14 +3652,32 @@ NvidiaBackend::~NvidiaBackend() {}
 
 namespace {
 void preflight_native_table_ir(const MaterialIR &ir);
+void preflight_geometry_ir(const MaterialIR &ir);
+size_t exact_material_compact_input_bytes(const MaterialIR &ir);
 }
 
 void NvidiaBackend::preflight_initialization(const InitializationPlan &initialization) const {
+  pending_initialization_reserve_valid_ = false;
+  pending_initialization_reserve_bytes_ = 0;
+  pending_initialization_compact_bytes_ = 0;
+  pending_initialization_native_ = false;
   if (initialization.materials.size() != 1)
     throw std::invalid_argument("NVIDIA initialization requires one frozen material recipe");
   const MaterialRecipe &recipe = initialization.materials[0];
   validate_material_recipe(recipe);
-  if (recipe.disposition() != MaterialRecipeDisposition::device_native) return;
+  const MaterialSupportDecision support = classify_material_support(recipe);
+  if (support.compact_input_bytes > uint64_t(std::numeric_limits<size_t>::max()))
+    throw std::overflow_error("NVIDIA initialization compact-input budget overflows size_t");
+  size_t compact_bytes = 0;
+  const size_t fixed_bytes = 2 * sizeof(nvidia::noisy_seed_block);
+  if (compact_bytes > std::numeric_limits<size_t>::max() - fixed_bytes)
+    throw std::overflow_error("NVIDIA initialization auxiliary-memory budget overflows");
+  pending_initialization_reserve_bytes_ = compact_bytes + fixed_bytes;
+  if (recipe.disposition() != MaterialRecipeDisposition::device_native &&
+      recipe.disposition() != MaterialRecipeDisposition::hybrid_interface) {
+    pending_initialization_reserve_valid_ = true;
+    return;
+  }
   if (!recipe.ir())
     throw std::invalid_argument("NVIDIA native material initialization has no owned IR");
   const MaterialIR &ir = *recipe.ir();
@@ -3625,7 +3694,17 @@ void NvidiaBackend::preflight_initialization(const InitializationPlan &initializ
       kind != meep_geom::material_data::MATERIAL_FILE &&
       kind != meep_geom::material_data::MATERIAL_GRID)
     throw std::invalid_argument("NVIDIA native material opcode is unsupported");
-  preflight_native_table_ir(ir);
+  if (ir.objects.empty() && ir.analytic_interfaces.empty() && ir.hybrid_patches.empty())
+    preflight_native_table_ir(ir);
+  else
+    preflight_geometry_ir(ir);
+  compact_bytes = exact_material_compact_input_bytes(ir);
+  if (compact_bytes > std::numeric_limits<size_t>::max() - fixed_bytes)
+    throw std::overflow_error("NVIDIA initialization auxiliary-memory budget overflows");
+  pending_initialization_reserve_bytes_ = compact_bytes + fixed_bytes;
+  pending_initialization_compact_bytes_ = compact_bytes;
+  pending_initialization_native_ = true;
+  pending_initialization_reserve_valid_ = true;
 }
 
 void NvidiaBackend::validate_host_custom_rebuild() {
@@ -3706,6 +3785,13 @@ size_t owned_count(double value, const char *what) {
       value > double(std::numeric_limits<size_t>::max()))
     throw std::invalid_argument(std::string("NVIDIA material IR has an invalid ") + what);
   return size_t(value);
+}
+
+uint32_t material_checked_uint32(uint64_t value, const char *what) {
+  if (value > UINT32_MAX)
+    throw std::overflow_error(std::string("NVIDIA material initialization overflow while ") +
+                              what);
+  return uint32_t(value);
 }
 
 OwnedSusceptibilitySpan parse_owned_susceptibility(const std::vector<double> &values,
@@ -3959,6 +4045,17 @@ ArrayId find_storage_key(const StoragePlan &plan, const StorageKey &key) {
   return invalid_array();
 }
 
+size_t material_compact_append_extent(size_t current, size_t count, size_t alignment,
+                                      const char *what, size_t *offset = NULL) {
+  if (!alignment || (alignment & (alignment - 1)))
+    throw std::logic_error("NVIDIA material compact-input alignment is invalid");
+  const size_t padding = (alignment - current % alignment) % alignment;
+  const size_t aligned = material_checked_add(current, padding, what);
+  const size_t total = material_checked_add(aligned, count, what);
+  if (offset) *offset = aligned;
+  return total;
+}
+
 struct MaterialCompactPack {
   std::vector<unsigned char> bytes;
   std::vector<size_t> table_header_offsets;
@@ -3967,17 +4064,22 @@ struct MaterialCompactPack {
   size_t pml_profile_bytes;
   size_t file_sample_bytes;
   size_t grid_weight_bytes;
+  size_t geometry_object_bytes;
+  size_t geometry_image_bytes;
+  size_t geometry_value_bytes;
+  size_t geometry_analytic_bytes;
+  size_t geometry_patch_bytes;
 
   MaterialCompactPack()
       : absorber_header_offset(0), absorber_profile_bytes(0), pml_profile_bytes(0),
-        file_sample_bytes(0), grid_weight_bytes(0) {}
+        file_sample_bytes(0), grid_weight_bytes(0), geometry_object_bytes(0),
+        geometry_image_bytes(0), geometry_value_bytes(0), geometry_analytic_bytes(0),
+        geometry_patch_bytes(0) {}
 
   size_t append_space(size_t count, size_t alignment, const char *what) {
-    if (!alignment || (alignment & (alignment - 1)))
-      throw std::logic_error("NVIDIA material compact-input alignment is invalid");
-    const size_t padding = (alignment - bytes.size() % alignment) % alignment;
-    const size_t offset = material_checked_add(bytes.size(), padding, what);
-    const size_t total = material_checked_add(offset, count, what);
+    size_t offset = 0;
+    const size_t total =
+        material_compact_append_extent(bytes.size(), count, alignment, what, &offset);
     bytes.resize(total, 0);
     return offset;
   }
@@ -4004,6 +4106,12 @@ struct MaterialCompactPack {
     return offset;
   }
 };
+
+template <typename T>
+bool material_compact_range(size_t offset, size_t count, size_t bytes) {
+  return offset % alignof(T) == 0 && offset <= bytes &&
+         count <= (bytes - offset) / sizeof(T);
+}
 
 size_t pack_material_medium(MaterialCompactPack &compact, const OwnedMediumView &medium,
                             const MaterialIR &ir) {
@@ -4056,6 +4164,129 @@ size_t pack_material_medium(MaterialCompactPack &compact, const OwnedMediumView 
         records, "packing material susceptibility records");
   memcpy(compact.bytes.data() + header_offset, &header, sizeof(header));
   return header_offset;
+}
+
+struct MaterialCompactSizer {
+  size_t bytes;
+
+  MaterialCompactSizer() : bytes(0) {}
+
+  void append(size_t count, size_t alignment, const char *what) {
+    bytes = material_compact_append_extent(bytes, count, alignment, what);
+  }
+
+  template <typename T> void append_records(size_t count, const char *what) {
+    append(material_checked_product(count, sizeof(T), what), alignof(T), what);
+  }
+
+  void append_doubles(size_t count, const char *what) {
+    append_records<double>(count, what);
+  }
+};
+
+void size_material_medium(MaterialCompactSizer &compact, const OwnedMediumView &medium) {
+  compact.append_records<nvidia::material_medium_header>(
+      1, "sizing packed material medium header");
+  const size_t susceptibility_count = medium.susceptibilities[0].size();
+  if (susceptibility_count)
+    compact.append_records<nvidia::material_susceptibility_record>(
+        susceptibility_count, "sizing packed material susceptibility records");
+}
+
+size_t exact_material_compact_input_bytes(const MaterialIR &ir) {
+  MaterialCompactSizer compact;
+  if (ir.topology.empty()) return 0;
+
+  const bool geometry_partition = !ir.objects.empty() || !ir.analytic_interfaces.empty() ||
+                                  !ir.hybrid_patches.empty();
+  const MaterialIRMaterial &root = ir.materials[ir.default_material];
+  const bool file_table = root.kind == meep_geom::material_data::MATERIAL_FILE;
+  const bool grid_table = root.kind == meep_geom::material_data::MATERIAL_GRID;
+
+  if (!geometry_partition && (file_table || grid_table)) {
+    compact.append_records<nvidia::material_table_header>(
+        1, "sizing packed material table header");
+    size_t parameter_offset = file_table ? 0 : 3;
+    const OwnedMediumView first = parse_owned_medium_at(root.parameters, parameter_offset);
+    if (grid_table) {
+      const OwnedMediumView second = parse_owned_medium_at(root.parameters, parameter_offset);
+      size_material_medium(compact, first);
+      size_material_medium(compact, second);
+    }
+    compact.append_doubles(root.samples.size(),
+                           file_table ? "sizing packed FILE samples"
+                                      : "sizing packed MaterialGrid weights");
+  }
+
+  if (!ir.absorbers.empty()) {
+    compact.append_records<nvidia::material_absorber_header>(
+        ir.absorbers.size(), "sizing packed absorber headers");
+    for (const MaterialIRPml &absorber : ir.absorbers)
+      compact.append_doubles(absorber.samples.size(),
+                             "sizing packed absorber profile samples");
+  }
+
+  if (geometry_partition) {
+    for (const MaterialIRObject &object : ir.objects) {
+      compact.append_doubles(object.parameters.size(), "sizing packed geometry parameters");
+      compact.append_doubles(object.vertices.size(), "sizing packed geometry vertices");
+      compact.append_doubles(object.indices.size(), "sizing packed geometry indices");
+      compact.append_doubles(object.auxiliary.size(),
+                             "sizing packed geometry auxiliary data");
+      if (object.kind == geometric_object::MESH) {
+        compact.append_records<nvidia::geometry_triangle_record>(
+            size_t(object.triangle_count), "sizing packed geometry triangles");
+        compact.append_records<uint32_t>(size_t(object.triangle_count),
+                                         "sizing packed geometry BVH faces");
+        compact.append_records<nvidia::geometry_bvh_record>(
+            size_t(object.bvh_count), "sizing packed geometry BVH nodes");
+      }
+    }
+    compact.append_records<nvidia::geometry_object_record>(
+        ir.objects.size(), "sizing packed geometry objects");
+    compact.append_records<nvidia::geometry_image_record>(
+        ir.active_images.size(), "sizing packed geometry images");
+
+    std::vector<uint8_t> used(ir.materials.size(), 0);
+    used[ir.default_material] = 1;
+    for (const MaterialIRObject &object : ir.objects) used[size_t(object.material)] = 1;
+    for (size_t material = 0; material < ir.materials.size(); ++material)
+      if (used[material] && !ir.materials[material].samples.empty())
+        compact.append_doubles(ir.materials[material].samples.size(),
+                               "sizing packed geometry material samples");
+
+    for (size_t destination = 0; destination < ir.destinations.size(); ++destination)
+      compact.append_records<nvidia::geometry_value_record>(
+          ir.materials.size(), "sizing packed geometry material values");
+
+    size_t analytic = 0;
+    while (analytic < ir.analytic_interfaces.size()) {
+      const uint32_t destination = ir.analytic_interfaces[analytic].destination;
+      const size_t begin = analytic++;
+      while (analytic < ir.analytic_interfaces.size() &&
+             ir.analytic_interfaces[analytic].destination == destination)
+        ++analytic;
+      compact.append_records<nvidia::geometry_analytic_record>(
+          analytic - begin, "sizing packed geometry analytic jobs");
+    }
+
+    size_t patch = 0;
+    while (patch < ir.hybrid_patches.size()) {
+      const uint32_t destination = ir.hybrid_patches[patch].destination;
+      const size_t begin = patch++;
+      while (patch < ir.hybrid_patches.size() &&
+             ir.hybrid_patches[patch].destination == destination)
+        ++patch;
+      compact.append_records<nvidia::geometry_patch_record>(
+          patch - begin, "sizing packed geometry patches");
+    }
+  }
+
+  for (const MaterialIRPmlAxis &axis : ir.pml_axes)
+    if (axis.profile_active)
+      compact.append_doubles(axis.profile_samples.size(),
+                             "sizing packed PML profile samples");
+  return compact.bytes;
 }
 
 struct MaterialStorageKeyLess {
@@ -4502,25 +4733,836 @@ int material_fill_phase(array_kind kind) {
   }
 }
 
+int geometry_property_phase(int property) {
+  switch (MaterialIRProperty(property)) {
+    case MaterialIRProperty::chi1inv: return 1;
+    case MaterialIRProperty::chi2:
+    case MaterialIRProperty::chi3: return 2;
+    case MaterialIRProperty::conductivity: return 3;
+    case MaterialIRProperty::condinv: return 4;
+    case MaterialIRProperty::sigma: return 5;
+  }
+  return 6;
+}
+
+void geometry_tensor_from_medium(nvidia::geometry_value_record &record,
+                                 const OwnedMediumView &medium, field_type ft,
+                                 double tensor[6]) {
+  const std::vector<double> &p = *medium.values;
+  const size_t diagonal = medium.base + (ft == E_stuff ? 0 : 9);
+  const size_t offdiagonal = medium.base + (ft == E_stuff ? 3 : 12);
+  if (p[offdiagonal + 1] != 0.0 || p[offdiagonal + 3] != 0.0 ||
+      p[offdiagonal + 5] != 0.0)
+    throw std::invalid_argument(
+        "NVIDIA geometry material has a non-real tensor offdiagonal");
+  tensor[0] = p[diagonal];
+  tensor[1] = p[diagonal + 1];
+  tensor[2] = p[diagonal + 2];
+  tensor[3] = p[offdiagonal];
+  tensor[4] = p[offdiagonal + 2];
+  tensor[5] = p[offdiagonal + 4];
+  (void)record;
+}
+
+const MaterialIRSusceptibility &geometry_sigma_identity(const MaterialIR &ir,
+                                                        const MaterialIRDestination &destination) {
+  const field_type ft = field_type(destination.key.aux % uint64_t(NUM_FIELD_TYPES));
+  const uint64_t identity = destination.key.aux / uint64_t(NUM_FIELD_TYPES);
+  for (const MaterialIRSusceptibility &candidate : ir.susceptibilities)
+    if (candidate.field_type == ft && candidate.identity == identity) return candidate;
+  throw std::invalid_argument("NVIDIA geometry sigma identity is absent");
+}
+
+double geometry_medium_scalar(const MaterialIR &ir, const OwnedMediumView &medium,
+                              const MaterialIRDestination &destination) {
+  const component c = component(destination.component);
+  const int row = component_index(c);
+  const std::vector<double> &p = *medium.values;
+  switch (destination.property) {
+    case MaterialIRProperty::conductivity:
+    case MaterialIRProperty::condinv:
+      if (direction(destination.tensor_direction) != component_direction(c) ||
+          (!is_D(c) && !is_B(c)))
+        return 0.0;
+      return p[medium.base + (is_D(c) ? 30 : 33) + row];
+    case MaterialIRProperty::chi2:
+      if (!is_electric(c) && !is_magnetic(c)) return 0.0;
+      return p[medium.base + (is_electric(c) ? 18 : 24) + row];
+    case MaterialIRProperty::chi3:
+      if (!is_electric(c) && !is_magnetic(c)) return 0.0;
+      return p[medium.base + (is_electric(c) ? 21 : 27) + row];
+    case MaterialIRProperty::sigma:
+      return owned_sigma_value(medium, geometry_sigma_identity(ir, destination), c,
+                               destination.tensor_direction);
+    case MaterialIRProperty::chi1inv: break;
+  }
+  throw std::logic_error("NVIDIA geometry scalar requested for tensor property");
+}
+
+bool geometry_medium_sigma(const MaterialIR &ir, const OwnedMediumView &medium,
+                           const MaterialIRDestination &destination, double &value) {
+  const MaterialIRSusceptibility &identity = geometry_sigma_identity(ir, destination);
+  const component c = component(destination.component);
+  const int slot = identity.field_type == E_stuff ? 0 : identity.field_type == H_stuff ? 1 : -1;
+  if (slot < 0 || type(c) != identity.field_type) return false;
+  for (const OwnedSusceptibilitySpan &candidate : medium.susceptibilities[slot])
+    if (same_owned_susceptibility(*medium.values, candidate, identity.parameters)) {
+      value = owned_sigma_value(medium, identity, c, destination.tensor_direction);
+      return true;
+    }
+  return false;
+}
+
+nvidia::geometry_value_record geometry_value_for(
+    const MaterialIR &ir, uint32_t material_index,
+    const MaterialIRDestination &destination, size_t sample_offset) {
+  if (material_index >= ir.materials.size())
+    throw std::invalid_argument("NVIDIA geometry material identity is invalid");
+  const MaterialIRMaterial &material = ir.materials[material_index];
+  const component c = component(destination.component);
+  nvidia::geometry_value_record result = {};
+  result.kind = nvidia::geometry_value_kind::constant;
+  result.flags = 1u; // geometry_value_direct
+
+  if (material.kind == meep_geom::material_data::PERFECT_METAL) {
+    if (destination.property == MaterialIRProperty::chi1inv) {
+      const bool diagonal = destination.tensor_column == component_index(c);
+      result.value_1 = is_electric(c) && diagonal ? -0.0
+                       : is_magnetic(c) && diagonal ? 1.0 : 0.0;
+    }
+    return result;
+  }
+  if (material.kind == meep_geom::material_data::MATERIAL_USER)
+    throw std::invalid_argument("NVIDIA geometry cannot pack a reachable user callback");
+
+  size_t offset = material.kind == meep_geom::material_data::MATERIAL_GRID ? 3 : 0;
+  OwnedMediumView first = parse_owned_medium_at(material.parameters, offset);
+  if (material.kind == meep_geom::material_data::MEDIUM) {
+    if (offset != material.parameters.size())
+      throw std::invalid_argument("NVIDIA geometry medium payload has trailing values");
+    if (destination.property == MaterialIRProperty::chi1inv &&
+        (is_electric(c) || is_magnetic(c)) && destination.tensor_column >= 0) {
+      result.flags = 0;
+      geometry_tensor_from_medium(result, first, is_electric(c) ? E_stuff : H_stuff,
+                                  result.tensor_1);
+    }
+    else if (destination.property == MaterialIRProperty::condinv ||
+             destination.property == MaterialIRProperty::conductivity)
+      result.value_1 = geometry_medium_scalar(ir, first, destination);
+    else if (destination.property != MaterialIRProperty::chi1inv)
+      result.value_1 = geometry_medium_scalar(ir, first, destination);
+    else
+      result.value_1 = destination.tensor_column == component_index(c) ? 1.0 : 0.0;
+    return result;
+  }
+
+  if (material.kind == meep_geom::material_data::MATERIAL_FILE) {
+    if (material.parameters.size() - offset != 3)
+      throw std::invalid_argument("NVIDIA geometry FILE payload has a wrong tail");
+    if (destination.property == MaterialIRProperty::chi1inv && is_electric(c) &&
+        destination.tensor_column == component_index(c)) {
+      result.kind = nvidia::geometry_value_kind::file_epsilon;
+      result.flags = 0;
+      result.sample_offset = sample_offset;
+      result.sample_count = material.samples.size();
+      for (int axis = 0; axis < 3; ++axis)
+        result.dimensions[axis] = material_checked_uint32(
+            owned_count(material.parameters[offset + axis], "geometry FILE dimension"),
+            "packing geometry FILE dimension");
+    }
+    else if (destination.property == MaterialIRProperty::chi1inv && is_magnetic(c) &&
+             destination.tensor_column >= 0) {
+      result.flags = 0;
+      geometry_tensor_from_medium(result, first, H_stuff, result.tensor_1);
+    }
+    else if (destination.property == MaterialIRProperty::chi1inv)
+      result.value_1 = destination.tensor_column == component_index(c) ? 1.0 : 0.0;
+    return result;
+  }
+
+  if (material.kind != meep_geom::material_data::MATERIAL_GRID)
+    throw std::invalid_argument("NVIDIA geometry material kind is unsupported");
+  OwnedMediumView second = parse_owned_medium_at(material.parameters, offset);
+  if (material.parameters.size() - offset != 3)
+    throw std::invalid_argument("NVIDIA geometry MaterialGrid payload has a wrong tail");
+  size_t comparison_offset = 0;
+  OwnedMediumView comparison = parse_owned_medium_at(material.comparison_medium,
+                                                      comparison_offset);
+  if (comparison_offset != material.comparison_medium.size())
+    throw std::invalid_argument("NVIDIA geometry MaterialGrid comparison medium is stale");
+  result.overlap_kind = uint32_t(material.material_grid_kind);
+  result.sample_offset = sample_offset;
+  result.sample_count = material.samples.size();
+  for (int axis = 0; axis < 3; ++axis)
+    result.dimensions[axis] = material_checked_uint32(
+        owned_count(material.parameters[axis], "geometry MaterialGrid dimension"),
+        "packing geometry MaterialGrid dimension");
+  result.beta = material.parameters[offset];
+  result.eta = material.parameters[offset + 1];
+  result.damping = material.parameters[offset + 2];
+  result.projection_offset = ir.projection_offset;
+  result.flags = 0;
+  if (destination.property == MaterialIRProperty::chi1inv && is_electric(c) &&
+      destination.tensor_column >= 0) {
+    result.kind = nvidia::geometry_value_kind::grid_tensor;
+    result.flags = 0;
+    geometry_tensor_from_medium(result, first, E_stuff, result.tensor_1);
+    geometry_tensor_from_medium(result, second, E_stuff, result.tensor_2);
+  }
+  else if (destination.property == MaterialIRProperty::chi1inv && is_magnetic(c) &&
+           destination.tensor_column >= 0) {
+    result.kind = nvidia::geometry_value_kind::constant;
+    result.flags = 0;
+    geometry_tensor_from_medium(result, comparison, H_stuff, result.tensor_1);
+  }
+  else if ((destination.property == MaterialIRProperty::conductivity ||
+            destination.property == MaterialIRProperty::condinv) && is_D(c) &&
+           direction(destination.tensor_direction) == component_direction(c)) {
+    result.kind = destination.property == MaterialIRProperty::conductivity
+                      ? nvidia::geometry_value_kind::grid_linear
+                      : nvidia::geometry_value_kind::grid_condinv;
+    result.value_1 = geometry_medium_scalar(ir, first, destination);
+    result.value_2 = geometry_medium_scalar(ir, second, destination);
+  }
+  else if (destination.property == MaterialIRProperty::sigma && is_electric(c)) {
+    result.kind = nvidia::geometry_value_kind::grid_linear;
+    double sigma = 0.0;
+    if (geometry_medium_sigma(ir, first, destination, sigma)) result.value_1 = sigma;
+    sigma = 0.0;
+    if (geometry_medium_sigma(ir, second, destination, sigma)) result.value_2 = sigma;
+  }
+  else if (destination.property == MaterialIRProperty::chi1inv) {
+    result.kind = nvidia::geometry_value_kind::constant;
+    result.flags = 1u;
+    result.value_1 = destination.tensor_column == component_index(c) ? 1.0 : 0.0;
+  }
+  else {
+    result.kind = nvidia::geometry_value_kind::constant;
+    result.flags = 1u;
+    result.value_1 = geometry_medium_scalar(ir, comparison, destination);
+  }
+  return result;
+}
+
+void preflight_geometry_ir(const MaterialIR &ir) {
+  std::vector<uint8_t> used(ir.materials.size(), 0);
+  used[ir.default_material] = 1;
+  for (const MaterialIRObject &object : ir.objects) used[size_t(object.material)] = 1;
+  for (const MaterialIRDestination &destination : ir.destinations)
+    for (uint32_t material = 0; material < ir.materials.size(); ++material)
+      if (used[material]) (void)geometry_value_for(ir, material, destination, 0);
+}
+
+int geometry_object_subtype(const MaterialIRObject &object) {
+  if (object.kind == geometric_object::BLOCK) return int(object.parameters[24]);
+  if (object.kind == geometric_object::CYLINDER) return int(object.parameters[8]);
+  if (object.kind == geometric_object::MESH) return int(object.parameters[3]);
+  return 0;
+}
+
+uint64_t geometry_compact_hash(const std::vector<unsigned char> &bytes) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (unsigned char byte : bytes) {
+    hash ^= byte;
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+bool same_geometry_common(nvidia::geometry_launch_common left,
+                          nvidia::geometry_launch_common right) {
+  if (left.destination != right.destination ||
+      left.compact_input_bytes != right.compact_input_bytes ||
+      left.object_offset != right.object_offset || left.object_count != right.object_count ||
+      left.image_offset != right.image_offset || left.image_count != right.image_count ||
+      left.value_offset != right.value_offset || left.material_count != right.material_count ||
+      left.absorber_header_offset != right.absorber_header_offset ||
+      left.absorber_count != right.absorber_count || left.default_material != right.default_material ||
+      left.elements != right.elements || left.point_count != right.point_count ||
+      left.dimensions != right.dimensions || left.component != right.component ||
+      left.tensor_row != right.tensor_row || left.tensor_column != right.tensor_column ||
+      left.property != right.property || left.inva != right.inva || left.dt != right.dt ||
+      left.logical_single != right.logical_single || left.precision != right.precision)
+    return false;
+  for (int axis = 0; axis < 3; ++axis)
+    if (left.axis_direction[axis] != right.axis_direction[axis] ||
+        left.loop_begin[axis] != right.loop_begin[axis] ||
+        left.little_corner[axis] != right.little_corner[axis] ||
+        left.loop_base_offset[axis] != right.loop_base_offset[axis] ||
+        left.loop_extent[axis] != right.loop_extent[axis] ||
+        left.strides[axis] != right.strides[axis] ||
+        left.evaluation_shift[axis] != right.evaluation_shift[axis] ||
+        left.cell_center[axis] != right.cell_center[axis] ||
+        left.cell_size[axis] != right.cell_size[axis])
+      return false;
+  for (int i = 0; i < 9; ++i)
+    if (left.metric[i] != right.metric[i]) return false;
+  return true;
+}
+
+nvidia::geometry_launch_common geometry_common_for(
+    const MaterialIR &ir, const MaterialIRDestination &destination,
+    const NvidiaBackendState &state, size_t object_offset, size_t object_count,
+    size_t image_offset, size_t image_count, size_t value_offset,
+    size_t absorber_header_offset, size_t absorber_count, double dt) {
+  const ArrayId id = find_storage_key(state.plan_, destination.key);
+  if (!is_valid(id)) throw std::invalid_argument("NVIDIA geometry destination is absent");
+  const MaterialIRChunk &chunk = ir.chunks[destination.chunk_index];
+  const component c = component(destination.component);
+  nvidia::geometry_launch_common common = {};
+  common.destination = state.arenas_->resolve(id.value).address;
+  common.object_offset = object_offset;
+  common.object_count = object_count;
+  common.image_offset = image_offset;
+  common.image_count = image_count;
+  common.value_offset = value_offset;
+  common.material_count = ir.materials.size();
+  common.default_material = ir.default_material;
+  common.absorber_header_offset = absorber_header_offset;
+  common.absorber_count =
+      (destination.property == MaterialIRProperty::conductivity ||
+       destination.property == MaterialIRProperty::condinv) &&
+              (is_D(c) || is_B(c)) &&
+              direction(destination.tensor_direction) == component_direction(c)
+          ? absorber_count
+          : 0;
+  common.elements = state.plan_.arrays[id.value].elements;
+  common.point_count = destination.point_count;
+  common.dimensions = ir.dimensions;
+  common.component = destination.component;
+  common.tensor_row = component_index(c);
+  common.tensor_column = destination.tensor_column;
+  common.property = int(destination.property);
+  for (int axis = 0; axis < 3; ++axis) {
+    common.axis_direction[axis] = material_axis_direction(ir.dimensions, axis);
+    common.loop_begin[axis] = chunk.loop_begin[c][axis];
+    common.little_corner[axis] = chunk.little_corner[axis];
+    const int64_t stagger = int64_t(chunk.loop_begin[c][axis]) - chunk.little_corner[axis];
+    const int64_t doubled_extent = int64_t(chunk.loop_end[c][axis]) - chunk.loop_begin[c][axis];
+    if (stagger < 0 || stagger > 1 || doubled_extent < 0 || doubled_extent % 2)
+      throw std::invalid_argument("NVIDIA geometry loop metadata is invalid");
+    common.loop_base_offset[axis] = size_t(stagger / 2) * size_t(chunk.strides[axis]);
+    common.loop_extent[axis] = size_t(doubled_extent / 2) + 1;
+    common.strides[axis] = chunk.strides[axis];
+    const bool shifted = destination.offdiagonal ||
+                         (destination.property == MaterialIRProperty::sigma &&
+                          direction(destination.tensor_direction) != component_direction(c));
+    common.evaluation_shift[axis] =
+        shifted &&
+                common.axis_direction[axis] == int(component_direction(c))
+            ? (type(c) == E_stuff ? -1 : 1)
+            : 0;
+    common.cell_center[axis] = ir.cell[axis];
+    common.cell_size[axis] = ir.cell[axis + 3];
+  }
+  for (int i = 0; i < 9; ++i) common.metric[i] = ir.lattice_metric[i];
+  common.inva = chunk.inva;
+  common.dt = dt;
+  common.logical_single = sizeof(realnum) == sizeof(float);
+  common.precision = scalar_precision_for(state.plan_, id, "NVIDIA geometry destination");
+  return common;
+}
+
+void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, double dt,
+                               MaterialCompactPack &compact, size_t absorber_header_offset,
+                               size_t absorber_count) {
+  std::vector<nvidia::geometry_object_record> objects;
+  objects.reserve(ir.objects.size());
+  for (const MaterialIRObject &source : ir.objects) {
+    nvidia::geometry_object_record object = {};
+    if (source.kind < 0 || source.material < 0)
+      throw std::invalid_argument("NVIDIA geometry object identity is negative");
+    const int subtype = geometry_object_subtype(source);
+    if (subtype < 0)
+      throw std::invalid_argument("NVIDIA geometry object subtype is negative");
+    object.kind = material_checked_uint32(uint64_t(source.kind),
+                                          "packing geometry object kind");
+    object.subtype = material_checked_uint32(uint64_t(subtype),
+                                             "packing geometry object subtype");
+    object.material = material_checked_uint32(uint64_t(source.material),
+                                              "packing geometry material identity");
+    object.closed = source.kind == geometric_object::PRISM
+                        ? uint32_t(ir.prism_include_boundaries)
+                        : source.kind == geometric_object::MESH
+                              ? uint32_t(source.parameters[3] != 0.0)
+                              : 0;
+    object.parameter_offset = compact.append_doubles(source.parameters,
+                                                     "packing geometry parameters");
+    object.parameter_count = source.parameters.size();
+    object.fixed_vertex_count = source.fixed_vertex_count;
+    object.vertex_offset = compact.append_doubles(source.vertices,
+                                                  "packing geometry vertices");
+    object.vertex_count = source.kind == geometric_object::PRISM
+                              ? source.fixed_vertex_count
+                              : source.vertices.size() / 3;
+    object.index_offset = compact.append_doubles(source.indices, "packing geometry indices");
+    object.index_count = source.indices.size();
+    object.auxiliary_offset = compact.append_doubles(source.auxiliary,
+                                                     "packing geometry auxiliary data");
+    object.auxiliary_count = source.auxiliary.size();
+    if (source.kind == geometric_object::MESH) {
+      std::vector<nvidia::geometry_triangle_record> triangles;
+      triangles.reserve(source.triangle_count);
+      for (uint64_t i = 0; i < source.triangle_count; ++i) {
+        const MaterialIRTriangle &captured =
+            ir.geometry_triangles[size_t(source.triangle_offset + i)];
+        nvidia::geometry_triangle_record triangle = {};
+        for (int vertex = 0; vertex < 3; ++vertex) {
+          if (source.vertex_offset > UINT32_MAX ||
+              uint64_t(captured.vertex[vertex]) < source.vertex_offset)
+            throw std::invalid_argument("NVIDIA geometry triangle vertex is stale");
+          triangle.vertex[vertex] = material_checked_uint32(
+              uint64_t(captured.vertex[vertex]) - source.vertex_offset,
+              "packing geometry triangle vertex");
+        }
+        for (int axis = 0; axis < 3; ++axis) {
+          triangle.normal[axis] = captured.normal[axis];
+          triangle.low[axis] = captured.low[axis];
+          triangle.high[axis] = captured.high[axis];
+        }
+        triangles.push_back(triangle);
+      }
+      object.triangle_offset = compact.append_records(triangles,
+                                                      "packing geometry triangles");
+      object.triangle_count = triangles.size();
+      uint64_t captured_face_begin = std::numeric_limits<uint64_t>::max();
+      for (uint64_t i = 0; i < source.bvh_count; ++i) {
+        const MaterialIRBvhNode &node = ir.geometry_bvh[size_t(source.bvh_offset + i)];
+        if (node.leaf) captured_face_begin = std::min(captured_face_begin, node.first_triangle);
+      }
+      if (captured_face_begin == std::numeric_limits<uint64_t>::max() ||
+          captured_face_begin > ir.geometry_bvh_face_ids.size() ||
+          source.triangle_count > ir.geometry_bvh_face_ids.size() - captured_face_begin)
+        throw std::invalid_argument("NVIDIA geometry mesh BVH face span is invalid");
+      std::vector<uint32_t> faces;
+      faces.reserve(source.triangle_count);
+      for (uint64_t i = 0; i < source.triangle_count; ++i)
+        {
+          const uint32_t face = ir.geometry_bvh_face_ids[size_t(captured_face_begin + i)];
+          if (uint64_t(face) < source.triangle_offset)
+            throw std::invalid_argument("NVIDIA geometry BVH face identity is stale");
+          faces.push_back(material_checked_uint32(
+              uint64_t(face) - source.triangle_offset,
+              "packing geometry BVH face identity"));
+        }
+      object.face_id_offset = compact.append_records(faces, "packing geometry BVH faces");
+      object.face_id_count = faces.size();
+      std::vector<nvidia::geometry_bvh_record> nodes;
+      nodes.reserve(source.bvh_count);
+      for (uint64_t i = 0; i < source.bvh_count; ++i) {
+        const MaterialIRBvhNode &captured = ir.geometry_bvh[size_t(source.bvh_offset + i)];
+        nvidia::geometry_bvh_record node = {};
+        for (int axis = 0; axis < 3; ++axis) {
+          node.low[axis] = captured.low[axis];
+          node.high[axis] = captured.high[axis];
+        }
+        node.leaf = captured.leaf;
+        if (!captured.leaf &&
+            (uint64_t(captured.left) < source.bvh_offset ||
+             uint64_t(captured.right) < source.bvh_offset))
+          throw std::invalid_argument("NVIDIA geometry BVH child identity is stale");
+        node.left = captured.leaf
+                        ? UINT32_MAX
+                        : material_checked_uint32(
+                              uint64_t(captured.left) - source.bvh_offset,
+                              "packing geometry BVH left child");
+        node.right = captured.leaf
+                         ? UINT32_MAX
+                         : material_checked_uint32(
+                               uint64_t(captured.right) - source.bvh_offset,
+                               "packing geometry BVH right child");
+        node.first_face = captured.leaf
+                              ? captured.first_triangle - captured_face_begin
+                              : 0;
+        node.face_count = captured.triangle_count;
+        nodes.push_back(node);
+      }
+      if (nodes.empty()) throw std::invalid_argument("NVIDIA geometry mesh BVH is empty");
+      std::vector<std::pair<uint32_t, uint32_t> > stack;
+      stack.push_back(std::make_pair(
+          0u, material_checked_uint32(nodes.size(), "packing geometry BVH node count")));
+      while (!stack.empty()) {
+        const std::pair<uint32_t, uint32_t> entry = stack.back();
+        stack.pop_back();
+        if (entry.first >= nodes.size())
+          throw std::invalid_argument("NVIDIA geometry mesh BVH child is invalid");
+        nvidia::geometry_bvh_record &node = nodes[entry.first];
+        node.escape = entry.second;
+        if (!node.leaf) {
+          stack.push_back(std::make_pair(node.right, entry.second));
+          stack.push_back(std::make_pair(node.left, node.right));
+        }
+      }
+      object.bvh_offset = compact.append_records(nodes, "packing geometry BVH nodes");
+      object.bvh_count = nodes.size();
+      compact.geometry_object_bytes = material_checked_add(
+          compact.geometry_object_bytes,
+          material_checked_add(
+              material_checked_product(triangles.size(),
+                                       sizeof(nvidia::geometry_triangle_record),
+                                       "accounting geometry triangles"),
+              material_checked_add(
+                  material_checked_product(nodes.size(), sizeof(nvidia::geometry_bvh_record),
+                                           "accounting geometry BVH nodes"),
+                  material_checked_product(faces.size(), sizeof(uint32_t),
+                                           "accounting geometry BVH faces"),
+                  "accounting geometry BVH"),
+              "accounting geometry mesh records"),
+          "accounting geometry mesh records");
+    }
+    object.mesh_lengthscale = source.mesh_lengthscale;
+    for (int axis = 0; axis < 3; ++axis) {
+      object.low[axis] = source.low[axis];
+      object.high[axis] = source.high[axis];
+    }
+    objects.push_back(object);
+    compact.geometry_object_bytes = material_checked_add(
+        compact.geometry_object_bytes,
+        material_checked_product(source.parameters.size() + source.vertices.size() +
+                                     source.indices.size() + source.auxiliary.size(),
+                                 sizeof(double), "accounting geometry payload"),
+        "accounting geometry payload");
+  }
+  const size_t object_offset = compact.append_records(objects, "packing geometry objects");
+  compact.geometry_object_bytes = material_checked_add(
+      compact.geometry_object_bytes,
+      material_checked_product(objects.size(), sizeof(nvidia::geometry_object_record),
+                               "accounting geometry object records"),
+      "accounting geometry object records");
+
+  std::vector<nvidia::geometry_image_record> images;
+  images.reserve(ir.active_images.size());
+  for (uint32_t image_index : ir.active_images) {
+    const MaterialIRGeometryImage &source = ir.images[image_index];
+    nvidia::geometry_image_record image = {};
+    image.object = source.object;
+    image.ordinal = source.ordinal;
+    image.precedence = source.precedence;
+    for (int axis = 0; axis < 3; ++axis) {
+      image.image[axis] = source.image[axis];
+      image.shift[axis] = source.shift[axis];
+      image.low[axis] = source.low[axis];
+      image.high[axis] = source.high[axis];
+    }
+    images.push_back(image);
+  }
+  const size_t image_offset = compact.append_records(images, "packing geometry images");
+  compact.geometry_image_bytes = material_checked_product(
+      images.size(), sizeof(nvidia::geometry_image_record), "accounting geometry images");
+
+  std::vector<size_t> sample_offsets(ir.materials.size(), 0);
+  std::vector<uint8_t> used(ir.materials.size(), 0);
+  used[ir.default_material] = 1;
+  for (const MaterialIRObject &object : ir.objects) used[size_t(object.material)] = 1;
+  for (size_t i = 0; i < ir.materials.size(); ++i)
+    if (used[i] && !ir.materials[i].samples.empty()) {
+      sample_offsets[i] = compact.append_doubles(ir.materials[i].samples,
+                                                 "packing geometry material samples");
+      const size_t bytes = material_checked_product(ir.materials[i].samples.size(),
+                                                    sizeof(double),
+                                                    "accounting geometry samples");
+      if (ir.materials[i].kind == meep_geom::material_data::MATERIAL_FILE)
+        compact.file_sample_bytes = material_checked_add(
+            compact.file_sample_bytes, bytes, "accounting geometry FILE samples");
+      else
+        compact.grid_weight_bytes = material_checked_add(
+            compact.grid_weight_bytes, bytes, "accounting geometry grid samples");
+    }
+
+  std::vector<size_t> value_offsets(ir.destinations.size(), 0);
+  for (size_t destination_index = 0; destination_index < ir.destinations.size();
+       ++destination_index) {
+    std::vector<nvidia::geometry_value_record> values;
+    values.reserve(ir.materials.size());
+    for (uint32_t material = 0; material < ir.materials.size(); ++material) {
+      if (used[material])
+        values.push_back(geometry_value_for(ir, material, ir.destinations[destination_index],
+                                            sample_offsets[material]));
+      else {
+        nvidia::geometry_value_record unused = {};
+        unused.kind = nvidia::geometry_value_kind::constant;
+        unused.flags = 1u;
+        values.push_back(unused);
+      }
+    }
+    value_offsets[destination_index] =
+        compact.append_records(values, "packing geometry material values");
+    compact.geometry_value_bytes = material_checked_add(
+        compact.geometry_value_bytes,
+        material_checked_product(values.size(), sizeof(nvidia::geometry_value_record),
+                                 "accounting geometry values"),
+        "accounting geometry values");
+  }
+
+  for (size_t source_index = 0; source_index < ir.bulk_spans.size(); ++source_index) {
+    const MaterialIRBulkSpan &source = ir.bulk_spans[source_index];
+    nvidia::geometry_bulk_launch launch = {};
+    launch.common = geometry_common_for(ir, ir.destinations[source.destination], state,
+                                        object_offset, objects.size(), image_offset,
+                                        images.size(), value_offsets[source.destination],
+                                        absorber_header_offset, absorber_count, dt);
+    launch.first_point = source.first_point;
+    launch.count = source.count;
+    state.material_geometry_bulk_launches_.push_back(launch);
+    NvidiaMaterialGeometryAuthority authority = {};
+    authority.kind = NvidiaMaterialGeometryKind::bulk;
+    authority.destination = source.destination;
+    authority.source_index = source_index;
+    authority.source_count = source.count;
+    authority.array = find_storage_key(state.plan_, ir.destinations[source.destination].key);
+    authority.topology = ir.topology[ir.destinations[source.destination].topology_index];
+    authority.object_offset = launch.common.object_offset;
+    authority.object_count = launch.common.object_count;
+    authority.image_offset = launch.common.image_offset;
+    authority.image_count = launch.common.image_count;
+    authority.value_offset = launch.common.value_offset;
+    authority.absorber_header_offset = launch.common.absorber_header_offset;
+    authority.absorber_count = launch.common.absorber_count;
+    authority.first_point = source.first_point;
+    state.material_geometry_authorities_.push_back(authority);
+  }
+  size_t analytic = 0;
+  while (analytic < ir.analytic_interfaces.size()) {
+    const size_t source_begin = analytic;
+    const uint32_t destination = ir.analytic_interfaces[analytic].destination;
+    std::vector<nvidia::geometry_analytic_record> jobs;
+    do {
+      const MaterialIRAnalyticInterface &source = ir.analytic_interfaces[analytic++];
+      nvidia::geometry_analytic_record job = {};
+      job.point = source.point;
+      job.front_material = source.front_material;
+      job.behind_material = source.behind_material;
+      for (int axis = 0; axis < 3; ++axis) job.normal[axis] = source.normal[axis];
+      job.fill = source.fill;
+      jobs.push_back(job);
+    } while (analytic < ir.analytic_interfaces.size() &&
+             ir.analytic_interfaces[analytic].destination == destination);
+    nvidia::geometry_analytic_launch launch = {};
+    launch.common = geometry_common_for(ir, ir.destinations[destination], state,
+                                        object_offset, objects.size(), image_offset,
+                                        images.size(), value_offsets[destination],
+                                        absorber_header_offset, absorber_count, dt);
+    launch.job_offset = compact.append_records(jobs, "packing geometry analytic jobs");
+    launch.count = jobs.size();
+    state.material_geometry_analytic_launches_.push_back(launch);
+    NvidiaMaterialGeometryAuthority authority = {};
+    authority.kind = NvidiaMaterialGeometryKind::analytic;
+    authority.destination = destination;
+    authority.source_index = source_begin;
+    authority.source_count = jobs.size();
+    authority.array = find_storage_key(state.plan_, ir.destinations[destination].key);
+    authority.topology = ir.topology[ir.destinations[destination].topology_index];
+    authority.object_offset = launch.common.object_offset;
+    authority.object_count = launch.common.object_count;
+    authority.image_offset = launch.common.image_offset;
+    authority.image_count = launch.common.image_count;
+    authority.value_offset = launch.common.value_offset;
+    authority.absorber_header_offset = launch.common.absorber_header_offset;
+    authority.absorber_count = launch.common.absorber_count;
+    authority.record_offset = launch.job_offset;
+    state.material_geometry_authorities_.push_back(authority);
+    compact.geometry_analytic_bytes = material_checked_add(
+        compact.geometry_analytic_bytes,
+        material_checked_product(jobs.size(), sizeof(nvidia::geometry_analytic_record),
+                                 "accounting geometry analytic jobs"),
+        "accounting geometry analytic jobs");
+  }
+  size_t patch = 0;
+  while (patch < ir.hybrid_patches.size()) {
+    const size_t source_begin = patch;
+    const uint32_t destination = ir.hybrid_patches[patch].destination;
+    std::vector<nvidia::geometry_patch_record> patches;
+    do {
+      const MaterialIRHybridPatch &source = ir.hybrid_patches[patch++];
+      patches.push_back(nvidia::geometry_patch_record{source.point, source.value});
+    } while (patch < ir.hybrid_patches.size() &&
+             ir.hybrid_patches[patch].destination == destination);
+    nvidia::geometry_patch_launch launch = {};
+    launch.common = geometry_common_for(ir, ir.destinations[destination], state,
+                                        object_offset, objects.size(), image_offset,
+                                        images.size(), value_offsets[destination],
+                                        absorber_header_offset, absorber_count, dt);
+    launch.patch_offset = compact.append_records(patches, "packing geometry patches");
+    launch.count = patches.size();
+    state.material_geometry_patch_launches_.push_back(launch);
+    NvidiaMaterialGeometryAuthority authority = {};
+    authority.kind = NvidiaMaterialGeometryKind::patch;
+    authority.destination = destination;
+    authority.source_index = source_begin;
+    authority.source_count = patches.size();
+    authority.array = find_storage_key(state.plan_, ir.destinations[destination].key);
+    authority.topology = ir.topology[ir.destinations[destination].topology_index];
+    authority.object_offset = launch.common.object_offset;
+    authority.object_count = launch.common.object_count;
+    authority.image_offset = launch.common.image_offset;
+    authority.image_count = launch.common.image_count;
+    authority.value_offset = launch.common.value_offset;
+    authority.absorber_header_offset = launch.common.absorber_header_offset;
+    authority.absorber_count = launch.common.absorber_count;
+    authority.record_offset = launch.patch_offset;
+    state.material_geometry_authorities_.push_back(authority);
+    compact.geometry_patch_bytes = material_checked_add(
+        compact.geometry_patch_bytes,
+        material_checked_product(patches.size(), sizeof(nvidia::geometry_patch_record),
+                                 "accounting geometry patches"),
+        "accounting geometry patches");
+  }
+}
+
+void validate_material_geometry_authority(
+    const MaterialIR &ir, const NvidiaBackendState &state, const MaterialCompactPack &compact,
+    const NvidiaMaterialGeometryAuthority &authority,
+    const nvidia::geometry_launch_common &common, uint64_t first_point, size_t record_offset,
+    size_t count, double dt, bool require_device_pointer) {
+  if (authority.destination >= ir.destinations.size())
+    throw std::invalid_argument("NVIDIA geometry authority destination is invalid");
+  if (authority.array.value >= state.plan_.arrays.size())
+    throw std::invalid_argument("NVIDIA geometry authority ArrayId is invalid");
+  if (!(state.plan_.keys[authority.array.value] ==
+        ir.destinations[authority.destination].key))
+    throw std::invalid_argument("NVIDIA geometry authority StorageKey is stale");
+  if (!(authority.topology ==
+        ir.topology[ir.destinations[authority.destination].topology_index]))
+    throw std::invalid_argument("NVIDIA geometry authority topology is stale");
+  if (!(authority.array == find_storage_key(state.plan_, authority.topology.key)))
+    throw std::invalid_argument("NVIDIA geometry authority binding is stale");
+  if (authority.source_count != count || authority.first_point != first_point ||
+      authority.record_offset != record_offset)
+    throw std::invalid_argument("NVIDIA geometry authority partition is stale");
+  nvidia::geometry_launch_common expected = geometry_common_for(
+      ir, ir.destinations[authority.destination], state, authority.object_offset,
+      authority.object_count, authority.image_offset, authority.image_count,
+      authority.value_offset, authority.absorber_header_offset, authority.absorber_count,
+      dt);
+  expected.compact_input_bytes = compact.bytes.size();
+  expected.compact_inputs = require_device_pointer
+                                ? static_cast<const unsigned char *>(
+                                      state.material_ir_inputs_.opaque_handle())
+                                : NULL;
+  if (!same_geometry_common(expected, common))
+    throw std::invalid_argument("NVIDIA geometry launch descriptor authority is stale");
+  const void *expected_destination = state.arenas_->resolve(authority.array.value).address;
+  const unsigned char *expected_inputs = require_device_pointer
+                                             ? static_cast<const unsigned char *>(
+                                                   state.material_ir_inputs_.opaque_handle())
+                                             : NULL;
+  if (common.destination != expected_destination || common.compact_inputs != expected_inputs ||
+      common.compact_input_bytes != compact.bytes.size())
+    throw std::invalid_argument("NVIDIA geometry launch pointer authority is stale");
+  if (authority.kind == NvidiaMaterialGeometryKind::bulk) {
+    if (authority.source_index >= ir.bulk_spans.size())
+      throw std::invalid_argument("NVIDIA geometry bulk authority is absent");
+    const MaterialIRBulkSpan &source = ir.bulk_spans[authority.source_index];
+    if (source.destination != authority.destination || source.first_point != first_point ||
+        source.count != count)
+      throw std::invalid_argument("NVIDIA geometry bulk partition authority is stale");
+  }
+  else if (authority.kind == NvidiaMaterialGeometryKind::analytic) {
+    if (authority.source_index > ir.analytic_interfaces.size() ||
+        count > ir.analytic_interfaces.size() - authority.source_index ||
+        !material_compact_range<nvidia::geometry_analytic_record>(record_offset, count,
+                                                                  compact.bytes.size()))
+      throw std::invalid_argument("NVIDIA geometry analytic authority is absent");
+    const nvidia::geometry_analytic_record *records =
+        reinterpret_cast<const nvidia::geometry_analytic_record *>(compact.bytes.data() +
+                                                                    record_offset);
+    for (size_t i = 0; i < count; ++i) {
+      const MaterialIRAnalyticInterface &source = ir.analytic_interfaces[authority.source_index + i];
+      if (source.destination != authority.destination || records[i].point != source.point ||
+          records[i].front_material != source.front_material ||
+          records[i].behind_material != source.behind_material ||
+          !same_material_double(records[i].fill, source.fill))
+        throw std::invalid_argument("NVIDIA geometry analytic record authority is stale");
+      for (int axis = 0; axis < 3; ++axis)
+        if (!same_material_double(records[i].normal[axis], source.normal[axis]))
+          throw std::invalid_argument("NVIDIA geometry analytic normal authority is stale");
+    }
+  }
+  else {
+    if (authority.source_index > ir.hybrid_patches.size() ||
+        count > ir.hybrid_patches.size() - authority.source_index ||
+        !material_compact_range<nvidia::geometry_patch_record>(record_offset, count,
+                                                               compact.bytes.size()))
+      throw std::invalid_argument("NVIDIA geometry patch authority is absent");
+    const nvidia::geometry_patch_record *records =
+        reinterpret_cast<const nvidia::geometry_patch_record *>(compact.bytes.data() +
+                                                                 record_offset);
+    for (size_t i = 0; i < count; ++i) {
+      const MaterialIRHybridPatch &source = ir.hybrid_patches[authority.source_index + i];
+      if (source.destination != authority.destination || records[i].point != source.point ||
+          !same_material_double(records[i].value, source.value))
+        throw std::invalid_argument("NVIDIA geometry patch record authority is stale");
+    }
+  }
+}
+
+void validate_all_material_geometry_authority(const MaterialIR &ir,
+                                              const NvidiaBackendState &state,
+                                              const MaterialCompactPack &compact,
+                                              double dt, bool require_device_pointer) {
+  if (state.material_geometry_compact_hash_ != geometry_compact_hash(compact.bytes))
+    throw std::invalid_argument("NVIDIA geometry compact authority is stale");
+  size_t bulk = 0, analytic = 0, patch = 0;
+  for (const NvidiaMaterialGeometryAuthority &authority :
+       state.material_geometry_authorities_) {
+    if (authority.kind == NvidiaMaterialGeometryKind::bulk) {
+      if (bulk >= state.material_geometry_bulk_launches_.size())
+        throw std::invalid_argument("NVIDIA geometry bulk launch authority is incomplete");
+      const nvidia::geometry_bulk_launch &launch = state.material_geometry_bulk_launches_[bulk++];
+      validate_material_geometry_authority(ir, state, compact, authority, launch.common,
+                                           launch.first_point, 0, launch.count,
+                                           dt, require_device_pointer);
+      nvidia::validate_geometry_bulk_launch(launch, compact.bytes.data(), compact.bytes.size());
+    }
+    else if (authority.kind == NvidiaMaterialGeometryKind::analytic) {
+      if (analytic >= state.material_geometry_analytic_launches_.size())
+        throw std::invalid_argument("NVIDIA geometry analytic launch authority is incomplete");
+      const nvidia::geometry_analytic_launch &launch =
+          state.material_geometry_analytic_launches_[analytic++];
+      validate_material_geometry_authority(ir, state, compact, authority, launch.common, 0,
+                                           launch.job_offset, launch.count,
+                                           dt, require_device_pointer);
+      nvidia::validate_geometry_analytic_launch(launch, compact.bytes.data(),
+                                                compact.bytes.size());
+    }
+    else {
+      if (patch >= state.material_geometry_patch_launches_.size())
+        throw std::invalid_argument("NVIDIA geometry patch launch authority is incomplete");
+      const nvidia::geometry_patch_launch &launch = state.material_geometry_patch_launches_[patch++];
+      validate_material_geometry_authority(ir, state, compact, authority, launch.common, 0,
+                                           launch.patch_offset, launch.count,
+                                           dt, require_device_pointer);
+      nvidia::validate_geometry_patch_launch(launch, compact.bytes.data(), compact.bytes.size());
+    }
+  }
+  if (bulk != state.material_geometry_bulk_launches_.size() ||
+      analytic != state.material_geometry_analytic_launches_.size() ||
+      patch != state.material_geometry_patch_launches_.size())
+    throw std::invalid_argument("NVIDIA geometry launch authority count is stale");
+}
+
 void compile_device_native_material_initialization(const MaterialRecipe &recipe,
                                                    NvidiaBackendState &state, const fields &f,
                                                    double dt,
                                                    MaterialCompactPack &compact) {
-  if (recipe.disposition() != MaterialRecipeDisposition::device_native || !recipe.ir())
+  if ((recipe.disposition() != MaterialRecipeDisposition::device_native &&
+       recipe.disposition() != MaterialRecipeDisposition::hybrid_interface) ||
+      !recipe.ir())
     throw std::invalid_argument("NVIDIA native material initialization requires owned native IR");
   const MaterialIR &ir = *recipe.ir();
   validate_material_ir(ir);
-  preflight_native_table_ir(ir);
   validate_material_ir_against_live(ir, f, dt);
-  if (!ir.objects.empty())
-    throw std::invalid_argument("NVIDIA table initialization does not execute geometry objects");
+  const bool geometry_partition = !ir.objects.empty() || !ir.analytic_interfaces.empty() ||
+                                  !ir.hybrid_patches.empty();
+  if (!geometry_partition) preflight_native_table_ir(ir);
   const MaterialIRMaterial &root = ir.materials[ir.default_material];
   if (root.kind != meep_geom::material_data::MEDIUM &&
       root.kind != meep_geom::material_data::PERFECT_METAL &&
       root.kind != meep_geom::material_data::MATERIAL_FILE &&
       root.kind != meep_geom::material_data::MATERIAL_GRID)
     throw std::invalid_argument("NVIDIA native material kind is unsupported");
-  if (root.kind == meep_geom::material_data::MATERIAL_GRID && root.do_averaging)
+  if (!geometry_partition && root.kind == meep_geom::material_data::MATERIAL_GRID &&
+      root.do_averaging)
     throw std::invalid_argument("NVIDIA table initialization does not support grid averaging");
   if (!std::isfinite(dt) || !(dt > 0.0))
     throw std::invalid_argument("NVIDIA native material initialization has an invalid timestep");
@@ -4542,6 +5584,11 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
   state.material_table_authorities_.clear();
   state.material_conductivity_launches_.clear();
   state.material_pml_launches_.clear();
+  state.material_geometry_bulk_launches_.clear();
+  state.material_geometry_analytic_launches_.clear();
+  state.material_geometry_patch_launches_.clear();
+  state.material_geometry_authorities_.clear();
+  state.material_geometry_compact_hash_ = 0;
   state.material_ir_inputs_.reset();
   compact = MaterialCompactPack();
   if (ir.topology.empty()) return;
@@ -4579,7 +5626,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
         !is_valid(state.plan_.arrays[i].alias_of) && !rows.count(state.plan_.keys[i]))
       throw std::invalid_argument("NVIDIA material storage is absent from owned topology");
 
-  if (file_table || grid_table) {
+  if (!geometry_partition && (file_table || grid_table)) {
     nvidia::material_table_header header = {};
     header.version = 1;
     header.material_id = ir.default_material;
@@ -4701,7 +5748,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
   /* Constant overrides execute in the legacy dependency order.  Absorber
      conductivity and its derived inverse are emitted as one ordered kernel
      below, so their logical predecessor is never reread after narrowing. */
-  if (!file_table && !grid_table)
+  if (!geometry_partition && !file_table && !grid_table)
     for (int phase = 1; phase <= 5; ++phase)
       for (const MaterialIRTopologyRow &row_spec : ir.topology) {
       const array_kind kind = static_cast<array_kind>(row_spec.key.kind);
@@ -4723,7 +5770,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       state.material_fill_launches_.push_back(launch);
       }
 
-  if (!ir.absorbers.empty())
+  if (!geometry_partition && !ir.absorbers.empty())
     for (const MaterialIRTopologyRow &row_spec : ir.topology) {
       if (static_cast<array_kind>(row_spec.key.kind) != array_kind::conductivity) continue;
       const component c = component(row_spec.key.component_);
@@ -4784,7 +5831,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       state.material_conductivity_launches_.push_back(launch);
     }
 
-  if (file_table || grid_table) {
+  if (!geometry_partition && (file_table || grid_table)) {
     const auto make_table_launch = [&](const MaterialIRTopologyRow &row_spec,
                                        nvidia::material_table_operation operation) {
       const component c = component(row_spec.key.component_);
@@ -4943,6 +5990,10 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     }
   }
 
+  if (geometry_partition)
+    compile_material_geometry(ir, state, dt, compact, compact.absorber_header_offset,
+                              absorber_headers.size());
+
   std::vector<size_t> pml_profile_offsets(ir.pml_axes.size(), size_t(-1));
   for (size_t i = 0; i < ir.pml_axes.size(); ++i)
     if (ir.pml_axes[i].profile_active) {
@@ -5016,6 +6067,21 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
   if (input_bytes) {
     for (nvidia::material_table_launch &launch : state.material_table_launches_)
       launch.compact_input_bytes = input_bytes;
+    for (nvidia::geometry_bulk_launch &launch : state.material_geometry_bulk_launches_)
+      launch.common.compact_input_bytes = input_bytes;
+    for (nvidia::geometry_analytic_launch &launch : state.material_geometry_analytic_launches_)
+      launch.common.compact_input_bytes = input_bytes;
+    for (nvidia::geometry_patch_launch &launch : state.material_geometry_patch_launches_)
+      launch.common.compact_input_bytes = input_bytes;
+    state.material_geometry_compact_hash_ = geometry_compact_hash(compact.bytes);
+    if (!state.material_geometry_bulk_launches_.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_geometry_descriptor_mutation))
+      ++state.material_geometry_bulk_launches_.front().common.evaluation_shift[0];
+    if (!state.material_geometry_authorities_.empty() && !compact.bytes.empty() &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_geometry_compact_mutation))
+      compact.bytes.back() ^= 1u;
     if (!state.material_table_launches_.empty() &&
         nvidia::testing::consume_failure_for_testing(
             nvidia::testing::failure_point::material_table_semantic_mutation))
@@ -5099,6 +6165,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       nvidia::validate_material_absorber_headers(compact.bytes.data(), compact.bytes.size(),
                                                   compact.absorber_header_offset,
                                                   absorber_headers.size());
+    validate_all_material_geometry_authority(ir, state, compact, dt, false);
     if (input_bytes > nvidia::free_memory_for_device(state.device_))
       throw std::runtime_error("NVIDIA material compact input exceeds available device memory");
     if (nvidia::testing::consume_failure_for_testing(
@@ -5120,7 +6187,39 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       launch.compact_inputs = base;
       launch.compact_input_bytes = input_bytes;
     }
+    for (nvidia::geometry_bulk_launch &launch : state.material_geometry_bulk_launches_) {
+      launch.common.compact_inputs = base;
+      launch.common.compact_input_bytes = input_bytes;
+    }
+    for (nvidia::geometry_analytic_launch &launch :
+         state.material_geometry_analytic_launches_) {
+      launch.common.compact_inputs = base;
+      launch.common.compact_input_bytes = input_bytes;
+    }
+    for (nvidia::geometry_patch_launch &launch : state.material_geometry_patch_launches_) {
+      launch.common.compact_inputs = base;
+      launch.common.compact_input_bytes = input_bytes;
+    }
   }
+}
+
+size_t exact_initialization_staging_bytes(const StoragePlan &plan, bool native_material,
+                                          size_t compact_input_bytes) {
+  size_t bytes = 0;
+  for (const ArraySpec &spec : plan.arrays) {
+    if (is_valid(spec.alias_of) || (native_material && spec.role == array_role::material))
+      continue;
+    const size_t array_bytes = storage_bytes(spec);
+    if (native_material)
+      bytes = material_checked_add(bytes, array_bytes,
+                                   "sizing NVIDIA initialization staging");
+    else
+      bytes = std::max(bytes, array_bytes);
+  }
+  if (native_material)
+    bytes = material_checked_add(bytes, compact_input_bytes,
+                                 "sizing NVIDIA compact-input staging");
+  return bytes;
 }
 
 } // namespace
@@ -5136,7 +6235,39 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
       throw std::invalid_argument(std::string("invalid NVIDIA storage aliases: ") + why);
     if (next_state_token_ == 0)
       throw std::overflow_error("NVIDIA backend state token overflow");
-    state.reset(new NvidiaBackendState(this, device_plan, device_, next_state_token_++));
+    const nvidia::arena_plan layout(allocation_requests_for(device_plan));
+    const size_t device_reserve_bytes = pending_initialization_reserve_valid_
+                                            ? pending_initialization_reserve_bytes_
+                                            : 2 * sizeof(nvidia::noisy_seed_block);
+    const size_t compact_input_bytes = pending_initialization_reserve_valid_
+                                           ? pending_initialization_compact_bytes_
+                                           : 0;
+    const bool native_material = pending_initialization_reserve_valid_ &&
+                                 pending_initialization_native_;
+    const size_t staging_bytes = exact_initialization_staging_bytes(
+        device_plan, native_material, compact_input_bytes);
+    if (device_reserve_bytes >
+        std::numeric_limits<size_t>::max() - layout.total_reserved_bytes())
+      throw std::overflow_error("NVIDIA initialization peak-memory admission overflows");
+    const size_t device_peak = layout.total_reserved_bytes() + device_reserve_bytes;
+    if (staging_bytes > std::numeric_limits<size_t>::max() - device_peak)
+      throw std::overflow_error("NVIDIA initialization staging peak overflows");
+    const size_t combined_peak = device_peak + staging_bytes;
+    const size_t physical_free = nvidia::free_memory_for_device(device_);
+    const size_t test_budget = nvidia::testing::initialization_memory_budget_for_testing();
+    if (device_peak > physical_free || combined_peak > test_budget) {
+      std::ostringstream message;
+      message << "NVIDIA initialization peak requires " << combined_peak
+              << " bytes (resident arenas " << layout.total_reserved_bytes()
+              << " plus device compact/auxiliary reserve " << device_reserve_bytes
+              << " plus pinned staging " << staging_bytes << "), but device "
+              << device_ << " has " << physical_free << " device bytes and the admission budget is "
+              << test_budget << " bytes";
+      throw std::runtime_error(message.str());
+    }
+    state.reset(new NvidiaBackendState(this, device_plan, device_, next_state_token_++,
+                                       device_reserve_bytes, compact_input_bytes,
+                                       staging_bytes));
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -5149,6 +6280,10 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
     if (local_error.empty()) local_error = "another rank failed to construct NVIDIA backend state";
     throw std::runtime_error(local_error);
   }
+  pending_initialization_reserve_valid_ = false;
+  pending_initialization_reserve_bytes_ = 0;
+  pending_initialization_compact_bytes_ = 0;
+  pending_initialization_native_ = false;
   return state.release();
 }
 
@@ -5158,6 +6293,7 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
   state.material_initialization_statistics_ = NvidiaMaterialInitializationStatistics();
   std::string local_error;
   try {
+    nvidia::device_scope device_scope(state.device_);
     if (state.transfer_failed_)
       throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
     if (state.device_authoritative_)
@@ -5189,6 +6325,7 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
             "accounting dense PML oracle bytes");
       }
     if (material.disposition() != MaterialRecipeDisposition::device_native &&
+        material.disposition() != MaterialRecipeDisposition::hybrid_interface &&
         material.disposition() != MaterialRecipeDisposition::host_reference)
       throw std::invalid_argument("NVIDIA native initialization received an unsupported route");
     const CpuArrayCatalog &catalog = *f_.array_catalog;
@@ -5204,7 +6341,8 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
     std::vector<Upload> uploads;
     uploads.reserve(state.plan_.arrays.size());
     const bool native_material =
-        material.disposition() == MaterialRecipeDisposition::device_native;
+        material.disposition() == MaterialRecipeDisposition::device_native ||
+        material.disposition() == MaterialRecipeDisposition::hybrid_interface;
     MaterialCompactPack compact_inputs;
     if (native_material)
       compile_device_native_material_initialization(material, state, f_, double(f_.dt),
@@ -5215,8 +6353,16 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
       state.material_table_authorities_.clear();
       state.material_conductivity_launches_.clear();
       state.material_pml_launches_.clear();
+      state.material_geometry_bulk_launches_.clear();
+      state.material_geometry_analytic_launches_.clear();
+      state.material_geometry_patch_launches_.clear();
+      state.material_geometry_authorities_.clear();
+      state.material_geometry_compact_hash_ = 0;
       state.material_ir_inputs_.reset();
     }
+    if (compact_inputs.bytes.size() != state.initialization_compact_input_bytes_)
+      throw std::logic_error(
+          "NVIDIA material compact-input size differs from pre-allocation admission");
     size_t staging_bytes = 0;
     for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
       const ArraySpec &device_spec = state.plan_.arrays[i];
@@ -5250,6 +6396,9 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
     const size_t compact_staging_offset = staging_bytes;
     staging_bytes =
         material_checked_add(staging_bytes, compact_input_bytes, "sizing compact input staging");
+    if (staging_bytes != state.initialization_staging_bytes_)
+      throw std::logic_error(
+          "NVIDIA initialization staging size differs from pre-allocation admission");
     state.ensure_staging(staging_bytes);
     size_t material_uploads = 0;
     const auto stage_upload = [&](const Upload &upload) {
@@ -5329,12 +6478,27 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
           compact_inputs.file_sample_bytes;
       state.material_initialization_statistics_.grid_weight_bytes =
           compact_inputs.grid_weight_bytes;
+      state.material_initialization_statistics_.geometry_object_bytes =
+          compact_inputs.geometry_object_bytes;
+      state.material_initialization_statistics_.geometry_image_bytes =
+          compact_inputs.geometry_image_bytes;
+      state.material_initialization_statistics_.geometry_value_bytes =
+          compact_inputs.geometry_value_bytes;
+      state.material_initialization_statistics_.geometry_analytic_bytes =
+          compact_inputs.geometry_analytic_bytes;
+      state.material_initialization_statistics_.geometry_patch_bytes =
+          compact_inputs.geometry_patch_bytes;
       state.material_initialization_statistics_.decoded_parameter_bytes =
           compact_input_bytes - compact_inputs.absorber_profile_bytes -
           compact_inputs.pml_profile_bytes - compact_inputs.file_sample_bytes -
           compact_inputs.grid_weight_bytes;
     }
     if (native_material) {
+      if (material.ir() && !state.material_geometry_authorities_.empty()) {
+        validate_material_ir_against_live(*material.ir(), f_, double(f_.dt));
+        validate_all_material_geometry_authority(*material.ir(), state, compact_inputs,
+                                                 double(f_.dt), true);
+      }
       for (uint32_t phase = 0; phase <= 5; ++phase) {
         for (const nvidia::material_fill_launch &launch : state.material_fill_launches_)
           if (launch.phase == phase) {
@@ -5342,6 +6506,39 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
             ++state.material_initialization_statistics_.constant_fill_kernel_launches;
             ++state.material_initialization_statistics_.pointwise_kernel_launches;
           }
+        for (const nvidia::geometry_bulk_launch &launch :
+             state.material_geometry_bulk_launches_)
+          if (geometry_property_phase(launch.common.property) == int(phase)) {
+            nvidia::launch_material_geometry_bulk(launch, *state.transfer_);
+            ++state.material_initialization_statistics_.geometry_bulk_kernel_launches;
+            ++state.material_initialization_statistics_.pointwise_kernel_launches;
+            state.material_initialization_statistics_.geometry_bulk_points =
+                material_checked_add(
+                    state.material_initialization_statistics_.geometry_bulk_points,
+                    launch.count, "accounting geometry bulk points");
+          }
+        if (phase == 1) {
+          for (const nvidia::geometry_analytic_launch &launch :
+               state.material_geometry_analytic_launches_) {
+            nvidia::launch_material_geometry_analytic(launch, *state.transfer_);
+            ++state.material_initialization_statistics_.geometry_analytic_kernel_launches;
+            ++state.material_initialization_statistics_.pointwise_kernel_launches;
+            state.material_initialization_statistics_.geometry_analytic_points =
+                material_checked_add(
+                    state.material_initialization_statistics_.geometry_analytic_points,
+                    launch.count, "accounting geometry analytic points");
+          }
+          for (const nvidia::geometry_patch_launch &launch :
+               state.material_geometry_patch_launches_) {
+            nvidia::launch_material_geometry_patch(launch, *state.transfer_);
+            ++state.material_initialization_statistics_.geometry_patch_kernel_launches;
+            ++state.material_initialization_statistics_.pointwise_kernel_launches;
+            state.material_initialization_statistics_.geometry_patch_points =
+                material_checked_add(
+                    state.material_initialization_statistics_.geometry_patch_points,
+                    launch.count, "accounting geometry patch points");
+          }
+        }
         if (phase == 3)
           for (const nvidia::material_conductivity_launch &launch :
                state.material_conductivity_launches_) {
@@ -5396,6 +6593,9 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
                                   !state.material_fill_launches_.empty() ||
                                   !state.material_table_launches_.empty() ||
                                   !state.material_conductivity_launches_.empty() ||
+                                  !state.material_geometry_bulk_launches_.empty() ||
+                                  !state.material_geometry_analytic_launches_.empty() ||
+                                  !state.material_geometry_patch_launches_.empty() ||
                                   !state.material_pml_launches_.empty();
       if (submitted_work) {
         if (nvidia::testing::consume_failure_for_testing(
@@ -7936,6 +9136,8 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   NvidiaBackendState &state = checked_state(raw_state);
   NvidiaExecutable &executable = checked_executable(raw_executable, state);
   if (!or_to_all(num_steps > 0)) return;
+  if (count_processors() != 1)
+    throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
   if (!state.initialized_) throw std::logic_error("cannot advance uninitialized NVIDIA storage");
   if (executable.storage_fingerprint_ != state.fingerprint_)
     throw std::logic_error("NVIDIA executable was compiled for a different storage layout");

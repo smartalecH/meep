@@ -26,7 +26,7 @@ namespace meep {
 
 namespace {
 
-const uint32_t material_recipe_format_version = 1;
+const uint32_t material_recipe_format_version = 2;
 int material_recipe_failure_rank_for_testing = -1;
 int material_recipe_failure_mode_for_testing = 0;
 
@@ -176,13 +176,21 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
   ADD_SCALAR(ir.ensure_periodicity);
   ADD_SCALAR(ir.contains_host_callback);
   ADD_SCALAR(ir.device_native_eligible);
+  ADD_SCALAR(ir.requires_hybrid);
+  ADD_SCALAR(ir.prism_include_boundaries);
   ADD_SCALAR(ir.dimensions);
   ADD_SCALAR(ir.projection_offset);
   ADD_SCALAR(ir.default_material);
+  ADD_SCALAR(ir.root_count);
   ADD_SCALAR(ir.signature);
   ADD_SCALAR(ir.layout_signature);
   add_compact_bytes(total, ir.cell.size(), sizeof(double));
-  add_compact_bytes(total, ir.roots.size(), sizeof(uint32_t));
+  add_compact_bytes(total, 6, sizeof(ir.captured_volume[0]));
+  add_compact_bytes(total, 3, sizeof(ir.lattice_basis_size[0]));
+  add_compact_bytes(total, 9, sizeof(ir.lattice_basis[0]));
+  add_compact_bytes(total, 9, sizeof(ir.lattice_metric[0]));
+  add_compact_bytes(total, 9, sizeof(ir.lattice_inverse[0]));
+  add_compact_bytes(total, 9, sizeof(ir.lattice_inverse_transpose[0]));
   add_compact_bytes(total, ir.extra_materials.size(), sizeof(uint32_t));
   for (const MaterialIRMaterial &m : ir.materials) {
     ADD_SCALAR(m.kind);
@@ -195,17 +203,39 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
     ADD_SCALAR(m.has_chi3);
     ADD_SCALAR(m.e_susceptibilities);
     ADD_SCALAR(m.h_susceptibilities);
+    add_compact_bytes(total, m.comparison_medium.size(), sizeof(double));
     add_compact_bytes(total, m.parameters.size(), sizeof(double));
     add_compact_bytes(total, m.samples.size(), sizeof(double));
   }
   for (const MaterialIRObject &o : ir.objects) {
     ADD_SCALAR(o.kind);
     ADD_SCALAR(o.material);
-    add_compact_bytes(total, o.children.size(), sizeof(uint32_t));
+    ADD_SCALAR(o.source_identity);
+    ADD_SCALAR(o.root_identity); ADD_SCALAR(o.leaf_ordinal);
+    add_compact_bytes(total, 3, sizeof(o.parent_shift[0]));
+    add_compact_bytes(total, 3, sizeof(o.low[0]));
+    add_compact_bytes(total, 3, sizeof(o.high[0]));
+    ADD_SCALAR(o.fixed_vertex_count);
+    ADD_SCALAR(o.vertex_offset); ADD_SCALAR(o.vertex_count);
+    ADD_SCALAR(o.triangle_offset); ADD_SCALAR(o.triangle_count);
+    ADD_SCALAR(o.bvh_offset); ADD_SCALAR(o.bvh_count); ADD_SCALAR(o.mesh_lengthscale);
     add_compact_bytes(total, o.parameters.size(), sizeof(double));
     add_compact_bytes(total, o.vertices.size(), sizeof(double));
     add_compact_bytes(total, o.indices.size(), sizeof(double));
+    add_compact_bytes(total, o.auxiliary.size(), sizeof(double));
   }
+  add_compact_bytes(total, ir.geometry_vertices.size(), sizeof(double));
+  add_compact_bytes(total, ir.geometry_triangles.size(), sizeof(MaterialIRTriangle));
+  add_compact_bytes(total, ir.geometry_bvh.size(), sizeof(MaterialIRBvhNode));
+  add_compact_bytes(total, ir.geometry_bvh_face_ids.size(), sizeof(uint32_t));
+  for (const MaterialIRGeometryImage &image : ir.images) {
+    ADD_SCALAR(image.object); ADD_SCALAR(image.ordinal); ADD_SCALAR(image.precedence);
+    add_compact_bytes(total, 3, sizeof(image.image[0]));
+    add_compact_bytes(total, 3, sizeof(image.shift[0]));
+    add_compact_bytes(total, 3, sizeof(image.low[0]));
+    add_compact_bytes(total, 3, sizeof(image.high[0]));
+  }
+  add_compact_bytes(total, ir.active_images.size(), sizeof(uint32_t));
   for (const MaterialIRSusceptibility &s : ir.susceptibilities) {
     ADD_SCALAR(s.identity);
     ADD_SCALAR(s.material);
@@ -275,6 +305,32 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
     add_compact_bytes(total, 3, sizeof(row.strides[0]));
     add_compact_bytes(total, 3, sizeof(row.stagger[0]));
   }
+  for (const MaterialIRDestination &destination : ir.destinations) {
+    ADD_SCALAR(destination.key.chunk); ADD_SCALAR(destination.key.kind);
+    ADD_SCALAR(destination.key.component_); ADD_SCALAR(destination.key.cmp);
+    ADD_SCALAR(destination.key.aux); ADD_SCALAR(destination.topology_index);
+    ADD_SCALAR(destination.chunk_index); ADD_SCALAR(destination.property);
+    ADD_SCALAR(destination.component); ADD_SCALAR(destination.tensor_direction);
+    ADD_SCALAR(destination.tensor_column); ADD_SCALAR(destination.offdiagonal);
+    ADD_SCALAR(destination.point_count);
+  }
+  for (const MaterialIRBulkSpan &span : ir.bulk_spans) {
+    ADD_SCALAR(span.destination); ADD_SCALAR(span.first_point); ADD_SCALAR(span.count);
+  }
+  for (const MaterialIRAnalyticInterface &job : ir.analytic_interfaces) {
+    ADD_SCALAR(job.destination); ADD_SCALAR(job.point); ADD_SCALAR(job.front_material);
+    ADD_SCALAR(job.behind_material); ADD_SCALAR(job.object); ADD_SCALAR(job.image);
+    add_compact_bytes(total, 3, sizeof(job.normal[0])); ADD_SCALAR(job.fill);
+  }
+  for (const MaterialIRHybridPatch &patch : ir.hybrid_patches) {
+    ADD_SCALAR(patch.destination); ADD_SCALAR(patch.point); ADD_SCALAR(patch.value);
+    ADD_SCALAR(patch.front_material); ADD_SCALAR(patch.behind_material);
+    ADD_SCALAR(patch.object); ADD_SCALAR(patch.image); ADD_SCALAR(patch.ambiguous);
+    ADD_SCALAR(patch.variable_material);
+    ADD_SCALAR(patch.variable_causes);
+    ADD_SCALAR(patch.adaptive_fallback); ADD_SCALAR(patch.negative_fallback);
+    ADD_SCALAR(patch.reason);
+  }
 #undef ADD_SCALAR
   return total;
 }
@@ -294,7 +350,6 @@ MaterialSupportDecision classify_support_input(
   }
 
   decision.reason_bits = material_support_none;
-  if (!ir->objects.empty()) decision.reason_bits |= material_support_object_lookup;
   if (ir->default_material >= ir->materials.size())
     throw std::invalid_argument("material support has an invalid default material");
   std::vector<uint8_t> used(ir->materials.size(), 0);
@@ -309,18 +364,27 @@ MaterialSupportDecision classify_support_input(
     const MaterialIRMaterial &material = ir->materials[i];
     if (material.host_callback)
       decision.reason_bits |= material_support_unowned_callback;
-    if (material.kind == meep_geom::material_data::MATERIAL_GRID && material.do_averaging)
+    if (material.kind == meep_geom::material_data::MATERIAL_GRID && material.do_averaging &&
+        ir->requires_hybrid)
       decision.reason_bits |= material_support_adaptive_averaging;
   }
 
   decision.compact_input_bytes = compact_material_ir_bytes(*ir);
-  for (const MaterialIRTopologyRow &row : ir->topology)
-    decision.native_points =
-        checked_u64_add(decision.native_points, uint64_t(row.elements), "native point count");
-
-  decision.disposition = decision.reason_bits == material_support_none
-                             ? MaterialRecipeDisposition::device_native
-                             : MaterialRecipeDisposition::host_reference;
+  for (const MaterialIRBulkSpan &span : ir->bulk_spans)
+    decision.native_points = checked_u64_add(decision.native_points, span.count,
+                                             "native point count");
+  decision.native_points = checked_u64_add(decision.native_points,
+                                           uint64_t(ir->analytic_interfaces.size()),
+                                           "native point count");
+  decision.interface_points = checked_u64_add(
+      uint64_t(ir->analytic_interfaces.size()), uint64_t(ir->hybrid_patches.size()),
+      "interface point count");
+  if (decision.reason_bits & material_support_unowned_callback)
+    decision.disposition = MaterialRecipeDisposition::host_reference;
+  else if (ir->requires_hybrid)
+    decision.disposition = MaterialRecipeDisposition::hybrid_interface;
+  else
+    decision.disposition = MaterialRecipeDisposition::device_native;
   return decision;
 }
 
@@ -330,11 +394,11 @@ void validate_input(const MaterialRecipeInput &input) {
     throw std::invalid_argument("material recipe has an invalid subpixel tolerance");
   if (input.subpixel_maxeval < 0 || (input.eps_averaging && input.subpixel_maxeval == 0))
     throw std::invalid_argument("material recipe has an invalid subpixel evaluation limit");
-  if (input.disposition == MaterialRecipeDisposition::hybrid_interface ||
-      input.disposition == MaterialRecipeDisposition::tiled_callback)
-    throw std::invalid_argument("material recipe disposition lacks owned PR5.1 work records");
+  if (input.disposition == MaterialRecipeDisposition::tiled_callback)
+    throw std::invalid_argument("material recipe disposition lacks owned callback work records");
   if (input.disposition != MaterialRecipeDisposition::host_reference &&
-      input.disposition != MaterialRecipeDisposition::device_native)
+      input.disposition != MaterialRecipeDisposition::device_native &&
+      input.disposition != MaterialRecipeDisposition::hybrid_interface)
     throw std::invalid_argument("material recipe disposition is invalid");
   if (input.from_host_callback || input.host_callback_id != invalid_array_value)
     throw std::invalid_argument("host-reference material recipe cannot contain a callback");
@@ -396,8 +460,9 @@ void validate_input(const MaterialRecipeInput &input) {
     if (!row.elements)
       throw std::invalid_argument("material recipe row has zero extent");
     const size_t bytes = checked_host_bytes(row.element_type, row.elements);
-    if (row.values.size() != bytes)
-      throw std::invalid_argument("material recipe row byte count does not match its extent");
+    const bool dense = input.disposition == MaterialRecipeDisposition::host_reference;
+    if ((dense && row.values.size() != bytes) || (!dense && !row.values.empty()))
+      throw std::invalid_argument("material recipe row payload disagrees with its route");
     if (bytes > std::numeric_limits<size_t>::max() - total_bytes)
       throw std::overflow_error("material recipe total byte count overflow");
     total_bytes += bytes;
@@ -603,9 +668,15 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
   const MaterialSupportDecision decision = classify_support_input(input.ir, input.rows);
   input.disposition = decision.disposition;
   input.support_reason_bits = decision.reason_bits;
-  input.description = decision.disposition == MaterialRecipeDisposition::device_native
-                          ? "owned-ir:device-native-ready"
-                          : "cpu:eager-host-reference";
+  if (decision.disposition == MaterialRecipeDisposition::device_native)
+    input.description = "owned-ir:device-native-ready";
+  else if (decision.disposition == MaterialRecipeDisposition::hybrid_interface)
+    input.description = "owned-ir:hybrid-interface-ready";
+  else
+    input.description = "cpu:eager-host-reference";
+  if (decision.disposition == MaterialRecipeDisposition::device_native ||
+      decision.disposition == MaterialRecipeDisposition::hybrid_interface)
+    for (MaterialRecipeRow &row : input.rows) row.values.clear();
   return MaterialRecipe(input);
 }
 
@@ -654,7 +725,8 @@ void resolve_material_storage(const MaterialRecipe &recipe,
   validate_plan_shape(authoritative);
   validate_plan_shape(provisional);
   if (recipe.disposition() != MaterialRecipeDisposition::host_reference &&
-      recipe.disposition() != MaterialRecipeDisposition::device_native)
+      recipe.disposition() != MaterialRecipeDisposition::device_native &&
+      recipe.disposition() != MaterialRecipeDisposition::hybrid_interface)
     throw std::invalid_argument("material storage resolver received an unsupported disposition");
   if (authoritative.arrays.size() > provisional.arrays.size())
     throw std::invalid_argument("provisional material storage lost the authoritative prefix");
