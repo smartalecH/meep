@@ -244,7 +244,8 @@ enum class failure_point {
   multilevel_transition,
   host_segment_after_download,
   host_segment_after_callback,
-  host_segment_after_upload
+  host_segment_after_upload,
+  state_rebuild_sync
 };
 void fail_next(failure_point point);
 void clear_failure();

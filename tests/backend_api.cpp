@@ -36,11 +36,13 @@
 #include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/material_ir.hpp"
 #include "backend/prepare.hpp"
 #include "backend/precision.hpp"
 #include "backend/random_state.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
+#include "meepgeom.hpp"
 
 using namespace meep;
 
@@ -61,6 +63,9 @@ static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; 
 static double unit_epsilon(const vec &) { return 1.0; }
 static double phase_conductivity(const vec &);
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
+static void material_ir_user_function(vector3, void *, meep_geom::medium_struct *medium) {
+  medium->epsilon_diag = meep_geom::make_vector3(2.0, 2.0, 2.0);
+}
 
 class lifecycle_custom_susceptibility : public lorentzian_susceptibility {
 public:
@@ -135,6 +140,13 @@ struct lifetime_counts {
   int custom_preflights;
   RandomSeedSnapshot last_noisy_seed;
   size_t arrays_at_create;
+  size_t material_arrays_at_create;
+  size_t provisional_material_arrays_at_create;
+  size_t material_recipe_rows_at_initialize;
+  uint64_t material_recipe_signature_at_initialize;
+  size_t arrays_at_compile;
+  size_t retained_logical_suffix_at_compile;
+  size_t provisional_material_arrays_at_compile;
   size_t polarization_arrays_at_create;
   size_t polarization_updates_at_compile;
   size_t polarization_subtractions_at_compile;
@@ -162,9 +174,11 @@ struct lifetime_counts {
   bool fail_rebuild;
   bool fail_create_state;
   bool fail_initialize;
+  bool fail_classify;
   bool fail_finalize;
   bool fail_compile;
   bool fail_advance;
+  bool retain_all_provisional_material_rows;
   bool corrupt_catalog_after_compile;
   bool fail_magnetic_synchronize;
   bool fail_magnetic_restore;
@@ -199,6 +213,10 @@ struct lifetime_counts {
         cw_executables_created(0), cw_executables_destroyed(0), cw_preflights(0), cw_solves(0),
         cw_callback_effects(0), malformed_cw_result(0), noisy_seed_refresh_attempts(0),
         noisy_seed_refreshes(0), custom_preflights(0), last_noisy_seed(), arrays_at_create(0),
+        material_arrays_at_create(0), provisional_material_arrays_at_create(0),
+        material_recipe_rows_at_initialize(0), material_recipe_signature_at_initialize(0),
+        arrays_at_compile(0), retained_logical_suffix_at_compile(0),
+        provisional_material_arrays_at_compile(0),
         polarization_arrays_at_create(0), polarization_updates_at_compile(0),
         polarization_subtractions_at_compile(0), beta_updates_at_compile(0),
         multilevel_population_updates_at_compile(0),
@@ -212,8 +230,8 @@ struct lifetime_counts {
         authoritative_value(0), migrate_multilevel_values(false),
         authoritative_population(realnum(0.625)), authoritative_p(realnum(0.375)),
         authoritative_p_prev(realnum(-0.25)), multilevel_migrations(0), fail_rebuild(false),
-        fail_create_state(false), fail_initialize(false), fail_finalize(false),
-        fail_compile(false), fail_advance(false),
+        fail_create_state(false), fail_initialize(false), fail_classify(false), fail_finalize(false),
+        fail_compile(false), fail_advance(false), retain_all_provisional_material_rows(false),
         corrupt_catalog_after_compile(false),
         fail_magnetic_synchronize(false), fail_magnetic_restore(false),
         fail_magnetic_synchronize_dispatch(false), fail_cw_preflight(false),
@@ -232,12 +250,13 @@ struct lifetime_counts {
 };
 
 struct tracking_state : BackendState {
-  explicit tracking_state(lifetime_counts &counts_)
-      : counts(counts_), staged_noisy_seed(), noisy_seed_staged(false) {
+  tracking_state(lifetime_counts &counts_, const StoragePlan &plan_)
+      : counts(counts_), plan(plan_), staged_noisy_seed(), noisy_seed_staged(false) {
     ++counts.states_created;
   }
   ~tracking_state() override { ++counts.states_destroyed; }
   lifetime_counts &counts;
+  StoragePlan plan;
   RandomSeedSnapshot staged_noisy_seed;
   bool noisy_seed_staged;
 };
@@ -279,31 +298,84 @@ public:
   BackendState *create_state(const StoragePlan &plan) override {
     if (counts.fail_create_state) throw std::runtime_error("injected state creation failure");
     counts.arrays_at_create = plan.arrays.size();
+    counts.material_arrays_at_create = 0;
+    counts.provisional_material_arrays_at_create = 0;
     counts.connections_current_at_create = connections_are_current(f);
     for (size_t i = 0; i < plan.arrays.size(); ++i) {
       const ArraySpec &spec = plan.arrays[i];
+      if (spec.role == array_role::material) {
+        ++counts.material_arrays_at_create;
+        if (spec.classification_provisional)
+          ++counts.provisional_material_arrays_at_create;
+      }
       if (spec.role != array_role::polarization || is_valid(spec.alias_of)) continue;
       ++counts.polarization_arrays_at_create;
       const realnum *values = f.array_catalog->resolve<realnum>(spec.id);
       for (size_t j = 0; j < spec.elements; ++j)
         if (values[j] != realnum(0)) counts.polarization_zero_at_create = false;
     }
-    return new tracking_state(counts);
+    return new tracking_state(counts, plan);
   }
-  void initialize(const InitializationPlan &, BackendState &) override {
+  void initialize(const InitializationPlan &plan, BackendState &) override {
     ++counts.initialized;
+    CHECK(plan.materials.size() == 1,
+          "tracking backend initialization did not receive one material recipe");
+    counts.material_recipe_rows_at_initialize =
+        plan.materials.empty() ? 0 : plan.materials[0].rows().size();
+    if (!plan.materials.empty()) {
+      validate_material_recipe(plan.materials[0]);
+      counts.material_recipe_signature_at_initialize = plan.materials[0].signature();
+    }
     if (counts.fail_initialize) throw std::runtime_error("injected initialization failure");
   }
-  MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
+  MaterialClassification classify_state(const StoragePlan &plan, BackendState &raw_state) override {
     ++counts.classified;
-    return classify(f, plan);
+    const std::string error = counts.fail_classify ? "injected material classify failure" : "";
+    backend_reconcile_host_access(error, "tracking material classify");
+    tracking_state &state = dynamic_cast<tracking_state &>(raw_state);
+    CHECK(plan.arrays.size() <= state.plan.arrays.size(),
+          "tracking classification plan exceeds resident storage");
+    MaterialClassification result = classify(f, state.plan);
+    if (counts.retain_all_provisional_material_rows) {
+      result.elided.clear();
+      for (size_t i = 0; i < state.plan.arrays.size(); ++i)
+        if (state.plan.arrays[i].role == array_role::material &&
+            state.plan.arrays[i].classification_provisional)
+          result.provisional_row_state[i] = MaterialClassification::retained;
+    }
+    return result;
   }
-  void finalize_storage(const StoragePlan &, BackendState &) override {
+  void finalize_storage(const StoragePlan &plan, const MaterialClassification &classification,
+                        BackendState &raw_state) override {
+    if (counts.fail_finalize) throw std::runtime_error("injected material finalize failure");
+    tracking_state &state = dynamic_cast<tracking_state &>(raw_state);
+    CHECK(f.initialization_plan && f.initialization_plan->materials.size() == 1,
+          "tracking backend did not receive one frozen material recipe");
+    if (f.initialization_plan && f.initialization_plan->materials.size() == 1)
+      resolve_material_storage(f.initialization_plan->materials[0], classification, plan,
+                               state.plan);
+    CHECK(!has_provisional_material_storage(state.plan),
+          "tracking backend retained provisional material storage after classification");
     ++counts.finalized;
-    if (counts.fail_finalize) throw std::runtime_error("injected finalization failure");
   }
-  Executable *compile(const StepPlan &plan, BackendState &) override {
+  Executable *compile(const StepPlan &plan, BackendState &raw_state) override {
     if (counts.fail_compile) throw std::runtime_error("injected executable compilation failure");
+    tracking_state &state = dynamic_cast<tracking_state &>(raw_state);
+    counts.arrays_at_compile = f.storage_plan ? f.storage_plan->arrays.size() : 0;
+    counts.retained_logical_suffix_at_compile = 0;
+    counts.provisional_material_arrays_at_compile = 0;
+    for (size_t i = 0; i < state.plan.arrays.size(); ++i) {
+      const ArraySpec &spec = state.plan.arrays[i];
+      if (spec.role == array_role::material && spec.classification_provisional)
+        ++counts.provisional_material_arrays_at_compile;
+      if (spec.role == array_role::material && !spec.classification_provisional &&
+          !spec.classification_elided && f.array_catalog && i < f.array_catalog->size() &&
+          !f.array_catalog->resolve_untyped(ArrayId{uint32_t(i)})) {
+        ++counts.retained_logical_suffix_at_compile;
+        CHECK(f.array_catalog->find(f.storage_plan->keys[i]) == ArrayId{uint32_t(i)},
+              "retained logical suffix key was invisible during compilation");
+      }
+    }
     counts.polarization_updates_at_compile = plan.polarization_updates.size();
     counts.polarization_subtractions_at_compile = plan.polarization_subtractions.size();
     counts.multilevel_population_updates_at_compile =
@@ -649,6 +721,8 @@ struct BackendEpochSnapshot {
   Executable *cw;
   std::vector<const void *> raw;
   std::vector<const void *> dft_fc;
+  std::vector<const void *> susceptibility_nodes;
+  std::vector<const void *> polarization_nodes;
   std::vector<const void *> comm;
   std::vector<uint64_t> catalog_values;
   std::vector<std::vector<unsigned char> > catalog_bytes;
@@ -663,6 +737,8 @@ struct BackendEpochSnapshot {
   uint64_t classification_hash, connections_generation, connections_built_generation;
   uint64_t local_generation, local_synced, mutations[fields::num_mutation_kinds];
   bool components_allocated, connections_valid, changed_materials;
+  bool host_custom_enabled;
+  HostCustomFallbackStats host_custom_stats;
   int time_step;
   uint64_t cw_storage_key, cw_step_key, cw_plan_key;
 
@@ -706,7 +782,11 @@ struct BackendEpochSnapshot {
         connections_built_generation(f.connections_built_generation),
         local_generation(f.local_invalidation_generation), local_synced(f.local_invalidation_synced),
         components_allocated(f.components_allocated), connections_valid(f.chunk_connections_valid),
-        changed_materials(f.changed_materials), time_step(f.t), cw_storage_key(0), cw_step_key(0),
+        changed_materials(f.changed_materials),
+        host_custom_enabled(f.backend && f.backend->host_custom_fallback_enabled()),
+        host_custom_stats(f.backend ? f.backend->host_custom_fallback_stats()
+                                    : HostCustomFallbackStats()),
+        time_step(f.t), cw_storage_key(0), cw_step_key(0),
         cw_plan_key(0) {
     steps[0] = f.step_plans[0];
     steps[1] = f.step_plans[1];
@@ -734,6 +814,17 @@ struct BackendEpochSnapshot {
         dft_fc.push_back(dft);
         dft_fc.push_back(dft->fc);
       }
+      if (f.chunks[chunk]->s)
+        FOR_FIELD_TYPES(ft)
+          for (const susceptibility *sus = f.chunks[chunk]->s->chiP[ft]; sus;
+               sus = sus->next)
+            susceptibility_nodes.push_back(sus);
+      FOR_FIELD_TYPES(ft)
+        for (const polarization_state *pol = f.chunks[chunk]->pol[ft]; pol; pol = pol->next) {
+          polarization_nodes.push_back(pol);
+          polarization_nodes.push_back(pol->s);
+          polarization_nodes.push_back(pol->data);
+        }
     }
     if (catalog) for (size_t i = 0; i < catalog->size(); ++i) {
       const ArrayId id = {uint32_t(i)};
@@ -750,6 +841,7 @@ struct BackendEpochSnapshot {
       mix(catalog_hash, spec.alignment);
       mix(catalog_hash, spec.alias_of.value);
       mix(catalog_hash, spec.classification_provisional);
+      mix(catalog_hash, spec.classification_elided);
       uint64_t value_hash = 1469598103934665603ULL;
       std::vector<unsigned char> value_bytes;
       if (base && !is_valid(spec.alias_of)) {
@@ -773,6 +865,7 @@ struct BackendEpochSnapshot {
       mix(storage_hash, spec.alignment);
       mix(storage_hash, spec.alias_of.value);
       mix(storage_hash, spec.classification_provisional);
+      mix(storage_hash, spec.classification_elided);
     }
     if (descriptors) {
       mix(descriptor_hash, source_plan_signature(descriptors->sources));
@@ -790,16 +883,20 @@ struct BackendEpochSnapshot {
     if (steps[0]) mix(descriptor_hash, steps[0]->signature);
     if (steps[1]) mix(descriptor_hash, steps[1]->signature);
     if (initialization) {
+      mix(descriptor_hash, initialization->material_values_generation);
+      mix(descriptor_hash, initialization->material_region_generation);
       mix_vector(descriptor_hash, initialization->operations);
       for (const MaterialRecipe &recipe : initialization->materials) {
-        mix_bytes(descriptor_hash, recipe.description.data(), recipe.description.size());
-        mix(descriptor_hash, recipe.eps_averaging);
-        mix_bytes(descriptor_hash, &recipe.subpixel_tol, sizeof(recipe.subpixel_tol));
-        mix(descriptor_hash, recipe.subpixel_maxeval);
-        mix(descriptor_hash, recipe.host_callback_id);
-        mix(descriptor_hash, recipe.from_host_callback);
+        mix(descriptor_hash, recipe.signature());
       }
-      mix_vector(descriptor_hash, initialization->pml);
+      mix(descriptor_hash, initialization->pml.size());
+      for (const PmlRecipe &recipe : initialization->pml) {
+        mix(descriptor_hash, uint64_t(recipe.chunk));
+        mix(descriptor_hash, uint64_t(recipe.direction_));
+        mix_vector(descriptor_hash, recipe.sigma);
+        mix_vector(descriptor_hash, recipe.kappa);
+        mix_vector(descriptor_hash, recipe.sigma_inv);
+      }
       for (const HostCallbackRecipe &recipe : initialization->host_callbacks) {
         mix(descriptor_hash, recipe.id);
         mix_bytes(descriptor_hash, recipe.description.data(), recipe.description.size());
@@ -873,7 +970,9 @@ struct BackendEpochSnapshot {
         storage != other.storage || descriptors != other.descriptors ||
         initialization != other.initialization || steps[0] != other.steps[0] ||
         steps[1] != other.steps[1] || state != other.state || ordinary != other.ordinary ||
-        cw != other.cw || raw != other.raw || dft_fc != other.dft_fc || comm != other.comm ||
+        cw != other.cw || raw != other.raw || dft_fc != other.dft_fc ||
+        susceptibility_nodes != other.susceptibility_nodes ||
+        polarization_nodes != other.polarization_nodes || comm != other.comm ||
         catalog_values != other.catalog_values ||
         catalog_bytes != other.catalog_bytes ||
         source_metadata != other.source_metadata || source_indices != other.source_indices ||
@@ -889,6 +988,20 @@ struct BackendEpochSnapshot {
         local_generation != other.local_generation || local_synced != other.local_synced ||
         components_allocated != other.components_allocated ||
         connections_valid != other.connections_valid || changed_materials != other.changed_materials ||
+        host_custom_enabled != other.host_custom_enabled ||
+        host_custom_stats.warnings != other.host_custom_stats.warnings ||
+        host_custom_stats.preflights != other.host_custom_stats.preflights ||
+        host_custom_stats.sessions != other.host_custom_stats.sessions ||
+        host_custom_stats.callbacks != other.host_custom_stats.callbacks ||
+        host_custom_stats.completed_sessions != other.host_custom_stats.completed_sessions ||
+        host_custom_stats.staging_allocations != other.host_custom_stats.staging_allocations ||
+        host_custom_stats.staging_bytes != other.host_custom_stats.staging_bytes ||
+        host_custom_stats.downloads != other.host_custom_stats.downloads ||
+        host_custom_stats.download_bytes != other.host_custom_stats.download_bytes ||
+        host_custom_stats.uploads != other.host_custom_stats.uploads ||
+        host_custom_stats.upload_bytes != other.host_custom_stats.upload_bytes ||
+        host_custom_stats.retryable_failures != other.host_custom_stats.retryable_failures ||
+        host_custom_stats.poisoned_failures != other.host_custom_stats.poisoned_failures ||
         time_step != other.time_step ||
         cw_storage_key != other.cw_storage_key || cw_step_key != other.cw_step_key ||
         cw_plan_key != other.cw_plan_key)
@@ -2035,7 +2148,7 @@ static void test_resident_magnetic_dispatch() {
   counts.fail_compile = false;
 
   f->synchronize_magnetic_fields();
-  CHECK(counts.states_created == 1 &&
+  CHECK(counts.states_created == 2 && counts.states_destroyed == 1 &&
             counts.executables_created == counts.executables_destroyed + 1,
         "pre-step resident sync did not prepare state and executable");
   CHECK(counts.magnetic_synchronizes == 1 && counts.magnetic_restores == 0,
@@ -2235,7 +2348,8 @@ public:
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &) override {
     return classify(f, plan);
   }
-  void finalize_storage(const StoragePlan &, BackendState &) override {}
+  void finalize_storage(const StoragePlan &, const MaterialClassification &,
+                        BackendState &) override {}
   Executable *compile(const StepPlan &, BackendState &) override {
     return new rebuild_executable(trace);
   }
@@ -2658,6 +2772,46 @@ static void test_material_phase_transaction() {
 
   delete f;
   delete current;
+
+  {
+    using namespace meep_geom;
+    geometric_object_list empty_geometry = {0, NULL};
+    material_type current_material = make_dielectric(2.0);
+    material_type target_material = make_dielectric(3.0);
+    structure geometry_current(gv, unit_epsilon, no_pml(), identity(), 2);
+    structure geometry_target(gv, unit_epsilon, no_pml(), identity(), 2);
+    set_materials_from_geometry(&geometry_current, empty_geometry, make_vector3(), false, 1e-5,
+                                128, false, current_material);
+    set_materials_from_geometry(&geometry_target, empty_geometry, make_vector3(), false, 1e-5,
+                                128, false, target_material);
+    fields geometry_fields(&geometry_current);
+    lifetime_counts geometry_counts;
+    geometry_fields.backend = new tracking_backend(geometry_fields, geometry_counts, true);
+    geometry_fields.advance(1);
+    const std::shared_ptr<const void> original_ir = geometry_fields.material_ir;
+    CHECK(original_ir && geometry_target.material_ir,
+          "geometry-backed material phase fixture has no immutable IR");
+    geometry_counts.fail_rebuild = true;
+    rejected = false;
+    try { geometry_fields.phase_in_material(&geometry_target, geometry_fields.dt); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(and_to_all(rejected) && geometry_fields.material_ir == original_ir,
+          "failed geometry-backed material phase discarded the committed IR");
+    geometry_counts.fail_rebuild = false;
+    CHECK(geometry_fields.phase_in_material(&geometry_target, geometry_fields.dt) == 1 &&
+              !geometry_fields.material_ir,
+          "successful geometry-backed material phase retained a stale source IR");
+    geometry_fields.init_backend();
+    CHECK(geometry_fields.initialization_plan &&
+              geometry_fields.initialization_plan->materials.size() == 1 &&
+              geometry_fields.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::host_reference &&
+              geometry_fields.initialization_plan->materials[0].support_reason_bits() ==
+                  material_support_no_owned_ir,
+          "material phase retry did not rebuild a dense host-reference recipe");
+    material_free(target_material);
+    material_free(current_material);
+  }
 
   grid_volume cyl_gv = volcyl(2.0, 3.0, 10.0);
   structure cyl_current(cyl_gv, unit_epsilon, no_pml());
@@ -3126,17 +3280,23 @@ static void test_precision_policy() {
 
   StoragePlan plan;
   plan.arrays.push_back(ArraySpec{ArrayId{0}, array_role::field, ElementType::realnum_value,
-                                  native_precision, 10, alignof(realnum), invalid_array(), false});
+                                  native_precision, 10, alignof(realnum), invalid_array(), false,
+                                  false});
   plan.arrays.push_back(ArraySpec{ArrayId{1}, array_role::field, ElementType::realnum_value,
-                                  native_precision, 10, alignof(realnum), ArrayId{0}, false});
+                                  native_precision, 10, alignof(realnum), ArrayId{0}, false,
+                                  false});
   plan.arrays.push_back(ArraySpec{ArrayId{2}, array_role::material, ElementType::realnum_value,
-                                  native_precision, 5, alignof(realnum), invalid_array(), true});
+                                  native_precision, 5, alignof(realnum), invalid_array(), true,
+                                  false});
   plan.arrays.push_back(ArraySpec{ArrayId{3}, array_role::dft, ElementType::complex_realnum,
-                                  native_precision, 2, alignof(realnum), invalid_array(), false});
+                                  native_precision, 2, alignof(realnum), invalid_array(), false,
+                                  false});
   plan.arrays.push_back(ArraySpec{ArrayId{4}, array_role::field, ElementType::float64,
-                                  native_precision, 3, alignof(double), invalid_array(), false});
+                                  native_precision, 3, alignof(double), invalid_array(), false,
+                                  false});
   plan.arrays.push_back(ArraySpec{ArrayId{5}, array_role::scratch, ElementType::int32,
-                                  native_precision, 4, alignof(int32_t), invalid_array(), false});
+                                  native_precision, 4, alignof(int32_t), invalid_array(), false,
+                                  false});
   apply_precision_policy(plan, precision_mixed());
   CHECK(plan.arrays[0].storage == Precision::f32 && plan.arrays[1].storage == Precision::f32,
         "mixed policy did not apply to field/alias storage");
@@ -3159,6 +3319,7 @@ static void test_precision_policy() {
                     std::numeric_limits<size_t>::max(),
                     alignof(double),
                     invalid_array(),
+                    false,
                     false};
   bool overflow_rejected = false;
   try {
@@ -3251,33 +3412,35 @@ static void test_backend_lifecycle_epoch() {
 
   invalidate(*f, MutationKind::material_values);
   f->advance(1);
-  CHECK(f->backend_state == first_state, "value-only refresh reallocated resident state");
-  CHECK(counts.states_created == 1 && counts.initialized == 2 && counts.classified == 2 &&
-            counts.finalized == 2 && counts.executables_created == 1,
-        "value-only refresh rebuilt the wrong backend artifacts");
+  CHECK(f->backend_state != first_state, "material refresh did not replace resident state");
+  CHECK(counts.states_created == 2 && counts.states_destroyed == 1 && counts.initialized == 2 &&
+            counts.classified == 2 && counts.finalized == 2 &&
+            counts.executables_created == 2 && counts.executables_destroyed == 1,
+        "material refresh did not commit one complete replacement epoch");
+  first_state = f->backend_state;
 
   f->zero_fields();
   f->advance(1);
-  CHECK(f->backend_state == first_state && counts.states_created == 1 && counts.initialized == 3,
+  CHECK(f->backend_state == first_state && counts.states_created == 2 && counts.initialized == 3,
         "field-value refresh did not preserve and reinitialize resident state");
-  CHECK(counts.classified == 2 && counts.finalized == 2 && counts.executables_created == 1,
+  CHECK(counts.classified == 2 && counts.finalized == 2 && counts.executables_created == 2,
         "field-value refresh rebuilt unrelated backend artifacts");
 
   f->initialize_field(Ez, initial_ez);
   CHECK(is_dirty(*f, dirty_initialization), "initialize_field did not invalidate resident values");
   f->advance(1);
-  CHECK(f->backend_state == first_state && counts.states_created == 1 && counts.initialized == 4,
+  CHECK(f->backend_state == first_state && counts.states_created == 2 && counts.initialized == 4,
         "initialize_field refresh did not preserve and reinitialize resident state");
 
   invalidate(*f, MutationKind::field_layout);
   f->advance(1);
-  CHECK(counts.states_created == 2 && counts.states_destroyed == 1,
+  CHECK(counts.states_created == 3 && counts.states_destroyed == 2,
         "storage invalidation did not replace resident state");
-  CHECK(counts.executables_created == 2 && counts.executables_destroyed == 1,
+  CHECK(counts.executables_created == 3 && counts.executables_destroyed == 2,
         "executable invalidation did not replace the compiled artifact");
 
   delete f;
-  CHECK(counts.states_destroyed == 2 && counts.executables_destroyed == 2,
+  CHECK(counts.states_destroyed == 3 && counts.executables_destroyed == 3,
         "polymorphic backend artifacts were not destroyed exactly once");
   delete s;
 }
@@ -3637,11 +3800,21 @@ static void test_resident_legacy_flux_catalog_rebuild() {
     lifetime_counts counts;
     f->backend = new tracking_backend(*f, counts);
     f->advance(1);
-    BackendState *const old_state = f->backend_state;
+    BackendState *old_state = f->backend_state;
     const uint64_t flux_generation =
         generation(*f, MutationKind::legacy_flux_definition);
     const double published = 3.25;
     backend_publish_legacy_flux(*f, &published, 1, "legacy flux catalog continuity test");
+
+    invalidate(*f, MutationKind::material_values, "legacy flux material candidate rebuild test");
+    f->advance(1);
+    CHECK(f->backend_state != old_state && f->descriptors->legacy_fluxes.size() == 1 &&
+              counts.legacy_flux_updates_at_compile == 1 &&
+              f->step_plans[0]->legacy_flux_updates.size() == 1 &&
+              generation(*f, MutationKind::legacy_flux_definition) == flux_generation &&
+              !is_dirty(*f, dirty_flux_plan),
+          "warm material candidate dropped a clean legacy flux recipe");
+    old_state = f->backend_state;
 
     invalidate(*f, MutationKind::field_layout, "legacy flux catalog rebuild test");
     f->advance(1);
@@ -3939,13 +4112,13 @@ static void test_resident_multilevel_lifecycle() {
     const std::vector<multilevel_value_snapshot> before_reset_addresses =
         capture_multilevel_values(f);
     f.reset();
-    CHECK(f.backend_state == rebuilt && f.executable == rebuilt_executable && f.t == 0 &&
+    CHECK(!f.backend_state && !f.executable && f.t == 0 &&
               !f.sources && !f.fluxes &&
               multilevel_values_equal(initialized_values, f) &&
               multilevel_addresses_match(before_reset_addresses, f, true),
           "multilevel reset replaced state or failed to clear definitions and restore exact rows");
     f.reset();
-    CHECK(f.backend_state == rebuilt && f.executable == rebuilt_executable && f.t == 0 &&
+    CHECK(!f.backend_state && !f.executable && f.t == 0 &&
               !f.sources && !f.fluxes && multilevel_values_equal(initialized_values, f) &&
               multilevel_addresses_match(before_reset_addresses, f, true),
           "repeated multilevel reset changed the resident epoch, rows, or addresses");
@@ -4951,12 +5124,12 @@ static void test_resident_host_custom_collective_preflight() {
       try { f.advance(1); }
       catch (const std::runtime_error &) { failed = true; }
       backend_set_host_custom_collective_failure_for_testing(-1, 0);
-      CHECK(and_to_all(failed) && f.backend_state && !f.executable &&
-                !f.backend_state->host_custom_plan_validated &&
-                counts.states_created == 1 && counts.advance_attempts == 0 &&
+      CHECK(and_to_all(failed) && !f.backend_state && !f.executable &&
+                counts.states_created == 1 && counts.states_destroyed == 1 &&
+                counts.advance_attempts == 0 &&
                 f.backend->host_custom_fallback_stats().callbacks == 0 &&
                 !f.backend->is_poisoned(),
-            "rank-asymmetric custom plan readiness failure compiled or dispatched");
+            "rank-asymmetric custom plan readiness failure published or dispatched");
       f.advance(1);
       CHECK(f.executable && f.backend_state->host_custom_plan_validated &&
                 counts.advance_attempts == 1,
@@ -4995,14 +5168,8 @@ static void test_resident_host_custom_collective_preflight() {
           "custom addition rebuild failure %d published policy, warning, stats, or poison",
           injection);
     if (injection == 3)
-      CHECK(f.backend_state && !f.executable &&
-                f.backend_state->host_custom_presence_validated &&
-                or_to_all(f.backend_state->host_custom_local_presence) &&
-                f.backend_state->host_custom_preflight_required &&
-                f.backend_state->host_custom_policy_pending &&
-                !f.backend_state->host_custom_plan_validated &&
-                is_dirty(f, dirty_executable),
-            "custom addition compile failure did not retain a retryable staged epoch");
+      CHECK(!f.backend_state && !f.executable && is_dirty(f, dirty_executable),
+            "custom addition compile failure published a candidate epoch");
     counts.fail_create_state = false;
     counts.fail_initialize = false;
     counts.fail_finalize = false;
@@ -5045,14 +5212,8 @@ static void test_resident_host_custom_collective_preflight() {
           "custom removal rebuild failure %d replaced the committed policy or stats",
           injection);
     if (injection == 3)
-      CHECK(f.backend_state && !f.executable &&
-                f.backend_state->host_custom_presence_validated &&
-                !f.backend_state->host_custom_local_presence &&
-                !f.backend_state->host_custom_preflight_required &&
-                f.backend_state->host_custom_policy_pending &&
-                !f.backend_state->host_custom_plan_validated &&
-                is_dirty(f, dirty_executable),
-            "custom removal compile failure did not retain a retryable staged epoch");
+      CHECK(!f.backend_state && !f.executable && is_dirty(f, dirty_executable),
+            "custom removal compile failure published a candidate epoch");
     counts.fail_create_state = false;
     counts.fail_initialize = false;
     counts.fail_finalize = false;
@@ -6085,7 +6246,6 @@ static void test_resident_noisy_seed_lifecycle() {
             counts.noisy_seed_refreshes == refreshes_before_remove,
         "legacy-flux add-after-remove rebuilt state or reset the noisy seed snapshot");
 
-  BackendState *const before_growth_state = f.backend_state;
   const int states_before_growth = counts.states_created;
   const int destroyed_before_growth = counts.states_destroyed;
   set_random_seed(6006);
@@ -6094,8 +6254,7 @@ static void test_resident_noisy_seed_lifecycle() {
   f.advance(1);
   const bool growth_noisy = has_local_noisy_actions(f);
   CHECK(!growth_noisy ||
-            (f.backend_state != before_growth_state &&
-             counts.states_created == states_before_growth + 1 &&
+            (counts.states_created == states_before_growth + 1 &&
              counts.states_destroyed == destroyed_before_growth + 1),
         "owned catalog growth did not replace resident state exactly once");
   CHECK(f.backend_state->random_seed_snapshot_accepted &&
@@ -6179,7 +6338,7 @@ static void test_resident_noisy_prelaunch_failures() {
     bool failed = false;
     try { f.advance(1); }
     catch (const std::runtime_error &) { failed = true; }
-    CHECK(failed && f.backend_state && !f.executable &&
+    CHECK(failed && !f.backend_state && !f.executable &&
               counts.noisy_seed_refresh_attempts == 0 && counts.advance_attempts == 0 &&
               !f.backend->is_poisoned(),
           "cold noisy compile failure crossed the seed/dispatch boundary");
@@ -6888,6 +7047,1414 @@ static void test_classification_change_recompiles() {
   delete s;
 }
 
+static MaterialRecipeInput material_recipe_input(const MaterialRecipe &recipe) {
+  MaterialRecipeInput input;
+  input.disposition = recipe.disposition();
+  input.description = recipe.description();
+  input.eps_averaging = recipe.eps_averaging();
+  input.subpixel_tol = recipe.subpixel_tol();
+  input.subpixel_maxeval = recipe.subpixel_maxeval();
+  input.host_callback_id = recipe.host_callback_id();
+  input.from_host_callback = recipe.from_host_callback();
+  input.support_reason_bits = recipe.support_reason_bits();
+  input.rows = recipe.rows();
+  input.topology = recipe.topology();
+  input.ir = recipe.ir();
+  return input;
+}
+
+static void expect_material_recipe_rejected(const MaterialRecipeInput &input,
+                                            const char *label) {
+  bool rejected = false;
+  try {
+    MaterialRecipe invalid(input);
+    (void)invalid;
+  }
+  catch (const std::invalid_argument &) {
+    rejected = true;
+  }
+  catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  CHECK(rejected, "%s was accepted", label);
+}
+
+static void expect_material_ir_rejected(MaterialIR malformed, const char *label) {
+  refresh_material_ir_signatures_for_testing(malformed);
+  bool rejected = false;
+  try { validate_material_ir(malformed); }
+  catch (const std::invalid_argument &) { rejected = true; }
+  catch (const std::overflow_error &) { rejected = true; }
+  CHECK(rejected, "%s was accepted", label);
+}
+
+static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
+  uint64_t total = 0;
+  const auto add = [&total](size_t count, size_t width) {
+    CHECK(count <= std::numeric_limits<uint64_t>::max() / width &&
+              uint64_t(count) * uint64_t(width) <=
+                  std::numeric_limits<uint64_t>::max() - total,
+          "material IR compact-byte test fixture overflowed");
+    total += uint64_t(count) * uint64_t(width);
+  };
+#define ADD_IR_SCALAR(member) add(1, sizeof(member))
+  ADD_IR_SCALAR(ir.version);
+  ADD_IR_SCALAR(ir.eps_averaging);
+  ADD_IR_SCALAR(ir.subpixel_tol);
+  ADD_IR_SCALAR(ir.subpixel_maxeval);
+  ADD_IR_SCALAR(ir.ensure_periodicity);
+  ADD_IR_SCALAR(ir.contains_host_callback);
+  ADD_IR_SCALAR(ir.device_native_eligible);
+  ADD_IR_SCALAR(ir.dimensions);
+  ADD_IR_SCALAR(ir.default_material);
+  ADD_IR_SCALAR(ir.signature);
+  ADD_IR_SCALAR(ir.layout_signature);
+  add(ir.cell.size(), sizeof(double));
+  add(ir.roots.size(), sizeof(uint32_t));
+  add(ir.extra_materials.size(), sizeof(uint32_t));
+  for (const MaterialIRMaterial &m : ir.materials) {
+    ADD_IR_SCALAR(m.kind);
+    ADD_IR_SCALAR(m.host_callback);
+    ADD_IR_SCALAR(m.do_averaging);
+    ADD_IR_SCALAR(m.material_grid_kind);
+    ADD_IR_SCALAR(m.material_grid_trivial);
+    ADD_IR_SCALAR(m.has_conductivity);
+    ADD_IR_SCALAR(m.has_chi2);
+    ADD_IR_SCALAR(m.has_chi3);
+    ADD_IR_SCALAR(m.e_susceptibilities);
+    ADD_IR_SCALAR(m.h_susceptibilities);
+    add(m.parameters.size(), sizeof(double));
+    add(m.samples.size(), sizeof(double));
+  }
+  for (const MaterialIRObject &o : ir.objects) {
+    ADD_IR_SCALAR(o.kind);
+    ADD_IR_SCALAR(o.material);
+    add(o.children.size(), sizeof(uint32_t));
+    add(o.parameters.size(), sizeof(double));
+    add(o.vertices.size(), sizeof(double));
+    add(o.indices.size(), sizeof(double));
+  }
+  for (const MaterialIRSusceptibility &s : ir.susceptibilities) {
+    ADD_IR_SCALAR(s.identity);
+    ADD_IR_SCALAR(s.material);
+    ADD_IR_SCALAR(s.field_type);
+    ADD_IR_SCALAR(s.material_ordinal);
+    add(s.parameters.size(), sizeof(double));
+  }
+  for (const MaterialIRChunk &c : ir.chunks) {
+    ADD_IR_SCALAR(c.chunk);
+    ADD_IR_SCALAR(c.dimensions);
+    ADD_IR_SCALAR(c.owned);
+    ADD_IR_SCALAR(c.resolution);
+    ADD_IR_SCALAR(c.inva);
+    ADD_IR_SCALAR(c.elements);
+    ADD_IR_SCALAR(c.component_bits);
+    add(3, sizeof(c.extents[0]));
+    add(3, sizeof(c.strides[0]));
+    add(3, sizeof(c.little_corner[0]));
+    add(3, sizeof(c.big_corner[0]));
+    add(3, sizeof(c.origin[0]));
+    add(NUM_FIELD_COMPONENTS * 3, sizeof(c.stagger[0][0]));
+    add(NUM_FIELD_COMPONENTS * 3, sizeof(c.loop_begin[0][0]));
+    add(NUM_FIELD_COMPONENTS * 3, sizeof(c.loop_end[0][0]));
+    add(NUM_FIELD_COMPONENTS, sizeof(c.loop_count[0]));
+    add(6, sizeof(c.pml_elements[0]));
+  }
+  for (const MaterialIRPml &p : ir.absorbers) {
+    ADD_IR_SCALAR(p.direction);
+    ADD_IR_SCALAR(p.side);
+    ADD_IR_SCALAR(p.thickness);
+    ADD_IR_SCALAR(p.r_asymptotic);
+    ADD_IR_SCALAR(p.mean_stretch);
+    ADD_IR_SCALAR(p.sample_spacing);
+    add(p.samples.size(), sizeof(double));
+  }
+  for (const MaterialIRPmlAxis &p : ir.pml_axes) {
+    ADD_IR_SCALAR(p.chunk);
+    ADD_IR_SCALAR(p.direction);
+    ADD_IR_SCALAR(p.elements);
+    add(p.sigma.size(), sizeof(double));
+    add(p.kappa.size(), sizeof(double));
+    add(p.sigma_inv.size(), sizeof(double));
+  }
+  for (const MaterialIRTopologyRow &row : ir.topology) {
+    ADD_IR_SCALAR(row.key.chunk);
+    ADD_IR_SCALAR(row.key.kind);
+    ADD_IR_SCALAR(row.key.component_);
+    ADD_IR_SCALAR(row.key.cmp);
+    ADD_IR_SCALAR(row.key.aux);
+    ADD_IR_SCALAR(row.element_type);
+    ADD_IR_SCALAR(row.logical_storage);
+    ADD_IR_SCALAR(row.elements);
+    ADD_IR_SCALAR(row.alignment);
+    ADD_IR_SCALAR(row.yee_component);
+    add(3, sizeof(row.extents[0]));
+    add(3, sizeof(row.strides[0]));
+    add(3, sizeof(row.stagger[0]));
+  }
+#undef ADD_IR_SCALAR
+  return total;
+}
+
+static void test_geometry_backed_material_ir() {
+  using namespace meep_geom;
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, unit_epsilon, pml(0.25), identity(), 2);
+  material_type dielectric = make_dielectric(3.25);
+  meep_geom::susceptibility e0 = meep_geom::susceptibility();
+  e0.frequency = 0.61; e0.gamma = 0.07; e0.sigma_diag = make_vector3(1.0, 0.0, 0.0);
+  meep_geom::susceptibility e1 = meep_geom::susceptibility();
+  e1.frequency = 0.83; e1.gamma = 0.09; e1.sigma_diag = make_vector3(0.0, 1.0, 0.0);
+  meep_geom::susceptibility e0_duplicate = e0;
+  e0_duplicate.sigma_diag = make_vector3(0.0, 0.0, 2.0);
+  dielectric->medium.E_susceptibilities.push_back(e0);
+  dielectric->medium.E_susceptibilities.push_back(e1);
+  dielectric->medium.E_susceptibilities.push_back(e0_duplicate);
+  meep_geom::susceptibility h0 = meep_geom::susceptibility();
+  h0.frequency = 0.47; h0.gamma = 0.04; h0.sigma_diag = make_vector3(1.0, 0.0, 0.0);
+  meep_geom::susceptibility h1 = meep_geom::susceptibility();
+  h1.frequency = 0.72; h1.gamma = 0.06; h1.sigma_diag = make_vector3(0.0, 1.0, 0.0);
+  meep_geom::susceptibility h0_duplicate = h0;
+  h0_duplicate.sigma_diag = make_vector3(0.0, 0.0, 3.0);
+  dielectric->medium.H_susceptibilities.push_back(h0);
+  dielectric->medium.H_susceptibilities.push_back(h1);
+  dielectric->medium.H_susceptibilities.push_back(h0_duplicate);
+  geometric_object object = make_block(dielectric, make_vector3(), make_vector3(1, 0, 0),
+                                       make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                                       make_vector3(0.75, 0.5, 1.0));
+  geometric_object inner = make_geometric_object(dielectric, make_vector3());
+  inner.which_subclass = geometric_object::COMPOUND_GEOMETRIC_OBJECT;
+  inner.subclass.compound_geometric_object_data =
+      static_cast<compound_geometric_object *>(calloc(1, sizeof(compound_geometric_object)));
+  inner.subclass.compound_geometric_object_data->component_objects.num_items = 1;
+  inner.subclass.compound_geometric_object_data->component_objects.items =
+      static_cast<geometric_object *>(calloc(1, sizeof(geometric_object)));
+  geometric_object_copy(&object,
+                        inner.subclass.compound_geometric_object_data->component_objects.items);
+  geometric_object outer = make_geometric_object(dielectric, make_vector3());
+  outer.which_subclass = geometric_object::COMPOUND_GEOMETRIC_OBJECT;
+  outer.subclass.compound_geometric_object_data =
+      static_cast<compound_geometric_object *>(calloc(1, sizeof(compound_geometric_object)));
+  outer.subclass.compound_geometric_object_data->component_objects.num_items = 1;
+  outer.subclass.compound_geometric_object_data->component_objects.items =
+      static_cast<geometric_object *>(calloc(1, sizeof(geometric_object)));
+  geometric_object_copy(&inner,
+                        outer.subclass.compound_geometric_object_data->component_objects.items);
+  const double infinite_extent = std::numeric_limits<double>::infinity();
+  geometric_object infinite_block =
+      make_block(dielectric, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 1), make_vector3(infinite_extent, 0.25, 1.0));
+  const vector3 prism_vertices[3] = {make_vector3(-0.2, -0.2), make_vector3(0.2, -0.2),
+                                     make_vector3(0.0, 0.2)};
+  geometric_object infinite_prism =
+      make_prism_with_center(dielectric, make_vector3(), prism_vertices, 3, 1.0,
+                             make_vector3(0, 0, 1));
+  geometric_object infinite_cylinder =
+      make_cylinder(dielectric, make_vector3(), 0.1, 1.0, make_vector3(0, 0, 1));
+  geometric_object geometry_items[4] = {outer, infinite_block, infinite_prism, infinite_cylinder};
+  geometric_object_list geometry = {4, geometry_items};
+  material_type file_material = new material_data();
+  file_material->which_subclass = material_data::MATERIAL_FILE;
+  file_material->epsilon_dims[0] = 2;
+  file_material->epsilon_dims[1] = file_material->epsilon_dims[2] = 1;
+  file_material->epsilon_data = new double[2]{1.5, 2.5};
+  material_type grid_material = make_material_grid(true, 8.0, 0.45, 0.0);
+  grid_material->material_grid_kinds = material_data::U_MEAN;
+  grid_material->grid_size = make_vector3(2, 1, 1);
+  grid_material->weights = new double[2]{0.2, 0.8};
+  grid_material->medium_1 = medium_struct(1.25);
+  grid_material->medium_2 = medium_struct(4.5);
+  grid_material->trivial = false; // mutable eager cache; IR must derive rather than copy it
+  material_type user_material = make_user_material(material_ir_user_function, NULL, true);
+  material_type extra_items[3] = {file_material, grid_material, user_material};
+  material_type_list extra_materials;
+  extra_materials.num_items = 3;
+  extra_materials.items = extra_items;
+  absorber_list absorbers = create_absorber_list();
+  add_absorbing_layer(absorbers, 0.125, ALL_DIRECTIONS, ALL_SIDES, 1e-12, 1.25);
+  set_materials_from_geometry(&s, geometry, make_vector3(), true, 1e-5, 4321, true, vacuum,
+                              absorbers, extra_materials);
+  CHECK(s.material_ir.get() != NULL, "geometry-backed material setup did not publish an IR");
+  const std::shared_ptr<const void> retained = s.material_ir;
+  const MaterialIR *ir = static_cast<const MaterialIR *>(retained.get());
+  validate_material_ir(*ir);
+  CHECK(ir->eps_averaging && ir->subpixel_maxeval == 4321 && ir->ensure_periodicity &&
+            ir->roots.size() == 4 && ir->objects.size() == 6 &&
+            ir->objects[ir->roots[0]].children.size() == 1 &&
+            ir->objects[ir->objects[ir->roots[0]].children[0]].children.size() == 1 &&
+            !ir->absorbers.empty(),
+        "geometry-backed IR omitted geometry or absorber input");
+  bool saw_infinite_block = false;
+  for (const MaterialIRObject &captured : ir->objects) {
+    saw_infinite_block =
+        saw_infinite_block ||
+        (captured.kind == geometric_object::BLOCK && captured.parameters.size() >= 15 &&
+         std::isinf(captured.parameters[12]) && captured.parameters[12] > 0.0);
+  }
+  CHECK(saw_infinite_block, "material IR rejected or altered a legal infinite block extent");
+  {
+    MaterialIR legal = *ir;
+    bool found = false;
+    for (MaterialIRObject &captured : legal.objects)
+      if (captured.kind == geometric_object::PRISM) {
+        captured.parameters[3] = infinite_extent;
+        found = true;
+        break;
+      }
+    CHECK(found, "material IR infinity fixture has no prism");
+    refresh_material_ir_signatures_for_testing(legal);
+    validate_material_ir(legal);
+    legal = *ir;
+    found = false;
+    for (MaterialIRObject &captured : legal.objects)
+      if (captured.kind == geometric_object::CYLINDER) {
+        captured.parameters[7] = infinite_extent;
+        found = true;
+        break;
+      }
+    CHECK(found, "material IR infinity fixture has no cylinder");
+    refresh_material_ir_signatures_for_testing(legal);
+    validate_material_ir(legal);
+  }
+  bool saw_file = false, saw_grid = false, saw_user = false;
+  for (const MaterialIRMaterial &material : ir->materials) {
+    saw_file = saw_file || material.kind == material_data::MATERIAL_FILE;
+    saw_grid = saw_grid ||
+               (material.kind == material_data::MATERIAL_GRID && material.do_averaging &&
+                material.material_grid_kind == material_data::U_MEAN &&
+                material.material_grid_trivial);
+    saw_user = saw_user ||
+               (material.kind == material_data::MATERIAL_USER && material.host_callback &&
+                material.do_averaging);
+  }
+  CHECK(saw_file && saw_grid && saw_user && ir->contains_host_callback &&
+            !ir->device_native_eligible,
+        "material IR omitted or altered FILE/GRID/USER variant metadata");
+  CHECK(or_to_all(!ir->pml_axes.empty()) && or_to_all(!ir->topology.empty()),
+        "geometry-backed IR omitted distributed PML or topology input");
+  for (const MaterialIRChunk &chunk : ir->chunks) {
+    CHECK(chunk.resolution > 0 && chunk.inva == 1.0 / chunk.resolution,
+          "material IR omitted the chunk resolution");
+    FOR_COMPONENTS(c) {
+      const bool present = (chunk.component_bits & (uint64_t(1) << int(c))) != 0;
+      CHECK(chunk.loop_count[c] == (present ? chunk.elements : 0),
+            "material IR component loop count differs from exact Yee traversal");
+      if (!present) continue;
+      ptrdiff_t maximum = 0;
+      for (int axis = 0; axis < 3; ++axis) {
+        CHECK(chunk.loop_begin[c][axis] ==
+                  chunk.little_corner[axis] + chunk.stagger[c][axis] &&
+                  chunk.loop_end[c][axis] ==
+                      chunk.big_corner[axis] + chunk.stagger[c][axis],
+              "material IR component loop bounds are not exact");
+        maximum += ((chunk.loop_end[c][axis] - chunk.little_corner[axis]) / 2) *
+                   chunk.strides[axis];
+      }
+      CHECK(maximum >= 0 && size_t(maximum) < chunk.elements,
+            "material IR component loop address exceeds owned storage");
+    }
+  }
+  {
+    MaterialIR malformed = *ir;
+    malformed.roots.push_back(malformed.roots[0]);
+    expect_material_ir_rejected(malformed, "duplicate material IR root");
+    malformed = *ir;
+    malformed.objects[malformed.roots[0]].children.push_back(malformed.roots[0]);
+    expect_material_ir_rejected(malformed, "cyclic/non-compound material IR child");
+    malformed = *ir;
+    malformed.materials[malformed.default_material].kind = 999;
+    expect_material_ir_rejected(malformed, "invalid material IR variant tag");
+    malformed = *ir;
+    for (MaterialIRMaterial &material : malformed.materials)
+      if (material.kind == material_data::MEDIUM && !material.parameters.empty()) {
+        material.parameters.pop_back();
+        break;
+      }
+    expect_material_ir_rejected(malformed, "short material IR medium schema");
+    malformed = *ir;
+    malformed.susceptibilities[0].parameters.resize(8);
+    expect_material_ir_rejected(malformed, "short material IR susceptibility schema");
+    malformed = *ir;
+    ++malformed.susceptibilities[0].material_ordinal;
+    expect_material_ir_rejected(malformed, "wrong material IR susceptibility ordinal");
+    malformed = *ir;
+    malformed.susceptibilities[0].parameters.push_back(1.0);
+    expect_material_ir_rejected(malformed, "trailing material IR susceptibility payload");
+    if (!ir->topology.empty()) {
+      malformed = *ir;
+      malformed.topology[0].extents[0] = 0;
+      expect_material_ir_rejected(malformed, "zero material IR topology extent");
+      malformed = *ir;
+      malformed.topology.pop_back();
+      expect_material_ir_rejected(malformed, "missing material IR topology row");
+      malformed = *ir;
+      MaterialIRTopologyRow extra = malformed.topology.back();
+      extra.key.chunk += int(malformed.chunks.size()) + 1;
+      malformed.topology.push_back(extra);
+      expect_material_ir_rejected(malformed, "extra material IR topology row");
+      malformed = *ir;
+      malformed.topology[0].elements = std::numeric_limits<size_t>::max();
+      expect_material_ir_rejected(malformed, "overflowing material IR topology row");
+    }
+    if (!ir->pml_axes.empty()) {
+      malformed = *ir;
+      malformed.pml_axes[0].sigma.pop_back();
+      expect_material_ir_rejected(malformed, "short material IR PML profile");
+      malformed = *ir;
+      ++malformed.pml_axes[0].elements;
+      expect_material_ir_rejected(malformed, "wrong material IR PML extent");
+      malformed = *ir;
+      malformed.pml_axes.push_back(malformed.pml_axes[0]);
+      expect_material_ir_rejected(malformed, "duplicate material IR PML axis");
+      malformed = *ir;
+      malformed.pml_axes[0].elements = size_t(std::numeric_limits<int>::max()) + 1;
+      expect_material_ir_rejected(malformed, "overflowing material IR PML integer extent");
+    }
+    if (!ir->chunks.empty()) {
+      malformed = *ir;
+      malformed.chunks[0].resolution = 0.0;
+      expect_material_ir_rejected(malformed, "zero material IR chunk resolution");
+      malformed = *ir;
+      component first = NO_COMPONENT;
+      FOR_COMPONENTS(c)
+        if (first == NO_COMPONENT &&
+            (malformed.chunks[0].component_bits & (uint64_t(1) << int(c))))
+          first = c;
+      if (first != NO_COMPONENT) {
+        ++malformed.chunks[0].loop_end[first][0];
+        expect_material_ir_rejected(malformed, "misaligned material IR component loop bound");
+        malformed = *ir;
+        ++malformed.chunks[0].loop_count[first];
+        expect_material_ir_rejected(malformed, "wrong material IR component loop count");
+      }
+    }
+    malformed = *ir;
+    MaterialIRObject &mesh = malformed.objects.back();
+    mesh.kind = geometric_object::MESH;
+    mesh.children.clear();
+    mesh.parameters.assign(4, 0.0);
+    mesh.vertices = {0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0};
+    mesh.indices = {0.0, 1.0, 3.0};
+    expect_material_ir_rejected(malformed, "out-of-range material IR mesh index");
+    malformed = *ir;
+    for (MaterialIRObject &candidate : malformed.objects)
+      if (candidate.kind == geometric_object::BLOCK) {
+        candidate.parameters[24] = double(std::numeric_limits<int>::max()) + 1024.0;
+        break;
+      }
+    expect_material_ir_rejected(malformed, "overflowing material IR block subtype");
+    malformed = *ir;
+    malformed.objects[ir->roots[0]].parameters[0] =
+        std::numeric_limits<double>::quiet_NaN();
+    expect_material_ir_rejected(malformed, "NaN material IR object center");
+    malformed = *ir;
+    malformed.objects[ir->roots[0]].parameters[0] = infinite_extent;
+    expect_material_ir_rejected(malformed, "illegal infinite material IR object center");
+    malformed = *ir;
+    for (MaterialIRObject &candidate : malformed.objects)
+      if (candidate.kind == geometric_object::BLOCK) {
+        candidate.parameters[12] = -infinite_extent;
+        break;
+      }
+    expect_material_ir_rejected(malformed, "negative infinite material IR block extent");
+    if (!ir->chunks.empty()) {
+      malformed = *ir;
+      malformed.chunks[0].little_corner[0] = std::numeric_limits<int>::min();
+      malformed.chunks[0].big_corner[0] = std::numeric_limits<int>::max() - 1;
+      expect_material_ir_rejected(malformed, "overflowing material IR chunk coordinate span");
+    }
+  }
+  std::vector<double> ir_frequencies[2];
+  for (const MaterialIRSusceptibility &sus : ir->susceptibilities) {
+    const int slot = sus.field_type == E_stuff ? 0 : sus.field_type == H_stuff ? 1 : -1;
+    CHECK(slot >= 0 && sus.parameters.size() > 9,
+          "material IR susceptibility has an invalid field or short payload");
+    if (slot >= 0 && sus.parameters.size() > 9) ir_frequencies[slot].push_back(sus.parameters[9]);
+  }
+  CHECK(ir_frequencies[0].size() == 2 && ir_frequencies[0][0] == e0.frequency &&
+            ir_frequencies[0][1] == e1.frequency && ir_frequencies[1].size() == 2 &&
+            ir_frequencies[1][0] == h0.frequency && ir_frequencies[1][1] == h1.frequency,
+        "material IR susceptibility identities do not preserve first-occurrence E/H order");
+  const uint64_t signature = ir->signature;
+  const uint64_t layout_signature = ir->layout_signature;
+  std::vector<double> frozen_file_samples, frozen_grid_samples;
+  for (const MaterialIRMaterial &material : ir->materials) {
+    if (material.kind == material_data::MATERIAL_FILE) frozen_file_samples = material.samples;
+    if (material.kind == material_data::MATERIAL_GRID) frozen_grid_samples = material.samples;
+  }
+  dielectric->medium.epsilon_diag.x = 99.0;
+  file_material->epsilon_data[0] = 77.0;
+  grid_material->weights[0] = 0.99;
+  grid_material->medium_1.epsilon_diag.x = 88.0;
+  bool owned_file = false, owned_grid = false;
+  for (const MaterialIRMaterial &material : ir->materials) {
+    if (material.kind == material_data::MATERIAL_FILE)
+      owned_file = material.samples == frozen_file_samples;
+    if (material.kind == material_data::MATERIAL_GRID)
+      owned_grid = material.samples == frozen_grid_samples && material.parameters.size() > 3 &&
+                   material.parameters[3] != 88.0;
+  }
+  CHECK(ir->signature == signature && ir->layout_signature == layout_signature && owned_file &&
+            owned_grid,
+        "material IR borrowed its caller's material payload");
+  structure copied(s);
+  structure mutated(s);
+  CHECK(mutated.material_ir.get() == retained.get(),
+        "structure copy did not retain immutable material IR");
+  mutated.set_conductivity(Dz, unit_epsilon);
+  CHECK(!mutated.material_ir,
+        "public coefficient mutation retained stale geometry-backed material IR");
+  set_materials_from_geometry(&mutated, geometry, make_vector3(), true, 1e-5, 4321, true,
+                              vacuum, absorbers, extra_materials);
+  CHECK(mutated.material_ir && mutated.material_ir.get() != retained.get(),
+        "geometry material rebuild did not publish a replacement immutable IR");
+  validate_material_ir(*static_cast<const MaterialIR *>(mutated.material_ir.get()));
+  fields f(&copied);
+  CHECK(f.material_ir.get() == retained.get(), "structure/fields copy lost immutable IR ownership");
+  validate_material_ir(*material_ir_for(f));
+  lifetime_counts counts;
+  counts.retain_all_provisional_material_rows = true;
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+  CHECK(f.initialization_plan && f.initialization_plan->materials.size() == 1 &&
+            f.initialization_plan->materials[0].eps_averaging() == ir->eps_averaging &&
+            f.initialization_plan->materials[0].subpixel_tol() == ir->subpixel_tol &&
+            f.initialization_plan->materials[0].subpixel_maxeval() == ir->subpixel_maxeval,
+        "material recipe did not inherit its immutable IR policy");
+  CHECK(f.initialization_plan && f.initialization_plan->pml.size() == ir->pml_axes.size(),
+        "initialization plan did not preserve every exact PML axis recipe");
+  CHECK(f.storage_plan && f.array_catalog &&
+            f.storage_plan->arrays.size() == f.array_catalog->size() &&
+            counts.arrays_at_compile == counts.arrays_at_create &&
+            or_to_all(counts.retained_logical_suffix_at_compile > 0),
+        "retained provisional material IDs were not published through compile");
+  if (f.initialization_plan) {
+    const MaterialRecipe &geometry_recipe = f.initialization_plan->materials[0];
+    const MaterialSupportDecision support = classify_material_support(geometry_recipe);
+    uint64_t exact_dense_bytes = 0;
+    for (const MaterialRecipeRow &row : geometry_recipe.rows())
+      exact_dense_bytes += row.values.size();
+    CHECK(geometry_recipe.disposition() == MaterialRecipeDisposition::host_reference &&
+              support.disposition == MaterialRecipeDisposition::host_reference &&
+              support.reason_bits == material_support_object_lookup &&
+              support.compact_input_bytes == expected_compact_material_ir_bytes(*ir) &&
+              support.dense_fallback_bytes == exact_dense_bytes,
+          "geometry-backed recipe did not freeze its host-reference support route");
+    CHECK(ir->extra_materials.size() == 3 && ir->contains_host_callback,
+          "support fixture lost its unused extra material variants");
+
+    MaterialRecipeInput referenced = material_recipe_input(geometry_recipe);
+    std::shared_ptr<MaterialIR> referenced_ir(new MaterialIR(*ir));
+    referenced_ir->objects[referenced_ir->roots[0]].material =
+        int(referenced_ir->extra_materials[1]);
+    refresh_material_ir_signatures_for_testing(*referenced_ir);
+    referenced.ir = referenced_ir;
+    referenced.support_reason_bits =
+        material_support_object_lookup | material_support_adaptive_averaging;
+    MaterialRecipe referenced_grid(referenced);
+    CHECK(classify_material_support(referenced_grid).reason_bits ==
+              referenced.support_reason_bits,
+          "support classification ignored averaging on an object-referenced material");
+
+    referenced = material_recipe_input(geometry_recipe);
+    referenced_ir.reset(new MaterialIR(*ir));
+    referenced_ir->default_material = referenced_ir->extra_materials[2];
+    refresh_material_ir_signatures_for_testing(*referenced_ir);
+    referenced.ir = referenced_ir;
+    referenced.support_reason_bits =
+        material_support_object_lookup | material_support_unowned_callback;
+    MaterialRecipe referenced_user(referenced);
+    CHECK(classify_material_support(referenced_user).reason_bits ==
+              referenced.support_reason_bits,
+          "support classification ignored the referenced default callback material");
+    MaterialRecipeInput malformed_recipe = material_recipe_input(geometry_recipe);
+    malformed_recipe.support_reason_bits ^= material_support_unowned_callback;
+    expect_material_recipe_rejected(malformed_recipe,
+                                    "stale material support reason signature");
+    for (size_t row_index = 0; row_index < geometry_recipe.rows().size(); ++row_index)
+      if (geometry_recipe.rows()[row_index].key.kind == int(array_kind::sigma)) {
+        malformed_recipe = material_recipe_input(geometry_recipe);
+        malformed_recipe.ir.reset();
+        malformed_recipe.topology.clear();
+        malformed_recipe.support_reason_bits = material_support_no_owned_ir;
+        malformed_recipe.rows[row_index].key.aux = uint64_t(D_stuff);
+        expect_material_recipe_rejected(malformed_recipe,
+                                        "invalid material sigma field-type encoding");
+        malformed_recipe = material_recipe_input(geometry_recipe);
+        malformed_recipe.ir.reset();
+        malformed_recipe.topology.clear();
+        malformed_recipe.support_reason_bits = material_support_no_owned_ir;
+        malformed_recipe.rows[row_index].key.aux =
+            (uint64_t(std::numeric_limits<int>::max()) + 1) * NUM_FIELD_TYPES + E_stuff;
+        expect_material_recipe_rejected(malformed_recipe,
+                                        "overflowing material sigma state identity");
+        break;
+      }
+    malformed_recipe = material_recipe_input(geometry_recipe);
+    if (!malformed_recipe.rows.empty()) {
+      malformed_recipe.rows.pop_back();
+      expect_material_recipe_rejected(malformed_recipe,
+                                      "geometry recipe missing dense IR topology key");
+    }
+    malformed_recipe = material_recipe_input(geometry_recipe);
+    if (!malformed_recipe.topology.empty()) {
+      malformed_recipe.topology.pop_back();
+      expect_material_recipe_rejected(malformed_recipe,
+                                      "geometry recipe missing provisional IR topology key");
+      malformed_recipe = material_recipe_input(geometry_recipe);
+      ++malformed_recipe.topology[0].elements;
+      expect_material_recipe_rejected(malformed_recipe,
+                                      "geometry recipe replaced IR topology metadata");
+    }
+    malformed_recipe = material_recipe_input(geometry_recipe);
+    if (!ir->topology.empty()) {
+      MaterialIRTopologyRow extra = ir->topology.front();
+      extra.key.chunk += f.num_chunks + 1;
+      malformed_recipe.topology.push_back(extra);
+      expect_material_recipe_rejected(malformed_recipe,
+                                      "geometry recipe added non-IR topology key");
+    }
+  }
+  {
+    const size_t resolved_size = f.storage_plan->arrays.size();
+    const size_t host_prefix = f.array_catalog->host_backed_size();
+    CHECK(or_to_all(resolved_size > host_prefix),
+          "warm material visibility fixture has no provisional logical suffix on any rank");
+    BackendState *const retained_state = f.backend_state;
+    Executable *const retained_executable = f.executable;
+    counts.retain_all_provisional_material_rows = false;
+    invalidate(f, MutationKind::material_values,
+               "backend_api:warm material suffix elision");
+    f.advance(1);
+    CHECK(f.backend_state != retained_state && f.executable != retained_executable &&
+              f.storage_plan->arrays.size() == resolved_size &&
+              f.array_catalog->size() == resolved_size &&
+              f.array_catalog->host_backed_size() == host_prefix &&
+              counts.arrays_at_compile == resolved_size &&
+              counts.retained_logical_suffix_at_compile == 0,
+          "warm material reclassification did not rebuild the resolved logical epoch");
+    for (size_t i = host_prefix; i < resolved_size; ++i)
+      CHECK(f.storage_plan->arrays[i].classification_elided &&
+                f.array_catalog->find(f.storage_plan->keys[i]) == invalid_array(),
+            "warm material reclassification exposed tombstoned ArrayId %zu", i);
+
+    BackendState *const elided_state = f.backend_state;
+    Executable *const elided_executable = f.executable;
+    counts.retain_all_provisional_material_rows = true;
+    invalidate(f, MutationKind::material_values,
+               "backend_api:warm material suffix retention");
+    f.advance(1);
+    CHECK(f.backend_state != elided_state && f.executable != elided_executable &&
+              f.storage_plan->arrays.size() == resolved_size &&
+              f.array_catalog->size() == resolved_size &&
+              counts.retained_logical_suffix_at_compile == resolved_size - host_prefix,
+          "warm material reclassification did not republish retained logical IDs");
+    for (size_t i = host_prefix; i < resolved_size; ++i)
+      CHECK(!f.storage_plan->arrays[i].classification_elided &&
+                f.array_catalog->find(f.storage_plan->keys[i]) == ArrayId{uint32_t(i)},
+            "warm material reclassification hid retained ArrayId %zu", i);
+  }
+  if (f.initialization_plan)
+    for (const PmlRecipe &p : f.initialization_plan->pml)
+      CHECK(!p.sigma.empty() && p.sigma.size() == p.kappa.size() &&
+                p.sigma.size() == p.sigma_inv.size(),
+            "initialization plan contains an incomplete exact PML axis recipe");
+  std::vector<double> live_frequencies[2];
+  for (const PolarizationDescriptor &descriptor : f.descriptors->polarizations) {
+    const int slot = descriptor.ft == E_stuff ? 0 : descriptor.ft == H_stuff ? 1 : -1;
+    if (slot >= 0 && descriptor.kind == SusceptibilityKind::lorentzian &&
+        descriptor.chunk >= 0 && descriptor.state_index == int(live_frequencies[slot].size()))
+      live_frequencies[slot].push_back(descriptor.lorentzian.omega_0);
+  }
+  for (int slot = 0; slot < 2; ++slot) {
+    CHECK(or_to_all(!live_frequencies[slot].empty()),
+          "geometry-backed susceptibility fixture has no live descriptor");
+    CHECK(live_frequencies[slot].empty() || live_frequencies[slot] == ir_frequencies[slot],
+          "material IR susceptibility order differs from live descriptor state_index order");
+  }
+  uint64_t reference_signature = signature;
+  broadcast(0, &reference_signature, 1);
+  CHECK(signature == reference_signature, "global material IR signature differs across ranks");
+  uint64_t rank_zero_layout = layout_signature;
+  broadcast(0, &rank_zero_layout, 1);
+  CHECK(count_processors() == 1 || or_to_all(layout_signature != rank_zero_layout),
+        "rank-local material IR layout signature omitted ownership/layout identity");
+  geometric_object_list empty_geometry = {0, NULL};
+  structure d1_structure(vol1d(1.5, 8.0), unit_epsilon, pml(0.25), identity(), 1);
+  set_materials_from_geometry(&d1_structure, empty_geometry, make_vector3(), true, 1e-5, 128,
+                              false, vacuum);
+  const MaterialIR *d1_ir = static_cast<const MaterialIR *>(d1_structure.material_ir.get());
+  validate_material_ir(*d1_ir);
+  CHECK(or_to_all(!d1_ir->pml_axes.empty()), "D1 material IR omitted its PML axis");
+  for (const MaterialIRPmlAxis &axis : d1_ir->pml_axes)
+    CHECK(axis.elements > 0 && axis.sigma.size() == axis.elements &&
+              axis.kappa.size() == axis.elements && axis.sigma_inv.size() == axis.elements,
+          "D1 material IR PML recipe has the wrong one-dimensional extent");
+  {
+    fields native_fields(&d1_structure);
+    lifetime_counts native_counts;
+    native_fields.backend = new tracking_backend(native_fields, native_counts);
+    native_fields.advance(1);
+    const MaterialRecipe &native_recipe = native_fields.initialization_plan->materials[0];
+    const MaterialSupportDecision support = classify_material_support(native_recipe);
+    CHECK(native_recipe.disposition() == MaterialRecipeDisposition::device_native &&
+              support.disposition == MaterialRecipeDisposition::device_native &&
+              support.reason_bits == material_support_none &&
+              or_to_all(support.native_points > 0) &&
+              support.compact_input_bytes > 0,
+          "uniform owned material IR was not classified device-native before allocation");
+  }
+  destroy_absorber_list(absorbers);
+  material_free(file_material);
+  material_free(grid_material);
+  material_free(user_material);
+  material_free(dielectric);
+  geometric_object_destroy(infinite_cylinder);
+  geometric_object_destroy(infinite_prism);
+  geometric_object_destroy(infinite_block);
+  geometric_object_destroy(outer);
+  geometric_object_destroy(inner);
+  geometric_object_destroy(object);
+  validate_material_ir(*static_cast<const MaterialIR *>(retained.get()));
+}
+
+static void test_material_ir_capture_atomicity() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.5, 1.25, 8.0);
+  material_type dielectric = make_dielectric(2.75);
+  geometric_object object =
+      make_block(dielectric, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 1), make_vector3(0.5, 0.5, 1.0));
+  geometric_object_list geometry = {1, &object};
+  for (int target = 0; target < count_processors(); ++target) {
+    const int maximum_mode = count_processors() > 1 ? 3 : 2;
+    for (int mode = 1; mode <= maximum_mode; ++mode) {
+      structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+      s.set_conductivity(Dz, unit_epsilon);
+      realnum *const address = s.chunks[0]->conductivity[Dz][Z];
+      const realnum value = address ? address[0] : realnum(0);
+      set_material_ir_capture_failure_for_testing(target, mode);
+      bool failed = false;
+      try {
+        set_materials_from_geometry(&s, geometry, make_vector3(), true, 1e-5, 256, true,
+                                    vacuum);
+      }
+      catch (const std::runtime_error &) { failed = true; }
+      set_material_ir_capture_failure_for_testing(-1, 0);
+      CHECK(and_to_all(failed) && !s.material_ir && s.chunks[0]->conductivity[Dz][Z] == address &&
+                (!address || address[0] == value),
+            "rank-asymmetric material IR capture failure mutated eager material state");
+    }
+  }
+  geometric_object_destroy(object);
+  material_free(dielectric);
+}
+
+static void test_geometry_backed_material_ir_removal() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.5, 1.25, 8.0);
+  material_type dielectric = make_dielectric(2.75);
+  meep_geom::susceptibility lorentz = meep_geom::susceptibility();
+  lorentz.frequency = 0.73;
+  lorentz.gamma = 0.04;
+  lorentz.sigma_diag = make_vector3(1.0, 0.5, 0.25);
+  dielectric->medium.E_susceptibilities.push_back(lorentz);
+  geometric_object object =
+      make_block(dielectric, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 1), make_vector3(0.75, 0.5, 1.0));
+  geometric_object_list geometry = {1, &object};
+  structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+  set_materials_from_geometry(&s, geometry, make_vector3(), true, 1e-5, 256, true, vacuum);
+  fields f(&s);
+  f.require_component(Ez);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+
+  const std::shared_ptr<const void> retained_ir = f.material_ir;
+  const MaterialIR *const retained = material_ir_for(f);
+  CHECK(retained_ir && retained && !retained->susceptibilities.empty(),
+        "geometry-backed removal fixture has no susceptibility IR");
+  const uint64_t retained_signature = retained ? retained->signature : 0;
+  const uint64_t retained_layout_signature = retained ? retained->layout_signature : 0;
+  const BackendEpochSnapshot retained_epoch(f);
+
+  counts.fail_rebuild = true;
+  bool failed = false;
+  try { f.remove_susceptibilities(); }
+  catch (const std::runtime_error &) { failed = true; }
+  const MaterialIR *const after_failure = material_ir_for(f);
+  CHECK(and_to_all(failed) && f.material_ir == retained_ir && after_failure &&
+            after_failure->signature == retained_signature &&
+            after_failure->layout_signature == retained_layout_signature &&
+            retained_epoch.matches(f),
+        "failed geometry-backed removal changed IR ownership, signatures, or live state");
+
+  counts.fail_rebuild = false;
+  f.remove_susceptibilities();
+  bool live_susceptibility = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    FOR_FIELD_TYPES(ft) {
+      live_susceptibility = live_susceptibility || f.chunks[chunk]->s->chiP[ft] ||
+                            f.chunks[chunk]->pol[ft];
+    }
+  }
+  CHECK(and_to_all(!f.material_ir && !live_susceptibility),
+        "successful geometry-backed removal retained IR or live susceptibility state");
+
+  f.advance(1);
+  bool stale_sigma = false;
+  if (f.initialization_plan) {
+    CHECK(f.initialization_plan->materials.size() == 1,
+          "post-removal rebuild did not publish one material recipe");
+    if (f.initialization_plan->materials.size() == 1) {
+      const MaterialRecipe &recipe = f.initialization_plan->materials[0];
+      stale_sigma = stale_sigma || bool(recipe.ir());
+      for (const MaterialRecipeRow &row : recipe.rows())
+        stale_sigma = stale_sigma || row.key.kind == int(array_kind::sigma);
+      for (const MaterialIRTopologyRow &row : recipe.topology())
+        stale_sigma = stale_sigma || row.key.kind == int(array_kind::sigma);
+    }
+  }
+  else {
+    stale_sigma = true;
+  }
+  if (f.storage_plan)
+    for (const StorageKey &key : f.storage_plan->keys)
+      stale_sigma = stale_sigma || key.kind == int(array_kind::sigma);
+  if (f.descriptors) stale_sigma = stale_sigma || !f.descriptors->polarizations.empty();
+  CHECK(and_to_all(!stale_sigma),
+        "post-removal recipe or provisional topology retained susceptibility sigma definitions");
+
+  geometric_object_destroy(object);
+  material_free(dielectric);
+}
+
+static void test_material_recipe_and_provisional_storage() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->advance(1);
+
+  const InitializationPlan initialization = build_initialization_plan(*f);
+  CHECK(initialization.materials.size() == 1,
+        "material recipe capture did not produce exactly one recipe");
+  const MaterialRecipe &recipe = initialization.materials[0];
+  validate_material_recipe(recipe);
+  CHECK(recipe.disposition() == MaterialRecipeDisposition::host_reference &&
+            !recipe.from_host_callback() && recipe.host_callback_id() == invalid_array_value,
+        "eager CPU material capture has the wrong fallback disposition");
+
+  size_t local_material_rows = 0;
+  for (const ArraySpec &spec : f->storage_plan->arrays)
+    if (spec.role == array_role::material) ++local_material_rows;
+  CHECK(recipe.rows().size() == local_material_rows,
+        "material recipe captured %zu rows for %zu material arrays", recipe.rows().size(),
+        local_material_rows);
+  CHECK(or_to_all(local_material_rows > 0), "material recipe fixture has no material rows");
+
+  for (const MaterialRecipeRow &row : recipe.rows()) {
+    const ArrayId id = f->array_catalog->find(row.key);
+    CHECK(is_valid(id), "material recipe row does not resolve in the CPU catalog");
+    if (is_valid(id)) {
+      const void *live = f->array_catalog->resolve_untyped(id);
+      CHECK(live && row.values.size() == row.elements * sizeof(realnum) &&
+                !memcmp(live, row.values.data(), row.values.size()),
+            "material recipe did not exactly own a CPU material row");
+    }
+  }
+
+  if (!recipe.rows().empty() && !recipe.rows()[0].values.empty()) {
+    const MaterialRecipeRow &row = recipe.rows()[0];
+    const ArrayId id = f->array_catalog->find(row.key);
+    CHECK(is_valid(id), "material recipe row does not resolve in the CPU catalog");
+    unsigned char *live = static_cast<unsigned char *>(f->array_catalog->resolve_untyped(id));
+    const unsigned char frozen = row.values[0];
+    const uint64_t signature = recipe.signature();
+    live[0] ^= 0x5a;
+    CHECK(row.values[0] == frozen && recipe.signature() == signature,
+          "material recipe borrowed mutable CPU coefficient storage");
+    live[0] ^= 0x5a;
+  }
+
+  const MaterialRecipe copied(recipe);
+  CHECK(copied == recipe && copied.signature() == recipe.signature(),
+        "material recipe copy changed identity");
+  MaterialRecipeInput detached_input = material_recipe_input(recipe);
+  const MaterialRecipe detached(detached_input);
+  if (!detached_input.rows.empty() && !detached_input.rows[0].values.empty()) {
+    const unsigned char frozen = detached.rows()[0].values[0];
+    detached_input.rows[0].values[0] ^= 0xff;
+    detached_input.description.clear();
+    CHECK(detached.rows()[0].values[0] == frozen && !detached.description().empty(),
+          "material recipe borrowed its constructor input");
+  }
+
+  MaterialRecipeInput changed = material_recipe_input(recipe);
+  changed.description += ":changed";
+  CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+        "material recipe signature ignores description");
+  changed = material_recipe_input(recipe);
+  changed.eps_averaging = !changed.eps_averaging;
+  if (recipe.ir())
+    expect_material_recipe_rejected(changed, "material recipe policy/IR averaging mismatch");
+  else
+    CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+          "material recipe signature ignores averaging policy");
+  changed = material_recipe_input(recipe);
+  changed.subpixel_tol *= 2.0;
+  if (recipe.ir())
+    expect_material_recipe_rejected(changed, "material recipe policy/IR tolerance mismatch");
+  else
+    CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+          "material recipe signature ignores subpixel tolerance");
+  changed = material_recipe_input(recipe);
+  ++changed.subpixel_maxeval;
+  if (recipe.ir())
+    expect_material_recipe_rejected(changed,
+                                    "material recipe policy/IR evaluation-limit mismatch");
+  else
+    CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+          "material recipe signature ignores subpixel evaluation limit");
+  changed = material_recipe_input(recipe);
+  changed.disposition = MaterialRecipeDisposition::device_native;
+  expect_material_recipe_rejected(changed, "unimplemented device-native material recipe");
+  changed = material_recipe_input(recipe);
+  changed.disposition = MaterialRecipeDisposition::tiled_callback;
+  changed.from_host_callback = true;
+  changed.host_callback_id = 7;
+  expect_material_recipe_rejected(changed, "unimplemented tiled material recipe");
+  changed = material_recipe_input(recipe);
+  changed.disposition = MaterialRecipeDisposition::hybrid_interface;
+  expect_material_recipe_rejected(changed, "unimplemented hybrid material recipe");
+  if (!recipe.rows().empty() && !recipe.rows()[0].values.empty()) {
+    changed = material_recipe_input(recipe);
+    changed.rows[0].values[0] ^= 1;
+    CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+          "material recipe signature ignores owned coefficient bytes");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].key.chunk += f->num_chunks + 1;
+    if (recipe.ir())
+      expect_material_recipe_rejected(changed, "material recipe row absent from IR topology");
+    else
+      CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+            "material recipe signature ignores storage identity");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].storage = changed.rows[0].storage == Precision::f32 ? Precision::f64
+                                                                       : Precision::f32;
+    expect_material_recipe_rejected(changed, "non-native material row storage");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].alignment *= 2;
+    expect_material_recipe_rejected(changed, "noncanonical material row alignment");
+    changed = material_recipe_input(recipe);
+    if (changed.rows[0].elements > 1) {
+      --changed.rows[0].elements;
+      changed.rows[0].values.resize(changed.rows[0].elements *
+                                    host_element_bytes(changed.rows[0].element_type));
+    }
+    else {
+      ++changed.rows[0].elements;
+      changed.rows[0].values.resize(changed.rows[0].elements *
+                                    host_element_bytes(changed.rows[0].element_type));
+    }
+    if (recipe.ir())
+      expect_material_recipe_rejected(changed,
+                                      "material recipe row extent differs from IR topology");
+    else
+      CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+            "material recipe signature ignores row extent");
+  }
+  if (recipe.rows().size() > 1) {
+    changed = material_recipe_input(recipe);
+    std::swap(changed.rows[0], changed.rows[1]);
+    CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
+          "material recipe signature ignores row order");
+  }
+
+  changed = material_recipe_input(recipe);
+  changed.description.clear();
+  expect_material_recipe_rejected(changed, "empty material recipe description");
+  changed = material_recipe_input(recipe);
+  changed.subpixel_tol = std::numeric_limits<double>::quiet_NaN();
+  expect_material_recipe_rejected(changed, "nonfinite material recipe tolerance");
+  changed = material_recipe_input(recipe);
+  changed.subpixel_maxeval = 0;
+  expect_material_recipe_rejected(changed, "zero material recipe evaluation limit");
+  changed = material_recipe_input(recipe);
+  changed.host_callback_id = 7;
+  expect_material_recipe_rejected(changed, "callback identity on host-reference recipe");
+  if (!recipe.rows().empty()) {
+    changed = material_recipe_input(recipe);
+    changed.rows.push_back(changed.rows[0]);
+    expect_material_recipe_rejected(changed, "duplicate material recipe row");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].role = array_role::field;
+    expect_material_recipe_rejected(changed, "non-material recipe row");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].alignment = 3;
+    expect_material_recipe_rejected(changed, "non-power-of-two material row alignment");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].key.kind = int(array_kind::f);
+    expect_material_recipe_rejected(changed, "non-material recipe storage kind");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].key.chunk = -1;
+    expect_material_recipe_rejected(changed, "negative material recipe chunk");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].key.component_ = NUM_FIELD_COMPONENTS;
+    expect_material_recipe_rejected(changed, "out-of-range material recipe component");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].key.cmp = 6;
+    expect_material_recipe_rejected(changed, "out-of-range material recipe complex part");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].element_type = static_cast<ElementType>(999);
+    expect_material_recipe_rejected(changed, "invalid material recipe element type");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].elements = 0;
+    changed.rows[0].values.clear();
+    expect_material_recipe_rejected(changed, "zero-extent material recipe row");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].values.pop_back();
+    expect_material_recipe_rejected(changed, "short material recipe row payload");
+    changed = material_recipe_input(recipe);
+    changed.rows[0].elements = std::numeric_limits<size_t>::max();
+    expect_material_recipe_rejected(changed, "overflowing material recipe row extent");
+  }
+  if (!recipe.topology().empty()) {
+    changed = material_recipe_input(recipe);
+    changed.topology.pop_back();
+    expect_material_recipe_rejected(changed, "missing provisional IR topology row");
+    changed = material_recipe_input(recipe);
+    MaterialIRTopologyRow extra = changed.topology.back();
+    extra.key.chunk += f->num_chunks + 1;
+    changed.topology.push_back(extra);
+    expect_material_recipe_rejected(changed, "extra provisional IR topology row");
+    changed = material_recipe_input(recipe);
+    ++changed.topology[0].elements;
+    expect_material_recipe_rejected(changed, "changed provisional IR topology metadata");
+  }
+
+  StoragePlan provisional = *f->storage_plan;
+  mark_material_storage_provisional(recipe, provisional);
+  size_t expected_peak = 0, expected_steady = 0, expected_suffix = 0;
+  for (const MaterialIRTopologyRow &row : recipe.topology())
+    if (!is_valid(f->array_catalog->find(row.key))) ++expected_suffix;
+  for (size_t i = 0; i < provisional.arrays.size(); ++i)
+    if (!is_valid(provisional.arrays[i].alias_of)) {
+      const size_t bytes = storage_bytes(provisional.arrays[i]);
+      CHECK(bytes <= std::numeric_limits<size_t>::max() - expected_peak,
+            "provisional material peak-byte oracle overflowed");
+      expected_peak += bytes;
+      if (!provisional.arrays[i].classification_provisional) {
+        CHECK(bytes <= std::numeric_limits<size_t>::max() - expected_steady,
+              "provisional material steady-byte oracle overflowed");
+        expected_steady += bytes;
+      }
+    }
+  for (size_t i = 0; i < provisional.arrays.size(); ++i) {
+    CHECK(provisional.arrays[i].classification_provisional ==
+              (provisional.arrays[i].role == array_role::material),
+          "provisional marking changed the wrong storage role at %zu", i);
+  }
+  CHECK(provisional.arrays.size() == f->storage_plan->arrays.size() + expected_suffix &&
+            provisional.provisional_peak_bytes() == expected_peak &&
+            provisional.steady_state_bytes() == expected_steady && expected_peak >= expected_steady,
+        "provisional suffix or peak/steady byte accounting differs from the exact oracle");
+
+  if (recipe.rows().size() > 1) {
+    changed = material_recipe_input(recipe);
+    std::swap(changed.rows[0], changed.rows[1]);
+    const MaterialRecipe reordered(changed);
+    StoragePlan unchanged = *f->storage_plan;
+    bool rejected = false;
+    try { mark_material_storage_provisional(reordered, unchanged); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected, "noncanonical material recipe row order was accepted");
+    CHECK(!has_provisional_material_storage(unchanged),
+          "failed reordered material recipe partially marked storage");
+  }
+  if (!recipe.rows().empty()) {
+    changed = material_recipe_input(recipe);
+    changed.rows.pop_back();
+    if (recipe.ir())
+      expect_material_recipe_rejected(changed, "missing material recipe row");
+    else {
+      const MaterialRecipe missing(changed);
+      StoragePlan unchanged = *f->storage_plan;
+      bool rejected = false;
+      try { mark_material_storage_provisional(missing, unchanged); }
+      catch (const std::invalid_argument &) { rejected = true; }
+      CHECK(rejected && !has_provisional_material_storage(unchanged),
+            "missing material recipe row was accepted or partially published");
+    }
+
+    changed = material_recipe_input(recipe);
+    MaterialRecipeRow extra = changed.rows.back();
+    extra.key.chunk += f->num_chunks + 1;
+    changed.rows.push_back(extra);
+    if (recipe.ir())
+      expect_material_recipe_rejected(changed, "extra material recipe row");
+    else {
+      const MaterialRecipe oversized(changed);
+      StoragePlan unchanged = *f->storage_plan;
+      bool rejected = false;
+      try { mark_material_storage_provisional(oversized, unchanged); }
+      catch (const std::invalid_argument &) { rejected = true; }
+      CHECK(rejected && !has_provisional_material_storage(unchanged),
+            "extra material recipe row was accepted or partially published");
+    }
+  }
+
+  const StoragePlan fully_provisional = provisional;
+  MaterialClassification classification;
+  classification.provisional_row_state.assign(
+      provisional.arrays.size(), MaterialClassification::not_provisional);
+  for (size_t i = 0; i < f->storage_plan->arrays.size(); ++i)
+    if (provisional.arrays[i].role == array_role::material)
+      classification.provisional_row_state[i] = MaterialClassification::retained;
+  for (size_t i = f->storage_plan->arrays.size(); i < provisional.arrays.size(); ++i) {
+    classification.elided.push_back(ArrayId{uint32_t(i)});
+    classification.provisional_row_state[i] = MaterialClassification::elided_row;
+  }
+  resolve_material_storage(recipe, classification, *f->storage_plan, provisional);
+  CHECK(!has_provisional_material_storage(provisional) &&
+            provisional.arrays.size() == fully_provisional.arrays.size() &&
+            provisional.provisional_peak_bytes() ==
+                fully_provisional.provisional_peak_bytes() &&
+            provisional.physical_resident_bytes() ==
+                fully_provisional.provisional_peak_bytes() &&
+            provisional.steady_state_bytes() == f->storage_plan->steady_state_bytes(),
+        "material classification did not resolve provisional rows");
+  resolve_material_storage(recipe, classification, *f->storage_plan, provisional);
+  CHECK(!has_provisional_material_storage(provisional),
+        "material classification resolution is not idempotent");
+
+  if (fully_provisional.arrays.size() > f->storage_plan->arrays.size()) {
+    StoragePlan all_retained = fully_provisional;
+    MaterialClassification retain_all;
+    retain_all.provisional_row_state.assign(
+        all_retained.arrays.size(), MaterialClassification::not_provisional);
+    for (size_t i = 0; i < all_retained.arrays.size(); ++i)
+      if (all_retained.arrays[i].role == array_role::material)
+        retain_all.provisional_row_state[i] = MaterialClassification::retained;
+    resolve_material_storage(recipe, retain_all, *f->storage_plan, all_retained);
+    CHECK(all_retained.arrays.size() == fully_provisional.arrays.size() &&
+              !has_provisional_material_storage(all_retained) &&
+              all_retained.steady_state_bytes() == all_retained.physical_resident_bytes(),
+          "all-retained material classification changed stable IDs or accounting");
+
+    StoragePlan retained = fully_provisional;
+    MaterialClassification selective;
+    selective.provisional_row_state.assign(
+        retained.arrays.size(), MaterialClassification::not_provisional);
+    for (size_t i = 0; i < f->storage_plan->arrays.size(); ++i)
+      if (retained.arrays[i].role == array_role::material)
+        selective.provisional_row_state[i] = MaterialClassification::retained;
+    size_t retained_suffix = 0;
+    for (size_t i = f->storage_plan->arrays.size(); i < retained.arrays.size(); ++i) {
+      if ((i - f->storage_plan->arrays.size()) % 2) {
+        selective.elided.push_back(ArrayId{uint32_t(i)});
+        selective.provisional_row_state[i] = MaterialClassification::elided_row;
+      }
+      else {
+        selective.provisional_row_state[i] = MaterialClassification::retained;
+        ++retained_suffix;
+      }
+    }
+    resolve_material_storage(recipe, selective, *f->storage_plan, retained);
+    CHECK(retained.arrays.size() == fully_provisional.arrays.size() &&
+              retained_suffix > 0 && !has_provisional_material_storage(retained) &&
+              retained.steady_state_bytes() > f->storage_plan->steady_state_bytes(),
+          "material classification did not preserve alternating stable-ID suffix rows");
+    for (size_t i = f->storage_plan->arrays.size(); i < retained.arrays.size(); ++i) {
+      const bool expected_elided = (i - f->storage_plan->arrays.size()) % 2;
+      CHECK(retained.arrays[i].id.value == i &&
+                retained.arrays[i].classification_elided == expected_elided,
+            "material resolution renumbered or misclassified stable ArrayId %zu", i);
+    }
+  }
+
+  StoragePlan mixed = *f->storage_plan;
+  mark_material_storage_provisional(recipe, mixed);
+  apply_precision_policy(mixed, precision_mixed());
+  const size_t mixed_peak_bytes = mixed.provisional_peak_bytes();
+  StoragePlan mixed_authoritative = *f->storage_plan;
+  apply_precision_policy(mixed_authoritative, precision_mixed());
+  resolve_material_storage(recipe, classification, *f->storage_plan, mixed,
+                           precision_mixed());
+  CHECK(mixed.arrays.size() == fully_provisional.arrays.size() &&
+            !has_provisional_material_storage(mixed) &&
+            mixed.physical_resident_bytes() == mixed_peak_bytes &&
+            mixed.steady_state_bytes() == mixed_authoritative.steady_state_bytes(),
+        "mixed material storage did not preserve stable tombstones and byte accounting "
+        "(arrays=%zu expected=%zu peak=%zu expected_peak=%zu steady=%zu expected_steady=%zu)",
+        mixed.arrays.size(), fully_provisional.arrays.size(), mixed.physical_resident_bytes(),
+        mixed_peak_bytes, mixed.steady_state_bytes(), mixed_authoritative.steady_state_bytes());
+  for (size_t i = f->storage_plan->arrays.size(); i < mixed.arrays.size(); ++i)
+    CHECK(mixed.arrays[i].classification_elided,
+          "mixed material storage exposed an elided suffix key at %zu", i);
+
+  if (!recipe.rows().empty()) {
+    StoragePlan malformed = *f->storage_plan;
+    for (size_t i = 0; i < malformed.arrays.size(); ++i)
+      if (malformed.arrays[i].role == array_role::material) {
+        ++malformed.arrays[i].elements;
+        break;
+      }
+    const StoragePlan entry = malformed;
+    bool rejected = false;
+    try {
+      mark_material_storage_provisional(recipe, malformed);
+    }
+    catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    CHECK(rejected, "mismatched material storage extent was accepted");
+    for (size_t i = 0; i < malformed.arrays.size(); ++i)
+      CHECK(malformed.arrays[i].classification_provisional ==
+                entry.arrays[i].classification_provisional,
+            "failed provisional marking partially changed storage at %zu", i);
+
+    provisional = *f->storage_plan;
+    mark_material_storage_provisional(recipe, provisional);
+    classification.elided.push_back(f->array_catalog->find(recipe.rows()[0].key));
+    const StoragePlan before_elision = provisional;
+    rejected = false;
+    try {
+      resolve_material_storage(recipe, classification, *f->storage_plan, provisional);
+    }
+    catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    CHECK(rejected, "host-reference material recipe accepted device row elision");
+    for (size_t i = 0; i < provisional.arrays.size(); ++i)
+      CHECK(provisional.arrays[i].classification_provisional ==
+                before_elision.arrays[i].classification_provisional,
+            "failed material resolution partially changed storage at %zu", i);
+
+    classification.elided.clear();
+    provisional = *f->storage_plan;
+    mark_material_storage_provisional(recipe, provisional);
+    for (size_t i = 0; i < provisional.arrays.size(); ++i)
+      if (provisional.arrays[i].role == array_role::material) {
+        provisional.arrays[i].storage =
+            provisional.arrays[i].storage == Precision::f32 ? Precision::f64 : Precision::f32;
+        break;
+      }
+    const StoragePlan before_precision = provisional;
+    rejected = false;
+    try {
+      resolve_material_storage(recipe, classification, *f->storage_plan, provisional);
+    }
+    catch (const std::invalid_argument &) {
+      rejected = true;
+    }
+    CHECK(rejected, "material resolution accepted a changed storage precision");
+    for (size_t i = 0; i < provisional.arrays.size(); ++i)
+      CHECK(provisional.arrays[i].storage == before_precision.arrays[i].storage &&
+                provisional.arrays[i].classification_provisional ==
+                    before_precision.arrays[i].classification_provisional,
+            "failed precision resolution partially changed storage at %zu", i);
+  }
+
+  delete f;
+  delete s;
+}
+
+static void test_resident_material_recipe_lifecycle() {
+  for (int target = 0; target < count_processors(); ++target)
+    for (int mode = 1; mode <= 2; ++mode) {
+      structure *s;
+      fields *f;
+      build(&s, &f);
+      lifetime_counts counts;
+      f->backend = new tracking_backend(*f, counts);
+      InitializationPlan *const entry_initialization = f->initialization_plan;
+      set_material_recipe_failure_for_testing(target, mode);
+      bool failed = false;
+      try { f->advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      set_material_recipe_failure_for_testing(-1, 0);
+      const bool all_failed = and_to_all(failed);
+      CHECK(all_failed && !f->backend_state && !f->executable &&
+                f->initialization_plan == entry_initialization && counts.states_created == 0 &&
+                counts.initialized == 0 && counts.advance_attempts == 0,
+            "rank-asymmetric material recipe capture failure published an epoch");
+      f->advance(1);
+      CHECK(f->backend_state && f->initialization_plan && f->executable,
+            "material recipe capture failure was not retryable");
+      delete f;
+      delete s;
+    }
+
+  {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    InitializationPlan *const entry_initialization = f->initialization_plan;
+    counts.fail_create_state = true;
+    bool failed = false;
+    try { f->advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    counts.fail_create_state = false;
+    const bool all_failed = and_to_all(failed);
+    CHECK(all_failed && !f->backend_state && !f->executable &&
+              f->initialization_plan == entry_initialization,
+          "failed material recipe state creation partially published the staged epoch");
+    f->advance(1);
+    CHECK(counts.states_created == 1 && counts.initialized == 1 && counts.classified == 1 &&
+              counts.finalized == 1 && counts.executables_created == 1,
+          "resident material recipe did not traverse one complete lifecycle");
+    CHECK(counts.material_arrays_at_create == counts.provisional_material_arrays_at_create,
+          "resident state creation saw non-provisional material storage");
+    CHECK(counts.material_recipe_rows_at_initialize == counts.material_arrays_at_create &&
+              counts.material_recipe_signature_at_initialize ==
+                  f->initialization_plan->materials[0].signature(),
+          "resident initialization recipe does not cover its provisional rows");
+    CHECK(counts.provisional_material_arrays_at_compile == 0,
+          "resident compile ran before material classification resolution");
+
+    const MaterialRecipe retained_recipe = f->initialization_plan->materials[0];
+    const uint64_t retained_signature = retained_recipe.signature();
+    InitializationPlan *const live_initialization = f->initialization_plan;
+    invalidate(*f, MutationKind::material_values, "material recipe refresh rollback");
+    set_material_recipe_failure_for_testing(my_rank() == 0 ? 0 : -1, 1);
+    failed = false;
+    try { f->advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    set_material_recipe_failure_for_testing(-1, 0);
+    const bool warm_all_failed = and_to_all(failed);
+    CHECK(warm_all_failed && f->initialization_plan == live_initialization &&
+              f->initialization_plan->materials[0].signature() == retained_signature &&
+              retained_recipe.signature() == retained_signature,
+          "failed warm recipe refresh replaced or mutated the owned recipe");
+    f->advance(1);
+    CHECK(f->initialization_plan &&
+              f->initialization_plan->materials[0].signature() == retained_signature,
+          "successful warm recipe refresh changed unchanged material identity");
+    delete f;
+    validate_material_recipe(retained_recipe);
+    CHECK(retained_recipe.signature() == retained_signature,
+          "owned material recipe lifetime depended on its fields object");
+    delete s;
+  }
+
+  for (int target = 0; target < count_processors(); ++target)
+    for (int failure = 0; failure < 8; ++failure) {
+      structure *s;
+      fields *f;
+      build(&s, &f);
+      lifetime_counts counts;
+      f->backend = new tracking_backend(*f, counts);
+      f->advance(1);
+      invalidate(*f, MutationKind::material_values, "material candidate failure matrix");
+      const BackendEpochSnapshot entry(*f);
+      const int created_before = counts.states_created;
+      const int destroyed_before = counts.states_destroyed;
+      const int executables_before = counts.executables_created;
+      const int executables_destroyed_before = counts.executables_destroyed;
+      const bool inject = my_rank() == target;
+      counts.fail_create_state = inject && failure == 0;
+      counts.fail_initialize = inject && failure == 1;
+      counts.fail_classify = inject && failure == 2;
+      counts.fail_finalize = inject && failure == 3;
+      if (failure == 4)
+        backend_set_material_candidate_plan_failure_for_testing(target, 1);
+      counts.fail_compile = inject && failure == 5;
+      counts.corrupt_catalog_after_compile = inject && failure == 6;
+      counts.fail_rebuild = inject && failure == 7;
+      bool failed = false;
+      try { f->advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_material_candidate_plan_failure_for_testing(-1, 0);
+      CHECK(and_to_all(failed) && entry.matches(*f) && !f->backend->is_poisoned(),
+            "warm material candidate failure %d changed the installed epoch", failure);
+      CHECK(counts.states_created - created_before == counts.states_destroyed - destroyed_before &&
+                counts.executables_created - executables_before ==
+                    counts.executables_destroyed - executables_destroyed_before,
+            "warm material candidate failure %d leaked staged state or executable", failure);
+      counts.fail_create_state = false;
+      counts.fail_initialize = false;
+      counts.fail_classify = false;
+      counts.fail_finalize = false;
+      counts.fail_compile = false;
+      counts.corrupt_catalog_after_compile = false;
+      counts.fail_rebuild = false;
+      BackendState *const old_state = f->backend_state;
+      Executable *const old_executable = f->executable;
+      f->advance(1);
+      CHECK(f->backend_state && f->executable && f->backend_state != old_state &&
+                f->executable != old_executable,
+            "warm material candidate failure %d was not retryable", failure);
+      delete f;
+      delete s;
+    }
+
+  for (int target = 0; target < count_processors(); ++target) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    f->add_flux_vol(X, volume(vec(0.1, -0.8), vec(0.1, 0.8)));
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    f->advance(1);
+    CHECK(f->descriptors && !f->descriptors->legacy_fluxes.empty(),
+          "warm material/flux failure fixture has no live legacy-flux recipe");
+    invalidate(*f, MutationKind::material_values,
+               "material candidate live-flux plan failure");
+    const BackendEpochSnapshot entry(*f);
+    backend_set_material_candidate_plan_failure_for_testing(target, 1);
+    bool failed = false;
+    try { f->advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    backend_set_material_candidate_plan_failure_for_testing(-1, 0);
+    CHECK(and_to_all(failed) && entry.matches(*f) && !f->backend->is_poisoned(),
+          "rank-asymmetric warm material/live-flux plan failure changed the installed epoch");
+    f->advance(1);
+    CHECK(f->descriptors && !f->descriptors->legacy_fluxes.empty(),
+          "warm material/live-flux plan failure was not retryable");
+    delete f;
+    delete s;
+  }
+
+  for (int failure = 0; failure < 3; ++failure) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    counts.fail_initialize = failure == 0;
+    counts.fail_classify = failure == 1;
+    counts.fail_finalize = failure == 2;
+    f->backend = new tracking_backend(*f, counts);
+    bool failed = false;
+    try { f->advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    const bool all_failed = and_to_all(failed);
+    CHECK(all_failed && !f->backend_state && !f->initialization_plan && !f->executable &&
+              f->t == 0,
+          "cold material initialize/finalize failure published a partial epoch");
+    counts.fail_initialize = false;
+    counts.fail_classify = false;
+    counts.fail_finalize = false;
+    f->advance(1);
+    const bool retry_ok = f->backend_state && f->initialization_plan && f->executable &&
+                          counts.provisional_material_arrays_at_compile == 0;
+    if (!retry_ok)
+      fprintf(stderr,
+              "material retry %d state=%d initialization=%d executable=%d provisional=%zu "
+              "initialized=%d classified=%d finalized=%d\n",
+              failure, int(f->backend_state != NULL),
+              int(f->initialization_plan != NULL), int(f->executable != NULL),
+              counts.provisional_material_arrays_at_compile, counts.initialized,
+              counts.classified, counts.finalized);
+    CHECK(retry_ok,
+          "material initialize/finalize retry replaced or incompletely resolved its epoch");
+    delete f;
+    delete s;
+  }
+}
+
 /* restrict_to has no Phase-1 consumer -- the in-place design update that would
    use it is deferred -- so it is built and unit-tested here rather than wired
    in. */
@@ -6915,11 +8482,17 @@ static void test_initialization_plan() {
   CHECK(whole.operations.size() == plan.operations.size(),
         "restrict_to(whole) dropped %zu operations",
         plan.operations.size() - whole.operations.size());
+  CHECK(whole.material_values_generation == plan.material_values_generation &&
+            whole.material_region_generation == plan.material_region_generation,
+        "restrict_to(whole) changed material recipe generations");
 
   InitRegion narrow(0, ivec(2, 2), ivec(4, 4));
   const InitializationPlan sub = plan.restrict_to(narrow);
   CHECK(sub.operations.size() <= plan.operations.size(), "restrict_to grew the plan");
   CHECK(sub.materials.size() == plan.materials.size(), "restrict_to dropped the recipes");
+  CHECK(sub.material_values_generation == plan.material_values_generation &&
+            sub.material_region_generation == plan.material_region_generation,
+        "restrict_to changed material recipe generations");
 
   master_printf("init plan: %zu ops (%zu zero, %zu material, %zu pml), restricted to %zu\n",
                 plan.operations.size(), zero_ops, material_ops, pml_ops, sub.operations.size());
@@ -7574,11 +9147,40 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_MATERIAL_ONLY")) {
+    test_geometry_backed_material_ir();
+    test_geometry_backed_material_ir_removal();
+    test_material_recipe_and_provisional_storage();
+    test_resident_material_recipe_lifecycle();
     test_resident_material_coefficient_preparation();
     test_material_phase_transaction();
     test_material_phase_cpu_to_resident_preparation();
     if (failures) return 1;
     master_printf("backend_api: material checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_MATERIAL_RECIPE_ONLY")) {
+    test_geometry_backed_material_ir();
+    test_material_ir_capture_atomicity();
+    test_geometry_backed_material_ir_removal();
+    test_material_recipe_and_provisional_storage();
+    test_resident_material_recipe_lifecycle();
+    if (failures) return 1;
+    master_printf("backend_api: material recipe checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_MATERIAL_RECIPE_UNIT_ONLY")) {
+    test_geometry_backed_material_ir();
+    test_material_ir_capture_atomicity();
+    test_geometry_backed_material_ir_removal();
+    test_material_recipe_and_provisional_storage();
+    if (failures) return 1;
+    master_printf("backend_api: material recipe unit checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_MATERIAL_RECIPE_LIFECYCLE_ONLY")) {
+    test_resident_material_recipe_lifecycle();
+    if (failures) return 1;
+    master_printf("backend_api: material recipe lifecycle checks passed\n");
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_NOISY_ONLY")) {
@@ -7691,6 +9293,11 @@ int main(int argc, char **argv) {
   test_resident_bfast_fingerprint();
   test_resident_cylindrical_fingerprint();
   test_classification_change_recompiles();
+  test_geometry_backed_material_ir();
+  test_material_ir_capture_atomicity();
+  test_geometry_backed_material_ir_removal();
+  test_material_recipe_and_provisional_storage();
+  test_resident_material_recipe_lifecycle();
   test_initialization_plan();
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();

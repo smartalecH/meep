@@ -29,7 +29,9 @@
 #include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
+#include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/material_recipe.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/nvidia/nvidia_polarization.hpp"
 #include "backend/nvidia/runtime.hpp"
@@ -1434,6 +1436,27 @@ static void run_case(const char *name, const grid_volume &gv, precision_policy_k
 
   if (check_lifecycle) {
     invalidate(gpu, MutationKind::field_layout, "nvidia_timestep migration test");
+    BackendState *const live_state = gpu.backend_state;
+    Executable *const live_executable = gpu.executable;
+    const nvidia::memory_accounting before_failure = nvidia::current_memory_accounting();
+    const nvidia::testing::failure_point failure_points[] = {
+        nvidia::testing::failure_point::device_to_host_copy,
+        nvidia::testing::failure_point::state_rebuild_sync};
+    for (nvidia::testing::failure_point point : failure_points) {
+      nvidia::testing::fail_next(point);
+      bool rejected = false;
+      try {
+        gpu.init_backend();
+      }
+      catch (const std::exception &) { rejected = true; }
+      nvidia::testing::clear_failure();
+      const nvidia::memory_accounting after_failure = nvidia::current_memory_accounting();
+      require(rejected && gpu.backend_state == live_state && gpu.executable == live_executable &&
+                  !gpu.backend->is_poisoned() &&
+                  before_failure.device_bytes_current == after_failure.device_bytes_current &&
+                  before_failure.pinned_bytes_current == after_failure.pinned_bytes_current,
+              "failed NVIDIA authority migration changed or poisoned the live epoch");
+    }
     gpu.init_backend();
     compare_fields(cpu, gpu, tolerance);
 
@@ -2196,6 +2219,140 @@ static void test_material_cpu_setup_to_nvidia() {
   }
   require_material_targets_host_only(migrating);
   master_printf("nvidia_timestep: material CPU-setup-to-NVIDIA PASS\n");
+}
+
+static void test_material_recipe_owned_upload(precision_policy_kind precision) {
+  const grid_volume gv = vol2d(2.4, 2.0, 8.0);
+  structure s(gv, isotropic_eps, pml(0.35, X), identity(), 2);
+  s.set_conductivity(Dz, phase_target_conductivity);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  nvidia::testing::reset_transfer_accounting();
+  f.init_backend();
+  require(f.initialization_plan && f.initialization_plan->materials.size() == 1,
+          "NVIDIA material recipe fixture has no frozen recipe");
+  const MaterialRecipe frozen = f.initialization_plan->materials[0];
+  validate_material_recipe(frozen);
+  require(!frozen.rows().empty(), "NVIDIA material recipe fixture has no material rows");
+  StoragePlan expected_upload = *f.storage_plan;
+  mark_material_storage_provisional(frozen, expected_upload);
+  apply_precision_policy(expected_upload, policy_for(f.options.precision));
+  size_t expected_calls = 0, expected_bytes = 0;
+  for (const ArraySpec &spec : expected_upload.arrays)
+    if (!is_valid(spec.alias_of)) {
+      ++expected_calls;
+      const size_t bytes = storage_bytes(spec);
+      require(bytes <= std::numeric_limits<size_t>::max() - expected_bytes,
+              "NVIDIA material upload byte expectation overflowed");
+      expected_bytes += bytes;
+    }
+  const nvidia::testing::transfer_accounting initial_transfers =
+      nvidia::testing::current_transfer_accounting();
+  /* Cold state construction may upload backend-private coordinate metadata in
+     addition to the initialization plan. The direct replay below isolates and
+     checks the recipe's exact call/byte count. */
+  require(initial_transfers.host_to_device_calls >= expected_calls &&
+              initial_transfers.host_to_device_bytes >= expected_bytes &&
+              initial_transfers.device_to_host_calls == 0 &&
+              initial_transfers.device_to_host_bytes == 0,
+          "NVIDIA material initialization omitted recipe storage or downloaded host data");
+
+  struct MutatedRow {
+    ArrayId id;
+    std::vector<unsigned char> original;
+  };
+  std::vector<MutatedRow> mutated;
+  for (const MaterialRecipeRow &row : frozen.rows()) {
+    const ArrayId id = f.array_catalog->find(row.key);
+    require(is_valid(id), "NVIDIA frozen material row has no catalog identity");
+    unsigned char *live =
+        static_cast<unsigned char *>(f.array_catalog->resolve_untyped(id));
+    require(live && !row.values.empty(), "NVIDIA frozen material row has no owned payload");
+    MutatedRow saved{id, std::vector<unsigned char>(live, live + row.values.size())};
+    mutated.push_back(saved);
+    live[0] ^= 0x5a;
+  }
+
+  /* Direct reinitialization is intentionally the final operation on this
+     state. It proves every native material/PML row comes from the immutable
+     recipe even though the compatibility catalog was changed afterward. */
+  nvidia::testing::reset_transfer_accounting();
+  f.backend->initialize(*f.initialization_plan, *f.backend_state);
+  const nvidia::testing::transfer_accounting replay_transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(replay_transfers.host_to_device_calls == expected_calls &&
+              replay_transfers.host_to_device_bytes == expected_bytes &&
+              replay_transfers.device_to_host_calls == 0 &&
+              replay_transfers.device_to_host_bytes == 0,
+          "NVIDIA frozen material replay transfer accounting differs from exact storage bytes");
+  for (size_t i = 0; i < frozen.rows().size(); ++i) {
+    const MaterialRecipeRow &row = frozen.rows()[i];
+    std::vector<unsigned char> observed(row.values.size());
+    f.backend->read(ArrayRef{mutated[i].id, 0, row.elements}, observed.data(), observed.size());
+    std::vector<unsigned char> expected = row.values;
+    if (precision != precision_policy_kind::native)
+      for (size_t element = 0; element < row.elements; ++element) {
+        realnum value = 0;
+        memcpy(&value, expected.data() + element * sizeof(realnum), sizeof(value));
+        value = realnum(float(value));
+        memcpy(expected.data() + element * sizeof(realnum), &value, sizeof(value));
+      }
+    require(observed == expected,
+            "NVIDIA material initialization borrowed a mutated CPU coefficient row");
+    memcpy(f.array_catalog->resolve_untyped(mutated[i].id), mutated[i].original.data(),
+           mutated[i].original.size());
+  }
+  master_printf("nvidia_timestep: material frozen-recipe upload PASS\n");
+}
+
+static void test_material_value_refresh_preserves_host_edit(precision_policy_kind precision) {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, isotropic_eps, pml(0.25, X), identity(), 2);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.init_backend();
+  f.advance(1);
+
+  ArrayId target = invalid_array();
+  realnum *host = NULL;
+  StorageKey key;
+  for (size_t i = 0; i < f.storage_plan->arrays.size(); ++i) {
+    const ArraySpec &spec = f.storage_plan->arrays[i];
+    if (spec.role != array_role::material || is_valid(spec.alias_of) || !spec.elements) continue;
+    target = spec.id;
+    key = f.storage_plan->keys[i];
+    host = f.array_catalog->resolve<realnum>(target);
+    if (host) break;
+  }
+  require(is_valid(target) && host, "NVIDIA material refresh fixture has no mutable host row");
+  const realnum sentinel = host[0] + realnum(0.1875);
+  host[0] = sentinel;
+  invalidate(f, MutationKind::material_values, "NVIDIA material host-value sentinel");
+  f.init_backend();
+
+  const MaterialRecipe &recipe = f.initialization_plan->materials[0];
+  bool recipe_saw_sentinel = false;
+  for (const MaterialRecipeRow &row : recipe.rows())
+    if (row.key == key && row.values.size() >= sizeof(realnum)) {
+      realnum captured = 0;
+      memcpy(&captured, row.values.data(), sizeof(captured));
+      recipe_saw_sentinel = captured == sentinel;
+    }
+  std::vector<realnum> observed(1);
+  f.backend->read(ArrayRef{target, 0, 1}, observed.data(), sizeof(realnum));
+  const realnum device_sentinel =
+      precision == precision_policy_kind::native ? sentinel : realnum(float(sentinel));
+  require(recipe_saw_sentinel && observed[0] == device_sentinel,
+          "NVIDIA authority migration overwrote a new host material coefficient");
+  master_printf("nvidia_timestep: material host-value refresh PASS\n");
 }
 
 static void test_material_collective_preflight() {
@@ -4240,16 +4397,19 @@ static void test_multilevel_lifecycle() {
   retry.require_component(Ez);
   retry.init_backend();
   BackendState *const prepared_state = retry.backend_state;
+  Executable *const prepared_executable = retry.executable;
+  invalidate(retry, MutationKind::coordinate_definition,
+             "NVIDIA multilevel compile allocation retry");
   nvidia::testing::fail_next(nvidia::testing::failure_point::device_allocate);
   bool failed = false;
   try { retry.advance(1); }
   catch (const std::runtime_error &) { failed = true; }
   nvidia::testing::clear_failure();
   require(failed && retry.t == 0 && retry.backend_state == prepared_state &&
-              !retry.executable && !retry.backend->is_poisoned(),
+              retry.executable == prepared_executable && !retry.backend->is_poisoned(),
           "NVIDIA multilevel compile allocation failure published or dispatched");
   retry.advance(1);
-  require(retry.executable && retry.t == 1,
+  require(retry.executable && retry.executable != prepared_executable && retry.t == 1,
           "NVIDIA multilevel compile allocation failure was not retryable");
 
   structure population_structure(gv, isotropic_eps, no_pml(), identity(), 2);
@@ -5349,6 +5509,13 @@ int main(int argc, char **argv) {
     master_printf("nvidia_timestep: compile retry checks PASS\n");
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_REBUILD_RETRY_ONLY")) {
+    run_case("state-rebuild-retry", vol2d(2.0, 2.0, 8.0),
+             precision_policy_kind::native, true, no_pml(), identity(), 2, NULL,
+             1u << CONNECT_COPY, 1u << 0, 1u << 0, false, true);
+    master_printf("nvidia_timestep: rebuild retry checks PASS\n");
+    return 0;
+  }
   const bool gyro_only = getenv("MEEP_NVIDIA_TIMESTEP_GYRO_ONLY") != NULL;
   const bool beta_only = getenv("MEEP_NVIDIA_TIMESTEP_BETA_ONLY") != NULL;
   const bool bfast_only = getenv("MEEP_NVIDIA_TIMESTEP_BFAST_ONLY") != NULL;
@@ -5394,6 +5561,17 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_MATERIAL_LIFECYCLE_ONLY")) {
     test_material_copy_after_compile_rejected();
     test_material_cpu_setup_to_nvidia();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_MATERIAL_RECIPE_ONLY")) {
+    const precision_policy_kind policies[] = {precision_policy_kind::native,
+                                              precision_policy_kind::mixed,
+                                              precision_policy_kind::f32};
+    for (precision_policy_kind policy : policies) {
+      test_material_recipe_owned_upload(policy);
+      test_material_value_refresh_preserves_host_edit(policy);
+    }
+    master_printf("nvidia_timestep: PASS\n");
     return 0;
   }
   if (getenv("MEEP_NVIDIA_MATERIAL_REJECTIONS_ONLY")) {

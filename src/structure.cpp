@@ -35,7 +35,7 @@ typedef structure_chunk *structure_chunk_ptr;
 structure::structure(const grid_volume &thegv, material_function &eps, const boundary_region &br,
                      const symmetry &s, int num, double Courant, bool use_anisotropic_averaging,
                      double tol, int maxeval, const binary_partition *_bp)
-    : Courant(Courant), v(D1) // Aaack, this is very hokey.
+    : Courant(Courant), v(D1), material_ir() // Aaack, this is very hokey.
 {
   outdir = ".";
   shared_chunks = false;
@@ -49,7 +49,7 @@ structure::structure(const grid_volume &thegv, material_function &eps, const bou
 structure::structure(const grid_volume &thegv, double eps(const vec &), const boundary_region &br,
                      const symmetry &s, int num, double Courant, bool use_anisotropic_averaging,
                      double tol, int maxeval, const binary_partition *_bp)
-    : Courant(Courant), v(D1) // Aaack, this is very hokey.
+    : Courant(Courant), v(D1), material_ir() // Aaack, this is very hokey.
 {
   outdir = ".";
   shared_chunks = false;
@@ -335,7 +335,8 @@ void structure::add_to_effort_volumes(const grid_volume &new_effort_volume, doub
 structure::structure(const structure &s)
     : num_chunks{s.num_chunks}, shared_chunks{false}, gv(s.gv), user_volume(s.user_volume), a{s.a},
       Courant{s.Courant}, dt{s.dt}, v(s.v), S(s.S), outdir(s.outdir),
-      num_effort_volumes{s.num_effort_volumes}, bp(new binary_partition(*s.bp)) {
+      num_effort_volumes{s.num_effort_volumes}, material_ir(s.material_ir),
+      bp(new binary_partition(*s.bp)) {
   chunks = new structure_chunk_ptr[num_chunks];
   for (int i = 0; i < num_chunks; i++) {
     chunks[i] = new structure_chunk(s.chunks[i]);
@@ -388,6 +389,7 @@ void structure::set_materials(material_function &mat, bool use_anisotropic_avera
 
 void structure::set_chi1inv(component c, material_function &eps, bool use_anisotropic_averaging,
                             double tol, int maxeval) {
+  material_ir.reset();
   changing_chunks();
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine())
@@ -424,6 +426,7 @@ void structure::set_mu(double mufunc(const vec &), bool use_anisotropic_averagin
 
 void structure::set_conductivity(component c, material_function &C) {
   if (!gv.has_field(c)) return;
+  material_ir.reset();
   double tstart = wall_time();
   changing_chunks();
   for (int i = 0; i < num_chunks; i++)
@@ -439,6 +442,7 @@ void structure::set_conductivity(component c, double Cfunc(const vec &)) {
 
 void structure::set_chi3(component c, material_function &eps) {
   if (!gv.has_field(c)) return;
+  material_ir.reset();
   changing_chunks();
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) chunks[i]->set_chi3(c, eps);
@@ -454,6 +458,7 @@ void structure::set_chi3(double eps(const vec &)) {
 }
 
 void structure::set_chi2(component c, material_function &eps) {
+  material_ir.reset();
   changing_chunks();
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) chunks[i]->set_chi2(c, eps);
@@ -476,6 +481,7 @@ void structure::add_susceptibility(double sigma(const vec &), field_type ft,
 
 void structure::add_susceptibility(material_function &sigma, field_type ft,
                                    const susceptibility &sus) {
+  material_ir.reset();
   changing_chunks();
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->add_susceptibility(sigma, ft, sus);
@@ -507,6 +513,7 @@ void structure::add_susceptibility(material_function &sigma, field_type ft,
 }
 
 void structure::use_pml(direction d, boundary_side b, double dx) {
+  material_ir.reset();
   if (dx <= 0.0) return;
   grid_volume pml_volume = gv;
   pml_volume.set_num_direction(d, int(dx * user_volume.a + 1 + 0.5)); // FIXME: exact value?
@@ -556,6 +563,7 @@ bool structure_chunk::has_nonlinearities() const {
 }
 
 void structure::mix_with(const structure *oth, double f) {
+  material_ir.reset();
   if (num_chunks != oth->num_chunks)
     meep::abort("You can't phase materials with different chunk topologies...\n");
   changing_chunks();
@@ -986,6 +994,7 @@ void structure_chunk::remove_susceptibilities() {
 }
 
 void structure::remove_susceptibilities() {
+  material_ir.reset();
   changing_chunks();
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->remove_susceptibilities();

@@ -71,6 +71,10 @@ struct ArraySpec {
   /* Allocated in pass 1 and possibly elided after classify(); unused until
      PR 4, defined here so the descriptor does not change shape later. */
   bool classification_provisional;
+  /* Classification resolves a provisional slot without renumbering it.
+     Elided slots remain physically allocated until epoch retirement but are
+     not part of the logical storage topology. */
+  bool classification_elided;
 };
 
 struct ArrayRef {

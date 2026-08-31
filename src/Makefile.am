@@ -43,6 +43,7 @@ susceptibility.cpp time.cpp update_eh.cpp mpb.cpp update_pols.cpp 	\
 vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
 backend/lifecycle.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
 backend/prepare.cpp backend/storage_plan.cpp backend/classification.cpp 	\
+backend/material_ir.cpp backend/material_recipe.cpp 	\
 backend/step_plan.cpp backend/cpu/cpu_executor.cpp 	\
 backend/descriptors.cpp backend/precision.cpp 	\
 backend/initialization_plan.cpp backend/cpu/cpu_backend.cpp backend/cpu/backend_access.cpp 	\

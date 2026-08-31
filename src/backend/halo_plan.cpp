@@ -46,6 +46,7 @@ ArrayId HaloArrayTable::intern(const HaloArrayKey &key, realnum *base, size_t el
   spec.alignment = alignof(realnum);
   spec.alias_of = invalid_array();
   spec.classification_provisional = false;
+  spec.classification_elided = false;
   specs_.push_back(spec);
   bases_.push_back(base);
   keys_.push_back(key);

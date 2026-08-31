@@ -47,7 +47,16 @@ namespace meep {
 typedef uint64_t component_mask;
 
 struct MaterialClassification {
+  enum ProvisionalRowState : uint8_t {
+    not_provisional = 0,
+    retained = 1,
+    elided_row = 2
+  };
+
   std::vector<ArrayId> elided;        // provisional arrays that turned out trivial
+  /* One entry per StoragePlan ArrayId. This makes classification total: an
+     omitted status can never be mistaken for retention. */
+  std::vector<uint8_t> provisional_row_state;
   std::vector<uint32_t> variant_keys; // one per update region
   component_mask required_components; // may grow: is_aniso2d, beta coupling
   bool has_nonlinearities;

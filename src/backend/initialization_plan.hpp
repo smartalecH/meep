@@ -19,6 +19,7 @@
 
 #include "meep.hpp"
 #include "backend/array_ref.hpp"
+#include "backend/material_recipe.hpp"
 
 namespace meep {
 
@@ -46,27 +47,12 @@ struct InitOperation {
   InitRegion region;
 };
 
-/* A deep-copied, backend-neutral description of the material geometry, held by
-   the simulation rather than borrowed from a temporary SWIG
-   geometric_object_list. */
-struct MaterialRecipe {
-  std::string description;
-  bool eps_averaging;
-  double subpixel_tol;
-  int subpixel_maxeval;
-  uint32_t host_callback_id; // valid when the material is an arbitrary eps_func
-  bool from_host_callback;
-
-  MaterialRecipe()
-      : eps_averaging(true), subpixel_tol(1e-4), subpixel_maxeval(100000),
-        host_callback_id(0xffffffffu), from_host_callback(false) {}
-};
-
 struct PmlRecipe {
+  int chunk;
   int direction_;
-  double thickness;
-  double strength;
-  double r_asymptotic;
+  std::vector<double> sigma;
+  std::vector<double> kappa;
+  std::vector<double> sigma_inv;
 };
 
 struct HostCallbackRecipe {
@@ -75,6 +61,8 @@ struct HostCallbackRecipe {
 };
 
 struct InitializationPlan {
+  uint64_t material_values_generation = 0;
+  uint64_t material_region_generation = 0;
   std::vector<InitOperation> operations;
   std::vector<MaterialRecipe> materials;
   std::vector<PmlRecipe> pml;
@@ -86,6 +74,8 @@ struct InitializationPlan {
   InitializationPlan restrict_to(const InitRegion &region) const;
 
   void clear() {
+    material_values_generation = 0;
+    material_region_generation = 0;
     operations.clear();
     materials.clear();
     pml.clear();

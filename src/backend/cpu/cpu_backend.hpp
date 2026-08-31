@@ -24,7 +24,8 @@ public:
   BackendState *create_state(const StoragePlan &) override;
   void initialize(const InitializationPlan &, BackendState &) override;
   MaterialClassification classify_state(const StoragePlan &, BackendState &) override;
-  void finalize_storage(const StoragePlan &, BackendState &) override;
+  void finalize_storage(const StoragePlan &, const MaterialClassification &,
+                        BackendState &) override;
   Executable *compile(const StepPlan &, BackendState &) override;
   void advance(Executable &, BackendState &, int num_steps) override;
   void read(ArrayRef, void *host_buffer, size_t bytes) override;

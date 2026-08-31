@@ -120,9 +120,12 @@ size_t StoragePlan::steady_state_bytes() const {
      would understate it later. */
   size_t n = 0;
   for (const ArraySpec &s : arrays)
-    if (!is_valid(s.alias_of) && !s.classification_provisional) add_array_bytes(n, s);
+    if (!is_valid(s.alias_of) && !s.classification_provisional && !s.classification_elided)
+      add_array_bytes(n, s);
   return n;
 }
+
+size_t StoragePlan::physical_resident_bytes() const { return provisional_peak_bytes(); }
 
 ArrayId CpuArrayCatalog::register_array(const StorageKey &key, void *address, size_t elements,
                                         array_role role, ElementType type) {
@@ -144,12 +147,61 @@ ArrayId CpuArrayCatalog::register_array(const StorageKey &key, void *address, si
   spec.alignment = alignof(realnum);
   spec.alias_of = invalid_array();
   spec.classification_provisional = false;
+  spec.classification_elided = false;
   specs_.push_back(spec);
   bases_.push_back(address);
   keys_.push_back(key);
   index_[key] = id;
   by_address_[address] = id;
   return ArrayId{id};
+}
+
+void CpuArrayCatalog::publish_resolved_plan(const StoragePlan &plan) {
+  const size_t prefix = host_backed_size();
+  if (plan.arrays.size() != plan.keys.size() || prefix > plan.arrays.size())
+    throw std::invalid_argument("resolved storage plan does not extend the host catalog");
+  std::vector<ArraySpec> specs(specs_.begin(), specs_.begin() + prefix);
+  std::vector<void *> bases(bases_.begin(), bases_.begin() + prefix);
+  std::vector<StorageKey> keys(keys_.begin(), keys_.begin() + prefix);
+  std::unordered_map<StorageKey, uint32_t, StorageKeyHash> index;
+  std::unordered_map<const void *, uint32_t> by_address = by_address_;
+  std::unordered_map<StorageKey, uint32_t, StorageKeyHash> all_keys;
+  for (size_t i = 0; i < plan.arrays.size(); ++i) {
+    const ArraySpec &spec = plan.arrays[i];
+    if (spec.id.value != i || spec.classification_provisional ||
+        !all_keys.insert(std::make_pair(plan.keys[i], uint32_t(i))).second)
+      throw std::invalid_argument("resolved storage plan has invalid stable identity");
+    if (i < prefix) {
+      const ArraySpec &host = specs[i];
+      if (!(keys[i] == plan.keys[i]) || host.id != spec.id || host.role != spec.role ||
+          host.element_type != spec.element_type || host.storage != spec.storage ||
+          host.elements != spec.elements || host.alignment != spec.alignment ||
+          host.alias_of != spec.alias_of || spec.classification_elided)
+        throw std::invalid_argument("resolved storage plan changed its host-backed prefix");
+      specs[i] = spec;
+      index[plan.keys[i]] = uint32_t(i);
+      continue;
+    }
+    if (spec.role != array_role::material || is_valid(spec.alias_of))
+      throw std::invalid_argument("resolved logical suffix is not owned material storage");
+    specs.push_back(spec);
+    bases.push_back(NULL);
+    keys.push_back(plan.keys[i]);
+    if (!spec.classification_elided) index[plan.keys[i]] = uint32_t(i);
+  }
+  specs_.swap(specs);
+  bases_.swap(bases);
+  keys_.swap(keys);
+  index_.swap(index);
+  by_address_.swap(by_address);
+}
+
+size_t CpuArrayCatalog::host_backed_size() const {
+  size_t result = 0;
+  while (result < bases_.size() && bases_[result]) ++result;
+  for (size_t i = result; i < bases_.size(); ++i)
+    if (bases_[i]) throw std::logic_error("logical catalog suffix has a host binding");
+  return result;
 }
 
 bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offset) const {
@@ -175,8 +227,8 @@ bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offs
 
 size_t CpuArrayCatalog::total_bytes() const {
   size_t n = 0;
-  for (const ArraySpec &s : specs_)
-    if (!is_valid(s.alias_of)) add_array_bytes(n, s);
+  for (size_t i = 0; i < specs_.size(); ++i)
+    if (bases_[i] && !is_valid(specs_[i].alias_of)) add_array_bytes(n, specs_[i]);
   return n;
 }
 

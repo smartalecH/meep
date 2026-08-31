@@ -165,7 +165,8 @@ public:
   BackendState *create_state(const StoragePlan &plan) override;
   void initialize(const InitializationPlan &plan, BackendState &state) override;
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &state) override;
-  void finalize_storage(const StoragePlan &plan, BackendState &state) override;
+  void finalize_storage(const StoragePlan &plan, const MaterialClassification &classification,
+                        BackendState &state) override;
 
   Executable *compile(const StepPlan &plan, BackendState &state) override;
   void advance(Executable &executable, BackendState &state, int num_steps) override;

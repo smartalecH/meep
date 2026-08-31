@@ -86,7 +86,8 @@ MaterialClassification CpuBackend::classify_state(const StoragePlan &plan, Backe
   return classify(f_, plan);
 }
 
-void CpuBackend::finalize_storage(const StoragePlan &, BackendState &) {
+void CpuBackend::finalize_storage(const StoragePlan &, const MaterialClassification &,
+                                  BackendState &) {
   /* Nothing to elide on CPU: set_chi1inv already deleted the trivial rows
      before preparation ever ran, so the provisional superset and the steady
      state coincide. */

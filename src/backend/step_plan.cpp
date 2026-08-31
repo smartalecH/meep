@@ -933,6 +933,7 @@ void hash_array_spec(uint64_t &sig, const StorageKey &key, const ArraySpec &spec
   target_fingerprint_mix(sig, uint64_t(spec.alignment));
   target_fingerprint_mix(sig, uint64_t(spec.alias_of.value));
   target_fingerprint_mix(sig, uint64_t(spec.classification_provisional));
+  target_fingerprint_mix(sig, uint64_t(spec.classification_elided));
 }
 
 uint64_t storage_fingerprint(const fields &f, const CwStateLayout &layout) {

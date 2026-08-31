@@ -51,8 +51,9 @@ static void test_concurrent_state_identity(fields &f, ArrayId chosen) {
   std::unique_ptr<Executable> live_executable(f.backend->compile(empty, *f.backend_state));
   std::unique_ptr<BackendState> sibling(f.backend->create_state(*f.storage_plan));
   f.backend->initialize(*f.initialization_plan, *sibling);
-  (void)f.backend->classify_state(*f.storage_plan, *sibling);
-  f.backend->finalize_storage(*f.storage_plan, *sibling);
+  const MaterialClassification sibling_classification =
+      f.backend->classify_state(*f.storage_plan, *sibling);
+  f.backend->finalize_storage(*f.storage_plan, sibling_classification, *sibling);
   std::unique_ptr<Executable> sibling_executable(f.backend->compile(empty, *sibling));
 
   require_advance_rejected(*f.backend, *live_executable, *sibling,

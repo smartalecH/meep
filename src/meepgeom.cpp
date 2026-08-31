@@ -16,7 +16,9 @@
 
 #include <algorithm>
 #include <vector>
+#include "backend/backend.hpp"
 #include "meepgeom.hpp"
+#include "backend/material_ir.hpp"
 #include "meep_internals.hpp"
 
 namespace meep_geom {
@@ -652,8 +654,40 @@ void epsilon_file_material(material_data *md, vector3 p) {
 
 /***********************************************************************/
 
+static void deep_copy_object_materials(geometric_object &destination,
+                                       const geometric_object &source) {
+  destination.material = new material_data();
+  static_cast<material_data *>(destination.material)
+      ->copy_from(*static_cast<const material_data *>(source.material));
+  if (source.which_subclass == geometric_object::COMPOUND_GEOMETRIC_OBJECT) {
+    geometric_object_list &dst =
+        destination.subclass.compound_geometric_object_data->component_objects;
+    const geometric_object_list &src =
+        source.subclass.compound_geometric_object_data->component_objects;
+    if (dst.num_items != src.num_items || dst.num_items < 0)
+      meep::abort("invalid compound geometry copy");
+    for (int i = 0; i < dst.num_items; ++i) deep_copy_object_materials(dst.items[i], src.items[i]);
+  }
+}
+
+static void free_object_materials(geometric_object &object) {
+  if (object.which_subclass == geometric_object::COMPOUND_GEOMETRIC_OBJECT) {
+    geometric_object_list &children =
+        object.subclass.compound_geometric_object_data->component_objects;
+    for (int i = 0; i < children.num_items; ++i) free_object_materials(children.items[i]);
+  }
+  material_free(static_cast<material_type>(object.material));
+  object.material = NULL;
+}
+
 geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
-                           const meep::volume &v) {
+                           const meep::volume &v) : captured_volume(v) {
+  captured_geometry_center = geometry_center;
+  captured_geometry_lattice = geometry_lattice;
+  captured_ensure_periodicity = ensure_periodicity;
+  captured_dimensions = dimensions;
+  captured_default_material = new material_data();
+  captured_default_material->copy_from(*static_cast<material_data *>(default_material));
   // Copy the geometry
   int length = g.num_items;
   geometry.num_items = length;
@@ -662,15 +696,19 @@ geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
                                                material_data::MATERIAL_USER;
   for (int i = 0; i < length; i++) {
     geometric_object_copy(&g.items[i], &geometry.items[i]);
-    geometry.items[i].material = new material_data();
-    static_cast<material_data *>(geometry.items[i].material)
-        ->copy_from(*(material_data *)(g.items[i].material));
+    deep_copy_object_materials(geometry.items[i], g.items[i]);
     if (static_cast<material_data *>(g.items[i].material)->which_subclass ==
         material_data::MATERIAL_USER)
       has_user_materials = true;
   }
 
-  extra_materials = mlist;
+  if (mlist.num_items < 0) meep::abort("invalid extra-material count");
+  extra_materials.num_items = mlist.num_items;
+  extra_materials.items = new material_type[size_t(mlist.num_items)];
+  for (int i = 0; i < mlist.num_items; ++i) {
+    extra_materials.items[i] = new material_data();
+    extra_materials.items[i]->copy_from(*mlist.items[i]);
+  }
   current_pol = NULL;
 
   FOR_DIRECTIONS(d) FOR_SIDES(b) { cond[d][b].prof = NULL; }
@@ -713,7 +751,13 @@ geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
 }
 
 // copy constructor
-geom_epsilon::geom_epsilon(const geom_epsilon &geps1) {
+geom_epsilon::geom_epsilon(const geom_epsilon &geps1) : captured_volume(geps1.captured_volume) {
+  captured_geometry_center = geps1.captured_geometry_center;
+  captured_geometry_lattice = geps1.captured_geometry_lattice;
+  captured_ensure_periodicity = geps1.captured_ensure_periodicity;
+  captured_dimensions = geps1.captured_dimensions;
+  captured_default_material = new material_data();
+  captured_default_material->copy_from(*geps1.captured_default_material);
   // Copy the geometry
   int length = geps1.geometry.num_items;
   geometry.num_items = length;
@@ -721,24 +765,40 @@ geom_epsilon::geom_epsilon(const geom_epsilon &geps1) {
   has_user_materials = geps1.has_user_materials;
   for (int i = 0; i < length; i++) {
     geometric_object_copy(&geps1.geometry.items[i], &geometry.items[i]);
-    geometry.items[i].material = new material_data();
-    static_cast<material_data *>(geometry.items[i].material)
-        ->copy_from(*(material_data *)(geps1.geometry.items[i].material));
+    deep_copy_object_materials(geometry.items[i], geps1.geometry.items[i]);
   }
 
-  geometry_tree = geps1.geometry_tree;
-  restricted_tree = geps1.restricted_tree;
-  extra_materials = geps1.extra_materials;
+  geometry_tree = create_geom_box_tree0(geometry, gv2box(captured_volume));
+  restricted_tree = geometry_tree;
+  extra_materials.num_items = geps1.extra_materials.num_items;
+  extra_materials.items = new material_type[size_t(extra_materials.num_items)];
+  for (int i = 0; i < extra_materials.num_items; ++i) {
+    extra_materials.items[i] = new material_data();
+    extra_materials.items[i]->copy_from(*geps1.extra_materials.items[i]);
+  }
   current_pol = NULL;
 
-  FOR_DIRECTIONS(d) FOR_SIDES(b) { cond[d][b].prof = geps1.cond[d][b].prof; }
+  FOR_DIRECTIONS(d) FOR_SIDES(b) {
+    cond[d][b].L = geps1.cond[d][b].L;
+    cond[d][b].N = geps1.cond[d][b].N;
+    cond[d][b].prof = NULL;
+    if (geps1.cond[d][b].prof) {
+      if (cond[d][b].N < 0) meep::abort("invalid copied absorber profile size");
+      cond[d][b].prof = new double[size_t(cond[d][b].N) + 1];
+      std::copy(geps1.cond[d][b].prof, geps1.cond[d][b].prof + size_t(cond[d][b].N) + 1,
+                cond[d][b].prof);
+    }
+  }
 }
 geom_epsilon::~geom_epsilon() {
+  material_free(captured_default_material);
   int length = geometry.num_items;
   for (int i = 0; i < length; i++) {
-    material_free((material_type)geometry.items[i].material);
+    free_object_materials(geometry.items[i]);
     geometric_object_destroy(geometry.items[i]);
   }
+  for (int i = 0; i < extra_materials.num_items; ++i) material_free(extra_materials.items[i]);
+  delete[] extra_materials.items;
   delete[] geometry.items;
   unset_volume();
   destroy_geom_box_tree(geometry_tree);
@@ -1818,6 +1878,28 @@ static pol *add_pols(pol *pols, const susceptibility_list &slist) {
   return pols;
 }
 
+std::vector<susceptibility> geom_epsilon::owned_unique_susceptibilities(meep::field_type ft) const {
+  std::vector<susceptibility> result;
+  const auto append = [&](const medium_struct &medium) {
+    const susceptibility_list &list =
+        ft == meep::E_stuff ? medium.E_susceptibilities : medium.H_susceptibilities;
+    for (const susceptibility &candidate : list) {
+      bool found = false;
+      for (const susceptibility &existing : result)
+        found = found || susceptibility_equiv(candidate, existing);
+      if (!found) result.push_back(candidate);
+    }
+  };
+  medium_struct *medium = NULL;
+  for (int i = 0; i < geometry.num_items; ++i)
+    if (is_medium(geometry.items[i].material, &medium)) append(*medium);
+  for (int i = 0; i < extra_materials.num_items; ++i)
+    if (is_medium(extra_materials.items[i], &medium)) append(*medium);
+  material_type captured = captured_default_material;
+  if (is_medium(captured, &medium)) append(*medium);
+  return result;
+}
+
 void geom_epsilon::add_susceptibilities(meep::structure *s) {
   add_susceptibilities(meep::E_stuff, s);
   add_susceptibilities(meep::H_stuff, s);
@@ -2043,9 +2125,38 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
       }
     }
   }
+  /* Freeze every dynamic/file/grid/user input before eager evaluation.  User
+     callbacks are represented only by an opaque host-owned marker; no raw
+     function or user-data pointer crosses the backend boundary. */
+  std::shared_ptr<const void> staged_material_ir;
+  std::string capture_error;
+  try {
+    staged_material_ir =
+        capture_material_ir(*s, *geps, use_anisotropic_averaging, tol, maxeval,
+                            static_cast<const void *>(alist));
+  }
+  catch (const std::exception &error) {
+    capture_error = error.what();
+  }
+  catch (...) {
+    capture_error = "unknown material IR capture failure";
+  }
+  meep::backend_reconcile_host_access(capture_error, "set_materials material IR capture");
+  uint64_t local_signature =
+      static_cast<const meep::MaterialIR *>(staged_material_ir.get())->signature;
+  if (meep::get_material_ir_capture_failure_rank_for_testing() == meep::my_rank() &&
+      meep::get_material_ir_capture_failure_mode_for_testing() == 3)
+    local_signature ^= UINT64_C(1);
+  uint64_t reference_signature = local_signature;
+  meep::broadcast(0, &reference_signature, 1);
+  if (local_signature != reference_signature)
+    capture_error = "material IR semantic signature differs across MPI ranks";
+  meep::backend_reconcile_host_access(capture_error,
+                                      "set_materials material IR reconciliation");
   s->set_materials(*geps, use_anisotropic_averaging, tol, maxeval);
   s->remove_susceptibilities();
   geps->add_susceptibilities(s);
+  s->material_ir = staged_material_ir;
 
   if (meep::verbosity > 0) master_printf("-----------\n");
 }

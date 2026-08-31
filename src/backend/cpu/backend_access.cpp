@@ -28,6 +28,7 @@
 #include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/material_ir.hpp"
 #include "backend/precision.hpp"
 #include "backend/prepare.hpp"
 #include "backend/random_state.hpp"
@@ -49,6 +50,8 @@ static int host_custom_collective_failure_mode_for_testing = 0;
 static size_t host_custom_collective_count_for_testing = 0;
 static size_t host_custom_presence_scan_count_for_testing = 0;
 static bool host_custom_mpi_override_for_testing = false;
+static int material_candidate_plan_failure_rank_for_testing = -1;
+static int material_candidate_plan_failure_mode_for_testing = 0;
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
   ++host_custom_presence_scan_count_for_testing;
@@ -74,6 +77,11 @@ void backend_cw_clone_checkpoint() {
 
 void backend_set_cw_plan_corruption_for_testing(bool enabled) {
   cw_plan_corruption_for_testing = enabled;
+}
+
+void backend_set_material_candidate_plan_failure_for_testing(int rank, int mode) {
+  material_candidate_plan_failure_rank_for_testing = rank;
+  material_candidate_plan_failure_mode_for_testing = mode;
 }
 
 void backend_set_legacy_flux_prepare_failure_for_testing(int rank) {
@@ -502,6 +510,12 @@ std::string validate_noisy_snapshot(const RandomSeedSnapshot &snapshot) {
 std::string backend_validate_multilevel_plan(const fields &f, const StepPlan &plan,
                                              bool &local_multilevel_actions) {
   return validate_multilevel_plan(f, plan, local_multilevel_actions);
+}
+
+std::string backend_validate_noisy_plan(const fields &f, const StepPlan &plan,
+                                        bool &local_noisy_actions, size_t &stream_count,
+                                        uint64_t &first_stream_tag) {
+  return validate_noisy_plan(f, plan, local_noisy_actions, stream_count, first_stream_tag);
 }
 
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site) {
@@ -1529,6 +1543,527 @@ private:
   bool old_changed_materials_;
 };
 
+struct BackendStateDeleter {
+  void operator()(BackendState *state) const noexcept {
+    BackendState *owned = state;
+    destroy_backend_state(owned);
+  }
+};
+
+struct LiveIdentitySnapshot {
+  std::vector<const void *> addresses;
+  uint64_t generations[fields::num_mutation_kinds];
+  uint64_t connections_generation;
+  uint64_t connections_built_generation;
+  uint64_t local_invalidation_generation;
+  uint64_t local_invalidation_synced;
+  uint32_t dirty_mask;
+  uint32_t storage_prepared_mask;
+  uint64_t prepared_classification_hash;
+  uint32_t classification_reentries;
+  bool chunk_connections_valid;
+  bool changed_materials;
+  std::shared_ptr<const void> material_ir;
+  uint64_t material_signature;
+  uint64_t material_layout_signature;
+
+  static LiveIdentitySnapshot capture(const fields &f) {
+    LiveIdentitySnapshot result;
+    result.addresses.push_back(f.chunks);
+    result.addresses.push_back(f.halos);
+    for (int ft = 0; ft < NUM_FIELD_TYPES; ++ft) {
+      result.addresses.push_back(f.comm_blocks[ft]);
+      if (f.comm_blocks[ft])
+        for (int i = 0; i < f.num_chunks * f.num_chunks; ++i)
+          result.addresses.push_back(f.comm_blocks[ft][i]);
+    }
+    for (int i = 0; i < f.num_chunks; ++i) {
+      const fields_chunk *fc = f.chunks[i];
+      result.addresses.push_back(fc);
+      result.addresses.push_back(fc ? fc->s : NULL);
+      if (!fc) continue;
+      FOR_COMPONENTS(c) DOCMP2 {
+        result.addresses.push_back(fc->f[c][cmp]);
+        result.addresses.push_back(fc->f_u[c][cmp]);
+        result.addresses.push_back(fc->f_w[c][cmp]);
+        result.addresses.push_back(fc->f_cond[c][cmp]);
+        result.addresses.push_back(fc->f_bfast[c][cmp]);
+        result.addresses.push_back(fc->f_backup[c][cmp]);
+        result.addresses.push_back(fc->f_u_backup[c][cmp]);
+        result.addresses.push_back(fc->f_w_backup[c][cmp]);
+        result.addresses.push_back(fc->f_cond_backup[c][cmp]);
+        result.addresses.push_back(fc->f_bfast_backup[c][cmp]);
+        result.addresses.push_back(fc->f_w_prev[c][cmp]);
+        result.addresses.push_back(fc->f_minus_p[c][cmp]);
+      }
+      result.addresses.push_back(fc->f_rderiv_int);
+      if (fc->s) {
+        FOR_COMPONENTS(c) {
+          result.addresses.push_back(fc->s->chi2[c]);
+          result.addresses.push_back(fc->s->chi3[c]);
+          for (int d = 0; d < 5; ++d) {
+            result.addresses.push_back(fc->s->chi1inv[c][d]);
+            result.addresses.push_back(fc->s->conductivity[c][d]);
+            result.addresses.push_back(fc->s->condinv[c][d]);
+          }
+        }
+        for (int d = 0; d < 6; ++d) {
+          result.addresses.push_back(fc->s->sig[d]);
+          result.addresses.push_back(fc->s->kap[d]);
+          result.addresses.push_back(fc->s->siginv[d]);
+        }
+        FOR_FIELD_TYPES(ft) for (const susceptibility *s = fc->s->chiP[ft]; s; s = s->next) {
+          result.addresses.push_back(s);
+          FOR_COMPONENTS(c) for (int d = 0; d < 5; ++d)
+            result.addresses.push_back(s->sigma[c][d]);
+        }
+      }
+      FOR_FIELD_TYPES(ft) for (const polarization_state *p = fc->pol[ft]; p; p = p->next) {
+        result.addresses.push_back(p);
+        result.addresses.push_back(p->s);
+        result.addresses.push_back(p->data);
+      }
+      for (const dft_chunk *dft = fc->dft_chunks; dft; dft = dft->next_in_chunk) {
+        result.addresses.push_back(dft);
+        result.addresses.push_back(dft->fc);
+        result.addresses.push_back(dft->dft);
+        result.addresses.push_back(dft->dft_phase);
+      }
+    }
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      result.generations[i] = f.mutation_generation[i];
+    result.connections_generation = f.connections_generation;
+    result.connections_built_generation = f.connections_built_generation;
+    result.local_invalidation_generation = f.local_invalidation_generation;
+    result.local_invalidation_synced = f.local_invalidation_synced;
+    result.dirty_mask = f.dirty_mask;
+    result.storage_prepared_mask = f.storage_prepared_mask;
+    result.prepared_classification_hash = f.prepared_classification_hash;
+    result.classification_reentries = f.classification_reentries;
+    result.chunk_connections_valid = f.chunk_connections_valid;
+    result.changed_materials = f.changed_materials;
+    result.material_ir = f.material_ir;
+    const MaterialIR *ir = material_ir_for(f);
+    result.material_signature = ir ? ir->signature : 0;
+    result.material_layout_signature = ir ? ir->layout_signature : 0;
+    return result;
+  }
+
+  bool operator==(const LiveIdentitySnapshot &other) const {
+    if (addresses != other.addresses || connections_generation != other.connections_generation ||
+        connections_built_generation != other.connections_built_generation ||
+        local_invalidation_generation != other.local_invalidation_generation ||
+        local_invalidation_synced != other.local_invalidation_synced ||
+        dirty_mask != other.dirty_mask || storage_prepared_mask != other.storage_prepared_mask ||
+        prepared_classification_hash != other.prepared_classification_hash ||
+        classification_reentries != other.classification_reentries ||
+        chunk_connections_valid != other.chunk_connections_valid ||
+        changed_materials != other.changed_materials || material_ir != other.material_ir ||
+        material_signature != other.material_signature ||
+        material_layout_signature != other.material_layout_signature)
+      return false;
+    for (int i = 0; i < fields::num_mutation_kinds; ++i)
+      if (generations[i] != other.generations[i]) return false;
+    return true;
+  }
+};
+
+struct ResidentEpochCandidate {
+  std::unique_ptr<CpuArrayCatalog> catalog;
+  std::unique_ptr<StoragePlan> host_storage;
+  StoragePlan allocation_storage;
+  std::unique_ptr<StoragePlan> resolved_storage;
+  std::unique_ptr<InitializationPlan> initialization;
+  MaterialClassification classification;
+  std::unique_ptr<DescriptorSet> descriptors;
+  std::unique_ptr<StepPlan> ordinary_plan;
+  std::unique_ptr<StepPlan> cw_plan;
+  std::unique_ptr<BackendState, BackendStateDeleter> state;
+  std::unique_ptr<Executable> executable;
+  std::vector<std::vector<grid_volume> > eh_tiles;
+  LiveIdentitySnapshot entry;
+
+  ResidentEpochCandidate() {}
+};
+
+static bool same_classification(const MaterialClassification &a,
+                                const MaterialClassification &b) {
+  return a.variant_keys == b.variant_keys && a.required_components == b.required_components &&
+         a.has_nonlinearities == b.has_nonlinearities &&
+         a.min_decimation_factor == b.min_decimation_factor && a.hash == b.hash &&
+         a.anisotropic_eh == b.anisotropic_eh && a.aniso2d == b.aniso2d;
+}
+
+static void build_candidate_eh_tiles(const fields &f, const MaterialClassification &classification,
+                                     std::vector<std::vector<grid_volume> > &tiles) {
+  tiles.clear();
+  tiles.resize(size_t(f.num_chunks) * NUM_FIELD_TYPES);
+  if (classification.anisotropic_eh.size() != tiles.size())
+    throw std::invalid_argument("candidate classification has the wrong chunk/field extent");
+  for (int i = 0; i < f.num_chunks; ++i) {
+    if (!f.chunks[i]->is_mine()) continue;
+    for (field_type ft : {E_stuff, H_stuff}) {
+      std::vector<grid_volume> &row = tiles[size_t(i) * NUM_FIELD_TYPES + ft];
+      const bool anisotropic = classification.anisotropic_eh[size_t(i) * NUM_FIELD_TYPES + ft];
+      if (f.loop_tile_base_eh > 0 && anisotropic)
+        split_into_tiles(f.chunks[i]->gv, &row, f.loop_tile_base_eh);
+      else
+        row.push_back(f.chunks[i]->gv);
+    }
+  }
+}
+
+class ScopedCandidateTiles {
+public:
+  ScopedCandidateTiles(fields &owner, std::vector<std::vector<grid_volume> > &tiles)
+      : owner_(owner), tiles_(tiles) {
+    for (int i = 0; i < owner_.num_chunks; ++i)
+      for (field_type ft : {E_stuff, H_stuff})
+        owner_.chunks[i]->gvs_eh[ft].swap(tiles_[size_t(i) * NUM_FIELD_TYPES + ft]);
+  }
+  ~ScopedCandidateTiles() {
+    for (int i = 0; i < owner_.num_chunks; ++i)
+      for (field_type ft : {E_stuff, H_stuff})
+        owner_.chunks[i]->gvs_eh[ft].swap(tiles_[size_t(i) * NUM_FIELD_TYPES + ft]);
+  }
+private:
+  fields &owner_;
+  std::vector<std::vector<grid_volume> > &tiles_;
+};
+
+class ScopedArtifactBuildView {
+public:
+  ScopedArtifactBuildView(fields &owner, ResidentEpochCandidate &candidate)
+      : owner_(owner), old_catalog_(owner.array_catalog), old_storage_(owner.storage_plan),
+        old_descriptors_(owner.descriptors), old_initialization_(owner.initialization_plan),
+        old_dirty_(owner.dirty_mask), old_prepared_mask_(owner.storage_prepared_mask),
+        old_classification_hash_(owner.prepared_classification_hash),
+        old_classification_reentries_(owner.classification_reentries) {
+    old_steps_[0] = owner.step_plans[0]; old_steps_[1] = owner.step_plans[1];
+    owner_.array_catalog = candidate.catalog.get();
+    owner_.storage_plan = candidate.resolved_storage ? candidate.resolved_storage.get()
+                                                     : candidate.host_storage.get();
+    owner_.descriptors = candidate.descriptors.get();
+    owner_.initialization_plan = candidate.initialization.get();
+    owner_.step_plans[0] = candidate.ordinary_plan.get();
+    owner_.step_plans[1] = candidate.cw_plan.get();
+  }
+  ~ScopedArtifactBuildView() {
+    owner_.array_catalog = old_catalog_; owner_.storage_plan = old_storage_;
+    owner_.descriptors = old_descriptors_; owner_.initialization_plan = old_initialization_;
+    owner_.step_plans[0] = old_steps_[0]; owner_.step_plans[1] = old_steps_[1];
+    owner_.dirty_mask = old_dirty_; owner_.storage_prepared_mask = old_prepared_mask_;
+    owner_.prepared_classification_hash = old_classification_hash_;
+    owner_.classification_reentries = old_classification_reentries_;
+  }
+private:
+  fields &owner_;
+  CpuArrayCatalog *old_catalog_;
+  StoragePlan *old_storage_;
+  DescriptorSet *old_descriptors_;
+  InitializationPlan *old_initialization_;
+  StepPlan *old_steps_[2];
+  DirtyMask old_dirty_;
+  uint32_t old_prepared_mask_;
+  uint64_t old_classification_hash_;
+  uint32_t old_classification_reentries_;
+};
+
+bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool local_custom,
+                                    bool any_custom, bool any_multilevel, bool any_flux,
+                                    const MaterialClassification &host_oracle,
+                                    const LiveIdentitySnapshot &entry) {
+  ResidentEpochCandidate candidate;
+  std::string local_error;
+
+  try {
+    candidate.catalog.reset(new CpuArrayCatalog);
+    candidate.host_storage.reset(new StoragePlan);
+    candidate.descriptors.reset(new DescriptorSet);
+    candidate.entry = entry;
+    build_storage_catalog(f, *candidate.catalog, *candidate.host_storage);
+    {
+      ScopedArtifactBuildView view(f, candidate);
+      candidate.initialization.reset(new InitializationPlan(build_initialization_plan(f)));
+    }
+    if (!candidate.initialization || candidate.initialization->materials.size() != 1)
+      throw std::logic_error("resident candidate requires one material recipe");
+    candidate.allocation_storage = *candidate.host_storage;
+    mark_material_storage_provisional(candidate.initialization->materials[0],
+                                      candidate.allocation_storage);
+    const MaterialRecipe &recipe = candidate.initialization->materials[0];
+    const MaterialSupportDecision support = classify_material_support(recipe);
+    if (support.disposition != recipe.disposition() ||
+        support.reason_bits != recipe.support_reason_bits())
+      throw std::logic_error("resident candidate material support decision changed");
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate recipe failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate recipe");
+
+  {
+    const MaterialRecipe &recipe = candidate.initialization->materials[0];
+    uint64_t reference_ir_signature = recipe.ir() ? recipe.ir()->signature : 0;
+    broadcast(0, &reference_ir_signature, 1);
+    local_error.clear();
+    if ((recipe.ir() ? recipe.ir()->signature : 0) != reference_ir_signature)
+      local_error = "material IR semantic signature differs across MPI ranks";
+    size_t local_route = size_t(1) << size_t(recipe.disposition());
+    size_t global_routes = 0;
+    bw_or_to_all(&local_route, &global_routes, 1);
+    if (global_routes != local_route)
+      local_error = "material recipe disposition differs across MPI ranks";
+    backend_reconcile_host_access(local_error,
+                                  "fields::init_backend candidate material support");
+  }
+
+  try {
+    candidate.state.reset(f.backend->create_state(candidate.allocation_storage));
+    if (!candidate.state) throw std::runtime_error("backend returned no candidate state");
+    candidate.state->host_custom_local_presence = local_custom;
+    candidate.state->host_custom_presence_validated = true;
+    candidate.state->host_custom_preflight_required = any_custom;
+    candidate.state->host_custom_plan_validated = false;
+    candidate.state->host_custom_validated_plan_signature = 0;
+    candidate.state->host_custom_policy_pending = true;
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate state failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate create");
+
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    f.backend->initialize(*candidate.initialization, *candidate.state);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate initialization failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate initialize");
+
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    candidate.classification =
+        f.backend->classify_state(candidate.allocation_storage, *candidate.state);
+    if (!same_classification(candidate.classification, host_oracle))
+      throw std::runtime_error("candidate classification differs from the captured host oracle");
+    build_candidate_eh_tiles(f, candidate.classification, candidate.eh_tiles);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate classification failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate classify");
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    f.backend->finalize_storage(*candidate.host_storage, candidate.classification,
+                                *candidate.state);
+    candidate.resolved_storage.reset(new StoragePlan(candidate.allocation_storage));
+    resolve_material_storage(candidate.initialization->materials[0], candidate.classification,
+                             *candidate.host_storage, *candidate.resolved_storage);
+    candidate.catalog->publish_resolved_plan(*candidate.resolved_storage);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate finalization failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate finalize");
+
+  try {
+    if (material_candidate_plan_failure_rank_for_testing == my_rank()) {
+      if (material_candidate_plan_failure_mode_for_testing == 1)
+        throw std::runtime_error("injected resident candidate plan failure");
+      if (material_candidate_plan_failure_mode_for_testing == 2) throw std::bad_alloc();
+    }
+    {
+      ScopedArtifactBuildView view(f, candidate);
+      ScopedCandidateTiles tile_view(f, candidate.eh_tiles);
+      refresh_operation_descriptors(f, true);
+    }
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate descriptor/plan failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate descriptors");
+
+  try {
+    if (any_flux) {
+      ScopedArtifactBuildView view(f, candidate);
+      ScopedCandidateTiles tile_view(f, candidate.eh_tiles);
+      refresh_legacy_flux_descriptors(f);
+    }
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate legacy-flux descriptor failure";
+  }
+  backend_reconcile_host_access(local_error,
+                                "fields::init_backend candidate legacy-flux descriptors");
+
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    ScopedCandidateTiles tile_view(f, candidate.eh_tiles);
+    candidate.ordinary_plan.reset(new StepPlan(build_step_plan(f, StepProgram::ordinary)));
+    if (!candidate.ordinary_plan)
+      throw std::runtime_error("resident candidate produced no ordinary plan");
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate plan failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate plan");
+
+  bool local_noisy = false;
+  for (const PolarizationUpdate &update : candidate.ordinary_plan->polarization_updates)
+    local_noisy = local_noisy || update.kind == PolarizationUpdateKind::noisy_add;
+  const bool any_noisy = or_to_all(local_noisy);
+  candidate.state->noisy_preflight_required = any_noisy;
+  candidate.state->noisy_static_validation_required = any_noisy;
+  candidate.state->noisy_plan_validated = false;
+
+  bool local_multilevel_actions = false;
+  size_t noisy_stream_count = 0;
+  uint64_t noisy_first_stream_tag = 0;
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    if (any_noisy) {
+      local_error = backend_validate_noisy_plan(f, *candidate.ordinary_plan, local_noisy,
+                                                noisy_stream_count, noisy_first_stream_tag);
+    }
+    if (local_error.empty() && any_multilevel) {
+      local_error = backend_validate_multilevel_plan(f, *candidate.ordinary_plan,
+                                                     local_multilevel_actions);
+      if (local_error.empty() && local_multilevel_actions != has_local_exact_multilevel(f))
+        local_error = "multilevel candidate action presence differs from live state";
+    }
+    if (local_error.empty() && any_custom)
+      backend_validate_host_custom_plan(f, *candidate.ordinary_plan, *candidate.state);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate static validation failure";
+  }
+  if (any_noisy) backend_note_noisy_collective_for_testing();
+  if (any_multilevel) backend_note_multilevel_collective_for_testing();
+  if (any_custom) backend_note_host_custom_collective_for_testing();
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate validation");
+
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    candidate.executable.reset(f.backend->compile(*candidate.ordinary_plan, *candidate.state));
+    if (!candidate.executable) throw std::runtime_error("backend returned no candidate executable");
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate compilation failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate compile");
+
+  try {
+    if (!candidate.catalog || !candidate.host_storage || !candidate.resolved_storage ||
+        candidate.catalog->size() != candidate.resolved_storage->arrays.size() ||
+        candidate.resolved_storage->keys.size() != candidate.resolved_storage->arrays.size())
+      local_error = "resident candidate artifacts changed before commit";
+    for (size_t i = 0; local_error.empty() && i < candidate.resolved_storage->arrays.size(); ++i) {
+      const ArrayId id = {uint32_t(i)};
+      if (candidate.resolved_storage->arrays[i].id != id ||
+          !(candidate.catalog->key(id) == candidate.resolved_storage->keys[i]) ||
+          candidate.catalog->spec(id).id != id ||
+          candidate.catalog->spec(id).classification_elided !=
+              candidate.resolved_storage->arrays[i].classification_elided)
+        local_error = "resident candidate catalog identity changed before commit";
+    }
+    if (local_error.empty() &&
+        candidate.ordinary_plan->signature != compute_step_plan_signature(*candidate.ordinary_plan))
+      local_error = "resident candidate plan changed before commit";
+    if (local_error.empty() && !(candidate.entry == LiveIdentitySnapshot::capture(f)))
+      local_error = "resident candidate became stale before commit";
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate staleness failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend candidate staleness");
+
+  candidate.state->multilevel_preflight_required = any_multilevel;
+  candidate.state->multilevel_static_validation_required = false;
+  candidate.state->multilevel_plan_validated = any_multilevel;
+  candidate.state->multilevel_validated_plan_signature = candidate.ordinary_plan->signature;
+  candidate.state->host_custom_preflight_required = any_custom;
+  candidate.state->host_custom_plan_validated = any_custom;
+  candidate.state->host_custom_validated_plan_signature = candidate.ordinary_plan->signature;
+  candidate.state->noisy_preflight_required = any_noisy;
+  candidate.state->noisy_static_validation_required = false;
+  candidate.state->noisy_plan_validated = any_noisy;
+  candidate.state->noisy_validated_plan_signature = candidate.ordinary_plan->signature;
+  candidate.state->noisy_stream_count = noisy_stream_count;
+  candidate.state->noisy_first_stream_tag = noisy_first_stream_tag;
+
+  halo_plan_set *old_halos = f.halos;
+  CpuArrayCatalog *old_catalog = f.array_catalog;
+  StoragePlan *old_storage = f.storage_plan;
+  DescriptorSet *old_descriptors = f.descriptors;
+  InitializationPlan *old_initialization = f.initialization_plan;
+  StepPlan *old_ordinary = f.step_plans[0];
+  StepPlan *old_cw = f.step_plans[1];
+  BackendState *old_state = f.backend_state;
+  Executable *old_executable = f.executable;
+
+  f.array_catalog = candidate.catalog.release();
+  f.storage_plan = candidate.resolved_storage.release();
+  f.descriptors = candidate.descriptors.release();
+  f.initialization_plan = candidate.initialization.release();
+  f.step_plans[0] = candidate.ordinary_plan.release();
+  f.step_plans[1] = candidate.cw_plan.release();
+  f.backend_state = candidate.state.release();
+  f.executable = candidate.executable.release();
+  f.prepared_classification_hash = candidate.classification.hash;
+  for (int i = 0; i < f.num_chunks; ++i)
+    for (field_type ft : {E_stuff, H_stuff})
+      f.chunks[i]->gvs_eh[ft].swap(candidate.eh_tiles[size_t(i) * NUM_FIELD_TYPES + ft]);
+  clear_dirty(f, completed_dirty);
+
+  if (f.backend_state->host_custom_policy_pending) {
+    backend_publish_host_custom_policy(f, local_custom, any_custom);
+    f.backend_state->host_custom_policy_pending = false;
+  }
+  if (old_state) old_state->clear_cw_executable();
+  delete old_executable; destroy_backend_state(old_state); delete old_initialization;
+  delete old_ordinary; delete old_cw; delete old_descriptors; delete old_catalog;
+  delete old_storage;
+  /* Halo topology is not part of this metadata-only transaction. */
+  f.halos = old_halos;
+
+  return true;
+}
+
 /* Reversible storage/connection epoch used only by resident solve_cw
    preparation. The supported PR7 slice has no polarization, BFAST,
    cylindrical scratch, material phase, or magnetic backup topology, so the
@@ -2293,11 +2828,175 @@ void fields::init_backend() {
   if (!and_to_all(coordinates_match))
     meep::abort("meep: fields coordinate state changed without invalidation; recreate fields so "
                 "the per-chunk coordinate state and resident executable agree");
-  /* A value-only material update can change classification without changing
-     the existing storage layout. Reconcile the host representation first; any
-     promotion it discovers will set dirty_storage for the rebuild below. */
-  if (backend_state && is_dirty(*this, dirty_classification) && !is_dirty(*this, dirty_storage))
-    classify_and_finalize();
+
+  const bool material_recipe_current =
+      initialization_plan &&
+      initialization_plan->material_values_generation ==
+          generation(*this, MutationKind::material_values) &&
+      initialization_plan->material_region_generation ==
+          generation(*this, MutationKind::material_region);
+  const bool material_candidate =
+      !backend_state || is_dirty(*this, dirty_classification) ||
+      (is_dirty(*this, dirty_initialization) && !material_recipe_current);
+  if (material_candidate) {
+    std::string candidate_error;
+    std::unique_ptr<LiveIdentitySnapshot> entry;
+    if (backend_state) try {
+        entry.reset(new LiveIdentitySnapshot(LiveIdentitySnapshot::capture(*this)));
+      }
+      catch (const std::exception &e) {
+        candidate_error = e.what();
+      }
+      catch (...) {
+        candidate_error = "unknown warm resident identity snapshot failure";
+      }
+    backend_reconcile_host_access(candidate_error,
+                                  "fields::init_backend candidate identity snapshot");
+    if (backend_state) try {
+        CpuArrayCatalog observed_catalog;
+        StoragePlan observed_storage;
+        build_storage_catalog(*this, observed_catalog, observed_storage);
+        const size_t host_prefix = array_catalog->host_backed_size();
+        if (observed_storage.arrays.size() != host_prefix ||
+            storage_plan->arrays.size() < host_prefix ||
+            !std::equal(observed_storage.keys.begin(), observed_storage.keys.end(),
+                        storage_plan->keys.begin()))
+          candidate_error =
+              "warm resident storage topology changed without the field-layout retirement fence";
+        for (size_t i = 0; candidate_error.empty() && i < observed_storage.arrays.size(); ++i) {
+          const ArraySpec &a = observed_storage.arrays[i];
+          const ArraySpec &b = storage_plan->arrays[i];
+          if (a.role != b.role || a.element_type != b.element_type || a.storage != b.storage ||
+              a.elements != b.elements || a.alignment != b.alignment ||
+              a.alias_of != b.alias_of ||
+              a.classification_provisional != b.classification_provisional ||
+              a.classification_elided != b.classification_elided ||
+              observed_catalog.resolve_untyped(a.id) != array_catalog->resolve_untyped(b.id))
+            candidate_error =
+                "warm resident storage identity changed without the field-layout retirement fence";
+        }
+      }
+      catch (const std::exception &e) {
+        candidate_error = e.what();
+      }
+      catch (...) {
+        candidate_error = "unknown warm resident topology validation failure";
+      }
+    backend_reconcile_host_access(candidate_error,
+                                  "fields::init_backend candidate topology gate");
+
+    if (backend_state) {
+      try {
+        backend->prepare_state_rebuild(*backend_state, DirtyMask(dirty_mask));
+      }
+      catch (const std::exception &e) {
+        candidate_error = e.what();
+      }
+      catch (...) {
+        candidate_error = "unknown resident candidate authority migration failure";
+      }
+      backend_reconcile_host_access(candidate_error,
+                                    "fields::init_backend candidate authority migration");
+    }
+    else {
+      if (any_multilevel) try {
+          if (multilevel_preflight_failure_rank_for_testing == my_rank()) {
+            if (multilevel_preflight_failure_mode_for_testing == 1)
+              candidate_error = "injected multilevel recipe validation failure";
+            else if (multilevel_preflight_failure_mode_for_testing == 2)
+              throw std::bad_alloc();
+          }
+          if (candidate_error.empty())
+            candidate_error = validate_resident_multilevel_recipes(*this);
+        }
+        catch (const std::exception &e) {
+          candidate_error = e.what();
+        }
+        catch (...) {
+          candidate_error = "unknown resident multilevel recipe preflight failure";
+        }
+      if (any_multilevel) backend_note_multilevel_collective_for_testing();
+      backend_reconcile_host_access(candidate_error,
+                                    "fields::init_backend candidate definition preflight");
+
+      std::unique_ptr<PreparedMaterialCoefficientStorage> prepared;
+      try {
+        prepared = prepare_material_coefficient_storage(*this);
+      }
+      catch (const std::exception &e) {
+        candidate_error = e.what();
+      }
+      catch (...) {
+        candidate_error = "unknown resident candidate coefficient preparation failure";
+      }
+      backend_reconcile_host_access(candidate_error,
+                                    "fields::init_backend candidate coefficients");
+      if (prepared) prepared->commit();
+      prepare_storage();
+      connect_chunks();
+    }
+    if (!entry) try {
+        entry.reset(new LiveIdentitySnapshot(LiveIdentitySnapshot::capture(*this)));
+      }
+      catch (const std::exception &e) {
+        candidate_error = e.what();
+      }
+      catch (...) {
+        candidate_error = "unknown cold resident identity snapshot failure";
+      }
+    backend_reconcile_host_access(candidate_error,
+                                  "fields::init_backend candidate identity snapshot");
+    MaterialClassification host_oracle;
+    try {
+      host_oracle = classify(*this, *storage_plan);
+    }
+    catch (const std::exception &e) {
+      candidate_error = e.what();
+    }
+    catch (...) {
+      candidate_error = "unknown candidate host classification failure";
+    }
+    backend_reconcile_host_access(candidate_error,
+                                  "fields::init_backend candidate host classification");
+
+    bool promotion = false;
+    FOR_COMPONENTS(c)
+      if ((host_oracle.required_components & (component_mask(1) << int(c))) &&
+          !have_component(c))
+        promotion = true;
+    if (backend_state && promotion) {
+      backend_preflight_field_layout_change(
+          *this, DirtyMask(dirty_storage | dirty_initialization | dirty_classification |
+                           dirty_executable),
+          "fields::init_backend candidate classification promotion");
+      backend_commit_field_layout_change(*this);
+      entry.reset();
+      apply_classification(*this, host_oracle);
+      prepared_classification_hash = host_oracle.hash;
+      ++classification_reentries;
+      if (classification_reentries > 1)
+        throw std::logic_error("candidate classification re-entered storage more than once");
+      require_source_components();
+      prepare_storage();
+      connect_chunks();
+      host_oracle = classify(*this, *storage_plan);
+      try {
+        entry.reset(new LiveIdentitySnapshot(LiveIdentitySnapshot::capture(*this)));
+      }
+      catch (const std::exception &e) {
+        candidate_error = e.what();
+      }
+      catch (...) {
+        candidate_error = "unknown promoted resident identity snapshot failure";
+      }
+      backend_reconcile_host_access(candidate_error,
+                                    "fields::init_backend promoted candidate identity snapshot");
+    }
+    const DirtyMask completed = DirtyMask(dirty_mask);
+    build_resident_epoch_candidate(*this, completed, local_custom, any_custom, any_multilevel,
+                                   any_flux, host_oracle, *entry);
+    return;
+  }
 
   const bool rebuild_state = !backend_state || is_dirty(*this, dirty_storage);
   const bool refresh_flux_after_rebuild =
@@ -2306,6 +3005,7 @@ void fields::init_backend() {
        is_dirty(*this, dirty_flux_plan));
   std::unique_ptr<PreparedMaterialCoefficientStorage> prepared_coefficients;
   std::unique_ptr<StepPlan> preclassification_ordinary;
+  std::unique_ptr<InitializationPlan> staged_initialization;
   if (rebuild_state) {
     std::string preflight_error;
     if (any_multilevel) try {
@@ -2384,7 +3084,38 @@ void fields::init_backend() {
       backend_reconcile_host_access(plan_error,
                                     "fields::init_backend legacy flux stable plan");
     }
-    backend_state = backend->create_state(*storage_plan);
+    StoragePlan provisional_storage;
+    std::string recipe_error;
+    try {
+      staged_initialization.reset(new InitializationPlan(build_initialization_plan(*this)));
+      if (staged_initialization->materials.size() != 1)
+        throw std::logic_error(std::string("resident initialization requires one material recipe, got ") +
+                               std::to_string(staged_initialization->materials.size()));
+      provisional_storage = *storage_plan;
+      mark_material_storage_provisional(staged_initialization->materials[0], provisional_storage);
+    }
+    catch (const std::exception &e) {
+      recipe_error = e.what();
+    }
+    catch (...) {
+      recipe_error = "unknown resident material recipe failure";
+    }
+    backend_reconcile_host_access(recipe_error, "fields::init_backend material recipe");
+    BackendState *replacement = NULL;
+    std::string state_error;
+    try {
+      replacement = backend->create_state(provisional_storage);
+    }
+    catch (const std::exception &e) {
+      state_error = e.what();
+    }
+    catch (...) {
+      state_error = "unknown resident state construction failure";
+    }
+    backend_reconcile_host_access(state_error, "fields::init_backend create state");
+    delete initialization_plan;
+    initialization_plan = staged_initialization.release();
+    backend_state = replacement;
     backend_state->host_custom_preflight_required = any_custom;
     backend_state->host_custom_plan_validated = false;
     backend_state->host_custom_validated_plan_signature = 0;
@@ -2405,17 +3136,73 @@ void fields::init_backend() {
     dirty_mask |= dirty_flux_plan | dirty_regions | dirty_executable;
 
   if (is_dirty(*this, dirty_initialization)) {
-    delete initialization_plan;
-    initialization_plan = new InitializationPlan(build_initialization_plan(*this));
-    backend->initialize(*initialization_plan, *backend_state);
+    if (!rebuild_state) {
+      const bool recipe_current =
+          initialization_plan &&
+          initialization_plan->material_values_generation ==
+              generation(*this, MutationKind::material_values) &&
+          initialization_plan->material_region_generation ==
+              generation(*this, MutationKind::material_region);
+      if (!recipe_current) {
+        std::unique_ptr<InitializationPlan> refreshed_initialization;
+        std::string recipe_error;
+        try {
+          refreshed_initialization.reset(new InitializationPlan(build_initialization_plan(*this)));
+          if (refreshed_initialization->materials.size() != 1)
+            throw std::logic_error("resident initialization requires one material recipe");
+        }
+        catch (const std::exception &e) {
+          recipe_error = e.what();
+        }
+        catch (...) {
+          recipe_error = "unknown resident material recipe refresh failure";
+        }
+        backend_reconcile_host_access(recipe_error,
+                                      "fields::init_backend material recipe refresh");
+        delete initialization_plan;
+        initialization_plan = refreshed_initialization.release();
+      }
+    }
+    std::string initialize_error;
+    try {
+      backend->initialize(*initialization_plan, *backend_state);
+    }
+    catch (const std::exception &e) {
+      initialize_error = e.what();
+    }
+    catch (...) {
+      initialize_error = "unknown resident initialization failure";
+    }
+    backend_reconcile_host_access(initialize_error, "fields::init_backend initialize");
     clear_dirty(*this, dirty_initialization);
   }
 
   if (is_dirty(*this, dirty_classification)) {
-    const MaterialClassification cls = backend->classify_state(*storage_plan, *backend_state);
+    MaterialClassification cls;
+    std::string classify_error;
+    try {
+      cls = backend->classify_state(*storage_plan, *backend_state);
+    }
+    catch (const std::exception &e) {
+      classify_error = e.what();
+    }
+    catch (...) {
+      classify_error = "unknown resident classification failure";
+    }
+    backend_reconcile_host_access(classify_error, "fields::init_backend classify");
     if (prepared_classification_hash && cls.hash != prepared_classification_hash)
       meep::abort("meep: backend classification disagrees with the prepared host state");
-    backend->finalize_storage(*storage_plan, *backend_state);
+    std::string finalize_error;
+    try {
+      backend->finalize_storage(*storage_plan, cls, *backend_state);
+    }
+    catch (const std::exception &e) {
+      finalize_error = e.what();
+    }
+    catch (...) {
+      finalize_error = "unknown resident storage finalization failure";
+    }
+    backend_reconcile_host_access(finalize_error, "fields::init_backend finalize");
     clear_dirty(*this, dirty_classification);
   }
   if (preclassification_ordinary) {

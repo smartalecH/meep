@@ -16,8 +16,12 @@
 */
 
 #include <stdio.h>
+#include <limits>
+#include <stdexcept>
+#include <utility>
 
 #include "backend/classification.hpp"
+#include "backend/backend.hpp"
 #include "backend/lifecycle.hpp"
 #include "meep_internals.hpp"
 
@@ -38,8 +42,23 @@ static uint64_t chunk_fact_hash(uint64_t chunk_id, uint64_t fact) {
   return h;
 }
 
-MaterialClassification classify(fields &f, const StoragePlan &plan) {
+namespace {
+
+struct PreparedClassification {
   MaterialClassification cls;
+  std::vector<int> local_words;
+  std::vector<int> all_words;
+  int local_components[NUM_FIELD_COMPONENTS];
+  bool local_nonlinearities;
+  bool local_aniso2d;
+};
+
+PreparedClassification prepare_classification_local(fields &f, const StoragePlan &plan) {
+  PreparedClassification prepared;
+  MaterialClassification &cls = prepared.cls;
+  if (f.num_chunks < 0 || size_t(f.num_chunks) >
+                            std::numeric_limits<size_t>::max() / NUM_FIELD_TYPES)
+    throw std::overflow_error("material classification chunk count overflow");
   cls.anisotropic_eh.assign(size_t(f.num_chunks) * NUM_FIELD_TYPES, 0);
 
   /* One slot per chunk, written by exactly the rank that owns it and left zero
@@ -47,7 +66,10 @@ MaterialClassification classify(fields &f, const StoragePlan &plan) {
      which makes the combination below independent of who owns what -- the
      property that matters, since a hash that differs between ranks deadlocks
      under MPI rather than merely mis-optimizing. */
-  std::vector<int> local_words(size_t(f.num_chunks) * 2, 0);
+  if (size_t(f.num_chunks) > std::numeric_limits<size_t>::max() / 2)
+    throw std::overflow_error("material classification reduction count overflow");
+  prepared.local_words.assign(size_t(f.num_chunks) * 2, 0);
+  prepared.all_words.assign(prepared.local_words.size(), 0);
 
   for (int i = 0; i < f.num_chunks; ++i) {
     if (!f.chunks[i]->is_mine()) continue;
@@ -103,26 +125,65 @@ MaterialClassification classify(fields &f, const StoragePlan &plan) {
     }
 
     const uint64_t h = chunk_fact_hash(chunk_id, rows);
-    local_words[size_t(i) * 2 + 0] = int(uint32_t(h & 0xffffffffu));
-    local_words[size_t(i) * 2 + 1] = int(uint32_t(h >> 32));
+    prepared.local_words[size_t(i) * 2 + 0] = int(uint32_t(h & 0xffffffffu));
+    prepared.local_words[size_t(i) * 2 + 1] = int(uint32_t(h >> 32));
   }
+
+  prepared.local_nonlinearities = f.has_nonlinearities(false);
+  prepared.local_aniso2d = false;
+  if (f.gv.dim == D2) {
+    for (int i = 0; i < f.num_chunks && !prepared.local_aniso2d; ++i)
+      prepared.local_aniso2d =
+          f.chunks[i]->s->has_chi(Ex, Z) || f.chunks[i]->s->has_chi(Ey, Z) ||
+          f.chunks[i]->s->has_chi(Ez, X) || f.chunks[i]->s->has_chi(Ez, Y) ||
+          f.chunks[i]->s->has_chi(Hx, Z) || f.chunks[i]->s->has_chi(Hy, Z) ||
+          f.chunks[i]->s->has_chi(Hz, X) || f.chunks[i]->s->has_chi(Hz, Y);
+  }
+  else if (f.beta != 0)
+    throw std::invalid_argument("nonzero beta requires a two-dimensional material classification");
+  FOR_COMPONENTS(c) prepared.local_components[c] = f.have_component(c) ? 1 : 0;
+  if (!f.array_catalog)
+    throw std::logic_error("material classification requires a live host catalog");
+  cls.provisional_row_state.assign(plan.arrays.size(), MaterialClassification::not_provisional);
+  for (size_t i = 0; i < plan.arrays.size(); ++i) {
+    const ArraySpec &spec = plan.arrays[i];
+    if (spec.role != array_role::material) continue;
+    if (!is_valid(f.array_catalog->find(plan.keys[i]))) {
+      cls.elided.push_back(spec.id);
+      cls.provisional_row_state[i] = MaterialClassification::elided_row;
+    }
+    else
+      cls.provisional_row_state[i] = MaterialClassification::retained;
+  }
+  return prepared;
+}
+
+MaterialClassification finish_classification_collective(fields &f,
+                                                         PreparedClassification &&prepared) {
+  MaterialClassification cls = std::move(prepared.cls);
 
   /* Collective facts. Each of these mirrors a reduction the CPU path already
      performs, and each must produce the same answer on every rank. */
-  std::vector<int> all_words(local_words.size(), 0);
-  if (!local_words.empty())
-    or_to_all(local_words.data(), all_words.data(), int(local_words.size()));
+  if (prepared.local_words.size() > size_t(std::numeric_limits<int>::max()))
+    meep::abort("material classification MPI extent exceeds INT_MAX");
+  if (!prepared.local_words.empty())
+    or_to_all(prepared.local_words.data(), prepared.all_words.data(),
+              int(prepared.local_words.size()));
 
   /* Combine in chunk order, which every rank agrees on. */
   uint64_t global_hash = 0xcbf29ce484222325ull;
   for (int i = 0; i < f.num_chunks; ++i) {
-    const uint64_t h = (uint64_t(uint32_t(all_words[size_t(i) * 2 + 1])) << 32) |
-                       uint64_t(uint32_t(all_words[size_t(i) * 2 + 0]));
+    const uint64_t h =
+        (uint64_t(uint32_t(prepared.all_words[size_t(i) * 2 + 1])) << 32) |
+        uint64_t(uint32_t(prepared.all_words[size_t(i) * 2 + 0]));
     global_hash = mix(global_hash, h);
   }
 
-  cls.has_nonlinearities = f.has_nonlinearities(true);
-  cls.aniso2d = f.is_aniso2d();
+  cls.has_nonlinearities = or_to_all(prepared.local_nonlinearities);
+  const bool material_aniso2d = or_to_all(prepared.local_aniso2d);
+  if (material_aniso2d && f.beta != 0 && f.is_real)
+    meep::abort("Nonzero beta need complex fields when mu/epsilon couple TE and TM");
+  cls.aniso2d = material_aniso2d || f.beta != 0;
 
   /* The decimation minimum add_dft takes over all chunks. Nothing in Phase 1
      consumes it yet -- PR 6's DftDescriptor does -- but recording it here is
@@ -135,7 +196,7 @@ MaterialClassification classify(fields &f, const StoragePlan &plan) {
      when one rank decides to rebuild and the others do not. */
   {
     int local[NUM_FIELD_COMPONENTS], all[NUM_FIELD_COMPONENTS];
-    FOR_COMPONENTS(c) { local[c] = f.have_component(c) ? 1 : 0; }
+    FOR_COMPONENTS(c) local[c] = prepared.local_components[c];
     or_to_all(local, all, NUM_FIELD_COMPONENTS);
     cls.required_components = 0;
     FOR_COMPONENTS(c) {
@@ -152,10 +213,27 @@ MaterialClassification classify(fields &f, const StoragePlan &plan) {
      classification describes what the materials produced, not how much storage
      one rank happens to hold; the per-chunk row facts above already cover
      which arrays exist. */
-  (void)plan;
   cls.hash = global_hash;
 
   return cls;
+}
+
+} // namespace
+
+MaterialClassification classify(fields &f, const StoragePlan &plan) {
+  PreparedClassification prepared;
+  std::string local_error;
+  try {
+    prepared = prepare_classification_local(f, plan);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown local material classification preparation failure";
+  }
+  backend_reconcile_host_access(local_error, "material classification preparation");
+  return finish_classification_collective(f, std::move(prepared));
 }
 
 bool apply_classification(fields &f, const MaterialClassification &cls) {

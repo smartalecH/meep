@@ -7,6 +7,8 @@
 */
 
 #include "backend/initialization_plan.hpp"
+#include "backend/lifecycle.hpp"
+#include "backend/material_ir.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -38,6 +40,8 @@ bool InitRegion::contains(const InitRegion &other) const {
 
 InitializationPlan InitializationPlan::restrict_to(const InitRegion &region) const {
   InitializationPlan out;
+  out.material_values_generation = material_values_generation;
+  out.material_region_generation = material_region_generation;
   out.materials = materials;
   out.pml = pml;
   out.host_callbacks = host_callbacks;
@@ -67,21 +71,42 @@ InitializationPlan InitializationPlan::restrict_to(const InitRegion &region) con
 InitializationPlan build_initialization_plan(fields &f) {
   InitializationPlan plan;
 
-  MaterialRecipe m;
-  m.description = "cpu:eager";
-  plan.materials.push_back(m);
+  plan.material_values_generation = generation(f, MutationKind::material_values);
+  plan.material_region_generation = generation(f, MutationKind::material_region);
+  plan.materials.push_back(build_host_reference_material_recipe(f));
 
-  for (int i = 0; i < f.num_chunks; ++i) {
-    if (!f.chunks[i]->is_mine()) continue;
-    const structure_chunk &sc = *f.chunks[i]->s;
-    for (int d = 0; d < 6; ++d) {
-      if (!sc.sig[d]) continue;
+  const MaterialIR *ir = material_ir_for(f);
+  if (ir) {
+    validate_material_ir(*ir);
+    for (const MaterialIRPmlAxis &source : ir->pml_axes) {
       PmlRecipe p;
-      p.direction_ = d;
-      p.thickness = 0;
-      p.strength = 0;
-      p.r_asymptotic = 0;
+      p.chunk = source.chunk;
+      p.direction_ = source.direction;
+      p.sigma = source.sigma;
+      p.kappa = source.kappa;
+      p.sigma_inv = source.sigma_inv;
       plan.pml.push_back(p);
+    }
+  }
+  else {
+    for (int i = 0; i < f.num_chunks; ++i) {
+      if (!f.chunks[i]->is_mine()) continue;
+      const structure_chunk &sc = *f.chunks[i]->s;
+      for (int d = 0; d < 6; ++d) {
+        if (!sc.sig[d]) continue;
+        PmlRecipe p;
+        p.chunk = i;
+        p.direction_ = d;
+        if (sc.sigsize[d] < 0)
+          throw std::invalid_argument("PML initialization recipe has a negative extent");
+        const size_t n = size_t(sc.sigsize[d]);
+        if (!n || !sc.kap[d] || !sc.siginv[d])
+          throw std::invalid_argument("PML initialization recipe has incomplete storage");
+        p.sigma.assign(sc.sig[d], sc.sig[d] + n);
+        p.kappa.assign(sc.kap[d], sc.kap[d] + n);
+        p.sigma_inv.assign(sc.siginv[d], sc.siginv[d] + n);
+        plan.pml.push_back(p);
+      }
     }
   }
 

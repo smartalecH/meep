@@ -104,7 +104,7 @@ bool same_material_phase_grid(const structure_chunk &current, const structure_ch
 
 fields::fields(structure *s, double m, double beta, bool zero_fields_near_cylorigin,
                int loop_tile_base_db, int loop_tile_base_eh, std::vector<double> bfast_scaled_k)
-    : S(s->S), gv(s->gv), user_volume(s->user_volume), v(s->v), m(m), beta(beta),
+    : S(s->S), material_ir(s->material_ir), gv(s->gv), user_volume(s->user_volume), v(s->v), m(m), beta(beta),
       loop_tile_base_db(loop_tile_base_db), loop_tile_base_eh(loop_tile_base_eh),
       working_on(&times_spent), bfast_scaled_k(bfast_scaled_k) {
   shared_chunks = s->shared_chunks;
@@ -188,7 +188,8 @@ fields::fields(structure *s, const execution_options &opts, double m, double bet
 }
 
 fields::fields(const fields &thef)
-    : S(thef.S), gv(thef.gv), user_volume(thef.user_volume), v(thef.v), working_on(&times_spent) {
+    : S(thef.S), material_ir(thef.material_ir), gv(thef.gv), user_volume(thef.user_volume),
+      v(thef.v), working_on(&times_spent) {
   /* A resident backend may own newer polarization populations and transition
      history than the host mirrors. Materialize those values before the copy
      constructor snapshots any chunk. Failure preserves the source resident
@@ -762,6 +763,16 @@ void fields::_require_component(component c, bool aniso2d) {
     meep::abort("cannot require a %s component in a %s grid", component_name(c),
                 dimension_name(gv.dim));
 
+  bool local_layout_growth = false;
+  FOR_COMPONENTS(c_alloc)
+    if (gv.has_field(c_alloc) && (is_like(gv.dim, c, c_alloc) || aniso2d))
+      for (int i = 0; i < num_chunks; ++i)
+        if (chunks[i]->is_mine() && !chunks[i]->f[c_alloc][0]) local_layout_growth = true;
+  if (or_to_all(local_layout_growth) && backend_state && backend &&
+      backend->requires_full_storage_preparation())
+    backend_prepare_field_layout_change(
+        *this, invalidation_closure(MutationKind::field_layout), "fields::require_component");
+
   components_allocated = true;
 
   // allocate fields if they haven't been allocated yet for this component
@@ -803,6 +814,9 @@ void fields_chunk::remove_sources() {
 }
 
 void fields::remove_sources() {
+  if (backend_state && backend && backend->requires_full_storage_preparation())
+    backend_prepare_field_layout_change(
+        *this, invalidation_closure(MutationKind::field_layout), "fields::remove_sources");
   delete sources;
   sources = NULL;
   for (int i = 0; i < num_chunks; i++)
@@ -850,6 +864,11 @@ void fields::remove_susceptibilities() {
   changed_materials = true;
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->remove_susceptibilities(shared_chunks);
+  /* The immutable geometry IR describes the susceptibility definitions that
+     were just removed.  Publish its absence only after the resident preflight
+     above succeeds and the non-throwing host removal has committed, so a
+     rejected removal retains the exact prior material epoch. */
+  material_ir.reset();
 }
 
 void fields::remove_fluxes() {
@@ -986,6 +1005,10 @@ int fields::phase_in_material(const structure *snew, double time) {
   if (resident) backend_commit_field_layout_change(*this);
   if (prepared_storage) prepared_storage->commit();
   staged_targets->commit();
+  /* Material phasing installs a new eager target graph. Until a combined
+     source/target IR exists, the prior geometry IR no longer describes the
+     coefficient source and must not survive a successful commit. */
+  material_ir.reset();
   phasein_time = next_phasein_time;
   /* Only owned chunks were touched above, so this is rank-local. */
   invalidate(*this, MutationKind::material_phase, "fields::phase_in_material");

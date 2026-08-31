@@ -25,6 +25,7 @@
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/backend.hpp"
 #include "backend/lifecycle.hpp"
 
 using namespace std;
@@ -463,6 +464,10 @@ void fields::add_volume_source(component c, const src_time &src, const volume &w
 
 void fields::add_volume_source(component c, const src_time &src, const volume &where_,
                                complex<double> A(const vec &), complex<double> amp) {
+  if (src.is_integrated && backend_state && backend && backend->requires_full_storage_preparation())
+    backend_prepare_field_layout_change(
+        *this, invalidation_closure(MutationKind::field_layout),
+        "fields::add_volume_source integrated source");
   volume where(where_); // make a copy to adjust size if necessary
   if (gv.dim != where.dim)
     meep::abort("incorrect source grid_volume dimensionality in add_volume_source");

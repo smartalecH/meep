@@ -58,6 +58,17 @@ static int failures = 0;
 static double one(const vec &) { return 1.0; }
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 
+class xz_anisotropic_material : public material_function {
+public:
+  void eff_chi1inv_row(component c, double row[3], const volume &, double, int) override {
+    row[0] = row[1] = row[2] = 0.0;
+    const int d = component_index(c);
+    row[d] = 1.0;
+    if (d == X) row[Z] = 0.125;
+    if (d == Z) row[X] = 0.125;
+  }
+};
+
 static void test_hash_across_ranks(const char *name, structure &s, const vec &src_at) {
   fields f(&s);
   gaussian_src_time src(0.3, 0.1);
@@ -144,6 +155,35 @@ static void test_reentry_bound() {
   master_printf("reentry bound: %u re-entries\n", unsigned(f.classification_reentries));
 }
 
+static void test_beta_anisotropy_semantics() {
+  const grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure isotropic(gv, one, no_pml());
+  fields beta_fields(&isotropic, 0, 0.2);
+  beta_fields.use_real_fields();
+  gaussian_src_time src(0.3, 0.1);
+  beta_fields.add_point_source(Ez, src, vec(0.11, 0.13));
+  beta_fields.advance(1);
+  const MaterialClassification beta = classify(beta_fields, *beta_fields.storage_plan);
+  CHECK(beta.aniso2d,
+        "nonzero beta did not retain the coupled-layout classification for isotropic material");
+
+  if (count_processors() == 1) {
+    xz_anisotropic_material tensor;
+    structure anisotropic(gv, tensor, no_pml());
+    fields invalid(&anisotropic, 0, 0.2);
+    invalid.use_real_fields();
+    bool rejected = false;
+    try {
+      invalid.add_point_source(Ez, src, vec(0.11, 0.13));
+      invalid.advance(1);
+    }
+    catch (const std::runtime_error &error) {
+      rejected = strstr(error.what(), "Nonzero beta need complex fields") != NULL;
+    }
+    CHECK(rejected, "real nonzero-beta material anisotropy was not rejected");
+  }
+}
+
 static void test_changed_hash_invalidates_executable() {
   grid_volume gv = vol2d(3.0, 3.0, 10.0);
   structure s(gv, eps_slab, pml(0.5));
@@ -185,6 +225,7 @@ int main(int argc, char **argv) {
   test_tiling_decision();
   test_value_change_preserves_hash();
   test_reentry_bound();
+  test_beta_anisotropy_semantics();
 
   if (failures) {
     master_printf("classification: %d FAILURE(S)\n", failures);

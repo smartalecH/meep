@@ -211,6 +211,11 @@ public:
   // Only unsafe when MATERIAL_USER materials are present.
   virtual bool is_thread_safe() const { return !has_user_materials; }
   bool has_user_materials;
+  vector3 captured_geometry_center;
+  lattice captured_geometry_lattice;
+  bool captured_ensure_periodicity;
+  int captured_dimensions;
+  meep::volume captured_volume;
 
   void eff_chi1inv_matrix(meep::component c, symm_matrix *chi1inv_matrix, const meep::volume &v,
                           double tol, int maxeval, bool &fallback);
@@ -223,9 +228,13 @@ public:
   void add_susceptibilities(meep::field_type ft, meep::structure *s);
 
   void get_material_pt(material_type &material, const meep::vec &r);
+  const material_type_list &owned_extra_materials() const { return extra_materials; }
+  const material_data &owned_default_material() const { return *captured_default_material; }
+  std::vector<susceptibility> owned_unique_susceptibilities(meep::field_type ft) const;
 
 private:
   material_type_list extra_materials;
+  material_data *captured_default_material;
   pol *current_pol;
 };
 

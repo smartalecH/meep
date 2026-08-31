@@ -802,8 +802,9 @@ int main(int argc, char **argv) {
     std::unique_ptr<BackendState> sibling_state(
         nvidia_backend->create_state(*gpu.storage_plan));
     nvidia_backend->initialize(*gpu.initialization_plan, *sibling_state);
-    (void)nvidia_backend->classify_state(*gpu.storage_plan, *sibling_state);
-    nvidia_backend->finalize_storage(*gpu.storage_plan, *sibling_state);
+    const MaterialClassification sibling_classification =
+        nvidia_backend->classify_state(*gpu.storage_plan, *sibling_state);
+    nvidia_backend->finalize_storage(*gpu.storage_plan, sibling_classification, *sibling_state);
     std::unique_ptr<Executable> sibling_executable(
         nvidia_backend->compile(build_step_plan(gpu, StepProgram::ordinary), *sibling_state));
     bool old_executable_rejected = false, sibling_executable_rejected = false;

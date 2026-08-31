@@ -108,6 +108,7 @@ struct StoragePlan {
      classification the two are equal, and both are reported. */
   size_t provisional_peak_bytes() const;
   size_t steady_state_bytes() const;
+  size_t physical_resident_bytes() const;
 };
 
 /* Non-owning views of storage that fields_chunk, structure_chunk, dft_chunk and
@@ -127,6 +128,12 @@ public:
   ArrayId register_array(const StorageKey &key, void *address, size_t elements, array_role role,
                          ElementType type);
 
+  /* Extend the host-backed authoritative prefix with a resolved logical plan.
+     Retained device-owned suffix rows receive stable key/ID metadata with a
+     null host binding; elided suffix rows remain addressable by ID for
+     diagnostics but are omitted from key lookup. */
+  void publish_resolved_plan(const StoragePlan &plan);
+
   void *resolve_untyped(ArrayId id) const { return bases_[id.value]; }
   template <typename T> T *resolve(ArrayId id) const {
     return static_cast<T *>(bases_[id.value]);
@@ -134,6 +141,7 @@ public:
   const ArraySpec &spec(ArrayId id) const { return specs_[id.value]; }
   const StorageKey &key(ArrayId id) const { return keys_[id.value]; }
   size_t size() const { return specs_.size(); }
+  size_t host_backed_size() const;
 
   bool contains(const StorageKey &key) const { return index_.count(key) != 0; }
   bool contains_address(const void *p) const { return by_address_.count(p) != 0; }

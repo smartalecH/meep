@@ -248,7 +248,8 @@ public:
 
   // Pass 2: report what initialization actually produced.
   virtual MaterialClassification classify_state(const StoragePlan &, BackendState &) = 0;
-  virtual void finalize_storage(const StoragePlan &, BackendState &) = 0;
+  virtual void finalize_storage(const StoragePlan &, const MaterialClassification &,
+                                BackendState &) = 0;
 
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
   virtual void advance(Executable &, BackendState &, int num_steps) = 0;
@@ -466,6 +467,9 @@ void backend_set_legacy_flux_prepare_failure_for_testing(int rank);
 void backend_refresh_noisy_seed(fields &f, const StepPlan &plan, const char *site);
 std::string backend_validate_multilevel_plan(const fields &f, const StepPlan &plan,
                                              bool &local_multilevel_actions);
+std::string backend_validate_noisy_plan(const fields &f, const StepPlan &plan,
+                                        bool &local_noisy_actions, size_t &stream_count,
+                                        uint64_t &first_stream_tag);
 void backend_set_multilevel_preflight_failure_for_testing(int rank, int mode);
 void backend_reset_multilevel_collective_count_for_testing();
 size_t backend_multilevel_collective_count_for_testing();
@@ -569,6 +573,7 @@ double cw_source_time(int t, double dt, double offset_in_dt);
 void backend_set_cw_clone_fail_after_for_testing(int checkpoints);
 void backend_cw_clone_checkpoint();
 void backend_set_cw_plan_corruption_for_testing(bool enabled);
+void backend_set_material_candidate_plan_failure_for_testing(int rank, int mode);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI

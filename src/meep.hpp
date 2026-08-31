@@ -877,6 +877,8 @@ public:
   grid_volume *effort_volumes;
   double *effort;
   int num_effort_volumes;
+  /* Opaque ownership for backend-private material geometry/PML input. */
+  std::shared_ptr<const void> material_ir;
 
   ~structure();
   structure(const grid_volume &gv, material_function &eps,
@@ -1852,6 +1854,7 @@ class ExecutionBackend;          // src/backend/backend.hpp -- backend-private
 enum class HostCustomFallbackUse; // src/backend/backend.hpp -- backend-private
 class PreparedBackendEpoch;      // src/backend/backend_access.cpp -- backend-private
 struct BackendEpochSnapshot;     // tests/backend_api.cpp -- lifecycle invariant probe
+struct LiveIdentitySnapshot;     // backend_access.cpp -- unpublished candidate guard
 class NvidiaBackend;             // src/backend/nvidia/nvidia_backend.hpp -- backend-private
 struct BackendState;
 struct Executable;
@@ -1868,6 +1871,8 @@ public:
   src_time *sources;
   flux_vol *fluxes;
   symmetry S;
+  /* Immutable material recipe inherited from the source structure. */
+  std::shared_ptr<const void> material_ir;
 
   double a, dt; // The resolution a and timestep dt=Courant/a
   grid_volume gv, user_volume;
@@ -2499,6 +2504,7 @@ private:
                                                       const char *);
   friend class PreparedBackendEpoch;
   friend struct BackendEpochSnapshot;
+  friend struct LiveIdentitySnapshot;
   int synchronized_magnetic_fields; // count number of nested synchs
   double last_wall_time;
   std::vector<time_sink> was_working_on;

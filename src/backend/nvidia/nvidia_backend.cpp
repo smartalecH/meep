@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "backend/initialization_plan.hpp"
+#include "backend/material_recipe.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
@@ -312,6 +313,8 @@ uint64_t storage_fingerprint(const StoragePlan &plan) {
     hash = mix_fingerprint(hash, spec.alignment);
     hash =
         mix_fingerprint(hash, is_valid(spec.alias_of) ? spec.alias_of.value : invalid_array_value);
+    hash = mix_fingerprint(hash, spec.classification_provisional ? 1 : 0);
+    hash = mix_fingerprint(hash, spec.classification_elided ? 1 : 0);
     hash = mix_fingerprint(hash, static_cast<uint64_t>(static_cast<int64_t>(key.chunk)));
     hash = mix_fingerprint(hash, static_cast<uint64_t>(static_cast<int64_t>(key.kind)));
     hash = mix_fingerprint(hash, static_cast<uint64_t>(static_cast<int64_t>(key.component_)));
@@ -428,6 +431,8 @@ AccessRange checked_access(const StoragePlan &plan, ArrayRef ref, const void *ho
   if (!is_valid(ref.id) || ref.id.value >= plan.arrays.size())
     throw std::out_of_range("NVIDIA backend access uses an invalid ArrayId");
   const ArraySpec &spec = plan.arrays[ref.id.value];
+  if (spec.classification_elided)
+    throw std::out_of_range("NVIDIA backend access names an elided ArrayId");
   if (ref.offset > spec.elements || ref.elements > spec.elements - ref.offset)
     throw std::out_of_range("NVIDIA backend access exceeds the registered array");
   const size_t expected_host_bytes = checked_product(
@@ -1033,6 +1038,8 @@ nvidia::scalar_precision scalar_precision_for(const StoragePlan &plan, ArrayId i
   if (!is_valid(id) || id.value >= plan.arrays.size())
     throw std::invalid_argument(std::string(what) + " uses an invalid ArrayId");
   const ArraySpec &spec = plan.arrays[id.value];
+  if (spec.classification_elided)
+    throw std::invalid_argument(std::string(what) + " uses an elided ArrayId");
   if (spec.element_type != ElementType::realnum_value)
     throw std::invalid_argument(std::string(what) + " is not a realnum array");
   return spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
@@ -1044,6 +1051,8 @@ nvidia::scalar_precision complex_precision_for(const StoragePlan &plan, ArrayId 
   if (!is_valid(id) || id.value >= plan.arrays.size())
     throw std::invalid_argument(std::string(what) + " uses an invalid ArrayId");
   const ArraySpec &spec = plan.arrays[id.value];
+  if (spec.classification_elided)
+    throw std::invalid_argument(std::string(what) + " uses an elided ArrayId");
   if (spec.element_type != ElementType::complex_realnum)
     throw std::invalid_argument(std::string(what) + " is not a complex-realnum array");
   return spec.storage == Precision::f32 ? nvidia::scalar_precision::f32
@@ -1061,6 +1070,8 @@ const ArraySpec &validate_dft_reduction_array(const StoragePlan &plan, ArrayId i
   if (!is_valid(id) || id.value >= plan.arrays.size())
     throw std::out_of_range(std::string(what) + " uses an invalid ArrayId");
   const ArraySpec &spec = plan.arrays[id.value];
+  if (spec.classification_elided)
+    throw std::invalid_argument(std::string(what) + " uses an elided ArrayId");
   if (spec.role != array_role::dft || spec.element_type != ElementType::complex_realnum)
     throw std::invalid_argument(std::string(what) + " is not a DFT complex-realnum array");
   if (is_valid(spec.alias_of))
@@ -3642,7 +3653,7 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
   return state.release();
 }
 
-void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_state) {
+void NvidiaBackend::initialize(const InitializationPlan &initialization, BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
   state.initialized_ = false;
   std::string local_error;
@@ -3654,9 +3665,13 @@ void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_sta
           "cannot refresh NVIDIA storage from a stale host mirror after device stepping");
     if (!f_.array_catalog)
       throw std::logic_error("NVIDIA initialization requires a prepared CPU catalog");
+    if (initialization.materials.size() != 1)
+      throw std::logic_error("NVIDIA initialization requires one frozen material recipe");
+    const MaterialRecipe &material = initialization.materials[0];
+    validate_material_recipe(material);
     const CpuArrayCatalog &catalog = *f_.array_catalog;
-    if (catalog.size() != state.plan_.arrays.size())
-      throw std::logic_error("CPU catalog changed after NVIDIA storage was finalized");
+    if (catalog.size() > state.plan_.arrays.size())
+      throw std::logic_error("CPU catalog exceeds the provisional NVIDIA storage plan");
 
     struct Upload {
       nvidia::allocation_id id;
@@ -3667,11 +3682,16 @@ void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_sta
     size_t staging_bytes = 0;
     for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
       const ArraySpec &device_spec = state.plan_.arrays[i];
-      const ArraySpec &host_spec = catalog.spec(ArrayId{uint32_t(i)});
-      if (host_spec.id != device_spec.id || host_spec.role != device_spec.role ||
-          host_spec.element_type != device_spec.element_type ||
-          host_spec.elements != device_spec.elements || host_spec.alias_of != device_spec.alias_of)
-        throw std::logic_error("CPU catalog no longer matches the NVIDIA storage plan");
+      if (i < catalog.size()) {
+        const ArraySpec &host_spec = catalog.spec(ArrayId{uint32_t(i)});
+        if (host_spec.id != device_spec.id || host_spec.role != device_spec.role ||
+            host_spec.element_type != device_spec.element_type ||
+            host_spec.elements != device_spec.elements || host_spec.alias_of != device_spec.alias_of)
+          throw std::logic_error("CPU catalog no longer matches the NVIDIA storage plan");
+      }
+      else if (device_spec.role != array_role::material ||
+               !device_spec.classification_provisional || is_valid(device_spec.alias_of))
+        throw std::logic_error("NVIDIA provisional suffix is not an owned material row");
       if (is_valid(device_spec.alias_of)) {
         if (catalog.resolve_untyped(device_spec.id) !=
             catalog.resolve_untyped(device_spec.alias_of))
@@ -3684,18 +3704,38 @@ void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_sta
     }
 
     state.ensure_staging(staging_bytes);
+    size_t material_uploads = 0;
     for (size_t i = 0; i < uploads.size(); ++i) {
       const Upload &upload = uploads[i];
       const ArraySpec &spec = state.plan_.arrays[upload.id];
-      const void *source = catalog.resolve_untyped(spec.id);
-      if (!source) throw std::logic_error("CPU catalog contains a null canonical allocation");
-      host_to_storage(state.staging_.data(), source, spec, spec.elements);
+      const void *source = upload.id < catalog.size() ? catalog.resolve_untyped(spec.id) : NULL;
+      if (spec.role == array_role::material) {
+        const StorageKey &key = state.plan_.keys[upload.id];
+        source = NULL;
+        for (const MaterialRecipeRow &row : material.rows())
+          if (row.key == key) {
+            if (row.role != spec.role || row.element_type != spec.element_type ||
+                row.elements != spec.elements || row.alignment != spec.alignment)
+              throw std::logic_error("material recipe row no longer matches device storage");
+            source = row.values.empty() ? NULL : row.values.data();
+            ++material_uploads;
+            break;
+          }
+      }
+      if (!source && upload.id >= catalog.size())
+        memset(state.staging_.data(), 0, upload.bytes);
+      else {
+        if (!source) throw std::logic_error("CPU catalog contains a null canonical allocation");
+        host_to_storage(state.staging_.data(), source, spec, spec.elements);
+      }
       state.arenas_->copy_from_host_async(upload.id, 0, state.staging_.data(), upload.bytes,
                                           *state.transfer_);
       /* Reuse one bounded pinned allocation instead of pinning a mirror of the
          complete simulation. Initialization is off the steady-state path. */
       state.transfer_->synchronize();
     }
+    if (material_uploads != material.rows().size())
+      throw std::logic_error("material recipe contains an unconsumed storage row");
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -3725,18 +3765,41 @@ void NvidiaBackend::initialize(const InitializationPlan &, BackendState &raw_sta
 
 MaterialClassification NvidiaBackend::classify_state(const StoragePlan &plan,
                                                      BackendState &raw_state) {
-  checked_state(raw_state);
+  std::string local_error;
+  NvidiaBackendState *state = NULL;
+  try {
+    state = &checked_state(raw_state);
+    if (!state->initialized_ || state->transfer_failed_)
+      local_error = "NVIDIA classification requires an initialized usable state";
+    else if (plan.arrays.size() > state->plan_.arrays.size())
+      local_error = "NVIDIA classification plan exceeds resident storage";
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown NVIDIA classification precondition failure";
+  }
+  backend_reconcile_host_access(local_error, "NVIDIA classification preflight");
   /* PR1 deliberately uses the already-populated CPU catalog as compatibility
      initialization. Classification therefore runs on those exact host values
-     before device execution can make them stale. */
-  return classify(f_, plan);
+     before device execution can make them stale. The resident plan is the
+     provisional allocation superset; the public host plan is only its stable
+     authoritative prefix until finalization publishes tombstone visibility. */
+  return classify(f_, state->plan_);
 }
 
-void NvidiaBackend::finalize_storage(const StoragePlan &, BackendState &raw_state) {
+void NvidiaBackend::finalize_storage(const StoragePlan &plan,
+                                     const MaterialClassification &classification,
+                                     BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
   if (!state.initialized_) throw std::logic_error("cannot finalize uninitialized NVIDIA storage");
-  /* PR1 retains the complete provisional arena. Device-side elision and
-     migration require the PR2 operation lowering and are not guessed here. */
+  if (!f_.initialization_plan || f_.initialization_plan->materials.size() != 1)
+    throw std::logic_error("NVIDIA material finalization requires one frozen recipe");
+  resolve_material_storage(f_.initialization_plan->materials[0], classification, plan,
+                           state.plan_, policy_for(options_.precision));
+  if (has_provisional_material_storage(state.plan_))
+    throw std::logic_error("NVIDIA material finalization left provisional storage");
 }
 
 void NvidiaBackend::refresh_noisy_seed(const RandomSeedSnapshot &candidate,
@@ -3797,6 +3860,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   std::unique_ptr<NvidiaExecutable> executable;
   std::string local_error;
   try {
+    if (has_provisional_material_storage(state.plan_))
+      throw std::logic_error("NVIDIA compile received unresolved material storage");
     if (plan.signature != compute_step_plan_signature(plan))
       throw std::invalid_argument("NVIDIA PR2 received a stale StepPlan signature");
     if (plan.program != StepProgram::ordinary && plan.program != StepProgram::solve_cw)
@@ -6819,50 +6884,56 @@ void NvidiaBackend::prepare_state_rebuild(BackendState &raw_state, DirtyMask) {
   NvidiaBackendState &state = checked_state(raw_state);
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
-  try {
-    state.transfer_->synchronize();
-  }
-  catch (...) {
-    state.transfer_failed_ = true;
-    throw;
-  }
+  try { state.transfer_->synchronize(); }
+  catch (...) { state.transfer_failed_ = true; throw; }
   if (!state.device_authoritative_) return;
-  if (!f_.array_catalog || f_.array_catalog->size() != state.plan_.arrays.size())
+  if (!f_.array_catalog || f_.array_catalog->size() > state.plan_.arrays.size())
     throw std::logic_error("cannot migrate NVIDIA state into a changed host catalog");
 
-  try {
-    std::set<uint32_t> host_authoritative_gamma_inv;
-    std::vector<PolarizationDescriptor> live_descriptors;
-    build_polarization_descriptors(f_, live_descriptors);
-    for (const PolarizationDescriptor &descriptor : live_descriptors)
-      if (descriptor.kind == SusceptibilityKind::multilevel) {
-        if (!is_valid(descriptor.multilevel_gamma_inv) ||
-            descriptor.multilevel_gamma_inv.value >= state.plan_.arrays.size())
-          throw std::logic_error("live multilevel GammaInv ArrayId is out of range");
-        host_authoritative_gamma_inv.insert(descriptor.multilevel_gamma_inv.value);
-      }
-    for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
-      const ArraySpec &spec = state.plan_.arrays[i];
-      if (is_valid(spec.alias_of)) continue;
-      /* GammaInv is computed and owned by the host multilevel object.  The
-         resident copy is read-only and may be narrowed by mixed/f32 policy;
-         never let that representation replace the authoritative host value
-         while migrating the remaining device-owned state. */
-      if (host_authoritative_gamma_inv.count(uint32_t(i))) continue;
-      const size_t bytes = storage_bytes(spec);
-      state.ensure_staging(bytes);
-      state.arenas_->copy_to_host_async(state.staging_.data(), spec.id.value, 0, bytes,
-                                        *state.transfer_);
-      state.transfer_->synchronize();
-      void *destination = f_.array_catalog->resolve_untyped(spec.id);
-      if (!destination) throw std::logic_error("NVIDIA migration found a null host allocation");
-      storage_to_host(destination, state.staging_.data(), spec, spec.elements);
+  std::set<uint32_t> host_authoritative_gamma_inv;
+  std::vector<PolarizationDescriptor> live_descriptors;
+  build_polarization_descriptors(f_, live_descriptors);
+  for (const PolarizationDescriptor &descriptor : live_descriptors)
+    if (descriptor.kind == SusceptibilityKind::multilevel) {
+      if (!is_valid(descriptor.multilevel_gamma_inv) ||
+          descriptor.multilevel_gamma_inv.value >= state.plan_.arrays.size())
+        throw std::logic_error("live multilevel GammaInv ArrayId is out of range");
+      host_authoritative_gamma_inv.insert(descriptor.multilevel_gamma_inv.value);
     }
+
+  struct MigrationRow { ArraySpec spec; size_t offset; void *destination; };
+  std::vector<MigrationRow> rows;
+  size_t total_bytes = 0;
+  for (size_t i = 0; i < f_.array_catalog->size(); ++i) {
+    const ArraySpec &spec = state.plan_.arrays[i];
+    if (is_valid(spec.alias_of) || spec.role == array_role::material ||
+        host_authoritative_gamma_inv.count(uint32_t(i)))
+      continue;
+    void *destination = f_.array_catalog->resolve_untyped(spec.id);
+    if (!destination) throw std::logic_error("NVIDIA migration found a null host allocation");
+    const size_t bytes = storage_bytes(spec);
+    if (bytes > std::numeric_limits<size_t>::max() - total_bytes)
+      throw std::overflow_error("NVIDIA migration staging size overflow");
+    rows.push_back(MigrationRow{spec, total_bytes, destination});
+    total_bytes += bytes;
   }
-  catch (...) {
-    state.transfer_failed_ = true;
-    throw;
+
+  nvidia::pinned_buffer staged(total_bytes);
+  nvidia::device_scope scope(state.device_);
+  nvidia::stream migration;
+  for (const MigrationRow &row : rows) {
+    state.arenas_->copy_to_host_async(static_cast<char *>(staged.data()) + row.offset,
+                                      row.spec.id.value, 0, storage_bytes(row.spec), migration);
   }
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::state_rebuild_sync))
+    throw std::runtime_error("injected NVIDIA rebuild synchronization failure");
+  migration.synchronize();
+
+  /* Commit host mirrors only after the entire transfer batch succeeds. */
+  for (const MigrationRow &row : rows)
+    storage_to_host(row.destination, static_cast<const char *>(staged.data()) + row.offset,
+                    row.spec, row.spec.elements);
   state.device_authoritative_ = false;
 }
 
