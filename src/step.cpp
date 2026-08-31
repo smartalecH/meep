@@ -62,6 +62,11 @@ void fields::advance(int n) {
   init_backend();
   ensure_backend_executable();
   backend_refresh_noisy_seed(*this, *step_plans[0], "fields::advance noisy seed refresh");
+  /* Recoverable backend validation stays outside the dispatch failure boundary:
+     no stream work has been submitted, so a rejected material-phase identity
+     must leave the installed epoch retryable. Resident implementations own
+     any collective reconciliation required by this hook. */
+  backend->preflight_advance(*executable, *backend_state, n);
   const bool collective_custom_dispatch =
       backend->requires_full_storage_preparation() &&
       backend_state->host_custom_preflight_required;

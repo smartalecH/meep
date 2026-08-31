@@ -747,6 +747,8 @@ static void run_beta_case(const char *name, precision_policy_kind policy, bool r
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options, 0, beta);
   if (real_fields) {
     cpu.use_real_fields();
@@ -2122,6 +2124,10 @@ static void require_material_targets_host_only(fields &gpu) {
   }
 }
 
+static bool same_material_initialization_statistics(
+    const NvidiaMaterialInitializationStatistics &a,
+    const NvidiaMaterialInitializationStatistics &b);
+
 static void run_material_phase_case(const char *name, precision_policy_kind policy,
                                     bool real_fields, bool current_conductivity) {
   const grid_volume gv = vol2d(3.0, 2.0, 8.0);
@@ -2145,6 +2151,8 @@ static void run_material_phase_case(const char *name, precision_policy_kind poli
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   if (real_fields) {
     cpu.use_real_fields();
@@ -2184,6 +2192,7 @@ static void run_material_phase_case(const char *name, precision_policy_kind poli
   for (int step = 1; step <= 5; ++step) {
     cpu.advance(1);
     nvidia::testing::reset_transfer_accounting();
+    backend_reset_material_phase_preflight_counts_for_testing();
     gpu.advance(1);
     const nvidia::testing::transfer_accounting transfers =
         nvidia::testing::current_transfer_accounting();
@@ -2193,9 +2202,38 @@ static void run_material_phase_case(const char *name, precision_policy_kind poli
             "NVIDIA material phase issued the wrong number of refresh uploads");
     require(transfers.host_to_device_bytes == (active ? expected_bytes : 0),
             "NVIDIA material phase uploaded the wrong byte count");
+    require((active && backend_material_phase_collective_count_for_testing() != 0 &&
+             backend_material_phase_scan_count_for_testing() != 0) ||
+                (!active && backend_material_phase_collective_count_for_testing() == 0 &&
+                 backend_material_phase_scan_count_for_testing() == 0),
+            "NVIDIA material phase preflight did not enter or leave its cached collective path");
     compare_fields(cpu, gpu, tolerance);
     compare_material_rows(cpu, gpu, tolerance);
   }
+  NvidiaBackend *const backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && gpu.backend_state && !gpu.backend_state->material_phase_active &&
+              !gpu.executable->material_phase_active,
+          "completed NVIDIA material phase retained its compiled active flag");
+  const NvidiaMaterialInitializationStatistics initialization_before =
+      backend->material_initialization_statistics_for_testing();
+  nvidia::testing::reset_material_transfer_accounting();
+  backend_reset_material_phase_preflight_counts_for_testing();
+  cpu.advance(100);
+  gpu.advance(100);
+  const nvidia::testing::material_transfer_accounting material_transfers =
+      nvidia::testing::current_material_transfer_accounting();
+  require(material_transfers.compact_calls == 0 && material_transfers.compact_bytes == 0 &&
+              material_transfers.dense_output_calls == 0 &&
+              material_transfers.dense_output_bytes == 0 &&
+              material_transfers.tiled_output_calls == 0 &&
+              material_transfers.tiled_output_bytes == 0 &&
+              backend_material_phase_collective_count_for_testing() == 0 &&
+              backend_material_phase_scan_count_for_testing() == 0 &&
+              same_material_initialization_statistics(
+                  initialization_before,
+                  backend->material_initialization_statistics_for_testing()),
+          "completed material phase repeated material work during 100 clean steps");
+  compare_fields(cpu, gpu, tolerance);
   master_printf("nvidia_timestep: material-%s/%s PASS\n", name,
                 precision_policy_name(policy));
 }
@@ -2274,6 +2312,9 @@ static void require_native_ir_preflight_rejected(NvidiaBackend &backend,
     input.from_host_callback = canonical.from_host_callback();
     input.support_reason_bits = canonical.support_reason_bits();
     input.rows = canonical.rows();
+    input.dense_fallback_rows = canonical.dense_fallback_rows();
+    input.callback_tiles = canonical.callback_tiles();
+    input.callback_owners = canonical.callback_owners();
     input.topology = canonical.topology();
     input.ir.reset(new MaterialIR(mutated));
     InitializationPlan plan = canonical_plan;
@@ -2306,6 +2347,8 @@ static void test_native_absorber_initialization(precision_policy_kind precision)
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -2376,7 +2419,7 @@ static void test_native_absorber_initialization(precision_policy_kind precision)
   const size_t candidate_attempts = 1 + gpu.classification_reentries;
   require(statistics.valid && statistics.device_native &&
               statistics.owned_ir_bytes >= statistics.compact_input_host_to_device_bytes &&
-              statistics.dense_oracle_bytes > 0 &&
+              statistics.dense_oracle_bytes == 0 &&
               statistics.dense_output_host_to_device_calls == 0 &&
               statistics.dense_output_host_to_device_bytes == 0 &&
               statistics.compact_input_host_to_device_calls == 1 &&
@@ -2413,7 +2456,9 @@ static void test_native_material_initialization_retry() {
       nvidia::testing::failure_point::material_pointwise_launch,
       nvidia::testing::failure_point::material_pml_launch,
       nvidia::testing::failure_point::material_initialization_sync};
-  for (nvidia::testing::failure_point failure : failures) {
+  for (size_t failure_index = 0;
+       failure_index < sizeof(failures) / sizeof(failures[0]); ++failure_index) {
+    const nvidia::testing::failure_point failure = failures[failure_index];
     const grid_volume gv = vol1d(2.0, 8.0);
     structure s(gv, isotropic_eps, pml(0.25), identity(), 1);
     absorber_list absorbers = create_absorber_list();
@@ -2451,6 +2496,8 @@ static void test_native_material_initialization_retry() {
   destroy_absorber_list(absorbers);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ex);
@@ -2575,7 +2622,12 @@ static bool same_material_initialization_statistics(
   return SAME_STAT(compact_input_host_to_device_calls) &&
          SAME_STAT(compact_input_host_to_device_bytes) && SAME_STAT(owned_ir_bytes) &&
          SAME_STAT(dense_oracle_bytes) && SAME_STAT(dense_output_host_to_device_calls) &&
-         SAME_STAT(dense_output_host_to_device_bytes) && SAME_STAT(decoded_parameter_bytes) &&
+         SAME_STAT(dense_output_host_to_device_bytes) &&
+         SAME_STAT(tiled_output_host_to_device_calls) &&
+         SAME_STAT(tiled_output_host_to_device_bytes) && SAME_STAT(logical_output_bytes) &&
+         SAME_STAT(callback_scratch_bytes) && SAME_STAT(upload_descriptor_bytes) &&
+         SAME_STAT(classification_status_bytes) && SAME_STAT(classification_result_bytes) &&
+         SAME_STAT(decoded_parameter_bytes) &&
          SAME_STAT(absorber_profile_bytes) && SAME_STAT(pml_profile_bytes) &&
          SAME_STAT(file_sample_bytes) && SAME_STAT(grid_weight_bytes) &&
          SAME_STAT(geometry_object_bytes) && SAME_STAT(geometry_image_bytes) &&
@@ -2640,6 +2692,8 @@ static void test_native_table_materials(precision_policy_kind precision, bool re
     execution_options options;
     options.backend = backend_kind::nvidia;
     options.precision = precision;
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
     fields gpu(&gpu_structure, options);
     if (real_fields) {
       cpu.use_real_fields();
@@ -3590,6 +3644,8 @@ static void test_native_material_initialization(precision_policy_kind precision,
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   if (real_fields) {
     cpu.use_real_fields();
@@ -3636,8 +3692,23 @@ static void test_native_material_initialization(precision_policy_kind precision,
               electric_state_frequencies[0] == 0.47 && electric_state_frequencies[1] == 0.73,
           "native susceptibility state identities differ from CPU prepend ordering");
   size_t expected_rows = 0, expected_pml = ir->pml_axes.size(), expected_compact = 0;
+  size_t logical_status_bytes = 0, physical_material_elements = 0;
   for (const MaterialIRTopologyRow &row : ir->topology) {
     const array_kind kind = array_kind(row.key.kind);
+    physical_material_elements += row.elements;
+    size_t logical = 0;
+    if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+        kind == array_kind::pml_siginv) {
+      for (const MaterialIRPmlAxis &axis : ir->pml_axes)
+        if (axis.chunk == row.key.chunk && uint64_t(axis.direction) == row.key.aux)
+          logical = axis.elements;
+    }
+    else
+      for (const MaterialIRDestination &destination : ir->destinations)
+        if (destination.key == row.key) logical = size_t(destination.point_count);
+    require(logical && logical <= row.elements,
+            "native material fixture has an invalid logical classification span");
+    logical_status_bytes += logical;
     if (kind != array_kind::pml_sig && kind != array_kind::pml_kap &&
         kind != array_kind::pml_siginv)
       ++expected_rows;
@@ -3653,7 +3724,7 @@ static void test_native_material_initialization(precision_policy_kind precision,
   const size_t candidate_attempts = 1 + gpu.classification_reentries;
   require(statistics.valid && statistics.device_native &&
               statistics.owned_ir_bytes >= statistics.compact_input_host_to_device_bytes &&
-              statistics.dense_oracle_bytes > 0 &&
+              statistics.dense_oracle_bytes == 0 &&
               statistics.dense_output_host_to_device_calls == 0 &&
               statistics.dense_output_host_to_device_bytes == 0 &&
               statistics.constant_fill_kernel_launches == 2 * expected_rows &&
@@ -3671,6 +3742,8 @@ static void test_native_material_initialization(precision_policy_kind precision,
               statistics.absorber_points_evaluated == 0 &&
               statistics.file_points_evaluated == 0 &&
               statistics.grid_points_evaluated == 0 &&
+              statistics.classification_status_bytes == logical_status_bytes &&
+              logical_status_bytes <= physical_material_elements &&
               statistics.synchronizations == 1,
           "native material initialization accounting is not exact");
   require(material_transfers.dense_output_calls == 0 &&
@@ -3707,6 +3780,510 @@ static void test_native_material_initialization(precision_policy_kind precision,
           "steady stepping repeated native material initialization work");
   master_printf("nvidia_timestep: native-material-%s/%s PASS\n",
                 real_fields ? "real" : "complex", precision_policy_name(precision));
+}
+
+static void pr54_borrowed_material(vector3 point, void *data, meep_geom::medium_struct *medium) {
+  const double base = *static_cast<const double *>(data);
+  *medium = meep_geom::medium_struct(base + 0.03125 * point.x);
+  medium->mu_diag = meep_geom::make_vector3(1.5 + 0.015625 * point.y,
+                                            1.625 - 0.0078125 * point.x, 1.75);
+}
+
+static double pr54_legacy_epsilon(const vec &) { return 2.375; }
+
+static bool retained_material_key(const StoragePlan &plan, const StorageKey &key) {
+  for (size_t i = 0; i < plan.keys.size(); ++i)
+    if (plan.keys[i] == key)
+      return plan.arrays[i].role == array_role::material &&
+             !plan.arrays[i].classification_elided;
+  return false;
+}
+
+static bool same_material_fallback_statistics(const MaterialFallbackStatistics &a,
+                                              const MaterialFallbackStatistics &b) {
+  return a.warnings == b.warnings && a.dense_rows == b.dense_rows &&
+         a.dense_bytes == b.dense_bytes && a.interface_points == b.interface_points &&
+         a.callback_tiles == b.callback_tiles && a.callback_points == b.callback_points &&
+         a.callback_calls == b.callback_calls &&
+         a.classification_launches == b.classification_launches &&
+         a.classification_device_to_host_calls == b.classification_device_to_host_calls &&
+         a.classification_device_to_host_bytes == b.classification_device_to_host_bytes;
+}
+
+static void check_pr54_route_timesteps(fields &cpu, fields &gpu) {
+  NvidiaBackend *const backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && gpu.backend_state, "PR5.4 route has no committed NVIDIA epoch");
+  const NvidiaMaterialInitializationStatistics initialization_before =
+      backend->material_initialization_statistics_for_testing();
+  const MaterialFallbackStatistics fallback_before =
+      gpu.backend_state->material_fallback_statistics;
+  nvidia::testing::reset_material_transfer_accounting();
+  backend_reset_material_phase_preflight_counts_for_testing();
+  initialize_live_fields_by_key(cpu, gpu, true, 0.071);
+  int completed = 0;
+  const int checkpoints[] = {1, 2, 100};
+  for (int checkpoint : checkpoints) {
+    cpu.advance(checkpoint - completed);
+    gpu.advance(checkpoint - completed);
+    completed = checkpoint;
+    compare_live_fields_by_key(cpu, gpu, 4e-4);
+  }
+  const NvidiaMaterialInitializationStatistics initialization_after =
+      backend->material_initialization_statistics_for_testing();
+  const nvidia::testing::material_transfer_accounting material_transfers =
+      nvidia::testing::current_material_transfer_accounting();
+  require(same_material_initialization_statistics(initialization_before,
+                                                  initialization_after) &&
+              same_material_fallback_statistics(
+                  fallback_before, gpu.backend_state->material_fallback_statistics) &&
+              material_transfers.compact_calls == 0 && material_transfers.compact_bytes == 0 &&
+              material_transfers.dense_output_calls == 0 &&
+              material_transfers.dense_output_bytes == 0 &&
+              material_transfers.tiled_output_calls == 0 &&
+              material_transfers.tiled_output_bytes == 0 &&
+              backend_material_phase_collective_count_for_testing() == 0 &&
+              backend_material_phase_scan_count_for_testing() == 0,
+          "100 clean route steps repeated material scans, collectives, transfers, kernels, "
+          "callbacks, synchronization, or capacity work");
+}
+
+static void test_pr54_classification_groups() {
+  using namespace meep_geom;
+  const grid_volume gv = vol3d(1.0, 1.0, 1.0, 5.0);
+  geometric_object_list geometry = {0, NULL};
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+
+  material_type sigma_material = new material_data();
+  sigma_material->which_subclass = material_data::MEDIUM;
+  sigma_material->medium = medium_struct(2.0);
+  meep_geom::susceptibility sigma = meep_geom::susceptibility();
+  sigma.frequency = 0.4;
+  sigma.gamma = 0.03;
+  sigma.sigma_diag = make_vector3(0.0, 0.0, 0.0);
+  sigma.sigma_offdiag = make_vector3(0.2, -0.15, 0.1);
+  sigma_material->medium.E_susceptibilities.push_back(sigma);
+  structure sigma_cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure sigma_gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&sigma_cpu_structure, geometry, make_vector3(), true, 1e-5, 64,
+                              false, sigma_material);
+  set_materials_from_geometry(&sigma_gpu_structure, geometry, make_vector3(), true, 1e-5, 64,
+                              false, sigma_material);
+  material_free(sigma_material);
+  fields sigma_cpu(&sigma_cpu_structure);
+  fields sigma_gpu(&sigma_gpu_structure, options);
+  sigma_cpu.use_real_fields();
+  sigma_gpu.use_real_fields();
+  for (component c : {Ex, Ey, Ez}) {
+    sigma_cpu.require_component(c);
+    sigma_gpu.require_component(c);
+  }
+  sigma_cpu.init_backend();
+  sigma_gpu.init_backend();
+  require(sigma_gpu.storage_plan, "sigma classification fixture has no storage plan");
+  bool saw_offdiagonal_sigma = false;
+  for (size_t i = 0; i < sigma_gpu.storage_plan->keys.size(); ++i) {
+    const StorageKey &key = sigma_gpu.storage_plan->keys[i];
+    if (key.kind != int(array_kind::sigma) ||
+        sigma_gpu.storage_plan->arrays[i].classification_elided || key.component_ < 0)
+      continue;
+    const direction diagonal = component_direction(component(key.component_));
+    if (key.cmp == int(diagonal)) continue;
+    saw_offdiagonal_sigma = true;
+    require(retained_material_key(
+                *sigma_gpu.storage_plan,
+                StorageKey{key.chunk, int(array_kind::sigma), key.component_, int(diagonal),
+                           key.aux}),
+            "retained sigma offdiagonal lost its same-state diagonal sigma");
+  }
+  require(saw_offdiagonal_sigma,
+          "zero-diagonal sigma fixture retained no offdiagonal susceptibility row");
+  compare_all_initialized_material_rows(sigma_cpu, sigma_gpu,
+                                        sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+
+  material_type nonlinear_material = new material_data();
+  nonlinear_material->which_subclass = material_data::MEDIUM;
+  nonlinear_material->medium = medium_struct(1.0);
+  nonlinear_material->medium.E_chi2_diag = make_vector3(0.2, 0.0, 0.0);
+  structure nonlinear_cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure nonlinear_gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&nonlinear_cpu_structure, geometry, make_vector3(), true, 1e-5,
+                              64, false, nonlinear_material);
+  set_materials_from_geometry(&nonlinear_gpu_structure, geometry, make_vector3(), true, 1e-5,
+                              64, false, nonlinear_material);
+  material_free(nonlinear_material);
+  fields nonlinear_cpu(&nonlinear_cpu_structure);
+  fields nonlinear_gpu(&nonlinear_gpu_structure, options);
+  nonlinear_cpu.use_real_fields();
+  nonlinear_gpu.use_real_fields();
+  nonlinear_cpu.require_component(Ex);
+  nonlinear_gpu.require_component(Ex);
+  nonlinear_cpu.init_backend();
+  nonlinear_gpu.init_backend();
+  require(nonlinear_gpu.storage_plan,
+          "nonlinear classification fixture has no storage plan");
+  bool saw_nonlinear = false;
+  for (size_t i = 0; i < nonlinear_gpu.storage_plan->keys.size(); ++i) {
+    const StorageKey &key = nonlinear_gpu.storage_plan->keys[i];
+    if ((key.kind != int(array_kind::chi2) && key.kind != int(array_kind::chi3)) ||
+        nonlinear_gpu.storage_plan->arrays[i].classification_elided)
+      continue;
+    saw_nonlinear = true;
+    const direction diagonal = component_direction(component(key.component_));
+    require(retained_material_key(
+                *nonlinear_gpu.storage_plan,
+                StorageKey{key.chunk, int(array_kind::chi2), key.component_, -1, 0}) &&
+                retained_material_key(
+                    *nonlinear_gpu.storage_plan,
+                    StorageKey{key.chunk, int(array_kind::chi3), key.component_, -1, 0}) &&
+                retained_material_key(
+                    *nonlinear_gpu.storage_plan,
+                    StorageKey{key.chunk, int(array_kind::chi1inv), key.component_, -1,
+                               uint64_t(diagonal)}),
+            "nonlinear row lost its chi2/chi3/diagonal-chi1 classification group");
+  }
+  require(saw_nonlinear, "epsilon=1 nonlinear fixture retained no nonlinear row");
+  compare_all_initialized_material_rows(nonlinear_cpu, nonlinear_gpu,
+                                        sizeof(realnum) == sizeof(float) ? 8e-6 : 2e-13);
+  master_printf("nvidia_timestep: PR5.4 classification groups PASS\n");
+}
+
+static void test_pr54_callback_routes() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.75, 1.25, 16.0);
+  geometric_object_list geometry = {0, NULL};
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::mixed;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+
+  std::shared_ptr<const OwnedMaterialCallback> owner(new OwnedMaterialCallback(
+      UINT64_C(0x707235342d74696c), UINT64_C(0x707235342d736967),
+      owned_material_callback_tiled_capabilities,
+      [](vector3 point, medium_struct &medium) {
+        medium = medium_struct(2.25 + 0.0625 * point.x - 0.03125 * point.y);
+      }));
+  material_type tiled_material = make_owned_user_material_for_backend(owner, false);
+  structure tiled_cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure tiled_gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&tiled_cpu_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, tiled_material);
+  set_materials_from_geometry(&tiled_gpu_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, tiled_material);
+  material_free(tiled_material);
+  fields tiled_cpu(&tiled_cpu_structure);
+  fields tiled_gpu(&tiled_gpu_structure, options);
+  tiled_cpu.use_real_fields();
+  tiled_gpu.use_real_fields();
+  tiled_cpu.require_component(Ez);
+  tiled_gpu.require_component(Ez);
+  tiled_cpu.init_backend();
+  nvidia::testing::reset_transfer_accounting();
+  nvidia::testing::reset_material_transfer_accounting();
+  nvidia::testing::fail_next(
+      nvidia::testing::failure_point::material_callback_prepare);
+  bool callback_prepare_rejected = false;
+  try { tiled_gpu.init_backend(); }
+  catch (const std::runtime_error &error) {
+    callback_prepare_rejected =
+        std::string(error.what()).find("callback preparation failure") != std::string::npos;
+  }
+  const nvidia::testing::transfer_accounting failed_callback_transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(callback_prepare_rejected && !tiled_gpu.backend_state && !tiled_gpu.executable &&
+              failed_callback_transfers.host_to_device_calls == 0 &&
+              failed_callback_transfers.device_to_host_calls == 0,
+          "owned callback prepare failure crossed the CUDA or publication boundary");
+  nvidia::testing::reset_material_transfer_accounting();
+  tiled_gpu.init_backend();
+  require(tiled_gpu.initialization_plan &&
+              tiled_gpu.initialization_plan->materials.size() == 1 &&
+              tiled_gpu.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::tiled_callback,
+          "owned callback did not select the NVIDIA tiled route");
+  compare_all_initialized_material_rows(tiled_cpu, tiled_gpu, 8e-6);
+  NvidiaBackend *const tiled_backend = dynamic_cast<NvidiaBackend *>(tiled_gpu.backend);
+  const NvidiaMaterialInitializationStatistics tiled_statistics =
+      tiled_backend ? tiled_backend->material_initialization_statistics_for_testing()
+                    : NvidiaMaterialInitializationStatistics();
+  const nvidia::testing::material_transfer_accounting tiled_transfers =
+      nvidia::testing::current_material_transfer_accounting();
+  bool short_tile = false;
+  uint64_t tiled_points = 0;
+  for (const MaterialCallbackTile &tile :
+       tiled_gpu.initialization_plan->materials[0].callback_tiles()) {
+    require(tile.count && tile.count <= 256,
+            "owned callback emitted a tile outside the bounded contract");
+    short_tile = short_tile || tile.count < 256;
+    tiled_points += tile.count;
+  }
+  require(tiled_gpu.backend_state && tiled_backend && tiled_statistics.valid &&
+              tiled_gpu.backend_state->material_fallback_statistics.callback_calls ==
+                  tiled_gpu.backend_state->material_fallback_statistics.callback_points &&
+              tiled_points ==
+                  tiled_gpu.backend_state->material_fallback_statistics.callback_points &&
+              tiled_gpu.backend_state->material_fallback_statistics.callback_tiles > 1 &&
+              short_tile && tiled_statistics.callback_scratch_bytes == 256 * sizeof(realnum) &&
+              tiled_statistics.logical_output_bytes > tiled_statistics.callback_scratch_bytes &&
+              tiled_statistics.dense_output_host_to_device_calls == 0 &&
+              tiled_statistics.dense_output_host_to_device_bytes == 0 &&
+              tiled_statistics.tiled_output_host_to_device_calls > 0 &&
+              tiled_statistics.tiled_output_host_to_device_bytes > 0 &&
+              tiled_statistics.tiled_output_host_to_device_calls ==
+                  tiled_transfers.tiled_output_calls &&
+              tiled_statistics.tiled_output_host_to_device_bytes ==
+                  tiled_transfers.tiled_output_bytes &&
+              tiled_transfers.dense_output_calls == 0 &&
+              tiled_transfers.dense_output_bytes == 0 &&
+              tiled_statistics.classification_status_bytes > 0 &&
+              tiled_statistics.classification_result_bytes > 0 &&
+              tiled_statistics.synchronizations == 1,
+          "owned tiled callback execution/staging/accounting is not exact");
+  check_pr54_route_timesteps(tiled_cpu, tiled_gpu);
+
+  double borrowed_base = 2.5;
+  material_type host_material =
+      make_user_material(pr54_borrowed_material, &borrowed_base, false);
+  structure host_cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure host_gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&host_cpu_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, host_material);
+  set_materials_from_geometry(&host_gpu_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, host_material);
+  material_free(host_material);
+  fields host_cpu(&host_cpu_structure);
+  fields host_gpu(&host_gpu_structure, options);
+  host_cpu.use_real_fields();
+  host_gpu.use_real_fields();
+  host_cpu.require_component(Ez);
+  host_gpu.require_component(Ez);
+  host_cpu.init_backend();
+  nvidia::testing::reset_material_transfer_accounting();
+  host_gpu.init_backend();
+  require(host_gpu.initialization_plan && host_gpu.initialization_plan->materials.size() == 1 &&
+              host_gpu.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::host_reference,
+          "borrowed callback did not select the NVIDIA host-reference route");
+  compare_all_initialized_material_rows(host_cpu, host_gpu, 8e-6);
+  NvidiaBackend *const host_backend = dynamic_cast<NvidiaBackend *>(host_gpu.backend);
+  const NvidiaMaterialInitializationStatistics host_statistics =
+      host_backend ? host_backend->material_initialization_statistics_for_testing()
+                   : NvidiaMaterialInitializationStatistics();
+  const nvidia::testing::material_transfer_accounting host_transfers =
+      nvidia::testing::current_material_transfer_accounting();
+  require(host_gpu.backend_state && host_backend && host_statistics.valid &&
+              host_gpu.backend_state->material_fallback_statistics.callback_calls == 0 &&
+              host_gpu.backend_state->material_fallback_statistics.dense_rows > 0 &&
+              host_statistics.callback_scratch_bytes == 0 &&
+              host_statistics.dense_output_host_to_device_calls > 0 &&
+              host_statistics.dense_output_host_to_device_bytes > 0 &&
+              host_statistics.tiled_output_host_to_device_calls == 0 &&
+              host_statistics.tiled_output_host_to_device_bytes == 0 &&
+              host_statistics.dense_output_host_to_device_calls ==
+                  host_transfers.dense_output_calls &&
+              host_statistics.dense_output_host_to_device_bytes ==
+                  host_transfers.dense_output_bytes &&
+              host_transfers.tiled_output_calls == 0 &&
+              host_transfers.tiled_output_bytes == 0 &&
+              host_statistics.synchronizations == 1,
+          "host-reference route re-evaluated a callback or lost dense accounting");
+  check_pr54_route_timesteps(host_cpu, host_gpu);
+
+  fields *recursive_fields = NULL;
+  std::shared_ptr<const OwnedMaterialCallback> recursive_owner(new OwnedMaterialCallback(
+      UINT64_C(0x707235342d726563), UINT64_C(0x707235342d726573),
+      owned_material_callback_tiled_capabilities,
+      [&recursive_fields](vector3, medium_struct &medium) {
+        if (recursive_fields) recursive_fields->init_backend();
+        medium = medium_struct(2.0);
+      }));
+  material_type recursive_material =
+      make_owned_user_material_for_backend(recursive_owner, false);
+  structure recursive_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&recursive_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, recursive_material);
+  material_free(recursive_material);
+  fields recursive_gpu(&recursive_structure, options);
+  recursive_fields = &recursive_gpu;
+  recursive_gpu.use_real_fields();
+  recursive_gpu.require_component(Ez);
+  nvidia::testing::reset_transfer_accounting();
+  bool recursion_rejected = false;
+  try { recursive_gpu.init_backend(); }
+  catch (const std::runtime_error &error) {
+    recursion_rejected =
+        std::string(error.what()).find("recursive owned tiled material callback") !=
+        std::string::npos;
+  }
+  const nvidia::testing::transfer_accounting recursive_transfers =
+      nvidia::testing::current_transfer_accounting();
+  require(recursion_rejected && !recursive_gpu.backend_state && !recursive_gpu.executable &&
+              recursive_transfers.host_to_device_calls == 0 &&
+              recursive_transfers.device_to_host_calls == 0,
+          "recursive callback crossed the CUDA or publication boundary");
+
+  simple_material_function legacy_epsilon(pr54_legacy_epsilon);
+  structure legacy_cpu_structure(gv, legacy_epsilon, no_pml(), identity(), 1);
+  structure legacy_gpu_structure(gv, legacy_epsilon, no_pml(), identity(), 1);
+  fields legacy_cpu(&legacy_cpu_structure);
+  fields legacy_gpu(&legacy_gpu_structure, options);
+  legacy_cpu.use_real_fields();
+  legacy_gpu.use_real_fields();
+  legacy_cpu.require_component(Ez);
+  legacy_gpu.require_component(Ez);
+  legacy_cpu.init_backend();
+  legacy_gpu.init_backend();
+  require(!material_ir_for(legacy_gpu) && legacy_gpu.initialization_plan &&
+              legacy_gpu.initialization_plan->materials.size() == 1 &&
+              legacy_gpu.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::host_reference,
+          "legacy no-IR material did not select host-reference");
+  compare_all_initialized_material_rows(legacy_cpu, legacy_gpu, 8e-6);
+  check_pr54_route_timesteps(legacy_cpu, legacy_gpu);
+  master_printf("nvidia_timestep: PR5.4 tiled/host routes PASS\n");
+}
+
+static void install_pr54_tiled_material(structure &s, size_t &callback_calls);
+
+static void run_pr54_route_policy_case(precision_policy_kind policy, bool magnetic,
+                                       bool complex_fields, bool tiled) {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.25, 1.0, 10.0);
+  geometric_object_list geometry = {0, NULL};
+  size_t callback_calls = 0;
+  material_type material = NULL;
+  double borrowed_base = 2.375;
+  if (tiled) {
+    std::shared_ptr<const OwnedMaterialCallback> owner(new OwnedMaterialCallback(
+        UINT64_C(0x707235342d6d6174) + uint64_t(magnetic),
+        UINT64_C(0x707235342d706f6c) + uint64_t(complex_fields),
+        owned_material_callback_tiled_capabilities,
+        [&callback_calls](vector3 point, medium_struct &medium) {
+          ++callback_calls;
+          medium = medium_struct(2.25 + 0.03125 * point.x);
+          medium.mu_diag = make_vector3(1.5 + 0.015625 * point.y,
+                                        1.625 - 0.0078125 * point.x, 1.75);
+        }));
+    material = make_owned_user_material_for_backend(owner, false);
+  }
+  else
+    material = make_user_material(pr54_borrowed_material, &borrowed_base, false);
+
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&cpu_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, material);
+  set_materials_from_geometry(&gpu_structure, geometry, make_vector3(), false, 1e-5, 64,
+                              false, material);
+  material_free(material);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&gpu_structure, options);
+  if (complex_fields) {
+    const vec bloch(0.11, -0.07);
+    cpu.use_bloch(bloch);
+    gpu.use_bloch(bloch);
+  }
+  else {
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+  }
+  const component c = magnetic ? Hz : Ez;
+  cpu.require_component(c);
+  gpu.require_component(c);
+  gaussian_src_time cpu_source(0.31, 0.14), gpu_source(0.31, 0.14);
+  const std::complex<double> amplitude =
+      complex_fields ? std::complex<double>(0.17, -0.09) : std::complex<double>(0.17, 0.0);
+  cpu.add_point_source(c, cpu_source, vec(0.17, -0.13), amplitude);
+  gpu.add_point_source(c, gpu_source, vec(0.17, -0.13), amplitude);
+  cpu.init_backend();
+  gpu.init_backend();
+  const MaterialRecipeDisposition expected = tiled
+                                                  ? MaterialRecipeDisposition::tiled_callback
+                                                  : MaterialRecipeDisposition::host_reference;
+  require(gpu.backend_state && gpu.initialization_plan &&
+              gpu.initialization_plan->materials.size() == 1 &&
+              gpu.initialization_plan->materials[0].disposition() == expected &&
+              gpu.backend_state->material_route == expected &&
+              (!tiled || callback_calls > 0),
+          "PR5.4 route/policy fixture selected the wrong material disposition");
+  compare_all_initialized_material_rows(
+      cpu, gpu, sizeof(realnum) == sizeof(float) || policy != precision_policy_kind::native
+                    ? 8e-5
+                    : 2e-12);
+  check_pr54_route_timesteps(cpu, gpu);
+  master_printf("nvidia_timestep: PR5.4 %s/%s/%s/%s PASS\n",
+                tiled ? "tiled" : "host-reference", magnetic ? "H" : "E",
+                complex_fields ? "complex" : "real", precision_policy_name(policy));
+}
+
+static void run_pr54_strict_rejection_case(precision_policy_kind policy) {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.25, 1.0, 10.0);
+  size_t callback_calls = 0;
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  install_pr54_tiled_material(s, callback_calls);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = policy;
+  options.strict = true;
+  options.fallback = fallback_policy::error;
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  const size_t callbacks_before = callback_calls;
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_transfer_accounting();
+  nvidia::testing::reset_material_transfer_accounting();
+  bool rejected = false;
+  try { f.advance(1); }
+  catch (const std::exception &) { rejected = true; }
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  const nvidia::testing::transfer_accounting transfers =
+      nvidia::testing::current_transfer_accounting();
+  const nvidia::testing::material_transfer_accounting material =
+      nvidia::testing::current_material_transfer_accounting();
+  const bool clean = rejected && !f.backend_state && !f.executable &&
+                     callback_calls == callbacks_before &&
+                     f.backend->material_fallback_warning_count() == 0 &&
+                     memory_before.device_bytes_current == memory_after.device_bytes_current &&
+                     memory_before.pinned_bytes_current == memory_after.pinned_bytes_current &&
+                     transfers.host_to_device_calls == 0 && transfers.device_to_host_calls == 0 &&
+                     material.compact_calls == 0 && material.dense_output_calls == 0 &&
+                     material.tiled_output_calls == 0;
+  if (!clean)
+    fprintf(stderr,
+            "PR5.4 strict %s rejected=%d state=%d executable=%d callbacks=%zu/%zu "
+            "warnings=%llu device=%zu/%zu pinned=%zu/%zu h2d=%zu d2h=%zu material=%zu/%zu/%zu\n",
+            precision_policy_name(policy), int(rejected), int(f.backend_state != NULL),
+            int(f.executable != NULL), callbacks_before, callback_calls,
+            (unsigned long long)f.backend->material_fallback_warning_count(),
+            memory_before.device_bytes_current, memory_after.device_bytes_current,
+            memory_before.pinned_bytes_current, memory_after.pinned_bytes_current,
+            transfers.host_to_device_calls, transfers.device_to_host_calls,
+            material.compact_calls, material.dense_output_calls, material.tiled_output_calls);
+  require(clean,
+          "strict material fallback crossed the callback/allocation/transfer/publication boundary");
+  master_printf("nvidia_timestep: PR5.4 strict/%s PASS\n", precision_policy_name(policy));
+}
+
+static void test_pr54_route_policy_matrix() {
+  const precision_policy_kind policies[] = {
+      precision_policy_kind::native, precision_policy_kind::mixed,
+      precision_policy_kind::f32};
+  for (precision_policy_kind policy : policies) {
+    run_pr54_strict_rejection_case(policy);
+    for (bool magnetic : {false, true})
+      for (bool complex_fields : {false, true})
+        for (bool tiled : {false, true})
+          run_pr54_route_policy_case(policy, magnetic, complex_fields, tiled);
+  }
+  master_printf("nvidia_timestep: PR5.4 route/policy matrix PASS\n");
 }
 
 static void install_geometry_block_material(structure &s) {
@@ -3763,6 +4340,8 @@ static void test_native_material_geometry(precision_policy_kind precision) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -3865,6 +4444,8 @@ static void test_driven_material_geometry(driven_geometry_route route) {
   fields cpu(&cpu_structure);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -4338,7 +4919,9 @@ static void test_native_geometry_retry() {
       nvidia::testing::failure_point::material_geometry_analytic_launch,
       nvidia::testing::failure_point::material_geometry_patch_launch,
       nvidia::testing::failure_point::material_initialization_sync};
-  for (nvidia::testing::failure_point failure : failures) {
+  for (size_t failure_index = 0;
+       failure_index < sizeof(failures) / sizeof(failures[0]); ++failure_index) {
+    const nvidia::testing::failure_point failure = failures[failure_index];
     structure s(vol2d(1.0, 1.0, 8.0), isotropic_eps, no_pml(), identity(), 1);
     install_geometry_block_material(s);
     execution_options options;
@@ -4387,6 +4970,167 @@ static void test_native_geometry_retry() {
   require(f.backend_state != live_state && f.executable != live_executable,
           "geometry replacement retry did not publish a new epoch");
   master_printf("nvidia_timestep: material-geometry rollback/retry PASS\n");
+}
+
+struct Pr54MaterialEpochSummary {
+  BackendState *state;
+  Executable *executable;
+  StoragePlan *storage;
+  InitializationPlan *initialization;
+  StepPlan *step;
+  uint32_t dirty;
+  uint64_t prepared_classification_hash;
+  MaterialRecipeDisposition global_route;
+  MaterialRecipeDisposition local_route;
+  uint64_t support_reasons;
+  uint64_t recipe_signature;
+  uint64_t classification_hash;
+  bool local_presence;
+  bool global_presence;
+  bool presence_validated;
+  bool policy_pending;
+  MaterialFallbackStatistics fallback;
+  NvidiaMaterialInitializationStatistics initialization_statistics;
+  uint64_t warning_count;
+  bool warning_emitted;
+
+  explicit Pr54MaterialEpochSummary(fields &f)
+      : state(f.backend_state), executable(f.executable), storage(f.storage_plan),
+        initialization(f.initialization_plan), step(f.step_plans[0]), dirty(f.dirty_mask),
+        prepared_classification_hash(f.prepared_classification_hash),
+        global_route(state ? state->material_route : MaterialRecipeDisposition::device_native),
+        local_route(state ? state->material_local_route : MaterialRecipeDisposition::device_native),
+        support_reasons(state ? state->material_support_reasons : 0),
+        recipe_signature(state ? state->material_recipe_signature : 0),
+        classification_hash(state ? state->material_classification_hash : 0),
+        local_presence(state && state->material_fallback_local_presence),
+        global_presence(state && state->material_fallback_global_presence),
+        presence_validated(state && state->material_fallback_presence_validated),
+        policy_pending(state && state->material_fallback_policy_pending),
+        fallback(state ? state->material_fallback_statistics : MaterialFallbackStatistics()),
+        initialization_statistics(),
+        warning_count(f.backend ? f.backend->material_fallback_warning_count() : 0),
+        warning_emitted(f.backend && f.backend->material_fallback_warning_emitted()) {
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(f.backend);
+    if (backend)
+      initialization_statistics = backend->material_initialization_statistics_for_testing();
+  }
+
+  bool matches(fields &f) const {
+    const Pr54MaterialEpochSummary other(f);
+    return state == other.state && executable == other.executable && storage == other.storage &&
+           initialization == other.initialization && step == other.step && dirty == other.dirty &&
+           prepared_classification_hash == other.prepared_classification_hash &&
+           global_route == other.global_route && local_route == other.local_route &&
+           support_reasons == other.support_reasons &&
+           recipe_signature == other.recipe_signature &&
+           classification_hash == other.classification_hash &&
+           local_presence == other.local_presence && global_presence == other.global_presence &&
+           presence_validated == other.presence_validated &&
+           policy_pending == other.policy_pending &&
+           same_material_fallback_statistics(fallback, other.fallback) &&
+           same_material_initialization_statistics(initialization_statistics,
+                                                   other.initialization_statistics) &&
+           warning_count == other.warning_count && warning_emitted == other.warning_emitted;
+  }
+};
+
+static void install_pr54_tiled_material(structure &s, size_t &callback_calls) {
+  using namespace meep_geom;
+  std::shared_ptr<const OwnedMaterialCallback> owner(new OwnedMaterialCallback(
+      UINT64_C(0x707235342d666169), UINT64_C(0x707235342d726f6c),
+      owned_material_callback_tiled_capabilities,
+      [&callback_calls](vector3 point, medium_struct &medium) {
+        ++callback_calls;
+        medium = medium_struct(2.125 + 0.03125 * point.x - 0.015625 * point.y);
+      }));
+  material_type material = make_owned_user_material_for_backend(owner, false);
+  geometric_object_list empty = {0, NULL};
+  set_materials_from_geometry(&s, empty, make_vector3(), false, 1e-5, 64, false, material);
+  material_free(material);
+}
+
+static void test_pr54_post_callback_failure_matrix() {
+  const nvidia::testing::failure_point failures[] = {
+      nvidia::testing::failure_point::material_callback_dispatch,
+      nvidia::testing::failure_point::material_tiled_upload,
+      nvidia::testing::failure_point::material_initialization_sync,
+      nvidia::testing::failure_point::material_classification_d2h,
+      nvidia::testing::failure_point::material_classification_result_mutation,
+      nvidia::testing::failure_point::material_finalize,
+      nvidia::testing::failure_point::material_compile};
+  const grid_volume gv = vol2d(1.5, 1.25, 12.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+
+  for (size_t failure_index = 0;
+       failure_index < sizeof(failures) / sizeof(failures[0]); ++failure_index) {
+    const nvidia::testing::failure_point failure = failures[failure_index];
+    size_t callback_calls = 0;
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_pr54_tiled_material(s, callback_calls);
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ez);
+    const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+    nvidia::testing::fail_next(failure);
+    bool rejected = false;
+    try { f.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    const bool clean = rejected && callback_calls > 0 && !f.backend_state && !f.executable &&
+                       before.device_bytes_current == after.device_bytes_current &&
+                       before.pinned_bytes_current == after.pinned_bytes_current &&
+                       f.backend->material_fallback_warning_count() == 0;
+    if (!clean)
+      fprintf(stderr,
+              "PR5.4 cold failure %zu rejected=%d callbacks=%zu state=%d executable=%d "
+              "device=%zu/%zu pinned=%zu/%zu warnings=%llu\n",
+              failure_index, int(rejected), callback_calls, int(f.backend_state != NULL),
+              int(f.executable != NULL), before.device_bytes_current,
+              after.device_bytes_current, before.pinned_bytes_current,
+              after.pinned_bytes_current,
+              (unsigned long long)f.backend->material_fallback_warning_count());
+    require(clean,
+            "cold post-callback material failure published or leaked a candidate");
+    f.init_backend();
+    require(f.backend_state && f.executable &&
+                f.backend_state->material_route == MaterialRecipeDisposition::tiled_callback &&
+                f.backend->material_fallback_warning_count() == 1,
+            "cold post-callback material failure was not retryable");
+  }
+
+  for (nvidia::testing::failure_point failure : failures) {
+    size_t callback_calls = 0;
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_pr54_tiled_material(s, callback_calls);
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ez);
+    f.init_backend();
+    invalidate(f, MutationKind::material_values, "PR5.4 warm post-callback failure");
+    const Pr54MaterialEpochSummary entry(f);
+    const size_t callbacks_before = callback_calls;
+    nvidia::testing::fail_next(failure);
+    bool rejected = false;
+    try { f.init_backend(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(rejected && callback_calls > callbacks_before && entry.matches(f) &&
+                !f.backend->is_poisoned(),
+            "warm post-callback material failure changed the committed epoch");
+    BackendState *const previous_state = f.backend_state;
+    f.init_backend();
+    require(f.backend_state && f.backend_state != previous_state && f.executable &&
+                f.backend_state->material_route == MaterialRecipeDisposition::tiled_callback &&
+                f.backend->material_fallback_warning_count() == 1,
+            "warm post-callback material failure was not retryable");
+  }
+  master_printf("nvidia_timestep: PR5.4 post-callback rollback/retry PASS\n");
 }
 
 static void test_native_geometry_tensor_preflight() {
@@ -4833,6 +5577,8 @@ static void test_native_geometry_cuda_mpi_initialization() {
   const grid_volume gv = vol2d(2.0, 1.0, 8.0);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
 
   {
     structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), ranks);
@@ -4872,6 +5618,34 @@ static void test_native_geometry_cuda_mpi_initialization() {
   }
 
   {
+    using namespace meep_geom;
+    std::shared_ptr<const OwnedMaterialCallback> owner(new OwnedMaterialCallback(
+        UINT64_C(0x707235342d6d7069), UINT64_C(0x707235342d6d7073),
+        owned_material_callback_tiled_capabilities,
+        [](vector3 point, medium_struct &medium) {
+          medium = medium_struct(2.125 + 0.03125 * point.x);
+        }));
+    material_type callback = make_owned_user_material_for_backend(owner, false);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    geometric_object_list empty = {0, NULL};
+    set_materials_from_geometry(&gpu_structure, empty, make_vector3(), false, 1e-5, 64,
+                                false, callback);
+    material_free(callback);
+    fields gpu(&gpu_structure, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ez);
+    nvidia::testing::reset_material_transfer_accounting();
+    gpu.init_backend();
+    const nvidia::testing::material_transfer_accounting material =
+        nvidia::testing::current_material_transfer_accounting();
+    const bool tiled_work = material.tiled_output_calls != 0;
+    require(sum_to_all(int(tiled_work)) == 1 && material.compact_calls == 0 &&
+                material.dense_output_calls == 0 &&
+                !gpu.backend_state && !gpu.executable,
+            "CUDA MPI tiled/native owner-idle route or classification diverged");
+  }
+
+  {
     structure failure_structure(gv, isotropic_eps, no_pml(), identity(), ranks);
     install_geometry_block_material(failure_structure);
     fields failure(&failure_structure, options);
@@ -4890,6 +5664,71 @@ static void test_native_geometry_cuda_mpi_initialization() {
     require(!failure.backend_state && !failure.executable &&
                 nvidia::testing::current_material_transfer_accounting().compact_calls != 0,
             "rank-asymmetric CUDA geometry failure was not retryable");
+  }
+
+  {
+    const nvidia::testing::failure_point failures[] = {
+        nvidia::testing::failure_point::material_initialization_sync,
+        nvidia::testing::failure_point::material_classification_d2h,
+        nvidia::testing::failure_point::material_classification_result_mutation,
+        nvidia::testing::failure_point::material_finalize};
+    for (int target = 0; target < ranks; ++target)
+      for (size_t failure_index = 0;
+           failure_index < sizeof(failures) / sizeof(failures[0]); ++failure_index) {
+        const nvidia::testing::failure_point point = failures[failure_index];
+        structure failure_structure(gv, isotropic_eps, no_pml(), identity(), ranks);
+        install_geometry_block_material(failure_structure);
+        fields failure(&failure_structure, options);
+        failure.use_real_fields();
+        for (component c : {Ex, Ey, Ez}) failure.require_component(c);
+        if (my_rank() == target) nvidia::testing::fail_next(point);
+        bool rejected = false;
+        try { failure.init_backend(); }
+        catch (const std::exception &) { rejected = true; }
+        nvidia::testing::clear_failure();
+        const bool clean = and_to_all(rejected) && !failure.backend_state &&
+                           !failure.executable &&
+                           failure.backend->material_fallback_warning_count() == 0;
+        if (!clean)
+          fprintf(stderr,
+                  "rank-asymmetric CUDA failure %zu target=%d local-rank=%d rejected=%d "
+                  "state=%d executable=%d warnings=%llu\n",
+                  failure_index, target, my_rank(), int(rejected),
+                  int(failure.backend_state != NULL), int(failure.executable != NULL),
+                  (unsigned long long)failure.backend->material_fallback_warning_count());
+        require(clean,
+                "rank-asymmetric CUDA classification/finalize/compile failure published state");
+        failure.init_backend();
+        require(!failure.backend_state && !failure.executable,
+                "rank-asymmetric CUDA classification/finalize/compile failure was not retryable");
+      }
+  }
+
+  {
+    const nvidia::testing::failure_point failures[] = {
+        nvidia::testing::failure_point::material_callback_dispatch,
+        nvidia::testing::failure_point::material_tiled_upload};
+    for (int target = 0; target < ranks; ++target)
+      for (nvidia::testing::failure_point point : failures) {
+        size_t callback_calls = 0;
+        structure failure_structure(gv, isotropic_eps, no_pml(), identity(), ranks);
+        install_pr54_tiled_material(failure_structure, callback_calls);
+        fields failure(&failure_structure, options);
+        failure.use_real_fields();
+        failure.require_component(Ez);
+        if (my_rank() == target) nvidia::testing::fail_next(point);
+        bool rejected = false;
+        try { failure.init_backend(); }
+        catch (const std::exception &) { rejected = true; }
+        nvidia::testing::clear_failure();
+        require(and_to_all(rejected) && callback_calls > 0 && !failure.backend_state &&
+                    !failure.executable &&
+                    failure.backend->material_fallback_warning_count() == 0,
+                "rank-asymmetric CUDA tiled post-callback failure published state");
+        failure.init_backend();
+        require(!failure.backend_state && !failure.executable,
+                "rank-asymmetric CUDA tiled post-callback failure was not retryable");
+      }
   }
 
   divide_parallel_processes(ranks);
@@ -4923,6 +5762,8 @@ static void test_material_copy_after_compile_rejected() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&current, options);
   gpu.use_real_fields();
   gpu.require_component(Ez);
@@ -4975,6 +5816,8 @@ static void test_material_cpu_setup_to_nvidia() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   migrating.select_backend(options);
   migrating.init_backend();
   for (int step = 0; step < 4; ++step) {
@@ -5337,6 +6180,8 @@ static void test_material_compile_rejections() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&current, options);
   gpu.use_real_fields();
   gpu.require_component(Ez);
@@ -8324,6 +9169,27 @@ int main(int argc, char **argv) {
     return 0;
   }
   set_finite_check_mode(FiniteCheckMode::off);
+  if (getenv("MEEP_NVIDIA_PR54_NATIVE_SMOKE")) {
+    test_native_material_initialization(precision_policy_kind::native, true);
+    master_printf("nvidia_timestep: PR5.4 native smoke PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_PR54_CALLBACK_ROUTES_ONLY")) {
+    test_pr54_callback_routes();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_PR54_ROUTE_MATRIX_ONLY")) {
+    test_pr54_route_policy_matrix();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_PR54_CLASSIFICATION_ONLY")) {
+    test_pr54_classification_groups();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_PR54_FAILURES_ONLY")) {
+    test_pr54_post_callback_failure_matrix();
+    return 0;
+  }
   if (getenv("MEEP_NVIDIA_BFAST_REJECTIONS_ONLY")) {
     test_bfast_compile_rejections();
     master_printf("nvidia_timestep: BFAST rejection checks PASS\n");

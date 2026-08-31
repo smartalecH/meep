@@ -48,6 +48,7 @@
 #include "backend/nvidia/nvidia_sources.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
 #include "material_data.hpp"
+#include "meepgeom.hpp"
 #include "meep_internals.hpp"
 
 namespace meep {
@@ -564,12 +565,30 @@ struct NvidiaMaterialGeometryAuthority {
   size_t record_offset;
 };
 
+struct NvidiaInitializationUpload {
+  uint32_t allocation;
+  size_t bytes;
+  size_t staging_offset;
+  size_t logical_offset;
+  bool material;
+};
+
+struct NvidiaMaterialClassificationRow {
+  StorageKey key;
+  uint32_t allocation;
+  size_t status_offset;
+  size_t logical_elements;
+  double trivial_value;
+};
+
 class NvidiaBackendState : public BackendState {
 public:
   NvidiaBackendState(NvidiaBackend *owner, StoragePlan plan, int device, uint64_t state_token,
                      size_t initialization_reserve_bytes,
                      size_t initialization_compact_input_bytes,
-                     size_t initialization_staging_bytes)
+                     size_t initialization_staging_bytes,
+                     const std::vector<std::pair<StorageKey, size_t> >
+                         &classification_rows)
       : owner_(owner), plan_(plan), layout_(allocation_requests_for(plan_)), device_(device),
         state_token_(state_token), fingerprint_(storage_fingerprint(plan_)), initialized_(false),
         transfer_failed_(false),
@@ -578,12 +597,54 @@ public:
         cw_skip_source_evaluation_(false), cw_workspace_allocations_(0),
         material_geometry_compact_hash_(0),
         initialization_compact_input_bytes_(initialization_compact_input_bytes),
-        initialization_staging_bytes_(initialization_staging_bytes), noisy_seed_active_slot_(-1),
+        initialization_staging_bytes_(initialization_staging_bytes),
+        initialization_prepared_(false),
+        prepared_material_route_(MaterialRecipeDisposition::device_native),
+        prepared_recipe_signature_(0), prepared_material_rows_(0),
+        prepared_authoritative_arrays_(0),
+        prepared_compact_staging_offset_(0), prepared_status_staging_offset_(0),
+        prepared_result_staging_offset_(0), prepared_callback_scratch_offset_(0),
+        noisy_seed_active_slot_(-1),
         noisy_seed_staged_slot_(-1) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_, initialization_reserve_bytes));
     noisy_seed_slots_.allocate(2 * sizeof(nvidia::noisy_seed_block), device_);
+    if (initialization_staging_bytes_) staging_.allocate(initialization_staging_bytes_);
+    size_t status_bytes = 0;
+    for (size_t i = 0; i < plan_.arrays.size(); ++i)
+      if (plan_.arrays[i].role == array_role::material &&
+          !is_valid(plan_.arrays[i].alias_of)) {
+        NvidiaMaterialClassificationRow row;
+        row.key = plan_.keys[i];
+        row.allocation = uint32_t(i);
+        row.status_offset = status_bytes;
+        row.logical_elements = 0;
+        for (const std::pair<StorageKey, size_t> &candidate : classification_rows)
+          if (candidate.first == row.key) {
+            if (row.logical_elements)
+              throw std::invalid_argument(
+                  "duplicate NVIDIA logical material classification row");
+            row.logical_elements = candidate.second;
+          }
+        if (!row.logical_elements)
+          throw std::invalid_argument(
+              "NVIDIA material classification row has no logical span");
+        row.trivial_value = 0.0;
+        material_classification_rows_.push_back(row);
+        status_bytes = checked_add(status_bytes, row.logical_elements,
+                                   "allocating NVIDIA material status");
+      }
+    if (material_classification_rows_.size() > UINT32_MAX)
+      throw std::overflow_error("NVIDIA material classification row count overflows");
+    if (status_bytes) material_classification_status_.allocate(status_bytes, device_);
+    material_classification_result_bytes_ = checked_add(
+        sizeof(nvidia::material_classification_header),
+        checked_product(material_classification_rows_.size(),
+                        sizeof(nvidia::material_classification_row_result),
+                        "allocating NVIDIA classification rows"),
+        "allocating NVIDIA classification result");
+    material_classification_result_.allocate(material_classification_result_bytes_, device_);
   }
 
   ~NvidiaBackendState() override {}
@@ -642,6 +703,21 @@ public:
   uint64_t material_geometry_compact_hash_;
   size_t initialization_compact_input_bytes_;
   size_t initialization_staging_bytes_;
+  bool initialization_prepared_;
+  MaterialRecipeDisposition prepared_material_route_;
+  uint64_t prepared_recipe_signature_;
+  size_t prepared_material_rows_;
+  size_t prepared_authoritative_arrays_;
+  size_t prepared_compact_staging_offset_;
+  size_t prepared_status_staging_offset_;
+  size_t prepared_result_staging_offset_;
+  size_t prepared_callback_scratch_offset_;
+  std::vector<NvidiaInitializationUpload> initialization_uploads_;
+  std::vector<NvidiaMaterialClassificationRow> material_classification_rows_;
+  nvidia::device_buffer material_classification_status_;
+  nvidia::device_buffer material_classification_result_;
+  size_t material_classification_result_bytes_;
+  MaterialClassificationFacts material_classification_facts_;
   std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
   nvidia::device_buffer noisy_seed_slots_;
   int noisy_seed_active_slot_;
@@ -791,7 +867,8 @@ public:
                    const std::vector<NvidiaCompiledHostSegment> &host_segments,
                    size_t host_staging_bytes,
                    NvidiaBackendState &state)
-      : owner_(owner), state_token_(state_token), program_(program), signature_(signature),
+      : Executable(state.material_phase_active), owner_(owner), state_token_(state_token),
+        program_(program), signature_(signature),
         storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
         cylindrical_radial_prefixes_(cylindrical_radial_prefixes),
@@ -3642,7 +3719,8 @@ void set_reason(std::string &why, size_t operation, const char *detail) {
 NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int selected_device)
     : f_(f), options_(options), device_(selected_device), device_memory_bytes_(0),
       next_state_token_(1), pending_initialization_reserve_bytes_(0),
-      pending_initialization_compact_bytes_(0), pending_initialization_native_(false),
+      pending_initialization_compact_bytes_(0), pending_initialization_scratch_bytes_(0),
+      pending_initialization_route_(MaterialRecipeDisposition::device_native),
       pending_initialization_reserve_valid_(false) {
   if (device_ < 0) throw std::invalid_argument("NVIDIA backend requires a resolved device ID");
   device_memory_bytes_ = nvidia::properties_for_device(device_).total_memory;
@@ -3654,18 +3732,131 @@ namespace {
 void preflight_native_table_ir(const MaterialIR &ir);
 void preflight_geometry_ir(const MaterialIR &ir);
 size_t exact_material_compact_input_bytes(const MaterialIR &ir);
+
+std::vector<std::pair<StorageKey, size_t> >
+logical_material_classification_rows(const MaterialRecipe &recipe) {
+  std::vector<std::pair<StorageKey, size_t> > result;
+  const MaterialIR *const ir = recipe.ir().get();
+  std::vector<MaterialIRTopologyRow> rows;
+  if (ir)
+    rows = ir->topology;
+  else {
+    rows.reserve(recipe.rows().size() + recipe.topology().size());
+    for (const MaterialRecipeRow &row : recipe.rows()) {
+      MaterialIRTopologyRow topology = {};
+      topology.key = row.key;
+      topology.element_type = row.element_type;
+      topology.logical_storage = row.storage;
+      topology.elements = row.elements;
+      topology.alignment = row.alignment;
+      rows.push_back(topology);
+    }
+    rows.insert(rows.end(), recipe.topology().begin(), recipe.topology().end());
+  }
+  result.reserve(rows.size());
+  for (const MaterialIRTopologyRow &row : rows) {
+    size_t logical_elements = 0;
+    if (ir) {
+      const array_kind kind = static_cast<array_kind>(row.key.kind);
+      if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+          kind == array_kind::pml_siginv) {
+        size_t matches = 0;
+        for (const MaterialIRPmlAxis &axis : ir->pml_axes)
+          if (axis.chunk == row.key.chunk && uint64_t(axis.direction) == row.key.aux) {
+            logical_elements = axis.elements;
+            ++matches;
+          }
+        if (matches != 1)
+          throw std::invalid_argument(
+              "NVIDIA PML classification row has ambiguous logical extent");
+      }
+      else {
+        size_t matches = 0;
+        for (const MaterialIRDestination &destination : ir->destinations)
+          if (destination.key == row.key) {
+            if (destination.point_count > uint64_t(std::numeric_limits<size_t>::max()))
+              throw std::overflow_error(
+                  "NVIDIA material classification logical extent overflows size_t");
+            logical_elements = size_t(destination.point_count);
+            ++matches;
+          }
+        if (matches != 1)
+          throw std::invalid_argument(
+              "NVIDIA material classification row has ambiguous logical destination");
+      }
+    }
+    else
+      logical_elements = row.elements;
+    if (!logical_elements || logical_elements > row.elements)
+      throw std::invalid_argument(
+          "NVIDIA material classification logical span exceeds physical storage");
+    result.push_back(std::make_pair(row.key, logical_elements));
+  }
+  return result;
+}
+
+size_t logical_material_classification_elements(const MaterialIR &ir,
+                                                const StorageKey &key) {
+  const array_kind kind = static_cast<array_kind>(key.kind);
+  if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+      kind == array_kind::pml_siginv) {
+    for (const MaterialIRPmlAxis &axis : ir.pml_axes)
+      if (axis.chunk == key.chunk && uint64_t(axis.direction) == key.aux)
+        return axis.elements;
+  }
+  else
+    for (const MaterialIRDestination &destination : ir.destinations)
+      if (destination.key == key) {
+        if (destination.point_count > uint64_t(std::numeric_limits<size_t>::max()))
+          throw std::overflow_error(
+              "NVIDIA material classification logical extent overflows size_t");
+        return size_t(destination.point_count);
+      }
+  throw std::invalid_argument(
+      "NVIDIA material classification has no logical span for storage key");
+}
+
+size_t logical_material_storage_index(const MaterialRecipe &recipe,
+                                      const StorageKey &key, size_t point) {
+  const MaterialIR *const ir = recipe.ir().get();
+  if (!ir) return point;
+  const array_kind kind = static_cast<array_kind>(key.kind);
+  if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+      kind == array_kind::pml_siginv)
+    return point;
+  const MaterialIRDestination *match = NULL;
+  for (const MaterialIRDestination &destination : ir->destinations)
+    if (destination.key == key) {
+      if (match)
+        throw std::invalid_argument(
+            "NVIDIA material classification has an ambiguous logical destination");
+      match = &destination;
+    }
+  if (!match)
+    throw std::invalid_argument(
+        "NVIDIA material classification has no logical destination");
+  return material_ir_destination_storage_index(*ir, *match, point);
+}
 }
 
 void NvidiaBackend::preflight_initialization(const InitializationPlan &initialization) const {
   pending_initialization_reserve_valid_ = false;
   pending_initialization_reserve_bytes_ = 0;
   pending_initialization_compact_bytes_ = 0;
-  pending_initialization_native_ = false;
+  pending_initialization_scratch_bytes_ = 0;
+  pending_initialization_classification_rows_.clear();
+  pending_initialization_route_ = MaterialRecipeDisposition::device_native;
   if (initialization.materials.size() != 1)
     throw std::invalid_argument("NVIDIA initialization requires one frozen material recipe");
   const MaterialRecipe &recipe = initialization.materials[0];
   validate_material_recipe(recipe);
+  pending_initialization_classification_rows_ =
+      logical_material_classification_rows(recipe);
   const MaterialSupportDecision support = classify_material_support(recipe);
+  pending_initialization_route_ = recipe.disposition();
+  if (support.scratch_bytes > uint64_t(std::numeric_limits<size_t>::max()))
+    throw std::overflow_error("NVIDIA initialization callback scratch budget overflows size_t");
+  pending_initialization_scratch_bytes_ = size_t(support.scratch_bytes);
   if (support.compact_input_bytes > uint64_t(std::numeric_limits<size_t>::max()))
     throw std::overflow_error("NVIDIA initialization compact-input budget overflows size_t");
   size_t compact_bytes = 0;
@@ -3688,6 +3879,12 @@ void NvidiaBackend::preflight_initialization(const InitializationPlan &initializ
         "NVIDIA material IR differs from the live canonical owned snapshot");
   if (ir.default_material >= ir.materials.size())
     throw std::invalid_argument("NVIDIA native material root is absent");
+  if (pending_initialization_classification_rows_.empty()) {
+    pending_initialization_reserve_bytes_ = fixed_bytes;
+    pending_initialization_compact_bytes_ = 0;
+    pending_initialization_reserve_valid_ = true;
+    return;
+  }
   const int kind = ir.materials[ir.default_material].kind;
   if (kind != meep_geom::material_data::MEDIUM &&
       kind != meep_geom::material_data::PERFECT_METAL &&
@@ -3698,12 +3895,13 @@ void NvidiaBackend::preflight_initialization(const InitializationPlan &initializ
     preflight_native_table_ir(ir);
   else
     preflight_geometry_ir(ir);
-  compact_bytes = exact_material_compact_input_bytes(ir);
+  compact_bytes = pending_initialization_classification_rows_.empty()
+                      ? 0
+                      : exact_material_compact_input_bytes(ir);
   if (compact_bytes > std::numeric_limits<size_t>::max() - fixed_bytes)
     throw std::overflow_error("NVIDIA initialization auxiliary-memory budget overflows");
   pending_initialization_reserve_bytes_ = compact_bytes + fixed_bytes;
   pending_initialization_compact_bytes_ = compact_bytes;
-  pending_initialization_native_ = true;
   pending_initialization_reserve_valid_ = true;
 }
 
@@ -3926,6 +4124,58 @@ SymmetricMaterialTensor inverse_owned_tensor(const OwnedMediumView &medium, fiel
       if (!std::isfinite(result.value[i][j]))
         throw std::invalid_argument("NVIDIA homogeneous tensor inverse is non-finite");
   return result;
+}
+
+SymmetricMaterialTensor inverse_callback_tensor(const meep_geom::medium_struct &medium,
+                                                field_type ft) {
+  const vector3 &diagonal = ft == E_stuff ? medium.epsilon_diag : medium.mu_diag;
+  const cvector3 &offdiagonal = ft == E_stuff ? medium.epsilon_offdiag : medium.mu_offdiag;
+  if (offdiagonal.x.im != 0.0 || offdiagonal.y.im != 0.0 || offdiagonal.z.im != 0.0)
+    throw std::invalid_argument(
+        "owned tiled material callback returned an imaginary tensor offdiagonal");
+  const double m00 = diagonal.x, m11 = diagonal.y, m22 = diagonal.z;
+  const double m01 = offdiagonal.x.re, m02 = offdiagonal.y.re, m12 = offdiagonal.z.re;
+  SymmetricMaterialTensor result = {};
+  const bool diagonal_tensor = m01 == 0.0 && m02 == 0.0 && m12 == 0.0;
+  if (diagonal_tensor) {
+    result.value[0][0] = 1.0 / m00;
+    result.value[1][1] = 1.0 / m11;
+    result.value[2][2] = 1.0 / m22;
+  }
+  else {
+    double determinant = m00 * m11 * m22 - m02 * m11 * m02 +
+                         2.0 * m01 * m12 * m02 - m01 * m01 * m22 -
+                         m12 * m12 * m00;
+    if (determinant == 0.0)
+      throw std::invalid_argument("owned tiled material callback returned a singular tensor");
+    const double detinv = 1.0 / determinant;
+    result.value[0][0] = detinv * (m11 * m22 - m12 * m12);
+    result.value[1][1] = detinv * (m00 * m22 - m02 * m02);
+    result.value[2][2] = detinv * (m11 * m00 - m01 * m01);
+    result.value[0][2] = result.value[2][0] = detinv * (m01 * m12 - m11 * m02);
+    result.value[0][1] = result.value[1][0] = detinv * (m12 * m02 - m01 * m22);
+    result.value[1][2] = result.value[2][1] = detinv * (m01 * m02 - m00 * m12);
+  }
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+      if (!std::isfinite(result.value[i][j]))
+        throw std::invalid_argument(
+            "owned tiled material callback returned a non-finite tensor inverse");
+  return result;
+}
+
+bool zero_vector3(const vector3 &value) {
+  return value.x == 0.0 && value.y == 0.0 && value.z == 0.0;
+}
+
+void validate_tiled_callback_output(const meep_geom::medium_struct &medium) {
+  if (!medium.E_susceptibilities.empty() || !medium.H_susceptibilities.empty() ||
+      !zero_vector3(medium.E_chi2_diag) || !zero_vector3(medium.E_chi3_diag) ||
+      !zero_vector3(medium.H_chi2_diag) || !zero_vector3(medium.H_chi3_diag) ||
+      !zero_vector3(medium.D_conductivity_diag) ||
+      !zero_vector3(medium.B_conductivity_diag))
+    throw std::invalid_argument(
+        "owned tiled material callback returned an undeclared output family");
 }
 
 int material_tensor_column(component c, int encoded_direction) {
@@ -4716,8 +4966,10 @@ double default_material_row_value(const StorageKey &key) {
     return component_direction(c) == direction(key.aux) ? 1.0 : 0.0;
   }
   if (kind == array_kind::chi2 || kind == array_kind::chi3 ||
-      kind == array_kind::conductivity || kind == array_kind::sigma)
+      kind == array_kind::conductivity || kind == array_kind::sigma ||
+      kind == array_kind::pml_sig)
     return 0.0;
+  if (kind == array_kind::pml_kap || kind == array_kind::pml_siginv) return 1.0;
   throw std::invalid_argument("NVIDIA material default initializer received an unsupported row");
 }
 
@@ -4982,6 +5234,7 @@ bool same_geometry_common(nvidia::geometry_launch_common left,
       left.dimensions != right.dimensions || left.component != right.component ||
       left.tensor_row != right.tensor_row || left.tensor_column != right.tensor_column ||
       left.property != right.property || left.inva != right.inva || left.dt != right.dt ||
+      left.trivial_value != right.trivial_value ||
       left.logical_single != right.logical_single || left.precision != right.precision)
     return false;
   for (int axis = 0; axis < 3; ++axis)
@@ -5011,6 +5264,7 @@ nvidia::geometry_launch_common geometry_common_for(
   const component c = component(destination.component);
   nvidia::geometry_launch_common common = {};
   common.destination = state.arenas_->resolve(id.value).address;
+  common.classification = NULL;
   common.object_offset = object_offset;
   common.object_count = object_count;
   common.image_offset = image_offset;
@@ -5058,6 +5312,7 @@ nvidia::geometry_launch_common geometry_common_for(
   for (int i = 0; i < 9; ++i) common.metric[i] = ir.lattice_metric[i];
   common.inva = chunk.inva;
   common.dt = dt;
+  common.trivial_value = default_material_row_value(destination.key);
   common.logical_single = sizeof(realnum) == sizeof(float);
   common.precision = scalar_precision_for(state.plan_, id, "NVIDIA geometry destination");
   return common;
@@ -5541,6 +5796,19 @@ void validate_all_material_geometry_authority(const MaterialIR &ir,
     throw std::invalid_argument("NVIDIA geometry launch authority count is stale");
 }
 
+void clear_material_initialization_launches(NvidiaBackendState &state) {
+  state.material_fill_launches_.clear();
+  state.material_table_launches_.clear();
+  state.material_table_authorities_.clear();
+  state.material_conductivity_launches_.clear();
+  state.material_pml_launches_.clear();
+  state.material_geometry_bulk_launches_.clear();
+  state.material_geometry_analytic_launches_.clear();
+  state.material_geometry_patch_launches_.clear();
+  state.material_geometry_authorities_.clear();
+  state.material_geometry_compact_hash_ = 0;
+}
+
 void compile_device_native_material_initialization(const MaterialRecipe &recipe,
                                                    NvidiaBackendState &state, const fields &f,
                                                    double dt,
@@ -5579,17 +5847,7 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
   std::unique_ptr<OwnedMediumView> table_medium_1, table_medium_2;
   size_t table_header_offset = size_t(-1);
 
-  state.material_fill_launches_.clear();
-  state.material_table_launches_.clear();
-  state.material_table_authorities_.clear();
-  state.material_conductivity_launches_.clear();
-  state.material_pml_launches_.clear();
-  state.material_geometry_bulk_launches_.clear();
-  state.material_geometry_analytic_launches_.clear();
-  state.material_geometry_patch_launches_.clear();
-  state.material_geometry_authorities_.clear();
-  state.material_geometry_compact_hash_ = 0;
-  state.material_ir_inputs_.reset();
+  clear_material_initialization_launches(state);
   compact = MaterialCompactPack();
   if (ir.topology.empty()) return;
   std::set<uint32_t> destinations;
@@ -5688,9 +5946,14 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     const ArrayId id = find_storage_key(state.plan_, row_spec.key);
     nvidia::material_fill_launch launch;
     launch.destination = state.arenas_->resolve(id.value).address;
+    launch.classification = NULL;
     launch.elements = state.plan_.arrays[id.value].elements;
+    launch.classification_elements =
+        logical_material_classification_elements(ir, row_spec.key);
     launch.value = default_material_row_value(row_spec.key);
+    launch.trivial_value = default_material_row_value(row_spec.key);
     launch.phase = 0;
+    launch.logical_single = sizeof(realnum) == sizeof(float);
     launch.precision = scalar_precision_for(state.plan_, id, "NVIDIA material destination");
     state.material_fill_launches_.push_back(launch);
   }
@@ -5763,9 +6026,14 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       const ArrayId id = find_storage_key(state.plan_, row_spec.key);
       nvidia::material_fill_launch launch;
       launch.destination = state.arenas_->resolve(id.value).address;
+      launch.classification = NULL;
       launch.elements = state.plan_.arrays[id.value].elements;
+      launch.classification_elements =
+          logical_material_classification_elements(ir, row_spec.key);
       launch.value = homogeneous_row_value(ir, medium.get(), tensors, row_spec.key, dt);
+      launch.trivial_value = default_material_row_value(row_spec.key);
       launch.phase = uint32_t(phase);
+      launch.logical_single = sizeof(realnum) == sizeof(float);
       launch.precision = scalar_precision_for(state.plan_, id, "NVIDIA material destination");
       state.material_fill_launches_.push_back(launch);
       }
@@ -5791,6 +6059,8 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       nvidia::material_conductivity_launch launch = {};
       launch.conductivity_destination = state.arenas_->resolve(conductivity.value).address;
       launch.condinv_destination = state.arenas_->resolve(inverse.value).address;
+      launch.conductivity_classification = NULL;
+      launch.condinv_classification = NULL;
       launch.compact_inputs = NULL;
       launch.compact_input_bytes = compact.bytes.size();
       launch.absorber_header_offset = compact.absorber_header_offset;
@@ -5838,6 +6108,8 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       const ArrayId destination = find_storage_key(state.plan_, row_spec.key);
       nvidia::material_table_launch launch = {};
       launch.destination = state.arenas_->resolve(destination.value).address;
+      launch.classification = NULL;
+      launch.secondary_classification = NULL;
       launch.compact_inputs = NULL;
       launch.compact_input_bytes = compact.bytes.size();
       launch.table_header_offset = table_header_offset;
@@ -5880,6 +6152,8 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
       launch.inva = chunk.inva;
       launch.dt = dt;
       launch.logical_single = sizeof(realnum) == sizeof(float);
+      launch.trivial_value = default_material_row_value(row_spec.key);
+      launch.secondary_trivial_value = 1.0;
       launch.precision =
           scalar_precision_for(state.plan_, destination, "NVIDIA material table destination");
       return launch;
@@ -6031,6 +6305,9 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
     launch.sigma_destination = state.arenas_->resolve(sig.value).address;
     launch.kappa_destination = state.arenas_->resolve(kap.value).address;
     launch.sigma_inv_destination = state.arenas_->resolve(inv.value).address;
+    launch.sigma_classification = NULL;
+    launch.kappa_classification = NULL;
+    launch.sigma_inv_classification = NULL;
     launch.compact_inputs = NULL;
     launch.compact_input_bytes = compact.bytes.size();
     launch.profile_offset = axis.profile_active ? pml_profile_offsets[pml_axis_index] : 0;
@@ -6166,59 +6443,129 @@ void compile_device_native_material_initialization(const MaterialRecipe &recipe,
                                                   compact.absorber_header_offset,
                                                   absorber_headers.size());
     validate_all_material_geometry_authority(ir, state, compact, dt, false);
-    if (input_bytes > nvidia::free_memory_for_device(state.device_))
-      throw std::runtime_error("NVIDIA material compact input exceeds available device memory");
-    if (nvidia::testing::consume_failure_for_testing(
-            nvidia::testing::failure_point::material_compact_allocate))
-      throw std::runtime_error("injected NVIDIA material compact allocation failure");
-    state.material_ir_inputs_.allocate(input_bytes, state.device_);
-    const unsigned char *base = static_cast<const unsigned char *>(
-        state.material_ir_inputs_.opaque_handle());
-    for (nvidia::material_table_launch &launch : state.material_table_launches_) {
-      launch.compact_inputs = base;
-      launch.compact_input_bytes = input_bytes;
-    }
-    for (nvidia::material_conductivity_launch &launch :
-         state.material_conductivity_launches_) {
-      launch.compact_inputs = base;
-      launch.compact_input_bytes = input_bytes;
-    }
-    for (nvidia::material_pml_launch &launch : state.material_pml_launches_) {
-      launch.compact_inputs = base;
-      launch.compact_input_bytes = input_bytes;
-    }
-    for (nvidia::geometry_bulk_launch &launch : state.material_geometry_bulk_launches_) {
-      launch.common.compact_inputs = base;
-      launch.common.compact_input_bytes = input_bytes;
-    }
-    for (nvidia::geometry_analytic_launch &launch :
-         state.material_geometry_analytic_launches_) {
-      launch.common.compact_inputs = base;
-      launch.common.compact_input_bytes = input_bytes;
-    }
-    for (nvidia::geometry_patch_launch &launch : state.material_geometry_patch_launches_) {
-      launch.common.compact_inputs = base;
-      launch.common.compact_input_bytes = input_bytes;
-    }
   }
 }
 
-size_t exact_initialization_staging_bytes(const StoragePlan &plan, bool native_material,
-                                          size_t compact_input_bytes) {
+void bind_material_compact_inputs(NvidiaBackendState &state, size_t input_bytes) {
+  if (!input_bytes) {
+    state.material_ir_inputs_.reset();
+    return;
+  }
+  if (input_bytes > nvidia::free_memory_for_device(state.device_))
+    throw std::runtime_error("NVIDIA material compact input exceeds available device memory");
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::material_compact_allocate))
+    throw std::runtime_error("injected NVIDIA material compact allocation failure");
+  state.material_ir_inputs_.allocate(input_bytes, state.device_);
+  const unsigned char *base = static_cast<const unsigned char *>(
+      state.material_ir_inputs_.opaque_handle());
+  for (nvidia::material_table_launch &launch : state.material_table_launches_) {
+    launch.compact_inputs = base;
+    launch.compact_input_bytes = input_bytes;
+  }
+  for (nvidia::material_conductivity_launch &launch : state.material_conductivity_launches_) {
+    launch.compact_inputs = base;
+    launch.compact_input_bytes = input_bytes;
+  }
+  for (nvidia::material_pml_launch &launch : state.material_pml_launches_) {
+    launch.compact_inputs = base;
+    launch.compact_input_bytes = input_bytes;
+  }
+  for (nvidia::geometry_bulk_launch &launch : state.material_geometry_bulk_launches_) {
+    launch.common.compact_inputs = base;
+    launch.common.compact_input_bytes = input_bytes;
+  }
+  for (nvidia::geometry_analytic_launch &launch : state.material_geometry_analytic_launches_) {
+    launch.common.compact_inputs = base;
+    launch.common.compact_input_bytes = input_bytes;
+  }
+  for (nvidia::geometry_patch_launch &launch : state.material_geometry_patch_launches_) {
+    launch.common.compact_inputs = base;
+    launch.common.compact_input_bytes = input_bytes;
+  }
+}
+
+void bind_material_classification(NvidiaBackendState &state) {
+  unsigned char *const base = static_cast<unsigned char *>(
+      state.material_classification_status_.opaque_handle());
+  const auto status_for_destination = [&](const void *destination) -> unsigned char * {
+    for (const NvidiaMaterialClassificationRow &row : state.material_classification_rows_)
+      if (state.arenas_->resolve(row.allocation).address == destination)
+        return base + row.status_offset;
+    throw std::logic_error("NVIDIA material writer has no classification row");
+  };
+  for (nvidia::material_fill_launch &launch : state.material_fill_launches_)
+    launch.classification = status_for_destination(launch.destination);
+  for (nvidia::material_table_launch &launch : state.material_table_launches_) {
+    launch.classification = status_for_destination(launch.destination);
+    if (launch.secondary_destination)
+      launch.secondary_classification = status_for_destination(launch.secondary_destination);
+  }
+  for (nvidia::material_conductivity_launch &launch : state.material_conductivity_launches_) {
+    launch.conductivity_classification =
+        status_for_destination(launch.conductivity_destination);
+    launch.condinv_classification = status_for_destination(launch.condinv_destination);
+  }
+  for (nvidia::material_pml_launch &launch : state.material_pml_launches_) {
+    launch.sigma_classification = status_for_destination(launch.sigma_destination);
+    launch.kappa_classification = status_for_destination(launch.kappa_destination);
+    launch.sigma_inv_classification = status_for_destination(launch.sigma_inv_destination);
+  }
+  for (nvidia::geometry_bulk_launch &launch : state.material_geometry_bulk_launches_)
+    launch.common.classification = status_for_destination(launch.common.destination);
+  for (nvidia::geometry_analytic_launch &launch : state.material_geometry_analytic_launches_)
+    launch.common.classification = status_for_destination(launch.common.destination);
+  for (nvidia::geometry_patch_launch &launch : state.material_geometry_patch_launches_)
+    launch.common.classification = status_for_destination(launch.common.destination);
+}
+
+size_t exact_initialization_staging_bytes(const StoragePlan &plan,
+                                          MaterialRecipeDisposition route,
+                                          size_t compact_input_bytes,
+                                          size_t callback_scratch_bytes,
+                                          size_t material_status_bytes,
+                                          size_t material_rows) {
   size_t bytes = 0;
+  size_t descriptors = 0;
+  const bool native_material = route == MaterialRecipeDisposition::device_native ||
+                               route == MaterialRecipeDisposition::hybrid_interface;
   for (const ArraySpec &spec : plan.arrays) {
     if (is_valid(spec.alias_of) || (native_material && spec.role == array_role::material))
       continue;
     const size_t array_bytes = storage_bytes(spec);
-    if (native_material)
-      bytes = material_checked_add(bytes, array_bytes,
-                                   "sizing NVIDIA initialization staging");
-    else
-      bytes = std::max(bytes, array_bytes);
+    bytes = material_checked_add(bytes, array_bytes,
+                                 "sizing NVIDIA initialization staging");
+    ++descriptors;
   }
+  if (!native_material)
+    for (const ArraySpec &spec : plan.arrays)
+      if (!is_valid(spec.alias_of) && spec.role == array_role::material)
+        bytes = material_checked_add(
+            bytes,
+            material_checked_product(spec.elements, sizeof(realnum),
+                                     "sizing NVIDIA logical material staging"),
+            "sizing NVIDIA logical material staging");
+  bytes = material_checked_add(bytes, material_status_bytes,
+                               "sizing NVIDIA material classification status");
+  const size_t result_bytes = material_checked_add(
+      sizeof(nvidia::material_classification_header),
+      material_checked_product(material_rows,
+                               sizeof(nvidia::material_classification_row_result),
+                               "sizing NVIDIA material classification rows"),
+      "sizing NVIDIA material classification result");
+  bytes = material_compact_append_extent(
+      bytes, result_bytes, alignof(nvidia::material_classification_row_result),
+      "sizing aligned NVIDIA material classification result");
   if (native_material)
     bytes = material_checked_add(bytes, compact_input_bytes,
                                  "sizing NVIDIA compact-input staging");
+  bytes = material_checked_add(bytes, callback_scratch_bytes,
+                               "sizing NVIDIA callback scratch");
+  bytes = material_checked_add(
+      bytes,
+      material_checked_product(descriptors, sizeof(NvidiaInitializationUpload),
+                               "sizing NVIDIA initialization descriptors"),
+      "sizing NVIDIA initialization descriptors");
   return bytes;
 }
 
@@ -6236,16 +6583,43 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
     if (next_state_token_ == 0)
       throw std::overflow_error("NVIDIA backend state token overflow");
     const nvidia::arena_plan layout(allocation_requests_for(device_plan));
-    const size_t device_reserve_bytes = pending_initialization_reserve_valid_
-                                            ? pending_initialization_reserve_bytes_
-                                            : 2 * sizeof(nvidia::noisy_seed_block);
+    size_t classification_status_bytes = 0;
+    for (const std::pair<StorageKey, size_t> &row :
+         pending_initialization_classification_rows_)
+      classification_status_bytes = material_checked_add(
+          classification_status_bytes, row.second,
+          "sizing NVIDIA device material classification status");
+    size_t material_rows = 0;
+    for (const ArraySpec &spec : device_plan.arrays)
+      if (!is_valid(spec.alias_of) && spec.role == array_role::material) ++material_rows;
+    if (material_rows != pending_initialization_classification_rows_.size())
+      throw std::logic_error(
+          "NVIDIA material classification preflight row count changed");
+    size_t classification_device_bytes = material_checked_add(
+        classification_status_bytes,
+        material_checked_add(
+            sizeof(nvidia::material_classification_header),
+            material_checked_product(material_rows,
+                                     sizeof(nvidia::material_classification_row_result),
+                                     "sizing NVIDIA device material classification rows"),
+            "sizing NVIDIA device material classification result"),
+        "sizing NVIDIA device material classification buffers");
+    const size_t base_reserve_bytes = pending_initialization_reserve_valid_
+                                          ? pending_initialization_reserve_bytes_
+                                          : 2 * sizeof(nvidia::noisy_seed_block);
+    const size_t device_reserve_bytes = material_checked_add(
+        base_reserve_bytes, classification_device_bytes,
+        "sizing NVIDIA initialization classification reserve");
     const size_t compact_input_bytes = pending_initialization_reserve_valid_
                                            ? pending_initialization_compact_bytes_
                                            : 0;
-    const bool native_material = pending_initialization_reserve_valid_ &&
-                                 pending_initialization_native_;
+    const MaterialRecipeDisposition route = pending_initialization_reserve_valid_
+                                                ? pending_initialization_route_
+                                                : MaterialRecipeDisposition::host_reference;
     const size_t staging_bytes = exact_initialization_staging_bytes(
-        device_plan, native_material, compact_input_bytes);
+        device_plan, route, compact_input_bytes,
+        pending_initialization_reserve_valid_ ? pending_initialization_scratch_bytes_ : 0,
+        classification_status_bytes, material_rows);
     if (device_reserve_bytes >
         std::numeric_limits<size_t>::max() - layout.total_reserved_bytes())
       throw std::overflow_error("NVIDIA initialization peak-memory admission overflows");
@@ -6267,7 +6641,8 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
     }
     state.reset(new NvidiaBackendState(this, device_plan, device_, next_state_token_++,
                                        device_reserve_bytes, compact_input_bytes,
-                                       staging_bytes));
+                                       staging_bytes,
+                                       pending_initialization_classification_rows_));
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -6283,222 +6658,412 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
   pending_initialization_reserve_valid_ = false;
   pending_initialization_reserve_bytes_ = 0;
   pending_initialization_compact_bytes_ = 0;
-  pending_initialization_native_ = false;
+  pending_initialization_scratch_bytes_ = 0;
+  pending_initialization_classification_rows_.clear();
+  pending_initialization_route_ = MaterialRecipeDisposition::device_native;
   return state.release();
+}
+
+void NvidiaBackend::prepare_initialization(const InitializationPlan &initialization,
+                                           BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  state.initialization_prepared_ = false;
+  state.initialization_uploads_.clear();
+  state.prepared_material_rows_ = 0;
+  state.prepared_compact_staging_offset_ = 0;
+  state.prepared_callback_scratch_offset_ = 0;
+  state.material_initialization_statistics_ = NvidiaMaterialInitializationStatistics();
+  if (state.transfer_failed_)
+    throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
+  if (state.device_authoritative_)
+    throw std::logic_error(
+        "cannot prepare NVIDIA storage from a stale host mirror after device stepping");
+  if (!f_.array_catalog)
+    throw std::logic_error("NVIDIA initialization requires a prepared CPU catalog");
+  if (initialization.materials.size() != 1)
+    throw std::logic_error("NVIDIA initialization requires one frozen material recipe");
+  const MaterialRecipe &material = initialization.materials[0];
+  validate_material_recipe(material);
+  const MaterialSupportDecision support = classify_material_support(material);
+  if (material.disposition() != MaterialRecipeDisposition::device_native &&
+      material.disposition() != MaterialRecipeDisposition::hybrid_interface &&
+      material.disposition() != MaterialRecipeDisposition::host_reference &&
+      material.disposition() != MaterialRecipeDisposition::tiled_callback)
+    throw std::invalid_argument("NVIDIA initialization received an unsupported route");
+  const bool native_material =
+      material.disposition() == MaterialRecipeDisposition::device_native ||
+      material.disposition() == MaterialRecipeDisposition::hybrid_interface;
+  const CpuArrayCatalog &catalog = *f_.array_catalog;
+  if (catalog.size() > state.plan_.arrays.size())
+    throw std::logic_error("CPU catalog exceeds the provisional NVIDIA storage plan");
+  state.prepared_authoritative_arrays_ = catalog.size();
+
+  MaterialCompactPack compact_inputs;
+  if (native_material && !state.material_classification_rows_.empty())
+    compile_device_native_material_initialization(material, state, f_, double(f_.dt),
+                                                  compact_inputs);
+  else
+    clear_material_initialization_launches(state);
+  if (compact_inputs.bytes.size() != state.initialization_compact_input_bytes_)
+    throw std::logic_error(
+        "NVIDIA material compact-input size differs from pre-allocation admission");
+
+  size_t cursor = 0;
+  for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
+    const ArraySpec &device_spec = state.plan_.arrays[i];
+    if (i < catalog.size()) {
+      const ArraySpec &host_spec = catalog.spec(ArrayId{uint32_t(i)});
+      if (host_spec.id != device_spec.id || host_spec.role != device_spec.role ||
+          host_spec.element_type != device_spec.element_type ||
+          host_spec.elements != device_spec.elements || host_spec.alias_of != device_spec.alias_of)
+        throw std::logic_error("CPU catalog no longer matches the NVIDIA storage plan");
+    }
+    else if (device_spec.role != array_role::material ||
+             !device_spec.classification_provisional || is_valid(device_spec.alias_of))
+      throw std::logic_error("NVIDIA provisional suffix is not an owned material row");
+    if (is_valid(device_spec.alias_of)) {
+      if (catalog.resolve_untyped(device_spec.id) != catalog.resolve_untyped(device_spec.alias_of))
+        throw std::logic_error("NVIDIA storage alias does not match the CPU catalog alias");
+      continue;
+    }
+    if (native_material && device_spec.role == array_role::material) continue;
+    const size_t bytes = storage_bytes(device_spec);
+    state.initialization_uploads_.push_back(
+        NvidiaInitializationUpload{device_spec.id.value, bytes, cursor, size_t(-1),
+                                   device_spec.role == array_role::material});
+    cursor = material_checked_add(cursor, bytes, "laying out NVIDIA initialization uploads");
+  }
+  state.prepared_compact_staging_offset_ = cursor;
+  cursor = material_checked_add(cursor, compact_inputs.bytes.size(),
+                                "laying out NVIDIA compact input staging");
+  if (!native_material)
+    for (NvidiaInitializationUpload &upload : state.initialization_uploads_)
+      if (upload.material) {
+        upload.logical_offset = cursor;
+        const ArraySpec &spec = state.plan_.arrays[upload.allocation];
+        cursor = material_checked_add(
+            cursor,
+            material_checked_product(spec.elements, sizeof(realnum),
+                                     "laying out NVIDIA logical material output"),
+            "laying out NVIDIA logical material output");
+      }
+  state.prepared_status_staging_offset_ = cursor;
+  size_t classification_status_bytes = 0;
+  for (NvidiaMaterialClassificationRow &row : state.material_classification_rows_) {
+    row.trivial_value = default_material_row_value(row.key);
+    classification_status_bytes = material_checked_add(
+        classification_status_bytes, row.logical_elements,
+        "laying out NVIDIA classification status");
+  }
+  cursor = material_checked_add(cursor, classification_status_bytes,
+                                "laying out NVIDIA classification status");
+  cursor = material_compact_append_extent(
+      cursor, state.material_classification_result_bytes_,
+      alignof(nvidia::material_classification_row_result),
+      "laying out aligned NVIDIA classification result",
+      &state.prepared_result_staging_offset_);
+  state.prepared_callback_scratch_offset_ = cursor;
+  cursor = material_checked_add(cursor, size_t(support.scratch_bytes),
+                                "laying out NVIDIA callback scratch");
+  cursor = material_checked_add(
+      cursor,
+      material_checked_product(state.initialization_uploads_.size(),
+                               sizeof(NvidiaInitializationUpload),
+                               "laying out NVIDIA initialization descriptors"),
+      "laying out NVIDIA initialization descriptors");
+  if (cursor != state.initialization_staging_bytes_ || state.staging_.size() != cursor)
+    throw std::logic_error(
+        "NVIDIA initialization staging differs from pre-allocation admission");
+
+  unsigned char *const staging = static_cast<unsigned char *>(state.staging_.data());
+  for (const NvidiaInitializationUpload &upload : state.initialization_uploads_) {
+    const ArraySpec &spec = state.plan_.arrays[upload.allocation];
+    if (!upload.material) {
+      const void *source = catalog.resolve_untyped(spec.id);
+      if (!source) throw std::logic_error("CPU catalog contains a null canonical allocation");
+      host_to_storage(staging + upload.staging_offset, source, spec, spec.elements);
+      continue;
+    }
+    if (upload.logical_offset == size_t(-1))
+      throw std::logic_error("NVIDIA material upload has no logical staging span");
+    const MaterialRecipeRow *row = NULL;
+    const MaterialRecipeRow *primary = NULL;
+    const MaterialIRTopologyRow *topology = NULL;
+    for (const MaterialRecipeRow &candidate : material.dense_fallback_rows())
+      if (candidate.key == state.plan_.keys[upload.allocation]) row = &candidate;
+    for (const MaterialRecipeRow &candidate : material.rows())
+      if (candidate.key == state.plan_.keys[upload.allocation]) primary = &candidate;
+    for (const MaterialIRTopologyRow &candidate : material.topology())
+      if (candidate.key == state.plan_.keys[upload.allocation]) topology = &candidate;
+    const bool row_matches = row && row->role == spec.role &&
+                             row->element_type == spec.element_type &&
+                             row->elements == spec.elements && row->alignment == spec.alignment;
+    const bool topology_matches = topology && spec.role == array_role::material &&
+                                  topology->element_type == spec.element_type &&
+                                  topology->elements == spec.elements &&
+                                  topology->alignment == spec.alignment;
+    const bool primary_matches = primary && primary->role == spec.role &&
+                                 primary->element_type == spec.element_type &&
+                                 primary->elements == spec.elements &&
+                                 primary->alignment == spec.alignment;
+    if ((material.disposition() == MaterialRecipeDisposition::host_reference &&
+         !row_matches) ||
+        (material.disposition() == MaterialRecipeDisposition::tiled_callback &&
+         !topology_matches && !primary_matches)) {
+      std::ostringstream message;
+      message << "material recipe row no longer matches device storage (route="
+              << material_recipe_disposition_name(material.disposition())
+              << ", id=" << upload.allocation << ", chunk="
+              << state.plan_.keys[upload.allocation].chunk << ", kind="
+              << state.plan_.keys[upload.allocation].kind << ", component="
+              << state.plan_.keys[upload.allocation].component_ << ", cmp="
+              << state.plan_.keys[upload.allocation].cmp << ", aux="
+              << state.plan_.keys[upload.allocation].aux << ", dense=" << bool(row)
+              << ", topology=" << bool(topology) << ")";
+      throw std::logic_error(message.str());
+    }
+    unsigned char *const logical = staging + upload.logical_offset;
+    const size_t logical_bytes = material_checked_product(
+        spec.elements, sizeof(realnum), "staging logical material output");
+    if (material.disposition() == MaterialRecipeDisposition::host_reference) {
+      if (row->values.size() != logical_bytes)
+        throw std::logic_error("host-reference material row is incomplete");
+      memcpy(logical, row->values.data(), logical_bytes);
+    }
+    else {
+      const realnum value = realnum(default_material_row_value(state.plan_.keys[upload.allocation]));
+      for (size_t point = 0; point < spec.elements; ++point)
+        memcpy(logical + point * sizeof(realnum), &value, sizeof(value));
+    }
+    ++state.prepared_material_rows_;
+  }
+
+  if (material.disposition() == MaterialRecipeDisposition::tiled_callback) {
+    if (!material.ir()) throw std::logic_error("tiled callback route has no immutable IR");
+    const MaterialIR &ir = *material.ir();
+    const MaterialIRMaterial &callback = ir.materials[ir.default_material];
+    const OwnedMaterialCallback *owner = NULL;
+    for (const std::shared_ptr<const OwnedMaterialCallback> &candidate :
+         material.callback_owners())
+      if (candidate && candidate->id == callback.callback_id) owner = candidate.get();
+    if (!owner || owner->signature != callback.callback_signature ||
+        owner->capabilities != callback.callback_capabilities ||
+        owner->capabilities != owned_material_callback_tiled_capabilities)
+      throw std::logic_error("tiled callback lifetime/capability token is stale");
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_callback_prepare))
+      throw std::runtime_error("injected owned tiled callback preparation failure");
+    static thread_local bool callback_active = false;
+    if (callback_active)
+      throw std::logic_error("recursive owned tiled material callback is unsupported");
+    struct CallbackScope {
+      bool &active;
+      explicit CallbackScope(bool &active_) : active(active_) { active = true; }
+      ~CallbackScope() { active = false; }
+    } scope(callback_active);
+    /* The declared pure/replay-stable contract makes destination-major calls
+       observationally equivalent to the legacy shared-evaluation grouping.
+       Exact shifted centers and scatter indices still come from the frozen IR. */
+    realnum *const scratch = reinterpret_cast<realnum *>(
+        staging + state.prepared_callback_scratch_offset_);
+    const size_t scratch_points = size_t(support.scratch_bytes) / sizeof(realnum);
+    for (const MaterialCallbackTile &tile : material.callback_tiles()) {
+      if (tile.destination >= ir.destinations.size())
+        throw std::logic_error("tiled callback destination is out of range");
+      const MaterialIRDestination &destination = ir.destinations[tile.destination];
+      if (destination.property != MaterialIRProperty::chi1inv ||
+          tile.material != ir.default_material)
+        throw std::logic_error("tiled callback contains an unsupported output");
+      const ArrayId id = find_storage_key(state.plan_, destination.key);
+      NvidiaInitializationUpload *upload = NULL;
+      for (NvidiaInitializationUpload &candidate : state.initialization_uploads_)
+        if (candidate.material && candidate.allocation == id.value) upload = &candidate;
+      if (!upload || upload->logical_offset == size_t(-1))
+        throw std::logic_error("tiled callback destination has no staged output");
+      if (!tile.count || tile.count > scratch_points || tile.count > 256)
+        throw std::logic_error("tiled callback exceeds its bounded scratch span");
+      unsigned char *const logical = staging + upload->logical_offset;
+      for (uint64_t local = 0; local < tile.count; ++local) {
+        const uint64_t point = tile.first_point + local;
+        meep_geom::medium_struct medium;
+        owner->function(meep_geom::vec_to_vector3(
+                            material_ir_destination_center(ir, destination, point)),
+                        medium);
+        validate_tiled_callback_output(medium);
+        const component c = component(destination.component);
+        const SymmetricMaterialTensor inverse = inverse_callback_tensor(medium, type(c));
+        const int row_index = component_index(c);
+        const double value = destination.tensor_column < 0
+                                 ? 0.0
+                                 : inverse.value[row_index][destination.tensor_column];
+        scratch[local] = realnum(value);
+        ++state.material_fallback_statistics.callback_calls;
+      }
+      for (uint64_t local = 0; local < tile.count; ++local) {
+        const uint64_t point = tile.first_point + local;
+        const size_t index =
+            material_ir_destination_storage_index(ir, destination, point);
+        memcpy(logical + index * sizeof(realnum), scratch + local, sizeof(realnum));
+      }
+    }
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_callback_dispatch))
+      throw std::runtime_error("injected owned tiled callback dispatch failure");
+  }
+
+  if (!native_material)
+    for (const NvidiaInitializationUpload &upload : state.initialization_uploads_)
+      if (upload.material) {
+        const ArraySpec &spec = state.plan_.arrays[upload.allocation];
+        host_to_storage(staging + upload.staging_offset,
+                        staging + upload.logical_offset, spec, spec.elements);
+      }
+  if (!native_material)
+    for (const NvidiaMaterialClassificationRow &row : state.material_classification_rows_) {
+      const NvidiaInitializationUpload *upload = NULL;
+      for (const NvidiaInitializationUpload &candidate : state.initialization_uploads_)
+        if (candidate.material && candidate.allocation == row.allocation) upload = &candidate;
+      if (!upload || upload->logical_offset == size_t(-1))
+        throw std::logic_error("material classification row has no logical output");
+      const unsigned char *logical = staging + upload->logical_offset;
+      unsigned char *status = staging + state.prepared_status_staging_offset_ + row.status_offset;
+      for (size_t i = 0; i < row.logical_elements; ++i) {
+        realnum value;
+        const size_t physical = logical_material_storage_index(material, row.key, i);
+        if (physical >= state.plan_.arrays[row.allocation].elements)
+          throw std::logic_error(
+              "NVIDIA material logical classification index exceeds physical storage");
+        memcpy(&value, logical + physical * sizeof(realnum), sizeof(value));
+        status[i] = 1u | (double(value) != row.trivial_value ? 2u : 0u);
+      }
+    }
+  if (!compact_inputs.bytes.empty())
+    memcpy(staging + state.prepared_compact_staging_offset_, compact_inputs.bytes.data(),
+           compact_inputs.bytes.size());
+
+  state.material_initialization_statistics_.owned_ir_bytes = support.compact_input_bytes;
+  state.material_initialization_statistics_.dense_oracle_bytes = support.dense_fallback_bytes;
+  for (const NvidiaInitializationUpload &upload : state.initialization_uploads_)
+    if (upload.material)
+      state.material_initialization_statistics_.logical_output_bytes = material_checked_add(
+          state.material_initialization_statistics_.logical_output_bytes,
+          material_checked_product(state.plan_.arrays[upload.allocation].elements,
+                                   sizeof(realnum),
+                                   "accounting logical material outputs"),
+          "accounting logical material outputs");
+  state.material_initialization_statistics_.callback_scratch_bytes = support.scratch_bytes;
+  state.material_initialization_statistics_.upload_descriptor_bytes =
+      material_checked_product(state.initialization_uploads_.size(),
+                               sizeof(NvidiaInitializationUpload),
+                               "accounting initialization upload descriptors");
+  state.material_initialization_statistics_.classification_status_bytes =
+      state.material_classification_status_.size();
+  state.material_initialization_statistics_.classification_result_bytes =
+      state.material_classification_result_bytes_;
+  state.material_initialization_statistics_.absorber_profile_bytes =
+      compact_inputs.absorber_profile_bytes;
+  state.material_initialization_statistics_.pml_profile_bytes = compact_inputs.pml_profile_bytes;
+  state.material_initialization_statistics_.file_sample_bytes = compact_inputs.file_sample_bytes;
+  state.material_initialization_statistics_.grid_weight_bytes = compact_inputs.grid_weight_bytes;
+  state.material_initialization_statistics_.geometry_object_bytes =
+      compact_inputs.geometry_object_bytes;
+  state.material_initialization_statistics_.geometry_image_bytes =
+      compact_inputs.geometry_image_bytes;
+  state.material_initialization_statistics_.geometry_value_bytes =
+      compact_inputs.geometry_value_bytes;
+  state.material_initialization_statistics_.geometry_analytic_bytes =
+      compact_inputs.geometry_analytic_bytes;
+  state.material_initialization_statistics_.geometry_patch_bytes =
+      compact_inputs.geometry_patch_bytes;
+  state.material_initialization_statistics_.decoded_parameter_bytes =
+      compact_inputs.bytes.size() - compact_inputs.absorber_profile_bytes -
+      compact_inputs.pml_profile_bytes - compact_inputs.file_sample_bytes -
+      compact_inputs.grid_weight_bytes;
+  state.prepared_material_route_ = material.disposition();
+  state.prepared_recipe_signature_ = material.signature();
+  state.initialization_prepared_ = true;
 }
 
 void NvidiaBackend::initialize(const InitializationPlan &initialization, BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
   state.initialized_ = false;
-  state.material_initialization_statistics_ = NvidiaMaterialInitializationStatistics();
   std::string local_error;
   try {
     nvidia::device_scope device_scope(state.device_);
     if (state.transfer_failed_)
       throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
-    if (state.device_authoritative_)
-      throw std::logic_error(
-          "cannot refresh NVIDIA storage from a stale host mirror after device stepping");
-    if (!f_.array_catalog)
-      throw std::logic_error("NVIDIA initialization requires a prepared CPU catalog");
-    if (initialization.materials.size() != 1)
-      throw std::logic_error("NVIDIA initialization requires one frozen material recipe");
-    const MaterialRecipe &material = initialization.materials[0];
-    validate_material_recipe(material);
-    const MaterialSupportDecision material_support = classify_material_support(material);
-    state.material_initialization_statistics_.owned_ir_bytes =
-        material_support.compact_input_bytes;
-    for (const MaterialRecipeRow &row : material.rows())
-      state.material_initialization_statistics_.dense_oracle_bytes = material_checked_add(
-          state.material_initialization_statistics_.dense_oracle_bytes, row.values.size(),
-          "accounting dense material oracle bytes");
-    if (material.ir())
-      for (const MaterialIRPmlAxis &axis : material.ir()->pml_axes) {
-        size_t values = material_checked_add(axis.sigma.size(), axis.kappa.size(),
-                                             "accounting dense PML oracle values");
-        values = material_checked_add(values, axis.sigma_inv.size(),
-                                      "accounting dense PML oracle values");
-        state.material_initialization_statistics_.dense_oracle_bytes = material_checked_add(
-            state.material_initialization_statistics_.dense_oracle_bytes,
-            material_checked_product(values, sizeof(double),
-                                     "accounting dense PML oracle bytes"),
-            "accounting dense PML oracle bytes");
-      }
-    if (material.disposition() != MaterialRecipeDisposition::device_native &&
-        material.disposition() != MaterialRecipeDisposition::hybrid_interface &&
-        material.disposition() != MaterialRecipeDisposition::host_reference)
-      throw std::invalid_argument("NVIDIA native initialization received an unsupported route");
-    const CpuArrayCatalog &catalog = *f_.array_catalog;
-    if (catalog.size() > state.plan_.arrays.size())
-      throw std::logic_error("CPU catalog exceeds the provisional NVIDIA storage plan");
-
-    struct Upload {
-      nvidia::allocation_id id;
-      size_t bytes;
-      size_t staging_offset;
-      bool material;
-    };
-    std::vector<Upload> uploads;
-    uploads.reserve(state.plan_.arrays.size());
+    if (!state.initialization_prepared_)
+      throw std::logic_error("NVIDIA initialization was not prepared collectively");
+    if (initialization.materials.size() != 1 ||
+        initialization.materials[0].signature() != state.prepared_recipe_signature_ ||
+        initialization.materials[0].disposition() != state.prepared_material_route_)
+      throw std::logic_error("NVIDIA prepared initialization identity is stale");
     const bool native_material =
-        material.disposition() == MaterialRecipeDisposition::device_native ||
-        material.disposition() == MaterialRecipeDisposition::hybrid_interface;
-    MaterialCompactPack compact_inputs;
-    if (native_material)
-      compile_device_native_material_initialization(material, state, f_, double(f_.dt),
-                                                    compact_inputs);
-    else {
-      state.material_fill_launches_.clear();
-      state.material_table_launches_.clear();
-      state.material_table_authorities_.clear();
-      state.material_conductivity_launches_.clear();
-      state.material_pml_launches_.clear();
-      state.material_geometry_bulk_launches_.clear();
-      state.material_geometry_analytic_launches_.clear();
-      state.material_geometry_patch_launches_.clear();
-      state.material_geometry_authorities_.clear();
-      state.material_geometry_compact_hash_ = 0;
-      state.material_ir_inputs_.reset();
-    }
-    if (compact_inputs.bytes.size() != state.initialization_compact_input_bytes_)
-      throw std::logic_error(
-          "NVIDIA material compact-input size differs from pre-allocation admission");
-    size_t staging_bytes = 0;
-    for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
-      const ArraySpec &device_spec = state.plan_.arrays[i];
-      if (i < catalog.size()) {
-        const ArraySpec &host_spec = catalog.spec(ArrayId{uint32_t(i)});
-        if (host_spec.id != device_spec.id || host_spec.role != device_spec.role ||
-            host_spec.element_type != device_spec.element_type ||
-            host_spec.elements != device_spec.elements || host_spec.alias_of != device_spec.alias_of)
-          throw std::logic_error("CPU catalog no longer matches the NVIDIA storage plan");
-      }
-      else if (device_spec.role != array_role::material ||
-               !device_spec.classification_provisional || is_valid(device_spec.alias_of))
-        throw std::logic_error("NVIDIA provisional suffix is not an owned material row");
-      if (is_valid(device_spec.alias_of)) {
-        if (catalog.resolve_untyped(device_spec.id) !=
-            catalog.resolve_untyped(device_spec.alias_of))
-          throw std::logic_error("NVIDIA storage alias does not match the CPU catalog alias");
-        continue;
-      }
-      const size_t bytes = storage_bytes(device_spec);
-      if (native_material && device_spec.role == array_role::material) continue;
-      uploads.push_back(Upload{device_spec.id.value, bytes, native_material ? staging_bytes : 0,
-                               device_spec.role == array_role::material});
-      if (native_material)
-        staging_bytes = material_checked_add(staging_bytes, bytes, "sizing host staging");
-      else if (bytes > staging_bytes)
-        staging_bytes = bytes;
-    }
+        state.prepared_material_route_ == MaterialRecipeDisposition::device_native ||
+        state.prepared_material_route_ == MaterialRecipeDisposition::hybrid_interface;
+    const size_t compact_input_bytes = state.initialization_compact_input_bytes_;
+    if (native_material) bind_material_compact_inputs(state, compact_input_bytes);
+    else state.material_ir_inputs_.reset();
+    bind_material_classification(state);
+    if (native_material && state.material_classification_status_.size())
+      nvidia::fill_byte_async(state.material_classification_status_, 0, 0,
+                              state.material_classification_status_.size(),
+                              *state.transfer_);
+    else if (state.material_classification_status_.size())
+      nvidia::copy_host_to_device_async(
+          state.material_classification_status_, 0,
+          static_cast<const unsigned char *>(state.staging_.data()) +
+              state.prepared_status_staging_offset_,
+          state.material_classification_status_.size(), *state.transfer_,
+          nvidia::host_to_device_copy_kind::general);
 
-    const size_t compact_input_bytes = compact_inputs.bytes.size();
-    const size_t compact_staging_offset = staging_bytes;
-    staging_bytes =
-        material_checked_add(staging_bytes, compact_input_bytes, "sizing compact input staging");
-    if (staging_bytes != state.initialization_staging_bytes_)
-      throw std::logic_error(
-          "NVIDIA initialization staging size differs from pre-allocation admission");
-    state.ensure_staging(staging_bytes);
-    size_t material_uploads = 0;
-    const auto stage_upload = [&](const Upload &upload) {
-      const ArraySpec &spec = state.plan_.arrays[upload.id];
-      const void *source = upload.id < catalog.size() ? catalog.resolve_untyped(spec.id) : NULL;
+    for (const NvidiaInitializationUpload &upload : state.initialization_uploads_) {
+      const nvidia::host_to_device_copy_kind copy_kind =
+          !upload.material
+              ? nvidia::host_to_device_copy_kind::general
+              : state.prepared_material_route_ == MaterialRecipeDisposition::host_reference
+                    ? nvidia::host_to_device_copy_kind::material_dense_output
+                    : nvidia::host_to_device_copy_kind::material_tiled_output;
+      if (copy_kind == nvidia::host_to_device_copy_kind::material_tiled_output &&
+          nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::material_tiled_upload))
+        throw std::runtime_error("injected NVIDIA tiled material upload failure");
+      state.arenas_->copy_from_host_async(
+          upload.allocation, 0,
+          static_cast<const unsigned char *>(state.staging_.data()) + upload.staging_offset,
+          upload.bytes, *state.transfer_, copy_kind);
       if (upload.material) {
-        const StorageKey &key = state.plan_.keys[upload.id];
-        source = NULL;
-        for (const MaterialRecipeRow &row : material.rows())
-          if (row.key == key) {
-            if (row.role != spec.role || row.element_type != spec.element_type ||
-                row.elements != spec.elements || row.alignment != spec.alignment)
-              throw std::logic_error("material recipe row no longer matches device storage");
-            source = row.values.empty() ? NULL : row.values.data();
-            ++material_uploads;
-            break;
-          }
-      }
-      if (!source && upload.id >= catalog.size())
-        memset(static_cast<unsigned char *>(state.staging_.data()) + upload.staging_offset, 0,
-               upload.bytes);
-      else {
-        if (!source) throw std::logic_error("CPU catalog contains a null canonical allocation");
-        host_to_storage(static_cast<unsigned char *>(state.staging_.data()) +
-                            upload.staging_offset,
-                        source, spec, spec.elements);
-      }
-    };
-    if (native_material)
-      for (const Upload &upload : uploads) stage_upload(upload);
-    else
-      for (const Upload &upload : uploads) {
-        stage_upload(upload);
-        state.arenas_->copy_from_host_async(upload.id, 0, state.staging_.data(), upload.bytes,
-                                            *state.transfer_,
-                                            upload.material
-                                                ? nvidia::host_to_device_copy_kind::material_dense_output
-                                                : nvidia::host_to_device_copy_kind::general);
-        state.transfer_->synchronize();
-        if (upload.material) {
+        if (copy_kind == nvidia::host_to_device_copy_kind::material_dense_output) {
           ++state.material_initialization_statistics_.dense_output_host_to_device_calls;
           state.material_initialization_statistics_.dense_output_host_to_device_bytes =
               material_checked_add(
                   state.material_initialization_statistics_.dense_output_host_to_device_bytes,
                   upload.bytes, "accounting dense material output uploads");
         }
+        else {
+          ++state.material_initialization_statistics_.tiled_output_host_to_device_calls;
+          state.material_initialization_statistics_.tiled_output_host_to_device_bytes =
+              material_checked_add(
+                  state.material_initialization_statistics_.tiled_output_host_to_device_bytes,
+                  upload.bytes, "accounting tiled material output uploads");
+        }
       }
-    if (!native_material && material_uploads != material.rows().size())
-      throw std::logic_error("material recipe contains an unconsumed storage row");
-    if (native_material && compact_input_bytes)
-      memcpy(static_cast<unsigned char *>(state.staging_.data()) + compact_staging_offset,
-             compact_inputs.bytes.data(), compact_input_bytes);
-
-    if (native_material)
-      for (const Upload &upload : uploads)
-        state.arenas_->copy_from_host_async(
-            upload.id, 0,
-            static_cast<const unsigned char *>(state.staging_.data()) + upload.staging_offset,
-            upload.bytes, *state.transfer_);
+    }
     if (native_material && compact_input_bytes) {
       if (nvidia::testing::consume_failure_for_testing(
               nvidia::testing::failure_point::material_ir_upload))
         throw std::runtime_error("injected NVIDIA material IR upload failure");
       nvidia::copy_host_to_device_async(
           state.material_ir_inputs_, 0,
-          static_cast<const unsigned char *>(state.staging_.data()) + compact_staging_offset,
+          static_cast<const unsigned char *>(state.staging_.data()) +
+              state.prepared_compact_staging_offset_,
           compact_input_bytes, *state.transfer_,
           nvidia::host_to_device_copy_kind::material_compact_input);
       state.material_initialization_statistics_.compact_input_host_to_device_calls = 1;
       state.material_initialization_statistics_.compact_input_host_to_device_bytes =
           compact_input_bytes;
-      state.material_initialization_statistics_.absorber_profile_bytes =
-          compact_inputs.absorber_profile_bytes;
-      state.material_initialization_statistics_.pml_profile_bytes =
-          compact_inputs.pml_profile_bytes;
-      state.material_initialization_statistics_.file_sample_bytes =
-          compact_inputs.file_sample_bytes;
-      state.material_initialization_statistics_.grid_weight_bytes =
-          compact_inputs.grid_weight_bytes;
-      state.material_initialization_statistics_.geometry_object_bytes =
-          compact_inputs.geometry_object_bytes;
-      state.material_initialization_statistics_.geometry_image_bytes =
-          compact_inputs.geometry_image_bytes;
-      state.material_initialization_statistics_.geometry_value_bytes =
-          compact_inputs.geometry_value_bytes;
-      state.material_initialization_statistics_.geometry_analytic_bytes =
-          compact_inputs.geometry_analytic_bytes;
-      state.material_initialization_statistics_.geometry_patch_bytes =
-          compact_inputs.geometry_patch_bytes;
-      state.material_initialization_statistics_.decoded_parameter_bytes =
-          compact_input_bytes - compact_inputs.absorber_profile_bytes -
-          compact_inputs.pml_profile_bytes - compact_inputs.file_sample_bytes -
-          compact_inputs.grid_weight_bytes;
     }
     if (native_material) {
-      if (material.ir() && !state.material_geometry_authorities_.empty()) {
-        validate_material_ir_against_live(*material.ir(), f_, double(f_.dt));
-        validate_all_material_geometry_authority(*material.ir(), state, compact_inputs,
-                                                 double(f_.dt), true);
-      }
       for (uint32_t phase = 0; phase <= 5; ++phase) {
         for (const nvidia::material_fill_launch &launch : state.material_fill_launches_)
           if (launch.phase == phase) {
@@ -6513,9 +7078,8 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
             ++state.material_initialization_statistics_.geometry_bulk_kernel_launches;
             ++state.material_initialization_statistics_.pointwise_kernel_launches;
             state.material_initialization_statistics_.geometry_bulk_points =
-                material_checked_add(
-                    state.material_initialization_statistics_.geometry_bulk_points,
-                    launch.count, "accounting geometry bulk points");
+                material_checked_add(state.material_initialization_statistics_.geometry_bulk_points,
+                                     launch.count, "accounting geometry bulk points");
           }
         if (phase == 1) {
           for (const nvidia::geometry_analytic_launch &launch :
@@ -6534,9 +7098,8 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
             ++state.material_initialization_statistics_.geometry_patch_kernel_launches;
             ++state.material_initialization_statistics_.pointwise_kernel_launches;
             state.material_initialization_statistics_.geometry_patch_points =
-                material_checked_add(
-                    state.material_initialization_statistics_.geometry_patch_points,
-                    launch.count, "accounting geometry patch points");
+                material_checked_add(state.material_initialization_statistics_.geometry_patch_points,
+                                     launch.count, "accounting geometry patch points");
           }
         }
         if (phase == 3)
@@ -6550,10 +7113,7 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
                     state.material_initialization_statistics_.absorber_points_evaluated,
                     launch.loop_count, "accounting absorber points");
           }
-        for (size_t table_index = 0; table_index < state.material_table_launches_.size();
-             ++table_index) {
-          const nvidia::material_table_launch &launch =
-              state.material_table_launches_[table_index];
+        for (const nvidia::material_table_launch &launch : state.material_table_launches_) {
           const uint32_t table_phase =
               launch.operation == nvidia::material_table_operation::file_chi1inv ||
                       launch.operation == nvidia::material_table_operation::grid_chi1inv
@@ -6562,26 +7122,19 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
                         ? 3
                         : 5;
           if (table_phase != phase) continue;
-          if (!material.ir() || table_index >= state.material_table_authorities_.size())
-            throw std::logic_error("NVIDIA material table authority is absent at launch");
-          validate_material_table_authority(*material.ir(), state, compact_inputs, double(f_.dt),
-                                            launch,
-                                            state.material_table_authorities_[table_index], true);
           nvidia::launch_material_table(launch, *state.transfer_);
           ++state.material_initialization_statistics_.pointwise_kernel_launches;
           if (launch.table_kind == nvidia::material_table_kind::file_scalar_epsilon) {
             ++state.material_initialization_statistics_.file_table_kernel_launches;
             state.material_initialization_statistics_.file_points_evaluated =
-                material_checked_add(
-                    state.material_initialization_statistics_.file_points_evaluated,
-                    launch.loop_count, "accounting FILE table points");
+                material_checked_add(state.material_initialization_statistics_.file_points_evaluated,
+                                     launch.loop_count, "accounting FILE table points");
           }
           else {
             ++state.material_initialization_statistics_.grid_table_kernel_launches;
             state.material_initialization_statistics_.grid_points_evaluated =
-                material_checked_add(
-                    state.material_initialization_statistics_.grid_points_evaluated,
-                    launch.loop_count, "accounting MaterialGrid table points");
+                material_checked_add(state.material_initialization_statistics_.grid_points_evaluated,
+                                     launch.loop_count, "accounting MaterialGrid table points");
           }
         }
       }
@@ -6589,21 +7142,94 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
         nvidia::launch_material_pml(launch, *state.transfer_);
         ++state.material_initialization_statistics_.pml_kernel_launches;
       }
-      const bool submitted_work = !uploads.empty() || compact_input_bytes ||
-                                  !state.material_fill_launches_.empty() ||
-                                  !state.material_table_launches_.empty() ||
-                                  !state.material_conductivity_launches_.empty() ||
-                                  !state.material_geometry_bulk_launches_.empty() ||
-                                  !state.material_geometry_analytic_launches_.empty() ||
-                                  !state.material_geometry_patch_launches_.empty() ||
-                                  !state.material_pml_launches_.empty();
-      if (submitted_work) {
-        if (nvidia::testing::consume_failure_for_testing(
-                nvidia::testing::failure_point::material_initialization_sync))
-          throw std::runtime_error("injected NVIDIA material initialization sync failure");
-        state.transfer_->synchronize();
-        state.material_initialization_statistics_.synchronizations = 1;
-      }
+    }
+    nvidia::material_classification_header header = {};
+    header.version = 1;
+    header.row_count = uint32_t(state.material_classification_rows_.size());
+    header.recipe_signature = state.prepared_recipe_signature_;
+    header.state_token = state.state_token_;
+    header.storage_fingerprint = state.fingerprint_;
+    nvidia::material_classification_header *const device_header =
+        static_cast<nvidia::material_classification_header *>(
+            state.material_classification_result_.opaque_handle());
+    nvidia::launch_material_classification_header(device_header, header, *state.transfer_);
+    nvidia::material_classification_row_result *const device_rows =
+        reinterpret_cast<nvidia::material_classification_row_result *>(device_header + 1);
+    const unsigned char *const status_base = static_cast<const unsigned char *>(
+        state.material_classification_status_.opaque_handle());
+    for (size_t i = 0; i < state.material_classification_rows_.size(); ++i) {
+      const NvidiaMaterialClassificationRow &row = state.material_classification_rows_[i];
+      nvidia::material_classification_row_result value = {};
+      value.chunk = row.key.chunk;
+      value.kind = row.key.kind;
+      value.component = row.key.component_;
+      value.cmp = row.key.cmp;
+      value.aux = row.key.aux;
+      nvidia::launch_material_classification_row(status_base + row.status_offset,
+                                                 row.logical_elements, device_rows + i, value,
+                                                 *state.transfer_);
+    }
+    state.material_fallback_statistics.classification_launches = material_checked_add(
+        state.material_fallback_statistics.classification_launches,
+        state.material_classification_rows_.size() + 1,
+        "accounting material classification launches");
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_classification_d2h))
+      throw std::runtime_error("injected NVIDIA material classification result copy failure");
+    nvidia::copy_device_to_host_async(
+        static_cast<unsigned char *>(state.staging_.data()) +
+            state.prepared_result_staging_offset_,
+        state.material_classification_result_, 0,
+        state.material_classification_result_bytes_, *state.transfer_);
+    ++state.material_fallback_statistics.classification_device_to_host_calls;
+    state.material_fallback_statistics.classification_device_to_host_bytes =
+        material_checked_add(
+            state.material_fallback_statistics.classification_device_to_host_bytes,
+            state.material_classification_result_bytes_,
+            "accounting material classification transfer");
+    {
+      if (nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::material_initialization_sync))
+        throw std::runtime_error("injected NVIDIA material initialization sync failure");
+      state.transfer_->synchronize();
+      state.material_initialization_statistics_.synchronizations = 1;
+    }
+    const unsigned char *const result =
+        static_cast<const unsigned char *>(state.staging_.data()) +
+        state.prepared_result_staging_offset_;
+    nvidia::material_classification_header actual_header;
+    memcpy(&actual_header, result, sizeof(actual_header));
+    if (actual_header.version != header.version ||
+        actual_header.row_count != header.row_count ||
+        actual_header.recipe_signature != header.recipe_signature ||
+        actual_header.state_token != header.state_token ||
+        actual_header.storage_fingerprint != header.storage_fingerprint)
+      throw std::runtime_error("NVIDIA material classification header is stale");
+    state.material_classification_facts_ = MaterialClassificationFacts();
+    std::set<StorageKey, MaterialStorageKeyLess> seen;
+    for (size_t i = 0; i < state.material_classification_rows_.size(); ++i) {
+      const NvidiaMaterialClassificationRow &expected = state.material_classification_rows_[i];
+      nvidia::material_classification_row_result actual;
+      memcpy(&actual,
+             result + sizeof(actual_header) +
+                 i * sizeof(nvidia::material_classification_row_result),
+             sizeof(actual));
+      if (i == 0 && nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::material_classification_result_mutation))
+        actual.nontrivial = 2;
+      const StorageKey key{actual.chunk, actual.kind, actual.component, actual.cmp, actual.aux};
+      if (!(key == expected.key) || actual.missing > 1 || actual.nontrivial > 1 ||
+          actual.missing ||
+          !seen.insert(key).second)
+        throw std::runtime_error(
+            "NVIDIA material classification producer coverage is incomplete");
+      const ArraySpec &spec = state.plan_.arrays[expected.allocation];
+      const uint8_t row_state = expected.allocation < state.prepared_authoritative_arrays_ ||
+                                        !spec.classification_provisional || actual.nontrivial
+                                    ? uint8_t(MaterialClassification::retained)
+                                    : uint8_t(MaterialClassification::elided_row);
+      state.material_classification_facts_.rows.push_back(
+          MaterialRowClassificationFact{key, row_state});
     }
     state.material_initialization_statistics_.device_native = native_material;
     state.material_initialization_statistics_.valid = true;
@@ -6611,20 +7237,14 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
   catch (const std::exception &error) {
     local_error = error.what();
     state.transfer_failed_ = true;
-    try {
-      state.transfer_->synchronize();
-    }
-    catch (...) {
-    }
+    try { state.transfer_->synchronize(); }
+    catch (...) {}
   }
   catch (...) {
     local_error = "unknown NVIDIA initialization failure";
     state.transfer_failed_ = true;
-    try {
-      state.transfer_->synchronize();
-    }
-    catch (...) {
-    }
+    try { state.transfer_->synchronize(); }
+    catch (...) {}
   }
   if (or_to_all(!local_error.empty())) {
     if (local_error.empty()) local_error = "another rank failed to initialize NVIDIA storage";
@@ -6634,16 +7254,143 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
   state.device_authoritative_ = false;
 }
 
+
 MaterialClassification NvidiaBackend::classify_state(const StoragePlan &plan,
                                                      BackendState &raw_state) {
   std::string local_error;
   NvidiaBackendState *state = NULL;
+  MaterialClassificationFacts facts;
   try {
     state = &checked_state(raw_state);
     if (!state->initialized_ || state->transfer_failed_)
       local_error = "NVIDIA classification requires an initialized usable state";
     else if (plan.arrays.size() > state->plan_.arrays.size())
       local_error = "NVIDIA classification plan exceeds resident storage";
+    else if (!f_.initialization_plan || f_.initialization_plan->materials.size() != 1)
+      local_error = "NVIDIA classification has no frozen material recipe";
+    else {
+      facts = state->material_classification_facts_;
+      std::map<StorageKey, uint8_t, MaterialStorageKeyLess> row_states;
+      for (const MaterialRowClassificationFact &row : facts.rows)
+        if (!row_states.insert(std::make_pair(row.key, row.state)).second)
+          throw std::invalid_argument("NVIDIA classification contains duplicate rows");
+      const auto retain_group = [&](const std::vector<StorageKey> &keys) {
+        bool keep = false;
+        for (const StorageKey &key : keys) {
+          const auto found = row_states.find(key);
+          keep = keep ||
+                 (found != row_states.end() &&
+                  found->second == MaterialClassification::retained);
+        }
+        if (keep)
+          for (const StorageKey &key : keys) {
+            const auto found = row_states.find(key);
+            if (found != row_states.end()) found->second = MaterialClassification::retained;
+          }
+      };
+      for (const auto &entry : row_states) {
+        const StorageKey key = entry.first;
+        const array_kind kind = static_cast<array_kind>(key.kind);
+        if (kind == array_kind::conductivity || kind == array_kind::condinv)
+          retain_group({StorageKey{key.chunk, int(array_kind::conductivity), key.component_,
+                                   key.cmp, key.aux},
+                        StorageKey{key.chunk, int(array_kind::condinv), key.component_,
+                                   key.cmp, key.aux}});
+        else if (kind == array_kind::chi2 || kind == array_kind::chi3) {
+          retain_group({StorageKey{key.chunk, int(array_kind::chi2), key.component_, -1, 0},
+                        StorageKey{key.chunk, int(array_kind::chi3), key.component_, -1, 0}});
+          const StorageKey chi2{key.chunk, int(array_kind::chi2), key.component_, -1, 0};
+          const StorageKey chi3{key.chunk, int(array_kind::chi3), key.component_, -1, 0};
+          const auto chi2_state = row_states.find(chi2);
+          const auto chi3_state = row_states.find(chi3);
+          const bool nonlinear =
+              (chi2_state != row_states.end() &&
+               chi2_state->second == MaterialClassification::retained) ||
+              (chi3_state != row_states.end() &&
+               chi3_state->second == MaterialClassification::retained);
+          if (nonlinear) {
+            const StorageKey diagonal{
+                key.chunk, int(array_kind::chi1inv), key.component_, -1,
+                uint64_t(component_direction(component(key.component_)))};
+            const auto found = row_states.find(diagonal);
+            if (found != row_states.end()) found->second = MaterialClassification::retained;
+          }
+        }
+        else if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+                 kind == array_kind::pml_siginv)
+          retain_group({StorageKey{key.chunk, int(array_kind::pml_sig), -1, -1, key.aux},
+                        StorageKey{key.chunk, int(array_kind::pml_kap), -1, -1, key.aux},
+                        StorageKey{key.chunk, int(array_kind::pml_siginv), -1, -1,
+                                   key.aux}});
+        const auto current = row_states.find(key);
+        if (kind == array_kind::chi1inv && key.component_ >= 0 &&
+            direction(key.aux) != component_direction(component(key.component_))) {
+          const StorageKey diagonal{key.chunk, int(array_kind::chi1inv), key.component_, -1,
+                                    uint64_t(component_direction(component(key.component_)))};
+          const auto found = row_states.find(diagonal);
+          if (current != row_states.end() &&
+              current->second == MaterialClassification::retained &&
+              found != row_states.end())
+            found->second = MaterialClassification::retained;
+        }
+        if (kind == array_kind::sigma && current != row_states.end() &&
+            current->second == MaterialClassification::retained) {
+          const StorageKey diagonal{
+              key.chunk, int(array_kind::sigma), key.component_,
+              int(component_direction(component(key.component_))), key.aux};
+          const auto found = row_states.find(diagonal);
+          if (found != row_states.end()) found->second = MaterialClassification::retained;
+        }
+      }
+      for (MaterialRowClassificationFact &row : facts.rows)
+        row.state = row_states[row.key];
+      MaterialClassification local;
+      local.provisional_row_state.assign(plan.arrays.size(),
+                                         MaterialClassification::not_provisional);
+      local.anisotropic_eh.assign(size_t(f_.num_chunks) * NUM_FIELD_TYPES, 0);
+      for (size_t i = 0; i < plan.arrays.size(); ++i) {
+        if (plan.arrays[i].role != array_role::material) continue;
+        const auto found = row_states.find(plan.keys[i]);
+        if (found == row_states.end())
+          throw std::invalid_argument("NVIDIA classification omitted a material row");
+        local.provisional_row_state[i] = found->second;
+        if (found->second == MaterialClassification::elided_row)
+          local.elided.push_back(ArrayId{uint32_t(i)});
+        else {
+          const array_kind kind = static_cast<array_kind>(plan.keys[i].kind);
+          local.has_nonlinearities = local.has_nonlinearities ||
+                                     kind == array_kind::chi2 || kind == array_kind::chi3;
+          if (f_.gv.dim == D2 && kind == array_kind::chi1inv) {
+            const component c = component(plan.keys[i].component_);
+            const direction d = direction(plan.keys[i].aux);
+            local.aniso2d = local.aniso2d ||
+                            ((c == Ex || c == Ey || c == Hx || c == Hy) && d == Z) ||
+                            ((c == Ez || c == Hz) && (d == X || d == Y));
+          }
+        }
+      }
+      FOR_COMPONENTS(c)
+        if (f_.have_component(c)) local.required_components |= component_mask(1) << int(c);
+      int minimum = 0;
+      for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+        if (!f_.chunks[chunk]->is_mine()) continue;
+        for (dft_chunk *dft = f_.chunks[chunk]->dft_chunks; dft; dft = dft->next_in_chunk) {
+          const int factor = dft->get_decimation_factor();
+          if (factor > 0 && (!minimum || factor < minimum)) minimum = factor;
+        }
+      }
+      local.min_decimation_factor = minimum ? minimum : 1;
+      refresh_material_classification_variants(f_, plan, local);
+      facts.required_components = local.required_components;
+      facts.has_nonlinearities = local.has_nonlinearities;
+      facts.aniso2d = local.aniso2d;
+      facts.min_decimation_factor = minimum;
+      facts.variants.clear();
+      for (const MaterialVariantClassificationFact &variant : local.variant_facts)
+        if (variant.chunk >= 0 && variant.chunk < f_.num_chunks &&
+            f_.chunks[variant.chunk]->is_mine())
+          facts.variants.push_back(variant);
+    }
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -6652,12 +7399,8 @@ MaterialClassification NvidiaBackend::classify_state(const StoragePlan &plan,
     local_error = "unknown NVIDIA classification precondition failure";
   }
   backend_reconcile_host_access(local_error, "NVIDIA classification preflight");
-  /* PR1 deliberately uses the already-populated CPU catalog as compatibility
-     initialization. Classification therefore runs on those exact host values
-     before device execution can make them stale. The resident plan is the
-     provisional allocation superset; the public host plan is only its stable
-     authoritative prefix until finalization publishes tombstone visibility. */
-  return classify(f_, state->plan_);
+  return assemble_material_classification(
+      f_, plan, f_.initialization_plan->materials[0], facts);
 }
 
 void NvidiaBackend::finalize_storage(const StoragePlan &plan,
@@ -6667,10 +7410,17 @@ void NvidiaBackend::finalize_storage(const StoragePlan &plan,
   if (!state.initialized_) throw std::logic_error("cannot finalize uninitialized NVIDIA storage");
   if (!f_.initialization_plan || f_.initialization_plan->materials.size() != 1)
     throw std::logic_error("NVIDIA material finalization requires one frozen recipe");
+  if (nvidia::testing::consume_failure_for_testing(
+          nvidia::testing::failure_point::material_finalize))
+    throw std::runtime_error("injected NVIDIA material finalization failure");
   resolve_material_storage(f_.initialization_plan->materials[0], classification, plan,
                            state.plan_, policy_for(options_.precision));
   if (has_provisional_material_storage(state.plan_))
     throw std::logic_error("NVIDIA material finalization left provisional storage");
+  /* phase_in_material is a collective public operation, so this bit is
+     identical on active and idle ranks.  It is copied into the executable at
+     compile and cleared only after all ranks finish the last phase step. */
+  state.material_phase_active = f_.phasein_time > 0;
 }
 
 void NvidiaBackend::refresh_noisy_seed(const RandomSeedSnapshot &candidate,
@@ -7947,6 +8697,10 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       local_error = "NVIDIA timestep plan is incomplete or non-canonical";
 
     if (local_error.empty())
+      if (nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::material_compile))
+        throw std::runtime_error("injected NVIDIA material executable compilation failure");
+    if (local_error.empty())
       executable.reset(new NvidiaExecutable(
           this, plan.program, plan.signature, state.fingerprint_, state.state_token_, operations,
           curl_updates,
@@ -9109,27 +9863,53 @@ void NvidiaBackend::restore_magnetic_fields(Executable &raw_executable,
 void nvidia::validate_material_phase_state(const fields &f,
                                            uint64_t expected_target_signature) {
   const bool local_active = f.phasein_time > 0;
+  backend_note_material_phase_collective_for_testing();
   const int minimum_countdown = min_to_all(f.phasein_time);
+  backend_note_material_phase_collective_for_testing();
   const int maximum_countdown = max_to_all(f.phasein_time);
+  backend_note_material_phase_collective_for_testing();
   const bool every_active = and_to_all(local_active);
+  backend_note_material_phase_collective_for_testing();
   const bool any_active = or_to_all(local_active);
+  backend_note_material_phase_scan_for_testing();
   const bool local_target_matches =
       !local_active || expected_target_signature == compute_material_phase_target_signature(f);
+  backend_note_material_phase_collective_for_testing();
   const bool every_target_matches = and_to_all(local_target_matches);
   bool local_storage_detached = true;
+  backend_note_material_phase_scan_for_testing();
   if (local_active)
     for (int i = 0; i < f.num_chunks; ++i)
       if (f.chunks[i] && f.chunks[i]->is_mine() &&
           (!f.chunks[i]->s || f.chunks[i]->s->refcount != 1)) {
         local_storage_detached = false;
-        break;
+          break;
       }
+  backend_note_material_phase_collective_for_testing();
   const bool every_storage_detached = and_to_all(local_storage_detached);
   if (minimum_countdown != maximum_countdown || any_active != every_active ||
       !every_target_matches || !every_storage_detached)
     throw std::logic_error(
         "NVIDIA material phase state, target, or current storage changed after compilation on "
         "an MPI rank");
+}
+
+void NvidiaBackend::preflight_advance(Executable &raw_executable,
+                                      BackendState &raw_state, int num_steps) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  NvidiaExecutable &executable = checked_executable(raw_executable, state);
+  if (num_steps <= 0) return;
+  if (!state.initialized_) throw std::logic_error("cannot advance uninitialized NVIDIA storage");
+  if (executable.storage_fingerprint_ != state.fingerprint_)
+    throw std::logic_error("NVIDIA executable was compiled for a different storage layout");
+  if (state.transfer_failed_)
+    throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
+  if (executable.has_noisy_updates_ && f_.t < 0)
+    throw std::invalid_argument("NVIDIA noisy polarization timestep is negative");
+  if (executable.material_phase_active != state.material_phase_active)
+    throw std::logic_error("NVIDIA executable and storage disagree on material phase activity");
+  if (!executable.material_phase_active) return;
+  nvidia::validate_material_phase_state(f_, executable.material_target_signature_);
 }
 
 void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state, int num_steps) {
@@ -9145,7 +9925,6 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     throw std::logic_error("NVIDIA execution stream failed; recreate backend state");
   if (executable.has_noisy_updates_ && f_.t < 0)
     throw std::invalid_argument("NVIDIA noisy polarization timestep is negative");
-  nvidia::validate_material_phase_state(f_, executable.material_target_signature_);
 
   const FiniteCheckMode finite_mode = finite_check_mode();
   try {
@@ -9490,6 +10269,10 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
     throw;
   }
   state.device_authoritative_ = true;
+  if (executable.material_phase_active && f_.phasein_time <= 0) {
+    executable.material_phase_active = false;
+    state.material_phase_active = false;
+  }
 }
 
 void NvidiaBackend::execute_host_segment(NvidiaExecutable &executable,

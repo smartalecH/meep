@@ -68,6 +68,7 @@ bool singular_nondiagonal_tensor(const double tensor[6]) {
 void validate_common(const geometry_launch_common &common, const unsigned char *host_inputs,
                      size_t host_bytes, const char *what) {
   if (!common.destination || !common.point_count || !common.elements ||
+      (common.compact_inputs && !common.classification) ||
       common.compact_input_bytes != host_bytes || !host_inputs ||
       common.dimensions < 0 || common.dimensions > 3 || common.component < 0 ||
       common.tensor_row < 0 || common.tensor_row > 2 || common.tensor_column < -1 ||
@@ -795,8 +796,10 @@ __device__ double analytic_value(const geometry_launch_common &common,
 
 template <typename T>
 __device__ void store_value(const geometry_launch_common &common, size_t destination,
-                            double value) {
+                            size_t logical_point, double value) {
   if (common.logical_single) value = double(float(value));
+  common.classification[logical_point] =
+      1u | (value != common.trivial_value ? 2u : 0u);
   static_cast<T *>(common.destination)[destination] = T(value);
 }
 
@@ -809,7 +812,8 @@ __global__ void geometry_bulk_kernel(geometry_bulk_launch launch) {
   material_geometry_numeric::vector position;
   double physical[5] = {};
   point_for(launch.common, point, destination, position, physical);
-  store_value<T>(launch.common, destination, value_at(launch.common, position, physical));
+  store_value<T>(launch.common, destination, point,
+                 value_at(launch.common, position, physical));
 }
 
 template <typename T>
@@ -823,7 +827,8 @@ __global__ void geometry_analytic_kernel(geometry_analytic_launch launch) {
   material_geometry_numeric::vector ignored;
   double physical[5] = {};
   point_for(launch.common, job.point, destination, ignored, physical);
-  store_value<T>(launch.common, destination, analytic_value(launch.common, job));
+  store_value<T>(launch.common, destination, job.point,
+                 analytic_value(launch.common, job));
 }
 
 template <typename T>
@@ -837,7 +842,7 @@ __global__ void geometry_patch_kernel(geometry_patch_launch launch) {
   material_geometry_numeric::vector ignored;
   double physical[5] = {};
   point_for(launch.common, patch.point, destination, ignored, physical);
-  store_value<T>(launch.common, destination, patch.value);
+  store_value<T>(launch.common, destination, patch.point, patch.value);
 }
 
 template <typename T>

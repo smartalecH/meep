@@ -265,18 +265,29 @@ __global__ void material_table_kernel(material_table_launch launch) {
       inverse = float(1.0 / (1.0 + double(logical_conductivity) * launch.dt * 0.5));
     }
     else inverse = 1.0 / (1.0 + conductivity * launch.dt * 0.5);
+    launch.classification[point] =
+        1u | (conductivity != launch.trivial_value ? 2u : 0u);
+    launch.secondary_classification[point] =
+        1u | (inverse != launch.secondary_trivial_value ? 2u : 0u);
     static_cast<T *>(launch.destination)[destination_index] = T(conductivity);
     static_cast<T *>(launch.secondary_destination)[destination_index] = T(inverse);
     return;
   }
   else return;
+  if (launch.logical_single) value = double(float(value));
+  launch.classification[point] =
+      1u | (value != launch.trivial_value ? 2u : 0u);
   static_cast<T *>(launch.destination)[destination_index] = T(value);
 }
 
 template <typename T>
-__global__ void material_fill_kernel(T *destination, size_t elements, double value) {
+__global__ void material_fill_kernel(material_fill_launch launch) {
   const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < elements) destination[i] = T(value);
+  const double value = launch.logical_single ? double(float(launch.value)) : launch.value;
+  if (i < launch.elements)
+    static_cast<T *>(launch.destination)[i] = T(value);
+  if (i < launch.classification_elements)
+    launch.classification[i] = 1u | (value != launch.trivial_value ? 2u : 0u);
 }
 
 __device__ double absorber_coordinate(const double coordinates[5], int direction) {
@@ -337,6 +348,10 @@ __global__ void material_conductivity_kernel(material_conductivity_launch launch
   }
   else
     inverse = 1 / (1 + conductivity * launch.dt * 0.5);
+  launch.conductivity_classification[point] =
+      1u | (conductivity != 0.0 ? 2u : 0u);
+  launch.condinv_classification[point] =
+      1u | (inverse != 1.0 ? 2u : 0u);
   static_cast<T *>(launch.conductivity_destination)[destination_index] = T(conductivity);
   static_cast<T *>(launch.condinv_destination)[destination_index] = T(inverse);
 }
@@ -344,6 +359,9 @@ __global__ void material_conductivity_kernel(material_conductivity_launch launch
 template <typename T>
 __global__ void material_pml_kernel(T *sigma_destination, T *kappa_destination,
                                     T *sigma_inv_destination,
+                                    unsigned char *sigma_classification,
+                                    unsigned char *kappa_classification,
+                                    unsigned char *sigma_inv_classification,
                                     const unsigned char *compact_inputs, size_t profile_offset,
                                     size_t elements, int little_corner, double resolution,
                                     double dt, double thickness, double boundary_location,
@@ -379,6 +397,9 @@ __global__ void material_pml_kernel(T *sigma_destination, T *kappa_destination,
           sigma_inv = 1 / (kappa + sigma);
       }
     }
+    sigma_classification[i] = 1u | (sigma != 0.0 ? 2u : 0u);
+    kappa_classification[i] = 1u | (kappa != 1.0 ? 2u : 0u);
+    sigma_inv_classification[i] = 1u | (sigma_inv != 1.0 ? 2u : 0u);
     sigma_destination[i] = T(sigma);
     kappa_destination[i] = T(kappa);
     sigma_inv_destination[i] = T(sigma_inv);
@@ -387,9 +408,11 @@ __global__ void material_pml_kernel(T *sigma_destination, T *kappa_destination,
 
 template <typename T>
 void launch_fill_typed(const material_fill_launch &launch, const stream &stream) {
-  material_fill_kernel<T><<<launch_blocks(launch.elements, "NVIDIA material fill"), 256, 0,
-                            static_cast<cudaStream_t>(stream.opaque_handle())>>>(
-      static_cast<T *>(launch.destination), launch.elements, launch.value);
+  const size_t work = launch.elements > launch.classification_elements
+                          ? launch.elements
+                          : launch.classification_elements;
+  material_fill_kernel<T><<<launch_blocks(work, "NVIDIA material fill"), 256, 0,
+                            static_cast<cudaStream_t>(stream.opaque_handle())>>>(launch);
   check_cuda(cudaPeekAtLastError(), "launching NVIDIA material fill kernel");
 }
 
@@ -415,7 +438,8 @@ void launch_pml_typed(const material_pml_launch &launch, const stream &stream) {
   material_pml_kernel<T><<<launch_blocks(launch.elements, "NVIDIA material PML"), 256, 0,
                            static_cast<cudaStream_t>(stream.opaque_handle())>>>(
       static_cast<T *>(launch.sigma_destination), static_cast<T *>(launch.kappa_destination),
-      static_cast<T *>(launch.sigma_inv_destination), launch.compact_inputs,
+      static_cast<T *>(launch.sigma_inv_destination), launch.sigma_classification,
+      launch.kappa_classification, launch.sigma_inv_classification, launch.compact_inputs,
       launch.profile_offset, launch.elements, launch.little_corner, launch.resolution,
       launch.dt, launch.thickness,
       launch.boundary_location, launch.r_asymptotic, launch.mean_stretch,
@@ -425,11 +449,39 @@ void launch_pml_typed(const material_pml_launch &launch, const stream &stream) {
   check_cuda(cudaPeekAtLastError(), "launching NVIDIA material PML kernel");
 }
 
+__global__ void material_classification_header_kernel(
+    material_classification_header *result, material_classification_header value) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) *result = value;
+}
+
+__global__ void material_classification_row_kernel(
+    const unsigned char *status, size_t elements,
+    material_classification_row_result *result,
+    material_classification_row_result value) {
+  __shared__ unsigned int missing;
+  __shared__ unsigned int nontrivial;
+  if (threadIdx.x == 0) missing = nontrivial = 0;
+  __syncthreads();
+  for (size_t i = threadIdx.x; i < elements; i += blockDim.x) {
+    const unsigned char state = status[i];
+    if (!(state & 1u)) atomicExch(&missing, 1u);
+    if (state & 2u) atomicExch(&nontrivial, 1u);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    value.missing = missing;
+    value.nontrivial = nontrivial;
+    *result = value;
+  }
+}
+
 } // namespace
 
 void launch_material_fill(const material_fill_launch &launch, const stream &stream) {
-  if (!launch.elements) return;
-  if (!launch.destination)
+  if (!launch.elements && !launch.classification_elements) return;
+  if (!launch.destination || !launch.classification || !std::isfinite(launch.value) ||
+      !std::isfinite(launch.trivial_value) ||
+      launch.classification_elements > launch.elements)
     throw std::invalid_argument("NVIDIA material fill has a null destination");
   const size_t bytes = checked_scalar_bytes(launch.elements, launch.precision,
                                             "NVIDIA material fill");
@@ -584,7 +636,8 @@ void validate_material_table_descriptor(const material_table_launch &launch,
   if (!launch.loop_count) return;
   if (!launch.destination || !launch.elements ||
       (require_compact_device_pointer &&
-       (!launch.compact_inputs ||
+       (!launch.compact_inputs || !launch.classification ||
+        (launch.secondary_destination && !launch.secondary_classification) ||
         !compact_range<material_table_header>(launch.table_header_offset, 1,
                                               launch.compact_input_bytes) ||
         reinterpret_cast<uintptr_t>(launch.compact_inputs) % alignof(double))) ||
@@ -913,6 +966,7 @@ void launch_material_conductivity(const material_conductivity_launch &launch,
                                   const stream &stream) {
   if (!launch.loop_count) return;
   if (!launch.conductivity_destination || !launch.condinv_destination ||
+      !launch.conductivity_classification || !launch.condinv_classification ||
       !launch.compact_inputs || !launch.absorber_count || !launch.elements)
     throw std::invalid_argument("NVIDIA material conductivity launch has a null input");
   const size_t destination_bytes = checked_scalar_bytes(
@@ -980,7 +1034,8 @@ void launch_material_conductivity(const material_conductivity_launch &launch,
 void launch_material_pml(const material_pml_launch &launch, const stream &stream) {
   if (!launch.elements) return;
   if (!launch.sigma_destination || !launch.kappa_destination ||
-      !launch.sigma_inv_destination ||
+      !launch.sigma_inv_destination || !launch.sigma_classification ||
+      !launch.kappa_classification || !launch.sigma_inv_classification ||
       (launch.profile_active &&
        (!launch.compact_inputs || launch.profile_offset % alignof(double) ||
         launch.profile_offset > launch.compact_input_bytes ||
@@ -1048,6 +1103,26 @@ void launch_material_pml(const material_pml_launch &launch, const stream &stream
     case scalar_precision::f64: launch_pml_typed<double>(launch, stream); break;
     default: throw std::invalid_argument("NVIDIA material PML precision is invalid");
   }
+}
+
+void launch_material_classification_header(material_classification_header *result,
+                                           material_classification_header value,
+                                           const stream &stream) {
+  if (!result) throw std::invalid_argument("NVIDIA material classification header is null");
+  material_classification_header_kernel<<<1, 1, 0,
+      static_cast<cudaStream_t>(stream.opaque_handle())>>>(result, value);
+  check_cuda(cudaPeekAtLastError(), "launching NVIDIA material classification header kernel");
+}
+
+void launch_material_classification_row(
+    const unsigned char *status, size_t elements,
+    material_classification_row_result *result,
+    material_classification_row_result value, const stream &stream) {
+  if (!status || !elements || !result)
+    throw std::invalid_argument("NVIDIA material classification row is invalid");
+  material_classification_row_kernel<<<1, 256, 0,
+      static_cast<cudaStream_t>(stream.opaque_handle())>>>(status, elements, result, value);
+  check_cuda(cudaPeekAtLastError(), "launching NVIDIA material classification row kernel");
 }
 
 } // namespace nvidia

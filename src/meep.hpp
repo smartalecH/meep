@@ -2525,6 +2525,7 @@ private:
   friend void backend_prepare_field_layout_change(fields &, uint32_t, const char *);
   friend void backend_preflight_field_layout_change(fields &, uint32_t, const char *);
   friend void backend_commit_field_layout_change(fields &);
+  friend void backend_note_material_definition_changed_for_testing(fields &);
   friend bool legacy_material_change_pending(const fields &);
   friend bool backend_try_synchronize_magnetic_fields(fields &, const char *);
   friend bool backend_try_restore_magnetic_fields(fields &, const char *);

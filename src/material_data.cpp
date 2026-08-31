@@ -18,10 +18,21 @@
 #include "material_data.hpp"
 
 #include <algorithm>
+#include <map>
+#include <mutex>
 
+#include "backend/material_callback.hpp"
 #include "meep/mympi.hpp"
 
 namespace meep_geom {
+
+namespace {
+
+std::mutex owned_callback_mutex;
+std::map<const material_data *, std::shared_ptr<const meep::OwnedMaterialCallback> >
+    owned_callbacks;
+
+} // namespace
 
 bool transition::operator==(const transition &other) const {
   return (from_level == other.from_level && to_level == other.to_level &&
@@ -57,6 +68,7 @@ void material_data::copy_from(const material_data &from) {
   // NOTE: the user_data field here opaque/void - so this is the best we can do.
   user_data = from.user_data;
   do_averaging = from.do_averaging;
+  copy_owned_material_callback(&from, this);
 
   std::copy(std::begin(from.epsilon_dims), std::end(from.epsilon_dims), std::begin(epsilon_dims));
   if (from.epsilon_data) {
@@ -78,6 +90,53 @@ void material_data::copy_from(const material_data &from) {
   eta = from.eta;
   damping = from.damping;
   material_grid_kinds = from.material_grid_kinds;
+}
+
+bool owned_material_callback(
+    const material_data *material,
+    std::shared_ptr<const meep::OwnedMaterialCallback> *owner) {
+  std::lock_guard<std::mutex> lock(owned_callback_mutex);
+  const auto found = owned_callbacks.find(material);
+  if (found == owned_callbacks.end()) return false;
+  if (owner) *owner = found->second;
+  return true;
+}
+
+void copy_owned_material_callback(const material_data *source, material_data *destination) {
+  std::lock_guard<std::mutex> lock(owned_callback_mutex);
+  owned_callbacks.erase(destination);
+  const auto found = owned_callbacks.find(source);
+  if (found != owned_callbacks.end()) owned_callbacks[destination] = found->second;
+}
+
+void release_owned_material_callback(const material_data *material) {
+  std::lock_guard<std::mutex> lock(owned_callback_mutex);
+  owned_callbacks.erase(material);
+}
+
+material_type make_owned_user_material_for_backend(
+    const std::shared_ptr<const meep::OwnedMaterialCallback> &owner, bool do_averaging) {
+  if (!owner || !owner->id || !owner->signature || !owner->capabilities || !owner->function)
+    meep::abort(
+        "owned user material callback requires stable identity, signature, and capabilities");
+  material_data *material = new material_data();
+  material->which_subclass = material_data::MATERIAL_USER;
+  material->do_averaging = do_averaging;
+  {
+    std::lock_guard<std::mutex> lock(owned_callback_mutex);
+    owned_callbacks[material] = owner;
+  }
+  return material;
+}
+
+void evaluate_material_user(material_data &material, vector3 point) {
+  std::shared_ptr<const meep::OwnedMaterialCallback> owner;
+  if (owned_material_callback(&material, &owner)) {
+    owner->function(point, material.medium);
+    return;
+  }
+  if (!material.user_func) meep::abort("user material has no callback");
+  material.user_func(point, material.user_data, &material.medium);
 }
 
 material_type_list::material_type_list() : items(NULL), num_items(0) {}

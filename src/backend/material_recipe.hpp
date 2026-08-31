@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "backend/storage_plan.hpp"
+#include "backend/material_callback.hpp"
 #include "backend/material_ir.hpp"
 #include "backend/precision.hpp"
 
@@ -40,7 +41,12 @@ enum MaterialSupportReason : uint64_t {
   material_support_adaptive_averaging = UINT64_C(1) << 1,
   material_support_unowned_callback = UINT64_C(1) << 2,
   material_support_missing_dense_fallback = UINT64_C(1) << 3,
-  material_support_no_owned_ir = UINT64_C(1) << 4
+  material_support_no_owned_ir = UINT64_C(1) << 4,
+  material_support_owned_callback = UINT64_C(1) << 5,
+  material_support_callback_geometry = UINT64_C(1) << 6,
+  material_support_composite_fallback = UINT64_C(1) << 7,
+  material_support_callback_capability = UINT64_C(1) << 8,
+  material_support_callback_output = UINT64_C(1) << 9
 };
 
 struct MaterialSupportDecision {
@@ -72,6 +78,17 @@ struct MaterialRecipeRow {
   bool operator==(const MaterialRecipeRow &other) const;
 };
 
+/* Bounded pointwise callback work.  The callable itself is retained by the
+   referenced MaterialIR material record through a real shared owner token. */
+struct MaterialCallbackTile {
+  uint32_t destination;
+  uint32_t material;
+  uint64_t first_point;
+  uint64_t count;
+
+  bool operator==(const MaterialCallbackTile &other) const;
+};
+
 struct MaterialRecipeInput {
   MaterialRecipeDisposition disposition;
   std::string description;
@@ -82,6 +99,9 @@ struct MaterialRecipeInput {
   bool from_host_callback;
   uint64_t support_reason_bits;
   std::vector<MaterialRecipeRow> rows;
+  std::vector<MaterialRecipeRow> dense_fallback_rows;
+  std::vector<MaterialCallbackTile> callback_tiles;
+  std::vector<std::shared_ptr<const OwnedMaterialCallback> > callback_owners;
   std::vector<MaterialIRTopologyRow> topology;
   std::shared_ptr<const MaterialIR> ir;
 
@@ -105,6 +125,13 @@ public:
   bool from_host_callback() const { return from_host_callback_; }
   uint64_t support_reason_bits() const { return support_reason_bits_; }
   const std::vector<MaterialRecipeRow> &rows() const { return rows_; }
+  const std::vector<MaterialRecipeRow> &dense_fallback_rows() const {
+    return dense_fallback_rows_;
+  }
+  const std::vector<MaterialCallbackTile> &callback_tiles() const { return callback_tiles_; }
+  const std::vector<std::shared_ptr<const OwnedMaterialCallback> > &callback_owners() const {
+    return callback_owners_;
+  }
   const std::vector<MaterialIRTopologyRow> &topology() const { return topology_; }
   const std::shared_ptr<const MaterialIR> &ir() const { return ir_; }
   uint64_t signature() const { return signature_; }
@@ -123,12 +150,24 @@ private:
   bool from_host_callback_;
   uint64_t support_reason_bits_;
   std::vector<MaterialRecipeRow> rows_;
+  std::vector<MaterialRecipeRow> dense_fallback_rows_;
+  std::vector<MaterialCallbackTile> callback_tiles_;
+  std::vector<std::shared_ptr<const OwnedMaterialCallback> > callback_owners_;
   std::vector<MaterialIRTopologyRow> topology_;
   std::shared_ptr<const MaterialIR> ir_;
   uint64_t signature_;
 };
 
 MaterialRecipe build_host_reference_material_recipe(const fields &f);
+MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
+                                            MaterialRecipeDisposition route);
+MaterialSupportDecision classify_material_ir_support(
+    const std::shared_ptr<const MaterialIR> &ir);
+bool material_recipe_has_complete_dense_fallback(const MaterialRecipe &recipe);
+bool material_recipe_has_local_fallback_work(const MaterialRecipe &recipe,
+                                             MaterialRecipeDisposition effective_route);
+MaterialRecipeDisposition reconcile_material_recipe_route(
+    MaterialRecipeDisposition local_route, bool local_dense_complete);
 MaterialSupportDecision classify_material_support(const MaterialRecipe &recipe);
 void validate_material_recipe(const MaterialRecipe &recipe);
 void mark_material_storage_provisional(const MaterialRecipe &recipe, StoragePlan &plan);

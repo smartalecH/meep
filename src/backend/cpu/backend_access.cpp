@@ -45,6 +45,8 @@ static size_t noisy_collective_count_for_testing = 0;
 static int multilevel_preflight_failure_rank_for_testing = -1;
 static int multilevel_preflight_failure_mode_for_testing = 0;
 static size_t multilevel_collective_count_for_testing = 0;
+static size_t material_phase_collective_count_for_testing = 0;
+static size_t material_phase_scan_count_for_testing = 0;
 static int host_custom_collective_failure_rank_for_testing = -1;
 static int host_custom_collective_failure_mode_for_testing = 0;
 static size_t host_custom_collective_count_for_testing = 0;
@@ -125,6 +127,27 @@ size_t backend_multilevel_collective_count_for_testing() {
 
 void backend_note_multilevel_collective_for_testing() {
   ++multilevel_collective_count_for_testing;
+}
+
+void backend_reset_material_phase_preflight_counts_for_testing() {
+  material_phase_collective_count_for_testing = 0;
+  material_phase_scan_count_for_testing = 0;
+}
+
+size_t backend_material_phase_collective_count_for_testing() {
+  return material_phase_collective_count_for_testing;
+}
+
+size_t backend_material_phase_scan_count_for_testing() {
+  return material_phase_scan_count_for_testing;
+}
+
+void backend_note_material_phase_collective_for_testing() {
+  ++material_phase_collective_count_for_testing;
+}
+
+void backend_note_material_phase_scan_for_testing() {
+  ++material_phase_scan_count_for_testing;
 }
 
 void backend_set_host_custom_collective_failure_for_testing(int rank, int mode) {
@@ -1107,6 +1130,47 @@ std::string backend_host_custom_policy_publish_error(const fields &f, bool any_p
   return std::string();
 }
 
+std::string backend_material_fallback_policy_error(
+    const fields &f, MaterialRecipeDisposition global_route) {
+  if (!f.backend || !f.backend->enforces_material_fallback_policy()) return std::string();
+  if (global_route != MaterialRecipeDisposition::device_native &&
+      (f.options.strict || f.options.fallback != fallback_policy::warn))
+    return "material fallback requires strict=false and fallback=warn";
+  if (global_route != MaterialRecipeDisposition::device_native && f.backend &&
+      !f.backend->material_fallback_warning_emitted_ &&
+      f.backend->material_fallback_warning_count_ == std::numeric_limits<uint64_t>::max())
+    return "material fallback warning counter overflow";
+  return std::string();
+}
+
+void backend_publish_material_fallback_policy(fields &f, BackendState &state) noexcept {
+  if (!f.backend || !f.backend->enforces_material_fallback_policy() ||
+      !state.material_fallback_policy_pending) {
+    state.material_fallback_policy_pending = false;
+    return;
+  }
+  if (state.material_fallback_global_presence &&
+      !f.backend->material_fallback_warning_emitted_) {
+    ++f.backend->material_fallback_warning_count_;
+    state.material_fallback_statistics.warnings = 1;
+    master_printf("meep: warning: using %s material initialization fallback\n",
+                  material_recipe_disposition_name(state.material_route));
+    f.backend->material_fallback_warning_emitted_ = true;
+  }
+  state.material_fallback_policy_pending = false;
+}
+
+void backend_set_material_fallback_warning_for_testing(ExecutionBackend &backend,
+                                                       uint64_t count, bool emitted) {
+  backend.material_fallback_warning_count_ = count;
+  backend.material_fallback_warning_emitted_ = emitted;
+}
+
+void backend_note_material_definition_changed_for_testing(fields &f) {
+  f.chunk_connections_valid = false;
+  f.changed_materials = true;
+}
+
 void backend_preflight_host_custom_fallback(fields &f, HostCustomFallbackUse use,
                                             const char *site) {
   if (!f.backend || !f.backend->requires_full_storage_preparation()) return;
@@ -1686,18 +1750,70 @@ struct ResidentEpochCandidate {
   std::unique_ptr<BackendState, BackendStateDeleter> state;
   std::unique_ptr<Executable> executable;
   std::vector<std::vector<grid_volume> > eh_tiles;
+  MaterialSupportDecision material_support;
+  MaterialRecipeDisposition global_material_route;
+  MaterialRecipeDisposition local_material_route;
   LiveIdentitySnapshot entry;
 
-  ResidentEpochCandidate() {}
+  ResidentEpochCandidate()
+      : material_support{MaterialRecipeDisposition::device_native, material_support_none,
+                         0, 0, 0, 0, 0, 0},
+        global_material_route(MaterialRecipeDisposition::device_native),
+        local_material_route(MaterialRecipeDisposition::device_native) {}
 };
 
-static bool same_classification(const MaterialClassification &a,
-                                const MaterialClassification &b) {
-  return a.variant_keys == b.variant_keys && a.required_components == b.required_components &&
-         a.has_nonlinearities == b.has_nonlinearities &&
-         a.min_decimation_factor == b.min_decimation_factor && a.hash == b.hash &&
-         a.anisotropic_eh == b.anisotropic_eh && a.aniso2d == b.aniso2d;
+struct MaterialFallbackPreflight {
+  MaterialSupportDecision local_support;
+  MaterialRecipeDisposition global_route;
+  uint32_t semantic_version;
+  uint64_t semantic_signature;
+};
+
+static MaterialFallbackPreflight preflight_material_fallback(fields &f) {
+  MaterialFallbackPreflight result = {
+      MaterialSupportDecision{MaterialRecipeDisposition::host_reference,
+                              material_support_no_owned_ir, 0, 0, 0, 0, 0, 0},
+      MaterialRecipeDisposition::host_reference, 0, 0};
+  std::string local_error;
+  try {
+    std::shared_ptr<const MaterialIR> ir;
+    if (f.material_ir) ir = std::shared_ptr<const MaterialIR>(f.material_ir, material_ir_for(f));
+    result.local_support = classify_material_ir_support(ir);
+    result.semantic_version = ir ? ir->version : 0;
+    result.semantic_signature = ir ? ir->signature : 0;
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown early material fallback preflight failure";
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend early material preflight");
+
+  int reference_version = int(result.semantic_version);
+  size_t reference_signature = size_t(result.semantic_signature);
+  broadcast(0, &reference_version, 1);
+  broadcast(0, &reference_signature, 1);
+  if (result.semantic_version != uint32_t(reference_version) ||
+      result.semantic_signature != uint64_t(reference_signature))
+    local_error = "material IR semantic version/signature differs across MPI ranks";
+  try {
+    /* Dense completeness is verified against the exact frozen topology after
+       host coefficients exist.  The early boundary only computes the route
+       needed to reject strict mode before authority migration/allocation. */
+    result.global_route =
+        reconcile_material_recipe_route(result.local_support.disposition, true);
+    if (local_error.empty())
+      local_error = backend_material_fallback_policy_error(f, result.global_route);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  backend_reconcile_host_access(local_error, "fields::init_backend early material policy");
+  return result;
 }
+
+enum class ResidentCandidateResult { committed, promotion_required };
 
 static void build_candidate_eh_tiles(const fields &f, const MaterialClassification &classification,
                                      std::vector<std::vector<grid_volume> > &tiles) {
@@ -1774,10 +1890,11 @@ private:
   uint32_t old_classification_reentries_;
 };
 
-bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool local_custom,
-                                    bool any_custom, bool any_multilevel, bool any_flux,
-                                    const MaterialClassification &host_oracle,
-                                    const LiveIdentitySnapshot &entry) {
+ResidentCandidateResult build_resident_epoch_candidate(
+    fields &f, DirtyMask completed_dirty, bool local_custom, bool any_custom,
+    bool any_multilevel, bool any_flux, const LiveIdentitySnapshot &entry,
+    const MaterialFallbackPreflight &material_preflight,
+    MaterialClassification *promotion_classification) {
   ResidentEpochCandidate candidate;
   std::string local_error;
 
@@ -1793,14 +1910,18 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     }
     if (!candidate.initialization || candidate.initialization->materials.size() != 1)
       throw std::logic_error("resident candidate requires one material recipe");
-    candidate.allocation_storage = *candidate.host_storage;
-    mark_material_storage_provisional(candidate.initialization->materials[0],
-                                      candidate.allocation_storage);
     const MaterialRecipe &recipe = candidate.initialization->materials[0];
-    const MaterialSupportDecision support = classify_material_support(recipe);
-    if (support.disposition != recipe.disposition() ||
-        support.reason_bits != recipe.support_reason_bits())
+    candidate.material_support = classify_material_support(recipe);
+    if (candidate.material_support.disposition != recipe.disposition() ||
+        candidate.material_support.reason_bits != recipe.support_reason_bits())
       throw std::logic_error("resident candidate material support decision changed");
+    if ((recipe.ir() && (recipe.ir()->version != material_preflight.semantic_version ||
+                         recipe.ir()->signature != material_preflight.semantic_signature)) ||
+        (!recipe.ir() && (material_preflight.semantic_version ||
+                          material_preflight.semantic_signature)) ||
+        candidate.material_support.disposition != material_preflight.local_support.disposition ||
+        candidate.material_support.reason_bits != material_preflight.local_support.reason_bits)
+      throw std::logic_error("resident candidate differs from early material preflight");
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -1812,16 +1933,26 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
 
   {
     const MaterialRecipe &recipe = candidate.initialization->materials[0];
-    uint64_t reference_ir_signature = recipe.ir() ? recipe.ir()->signature : 0;
-    broadcast(0, &reference_ir_signature, 1);
     local_error.clear();
-    if ((recipe.ir() ? recipe.ir()->signature : 0) != reference_ir_signature)
-      local_error = "material IR semantic signature differs across MPI ranks";
-    size_t local_route = size_t(1) << size_t(recipe.disposition());
-    size_t global_routes = 0;
-    bw_or_to_all(&local_route, &global_routes, 1);
-    if (global_routes != local_route)
-      local_error = "material recipe disposition differs across MPI ranks";
+    const bool local_dense_complete = material_recipe_has_complete_dense_fallback(recipe);
+    try {
+      candidate.global_material_route =
+          reconcile_material_recipe_route(recipe.disposition(), local_dense_complete);
+      if (candidate.global_material_route != material_preflight.global_route)
+        throw std::logic_error("exact material route differs from early preflight");
+      candidate.local_material_route =
+          candidate.global_material_route == MaterialRecipeDisposition::host_reference
+              ? MaterialRecipeDisposition::host_reference
+              : recipe.disposition();
+      candidate.initialization->materials[0] =
+          select_material_recipe_route(recipe, candidate.local_material_route);
+      candidate.allocation_storage = *candidate.host_storage;
+      mark_material_storage_provisional(candidate.initialization->materials[0],
+                                        candidate.allocation_storage);
+    }
+    catch (const std::exception &e) {
+      local_error = e.what();
+    }
     backend_reconcile_host_access(local_error,
                                   "fields::init_backend candidate material support");
   }
@@ -1836,6 +1967,34 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     candidate.state->host_custom_plan_validated = false;
     candidate.state->host_custom_validated_plan_signature = 0;
     candidate.state->host_custom_policy_pending = true;
+    candidate.state->material_route = candidate.global_material_route;
+    candidate.state->material_local_route = candidate.local_material_route;
+    candidate.state->material_support_reasons = candidate.material_support.reason_bits;
+    candidate.state->material_recipe_signature =
+        candidate.initialization->materials[0].signature();
+    const MaterialRecipe &effective_material = candidate.initialization->materials[0];
+    candidate.state->material_fallback_local_presence =
+        material_recipe_has_local_fallback_work(effective_material,
+                                                candidate.local_material_route);
+    candidate.state->material_fallback_global_presence =
+        candidate.global_material_route != MaterialRecipeDisposition::device_native;
+    candidate.state->material_fallback_presence_validated = true;
+    candidate.state->material_fallback_policy_pending = true;
+    if (candidate.local_material_route == MaterialRecipeDisposition::host_reference) {
+      candidate.state->material_fallback_statistics.dense_rows =
+          candidate.initialization->materials[0].dense_fallback_rows().size();
+      candidate.state->material_fallback_statistics.dense_bytes =
+          candidate.material_support.dense_fallback_bytes;
+    }
+    if (candidate.local_material_route == MaterialRecipeDisposition::hybrid_interface)
+      candidate.state->material_fallback_statistics.interface_points =
+          candidate.material_support.interface_points;
+    if (candidate.local_material_route == MaterialRecipeDisposition::tiled_callback) {
+      candidate.state->material_fallback_statistics.callback_tiles =
+          candidate.initialization->materials[0].callback_tiles().size();
+      candidate.state->material_fallback_statistics.callback_points =
+          candidate.material_support.callback_points;
+    }
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -1844,6 +2003,20 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     local_error = "unknown resident candidate state failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate create");
+
+  bool candidate_promotion = false;
+  try {
+    ScopedArtifactBuildView view(f, candidate);
+    f.backend->prepare_initialization(*candidate.initialization, *candidate.state);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate host material fallback failure";
+  }
+  backend_reconcile_host_access(local_error,
+                                "fields::init_backend candidate host material fallback");
 
   try {
     ScopedArtifactBuildView view(f, candidate);
@@ -1856,15 +2029,11 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     local_error = "unknown resident candidate initialization failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate initialize");
-  if (initialization_only_for_testing) return true;
 
   try {
     ScopedArtifactBuildView view(f, candidate);
     candidate.classification =
         f.backend->classify_state(candidate.allocation_storage, *candidate.state);
-    if (!same_classification(candidate.classification, host_oracle))
-      throw std::runtime_error("candidate classification differs from the captured host oracle");
-    build_candidate_eh_tiles(f, candidate.classification, candidate.eh_tiles);
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -1873,6 +2042,37 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     local_error = "unknown resident candidate classification failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate classify");
+  validate_material_classification(f, candidate.allocation_storage,
+                                   candidate.initialization->materials[0],
+                                   candidate.classification);
+  try {
+    const component_mask global_components = global_field_component_presence(f);
+    if (candidate.classification.aniso2d)
+      FOR_COMPONENTS(c)
+        candidate_promotion = candidate_promotion ||
+                              (f.gv.has_field(c) &&
+                               !(global_components & (component_mask(1) << int(c))));
+    FOR_COMPONENTS(c)
+      candidate_promotion = candidate_promotion ||
+                            ((candidate.classification.required_components &
+                              (component_mask(1) << int(c))) &&
+                             !(global_components & (component_mask(1) << int(c))));
+    if (!candidate_promotion)
+      build_candidate_eh_tiles(f, candidate.classification, candidate.eh_tiles);
+  }
+  catch (const std::exception &e) {
+    local_error = e.what();
+  }
+  catch (...) {
+    local_error = "unknown resident candidate classification consumption failure";
+  }
+  backend_reconcile_host_access(local_error,
+                                "fields::init_backend candidate classification consumption");
+  candidate_promotion = or_to_all(candidate_promotion);
+  if (candidate_promotion) {
+    if (promotion_classification) *promotion_classification = candidate.classification;
+    return ResidentCandidateResult::promotion_required;
+  }
   try {
     ScopedArtifactBuildView view(f, candidate);
     f.backend->finalize_storage(*candidate.host_storage, candidate.classification,
@@ -1889,6 +2089,7 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     local_error = "unknown resident candidate finalization failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate finalize");
+  if (initialization_only_for_testing) return ResidentCandidateResult::committed;
 
   try {
     if (material_candidate_plan_failure_rank_for_testing == my_rank()) {
@@ -1932,6 +2133,10 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     candidate.ordinary_plan.reset(new StepPlan(build_step_plan(f, StepProgram::ordinary)));
     if (!candidate.ordinary_plan)
       throw std::runtime_error("resident candidate produced no ordinary plan");
+    validate_material_classification_consumers(*candidate.resolved_storage,
+                                               *candidate.initialization,
+                                               *candidate.ordinary_plan,
+                                               candidate.classification);
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -2052,6 +2257,7 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
   f.backend_state = candidate.state.release();
   f.executable = candidate.executable.release();
   f.prepared_classification_hash = candidate.classification.hash;
+  f.backend_state->material_classification_hash = candidate.classification.hash;
   for (int i = 0; i < f.num_chunks; ++i)
     for (field_type ft : {E_stuff, H_stuff})
       f.chunks[i]->gvs_eh[ft].swap(candidate.eh_tiles[size_t(i) * NUM_FIELD_TYPES + ft]);
@@ -2061,6 +2267,7 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
     backend_publish_host_custom_policy(f, local_custom, any_custom);
     f.backend_state->host_custom_policy_pending = false;
   }
+  backend_publish_material_fallback_policy(f, *f.backend_state);
   if (old_state) old_state->clear_cw_executable();
   delete old_executable; destroy_backend_state(old_state); delete old_initialization;
   delete old_ordinary; delete old_cw; delete old_descriptors; delete old_catalog;
@@ -2068,7 +2275,7 @@ bool build_resident_epoch_candidate(fields &f, DirtyMask completed_dirty, bool l
   /* Halo topology is not part of this metadata-only transaction. */
   f.halos = old_halos;
 
-  return true;
+  return ResidentCandidateResult::committed;
 }
 
 /* Reversible storage/connection epoch used only by resident solve_cw
@@ -2810,6 +3017,21 @@ void fields::init_backend() {
     }
   }
 
+  const bool material_recipe_current =
+      initialization_plan &&
+      initialization_plan->material_values_generation ==
+          generation(*this, MutationKind::material_values) &&
+      initialization_plan->material_region_generation ==
+          generation(*this, MutationKind::material_region);
+  const bool material_candidate =
+      !backend_state || is_dirty(*this, dirty_classification) ||
+      (is_dirty(*this, dirty_initialization) && !material_recipe_current);
+  MaterialFallbackPreflight material_preflight = {
+      MaterialSupportDecision{MaterialRecipeDisposition::host_reference,
+                              material_support_no_owned_ir, 0, 0, 0, 0, 0, 0},
+      MaterialRecipeDisposition::host_reference, 0, 0};
+  if (material_candidate) material_preflight = preflight_material_fallback(*this);
+
   /* A phase may have been configured while the CPU backend was still lazy and
      only then moved to a resident backend.  Before that backend freezes its
      catalog, detach shared current structure chunks and realize the retained
@@ -2836,15 +3058,6 @@ void fields::init_backend() {
     meep::abort("meep: fields coordinate state changed without invalidation; recreate fields so "
                 "the per-chunk coordinate state and resident executable agree");
 
-  const bool material_recipe_current =
-      initialization_plan &&
-      initialization_plan->material_values_generation ==
-          generation(*this, MutationKind::material_values) &&
-      initialization_plan->material_region_generation ==
-          generation(*this, MutationKind::material_region);
-  const bool material_candidate =
-      !backend_state || is_dirty(*this, dirty_classification) ||
-      (is_dirty(*this, dirty_initialization) && !material_recipe_current);
   if (material_candidate) {
     std::string candidate_error;
     std::unique_ptr<LiveIdentitySnapshot> entry;
@@ -2953,55 +3166,59 @@ void fields::init_backend() {
       }
     backend_reconcile_host_access(candidate_error,
                                   "fields::init_backend candidate identity snapshot");
-    MaterialClassification host_oracle;
+    const DirtyMask completed = DirtyMask(dirty_mask);
+    MaterialClassification promotion_classification;
+    const ResidentCandidateResult first_result = build_resident_epoch_candidate(
+        *this, completed, local_custom, any_custom, any_multilevel, any_flux, *entry,
+        material_preflight, &promotion_classification);
+    if (first_result == ResidentCandidateResult::committed) return;
+
+    std::unique_ptr<PreparedBackendEpoch> promotion_epoch;
     try {
-      host_oracle = classify(*this, *storage_plan);
+      promotion_epoch.reset(new PreparedBackendEpoch(*this));
     }
     catch (const std::exception &e) {
       candidate_error = e.what();
     }
     catch (...) {
-      candidate_error = "unknown candidate host classification failure";
+      candidate_error = "unknown material promotion epoch preparation failure";
     }
     backend_reconcile_host_access(candidate_error,
-                                  "fields::init_backend candidate host classification");
-
-    bool promotion = false;
-    FOR_COMPONENTS(c)
-      if ((host_oracle.required_components & (component_mask(1) << int(c))) &&
-          !have_component(c))
-        promotion = true;
-    if (backend_state && promotion) {
-      backend_preflight_field_layout_change(
-          *this, DirtyMask(dirty_storage | dirty_initialization | dirty_classification |
-                           dirty_executable),
-          "fields::init_backend candidate classification promotion");
-      backend_commit_field_layout_change(*this);
-      entry.reset();
-      apply_classification(*this, host_oracle);
-      prepared_classification_hash = host_oracle.hash;
-      ++classification_reentries;
-      if (classification_reentries > 1)
-        throw std::logic_error("candidate classification re-entered storage more than once");
+                                  "fields::init_backend candidate promotion epoch");
+    try {
+      apply_classification(*this, promotion_classification);
+      classification_reentries = 1;
       require_source_components();
       prepare_storage();
       connect_chunks();
-      host_oracle = classify(*this, *storage_plan);
-      try {
-        entry.reset(new LiveIdentitySnapshot(LiveIdentitySnapshot::capture(*this)));
-      }
-      catch (const std::exception &e) {
-        candidate_error = e.what();
-      }
-      catch (...) {
-        candidate_error = "unknown promoted resident identity snapshot failure";
-      }
-      backend_reconcile_host_access(candidate_error,
-                                    "fields::init_backend promoted candidate identity snapshot");
     }
-    const DirtyMask completed = DirtyMask(dirty_mask);
-    build_resident_epoch_candidate(*this, completed, local_custom, any_custom, any_multilevel,
-                                   any_flux, host_oracle, *entry);
+    catch (const std::exception &e) {
+      candidate_error = e.what();
+    }
+    catch (...) {
+      candidate_error = "unknown staged material component promotion failure";
+    }
+    backend_reconcile_host_access(candidate_error,
+                                  "fields::init_backend staged material promotion");
+    std::unique_ptr<LiveIdentitySnapshot> promoted_entry;
+    try {
+      promoted_entry.reset(new LiveIdentitySnapshot(LiveIdentitySnapshot::capture(*this)));
+    }
+    catch (const std::exception &e) {
+      candidate_error = e.what();
+    }
+    catch (...) {
+      candidate_error = "unknown staged promoted identity snapshot failure";
+    }
+    backend_reconcile_host_access(candidate_error,
+                                  "fields::init_backend staged promoted identity snapshot");
+    const DirtyMask promoted_completed = DirtyMask(dirty_mask);
+    const ResidentCandidateResult second_result = build_resident_epoch_candidate(
+        *this, promoted_completed, local_custom, any_custom, any_multilevel, any_flux,
+        *promoted_entry, material_preflight, NULL);
+    if (second_result != ResidentCandidateResult::committed)
+      throw std::logic_error("material classification requested a second component promotion");
+    promotion_epoch->commit();
     return;
   }
 
@@ -3198,8 +3415,10 @@ void fields::init_backend() {
       classify_error = "unknown resident classification failure";
     }
     backend_reconcile_host_access(classify_error, "fields::init_backend classify");
-    if (prepared_classification_hash && cls.hash != prepared_classification_hash)
-      meep::abort("meep: backend classification disagrees with the prepared host state");
+    if (!initialization_plan || initialization_plan->materials.size() != 1)
+      meep::abort("meep: resident classification has no material recipe");
+    validate_material_classification(*this, *storage_plan,
+                                     initialization_plan->materials[0], cls);
     std::string finalize_error;
     try {
       backend->finalize_storage(*storage_plan, cls, *backend_state);
@@ -3211,6 +3430,8 @@ void fields::init_backend() {
       finalize_error = "unknown resident storage finalization failure";
     }
     backend_reconcile_host_access(finalize_error, "fields::init_backend finalize");
+    prepared_classification_hash = cls.hash;
+    backend_state->material_classification_hash = cls.hash;
     clear_dirty(*this, dirty_classification);
   }
   if (preclassification_ordinary) {

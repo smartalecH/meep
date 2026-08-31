@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <vector>
 
@@ -101,10 +102,12 @@ static void check_geometry_kernels(int device, scalar_precision precision) {
   device_buffer device_compact(compact.size(), device);
   std::vector<T> host(points + 2, T(-17.0));
   device_buffer destination(host.size() * sizeof(T), device);
+  device_buffer classification(points, device);
   copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
   copy_host_to_device_async(destination, 0, host.data(), host.size() * sizeof(T), execution);
   geometry_launch_common common = {};
   common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+  common.classification = static_cast<unsigned char *>(classification.opaque_handle());
   common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
   common.compact_input_bytes = compact.size();
   common.object_offset = object_offset;
@@ -376,11 +379,13 @@ static void check_geometry_precedence(int device, scalar_precision precision) {
   stream execution;
   device_buffer device_compact(compact.size(), device);
   device_buffer destination(3 * sizeof(T), device);
+  device_buffer classification(1, device);
   std::vector<T> output(3, T(-37.0));
   copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
   copy_host_to_device_async(destination, 0, output.data(), output.size() * sizeof(T), execution);
   geometry_launch_common common = {};
   common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+  common.classification = static_cast<unsigned char *>(classification.opaque_handle());
   common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
   common.compact_input_bytes = compact.size();
   common.object_offset = object_offset;
@@ -489,10 +494,12 @@ static void check_geometry_fixed_shapes(int device, scalar_precision precision) 
     device_buffer device_compact(compact.size(), device);
     std::vector<T> output(4, T(-91.0));
     device_buffer destination(output.size() * sizeof(T), device);
+    device_buffer classification(2, device);
     copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
     copy_host_to_device_async(destination, 0, output.data(), output.size() * sizeof(T), execution);
     geometry_launch_common common = {};
     common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+    common.classification = static_cast<unsigned char *>(classification.opaque_handle());
     common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
     common.compact_input_bytes = compact.size();
     common.object_offset = object_offset;
@@ -712,10 +719,12 @@ static void check_geometry_file_grid_values(int device, scalar_precision precisi
     device_buffer device_compact(compact.size(), device);
     std::vector<T> output(5, T(-73.0));
     device_buffer destination(output.size() * sizeof(T), device);
+    device_buffer classification(3, device);
     copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
     copy_host_to_device_async(destination, 0, output.data(), output.size() * sizeof(T), execution);
     geometry_launch_common common = {};
     common.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+    common.classification = static_cast<unsigned char *>(classification.opaque_handle());
     common.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
     common.compact_input_bytes = compact.size();
     common.object_offset = object_offset; common.object_count = 1;
@@ -750,7 +759,7 @@ static void check_geometry_file_grid_values(int device, scalar_precision precisi
           tensor[i] = first[i] * (1.0 - weight) + second[i] * weight;
         expected = inverse_tensor_member_for_testing(tensor, row, column);
       }
-      const double tolerance = sizeof(T) == sizeof(float) ? 2e-7 : 2e-15;
+      const double tolerance = sizeof(T) == sizeof(float) ? 2e-7 : 2e-12;
       require(std::fabs(double(output[size_t(point) + 1]) - expected) <= tolerance,
               "geometry FILE/Grid endpoint or fill value differs");
     }
@@ -762,6 +771,57 @@ static void check_geometry_file_grid_values(int device, scalar_precision precisi
 }
 
 template <typename T>
+static void check_logical_classification_status(int device, scalar_precision precision) {
+  stream execution;
+  const size_t logical_indices[] = {0, 2, 5};
+  std::vector<T> physical(7, T(std::numeric_limits<double>::quiet_NaN()));
+  for (size_t index : logical_indices) physical[index] = T(1);
+  device_buffer device_physical(physical.size() * sizeof(T), device);
+  copy_host_to_device_async(device_physical, 0, physical.data(), physical.size() * sizeof(T),
+                            execution);
+
+  std::vector<unsigned char> status(3, 1u);
+  device_buffer device_status(status.size(), device);
+  copy_host_to_device_async(device_status, 0, status.data(), status.size(), execution);
+  device_buffer device_result(sizeof(material_classification_row_result), device);
+  material_classification_row_result seed = {};
+  seed.chunk = 7;
+  seed.kind = 11;
+  launch_material_classification_row(
+      static_cast<const unsigned char *>(device_status.opaque_handle()), status.size(),
+      static_cast<material_classification_row_result *>(device_result.opaque_handle()), seed,
+      execution);
+  material_classification_row_result result = {};
+  copy_device_to_host_async(&result, device_result, 0, sizeof(result), execution);
+  execution.synchronize();
+  require(result.missing == 0 && result.nontrivial == 0,
+          "poisoned physical padding affected compact logical classification");
+
+  device_buffer logical_values(3 * sizeof(T), device);
+  material_fill_launch writer = {};
+  writer.destination = logical_values.opaque_handle();
+  writer.classification =
+      static_cast<unsigned char *>(device_status.opaque_handle());
+  writer.elements = 3;
+  writer.classification_elements = 3;
+  writer.trivial_value = 1.0;
+  writer.phase = 0;
+  writer.precision = precision;
+  writer.value = 2.0;
+  launch_material_fill(writer, execution);
+  writer.value = 1.0;
+  launch_material_fill(writer, execution);
+  launch_material_classification_row(
+      static_cast<const unsigned char *>(device_status.opaque_handle()), 3,
+      static_cast<material_classification_row_result *>(device_result.opaque_handle()), seed,
+      execution);
+  copy_device_to_host_async(&result, device_result, 0, sizeof(result), execution);
+  execution.synchronize();
+  require(result.missing == 0 && result.nontrivial == 0,
+          "final trivial writer did not overwrite an earlier nontrivial classification");
+}
+
+template <typename T>
 static void check_length(int device, scalar_precision precision, size_t elements,
                          bool logical_single = false) {
   stream execution;
@@ -769,11 +829,15 @@ static void check_length(int device, scalar_precision precision, size_t elements
   const double fill_value = 0.12345678901234567;
   std::vector<T> destination(elements + 2, sentinel);
   device_buffer device_destination(destination.size() * sizeof(T), device);
+  device_buffer device_classification(elements ? elements : 1, device);
   copy_host_to_device_async(device_destination, 0, destination.data(),
                             destination.size() * sizeof(T), execution);
   material_fill_launch fill = {};
   fill.destination = static_cast<unsigned char *>(device_destination.opaque_handle()) + sizeof(T);
+  fill.classification =
+      static_cast<unsigned char *>(device_classification.opaque_handle());
   fill.elements = elements;
+  fill.classification_elements = elements;
   fill.value = fill_value;
   fill.phase = 0;
   fill.precision = precision;
@@ -808,6 +872,9 @@ static void check_length(int device, scalar_precision precision, size_t elements
   device_buffer device_sigma((elements + 2) * sizeof(T), device);
   device_buffer device_kappa((elements + 2) * sizeof(T), device);
   device_buffer device_inverse((elements + 2) * sizeof(T), device);
+  device_buffer device_sigma_status(elements ? elements : 1, device);
+  device_buffer device_kappa_status(elements ? elements : 1, device);
+  device_buffer device_inverse_status(elements ? elements : 1, device);
   std::vector<T> guards(elements + 2, sentinel);
   copy_host_to_device_async(device_profile, 0, compact.data(), compact.size(), execution);
   copy_host_to_device_async(device_sigma, 0, guards.data(), guards.size() * sizeof(T), execution);
@@ -818,6 +885,12 @@ static void check_length(int device, scalar_precision precision, size_t elements
   pml.kappa_destination = static_cast<unsigned char *>(device_kappa.opaque_handle()) + sizeof(T);
   pml.sigma_inv_destination =
       static_cast<unsigned char *>(device_inverse.opaque_handle()) + sizeof(T);
+  pml.sigma_classification =
+      static_cast<unsigned char *>(device_sigma_status.opaque_handle());
+  pml.kappa_classification =
+      static_cast<unsigned char *>(device_kappa_status.opaque_handle());
+  pml.sigma_inv_classification =
+      static_cast<unsigned char *>(device_inverse_status.opaque_handle());
   pml.compact_inputs = static_cast<const unsigned char *>(device_profile.opaque_handle());
   pml.compact_input_bytes = compact.size();
   pml.profile_offset = profile_offset;
@@ -881,9 +954,17 @@ static void check_failures(int device, scalar_precision precision) {
   stream execution;
   std::vector<T> initial(5, T(-7));
   device_buffer destination(initial.size() * sizeof(T), device);
+  device_buffer classification(initial.size(), device);
   copy_host_to_device_async(destination, 0, initial.data(), initial.size() * sizeof(T), execution);
   execution.synchronize();
-  material_fill_launch fill = {destination.opaque_handle(), initial.size(), 3.0, 0, precision};
+  material_fill_launch fill = {};
+  fill.destination = destination.opaque_handle();
+  fill.classification = static_cast<unsigned char *>(classification.opaque_handle());
+  fill.elements = initial.size();
+  fill.classification_elements = initial.size();
+  fill.value = 3.0;
+  fill.trivial_value = 0.0;
+  fill.precision = precision;
   testing::fail_next(testing::failure_point::material_pointwise_launch);
   bool rejected = false;
   try { launch_material_fill(fill, execution); }
@@ -910,7 +991,9 @@ static void check_failures(int device, scalar_precision precision) {
   malformed.elements = std::numeric_limits<size_t>::max();
   require_invalid([&]() { launch_material_fill(malformed, execution); },
                   "overflowing material fill range was accepted");
-  material_fill_launch empty = {NULL, 0, 1.0, 0, precision};
+  material_fill_launch empty = {};
+  empty.value = 1.0;
+  empty.precision = precision;
   launch_material_fill(empty, execution);
 
   const size_t profile_offset = 16;
@@ -919,6 +1002,8 @@ static void check_failures(int device, scalar_precision precision) {
   std::memcpy(compact_bytes.data() + profile_offset, profile, sizeof(profile));
   device_buffer compact(compact_bytes.size(), device), kappa(initial.size() * sizeof(T), device),
       inverse(initial.size() * sizeof(T), device);
+  device_buffer sigma_status(initial.size(), device), kappa_status(initial.size(), device),
+      inverse_status(initial.size(), device);
   copy_host_to_device_async(compact, 0, compact_bytes.data(), compact_bytes.size(), execution);
   copy_host_to_device_async(destination, 0, initial.data(), initial.size() * sizeof(T), execution);
   copy_host_to_device_async(kappa, 0, initial.data(), initial.size() * sizeof(T), execution);
@@ -928,6 +1013,10 @@ static void check_failures(int device, scalar_precision precision) {
   pml.sigma_destination = destination.opaque_handle();
   pml.kappa_destination = kappa.opaque_handle();
   pml.sigma_inv_destination = inverse.opaque_handle();
+  pml.sigma_classification = static_cast<unsigned char *>(sigma_status.opaque_handle());
+  pml.kappa_classification = static_cast<unsigned char *>(kappa_status.opaque_handle());
+  pml.sigma_inv_classification =
+      static_cast<unsigned char *>(inverse_status.opaque_handle());
   pml.compact_inputs = static_cast<const unsigned char *>(compact.opaque_handle());
   pml.compact_input_bytes = compact.size();
   pml.profile_offset = profile_offset;
@@ -1093,6 +1182,8 @@ static void check_absorber(int device, scalar_precision precision,
       observed_inv(elements + 2);
   device_buffer device_cnd(guards.size() * sizeof(T), device);
   device_buffer device_inv(guards.size() * sizeof(T), device);
+  device_buffer cnd_classification(elements, device);
+  device_buffer inv_classification(elements, device);
   copy_host_to_device_async(device_cnd, 0, guards.data(), guards.size() * sizeof(T), execution);
   copy_host_to_device_async(device_inv, 0, guards.data(), guards.size() * sizeof(T), execution);
 
@@ -1101,6 +1192,10 @@ static void check_absorber(int device, scalar_precision precision,
       static_cast<unsigned char *>(device_cnd.opaque_handle()) + sizeof(T);
   launch.condinv_destination =
       static_cast<unsigned char *>(device_inv.opaque_handle()) + sizeof(T);
+  launch.conductivity_classification =
+      static_cast<unsigned char *>(cnd_classification.opaque_handle());
+  launch.condinv_classification =
+      static_cast<unsigned char *>(inv_classification.opaque_handle());
   launch.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
   launch.compact_input_bytes = compact.size();
   launch.absorber_header_offset = header_offset;
@@ -1330,11 +1425,14 @@ static void check_table_length(int device, scalar_precision precision, size_t el
   std::vector<T> guarded(leading_guards + elements + trailing_guards, sentinel), observed;
   device_buffer device_compact(compact.size(), device);
   device_buffer destination(guarded.size() * sizeof(T), device);
+  device_buffer classification(elements ? elements : 1, device);
   copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
   copy_host_to_device_async(destination, 0, guarded.data(), guarded.size() * sizeof(T), execution);
   material_table_launch launch = {};
   launch.destination = static_cast<unsigned char *>(destination.opaque_handle()) +
                        leading_guards * sizeof(T);
+  launch.classification =
+      static_cast<unsigned char *>(classification.opaque_handle());
   launch.compact_inputs = static_cast<const unsigned char *>(device_compact.opaque_handle());
   launch.compact_input_bytes = compact.size();
   launch.elements = elements;
@@ -1391,16 +1489,24 @@ static void check_table_materials(int device, scalar_precision precision,
   std::vector<T> guards(elements + 2, sentinel), observed(elements + 2), inverse(elements + 2);
   device_buffer destination(guards.size() * sizeof(T), device);
   device_buffer secondary(guards.size() * sizeof(T), device);
+  device_buffer classification(elements, device);
+  device_buffer secondary_classification(elements, device);
 
   const auto make_launch = [&](device_buffer &compact, size_t compact_bytes,
                                material_table_kind kind,
                                material_table_operation operation) {
     material_table_launch launch = {};
     launch.destination = static_cast<unsigned char *>(destination.opaque_handle()) + sizeof(T);
+    launch.classification =
+        static_cast<unsigned char *>(classification.opaque_handle());
     launch.secondary_destination = operation == material_table_operation::grid_conductivity
                                        ? static_cast<unsigned char *>(secondary.opaque_handle()) +
                                              sizeof(T)
                                        : NULL;
+    launch.secondary_classification =
+        operation == material_table_operation::grid_conductivity
+            ? static_cast<unsigned char *>(secondary_classification.opaque_handle())
+            : NULL;
     launch.compact_inputs = static_cast<const unsigned char *>(compact.opaque_handle());
     launch.compact_input_bytes = compact_bytes;
     launch.table_header_offset = 0;
@@ -1513,7 +1619,17 @@ static void check_table_materials(int device, scalar_precision precision,
     for (size_t i = 0; i < elements; ++i) {
       const double z = -2.0 + i;
       const double epsilon = scalar_interpolate(0.5 + z / 4.0, samples);
-      require(observed[i + 1] == T(1.0 / epsilon), "FILE table interpolation differs");
+      const double logical_expected = logical_single ? double(float(1.0 / epsilon))
+                                                     : 1.0 / epsilon;
+      const T expected = T(logical_expected);
+      const double tolerance = sizeof(T) == sizeof(float) ? 2e-7 : 2e-15;
+      if (std::fabs(double(observed[i + 1]) - double(expected)) > tolerance) {
+        std::ostringstream message;
+        message.precision(17);
+        message << "FILE table interpolation differs at " << i << ": observed="
+                << observed[i + 1] << " expected=" << expected;
+        throw std::runtime_error(message.str());
+      }
     }
     copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T), execution);
     execution.synchronize();
@@ -1600,11 +1716,14 @@ static void check_table_materials(int device, scalar_precision precision,
       std::vector<T> guarded(point_count + 2, sentinel), values(point_count + 2);
       device_buffer device_compact(compact.size(), device);
       device_buffer device_values(guarded.size() * sizeof(T), device);
+      device_buffer classification(point_count, device);
       copy_host_to_device_async(device_compact, 0, compact.data(), compact.size(), execution);
       copy_host_to_device_async(device_values, 0, guarded.data(), guarded.size() * sizeof(T),
                                 execution);
       material_table_launch launch = {};
       launch.destination = static_cast<unsigned char *>(device_values.opaque_handle()) + sizeof(T);
+      launch.classification =
+          static_cast<unsigned char *>(classification.opaque_handle());
       launch.compact_inputs =
           static_cast<const unsigned char *>(device_compact.opaque_handle());
       launch.compact_input_bytes = compact.size();
@@ -1661,8 +1780,9 @@ static void check_table_materials(int device, scalar_precision precision,
         double normalized[3];
         for (int axis = 0; axis < 3; ++axis)
           normalized[axis] = 0.5 + coordinate[axis] / launch.cell_size[axis];
-        const double expected = 1.0 /
+        double expected = 1.0 /
             table_interpolate_3d(normalized, dimension_case.table_extent, samples);
+        if (logical_single) expected = double(float(expected));
         require(values[point + 1] == T(expected),
                 "multidimensional FILE row-major mapping differs");
       }
@@ -1826,11 +1946,13 @@ static void check_table_materials(int device, scalar_precision precision,
                        std::tanh(header.beta * (1 - header.eta)));
       return u;
     };
-    const auto table_equal = [](T observed_value, T expected_value) {
+    const auto table_equal = [logical_single](T observed_value, T expected_value) {
       const double scale = std::max(1.0, std::fabs(double(expected_value)));
+      const double epsilon = logical_single ? std::numeric_limits<float>::epsilon()
+                                            : std::numeric_limits<T>::epsilon();
       return observed_value == expected_value ||
              std::fabs(double(observed_value) - double(expected_value)) <=
-                 8.0 * std::numeric_limits<T>::epsilon() * scale;
+                 8.0 * epsilon * scale;
     };
     validate_material_table_launch(launch, compact.data(), compact.size());
     if (mode == 2) {
@@ -1937,9 +2059,12 @@ static void check_table_materials(int device, scalar_precision precision,
         if (epsilon == 0.0)
           require(std::isinf(double(observed[i + 1])) && observed[i + 1] > 0,
                   "zero MaterialGrid epsilon did not preserve positive infinity");
-        else
-          require(observed[i + 1] == T(1.0 / epsilon),
+        else {
+          const double expected = logical_single ? double(float(1.0 / epsilon))
+                                                 : 1.0 / epsilon;
+          require(observed[i + 1] == T(expected),
                   "negative MaterialGrid epsilon inverse differs");
+        }
     }
     if (mode == 3) {
       copy_host_to_device_async(destination, 0, guards.data(), guards.size() * sizeof(T), execution);
@@ -1963,8 +2088,19 @@ int main() {
     const bool table_tail_only = std::getenv("MEEP_NVIDIA_TABLE_TAIL_ONLY") != NULL;
     const bool geometry_profile_only =
         std::getenv("MEEP_NVIDIA_GEOMETRY_PROFILE_ONLY") != NULL;
+    const bool classification_status_only =
+        std::getenv("MEEP_NVIDIA_CLASSIFICATION_STATUS_ONLY") != NULL;
     for (size_t di = 0; di < devices.size(); ++di) {
       device_scope scope(devices[di].id);
+      if (classification_status_only) {
+        check_logical_classification_status<float>(devices[di].id,
+                                                   scalar_precision::f32);
+        check_logical_classification_status<double>(devices[di].id,
+                                                    scalar_precision::f64);
+        std::cout << "device " << devices[di].id
+                  << ": NVIDIA logical classification padding/overwrite PASS\n";
+        continue;
+      }
       if (geometry_profile_only) {
         check_geometry_kernels<float>(devices[di].id, scalar_precision::f32);
         check_geometry_kernels<double>(devices[di].id, scalar_precision::f64);

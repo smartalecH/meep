@@ -35,7 +35,9 @@
 #ifndef MEEP_BACKEND_CLASSIFICATION_HPP
 #define MEEP_BACKEND_CLASSIFICATION_HPP
 
+#include <cstddef>
 #include <stdint.h>
+#include <string>
 #include <vector>
 
 #include "meep.hpp"
@@ -45,6 +47,57 @@
 namespace meep {
 
 typedef uint64_t component_mask;
+
+const uint32_t material_classification_facts_version = 2;
+
+enum MaterialVariantBits : uint32_t {
+  material_variant_anisotropic = 1u << 0,
+  material_variant_nonlinear = 1u << 1,
+  material_variant_conductivity = 1u << 2,
+  material_variant_pml = 1u << 3,
+  material_variant_sigma = 1u << 4,
+  material_variant_chi2 = 1u << 5,
+  material_variant_chi3 = 1u << 6
+};
+
+/* Compact, pointer-free facts emitted by a material initializer.  CPU and
+   device backends use the same records; the collective assembler below is the
+   sole authority for normalization, group validation, and hashing. */
+struct MaterialRowClassificationFact {
+  StorageKey key;
+  uint8_t state;
+};
+
+struct MaterialVariantClassificationFact {
+  uint32_t operation;
+  uint32_t region;
+  int chunk;
+  int field_type_;
+  int component_;
+  int cmp;
+  int dimension;
+  int begin[5];
+  int end[5];
+  size_t base;
+  size_t counts[3];
+  ptrdiff_t strides[3];
+  uint32_t variant_key;
+};
+
+struct MaterialClassificationFacts {
+  uint32_t version;
+  std::vector<MaterialRowClassificationFact> rows;
+  std::vector<MaterialVariantClassificationFact> variants;
+  component_mask required_components;
+  bool has_nonlinearities;
+  bool aniso2d;
+  /* Zero means that this rank contributes no DFT decimation constraint. */
+  int min_decimation_factor;
+
+  MaterialClassificationFacts()
+      : version(material_classification_facts_version), required_components(0),
+        has_nonlinearities(false), aniso2d(false), min_decimation_factor(0) {}
+};
 
 struct MaterialClassification {
   enum ProvisionalRowState : uint8_t {
@@ -57,7 +110,9 @@ struct MaterialClassification {
   /* One entry per StoragePlan ArrayId. This makes classification total: an
      omitted status can never be mistaken for retention. */
   std::vector<uint8_t> provisional_row_state;
-  std::vector<uint32_t> variant_keys; // one per update region
+  /* Exact ordinary-StepPlan constitutive regions in canonical operation,
+     chunk, and within-chunk order. */
+  std::vector<MaterialVariantClassificationFact> variant_facts;
   component_mask required_components; // may grow: is_aniso2d, beta coupling
   bool has_nonlinearities;
   int min_decimation_factor;
@@ -83,6 +138,34 @@ struct PreparedSimulation {
   PreparedSimulation() : classification_hash(0), reentry_count(0) {}
 };
 
+struct MaterialRecipe;
+struct InitializationPlan;
+struct StepPlan;
+
+/* Assemble local compact facts into one rank-identical semantic result. */
+MaterialClassification assemble_material_classification(
+    fields &f, const StoragePlan &plan, const MaterialRecipe &recipe,
+    const MaterialClassificationFacts &local_facts);
+
+/* Recompute this rank's semantic variants after a test/backend changes row
+   status facts, without inspecting coefficient payloads. */
+void refresh_material_classification_variants(fields &f, const StoragePlan &plan,
+                                              MaterialClassification &classification);
+
+/* Validate every backend-produced fact before lifecycle code reads promotion
+   bits or publishes elision.  On success this replaces `hash` with the common
+   semantic-recipe-inclusive canonical hash. */
+void validate_material_classification(fields &f, const StoragePlan &plan,
+                                      const MaterialRecipe &recipe,
+                                      MaterialClassification &classification);
+
+/* Final post-resolution safety gate.  No alias, initialization action, step
+   action, or access may retain a tombstoned ArrayId. */
+void validate_material_classification_consumers(const StoragePlan &plan,
+                                                const InitializationPlan &initialization,
+                                                const StepPlan &steps,
+                                                const MaterialClassification &classification);
+
 /* Reproduce, from the values initialization actually produced, every fact in
    the table in section 9.1 of the plan.
 
@@ -92,6 +175,12 @@ struct PreparedSimulation {
    merely mis-optimizing -- so it is computed order-independently across chunks
    and then reduced. */
 MaterialClassification classify(fields &f, const StoragePlan &plan);
+
+/* Return the component layout present on any rank in the active Meep
+   communicator.  This is collective: idle ranks deliberately contribute an
+   empty local mask rather than interpreting that empty mask as a globally
+   missing layout. */
+component_mask global_field_component_presence(fields &f);
 
 /* Apply the classification: choose update variants and publish the tiling
    decision. Returns true if it promoted the mutation (e.g. is_aniso2d added

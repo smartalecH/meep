@@ -16,9 +16,13 @@ namespace nvidia {
    passed by value and PML inputs point into state-owned device storage. */
 struct material_fill_launch {
   void *destination;
+  unsigned char *classification;
   size_t elements;
+  size_t classification_elements;
   double value;
+  double trivial_value;
   uint32_t phase;
+  bool logical_single;
   scalar_precision precision;
 };
 
@@ -72,6 +76,8 @@ struct material_table_header {
 struct material_table_launch {
   void *destination;
   void *secondary_destination;
+  unsigned char *classification;
+  unsigned char *secondary_classification;
   const unsigned char *compact_inputs;
   size_t compact_input_bytes;
   size_t table_header_offset;
@@ -105,6 +111,8 @@ struct material_table_launch {
   double inva;
   double dt;
   bool logical_single;
+  double trivial_value;
+  double secondary_trivial_value;
   scalar_precision precision;
 };
 
@@ -122,6 +130,8 @@ struct material_absorber_header {
 struct material_conductivity_launch {
   void *conductivity_destination;
   void *condinv_destination;
+  unsigned char *conductivity_classification;
+  unsigned char *condinv_classification;
   const unsigned char *compact_inputs;
   size_t compact_input_bytes;
   size_t absorber_header_offset;
@@ -148,6 +158,9 @@ struct material_pml_launch {
   void *sigma_destination;
   void *kappa_destination;
   void *sigma_inv_destination;
+  unsigned char *sigma_classification;
+  unsigned char *kappa_classification;
+  unsigned char *sigma_inv_classification;
   const unsigned char *compact_inputs;
   size_t compact_input_bytes;
   size_t profile_offset;
@@ -168,6 +181,31 @@ struct material_pml_launch {
   scalar_precision precision;
 };
 
+struct material_classification_header {
+  uint32_t version;
+  uint32_t row_count;
+  uint64_t recipe_signature;
+  uint64_t state_token;
+  uint64_t storage_fingerprint;
+};
+
+struct material_classification_row_result {
+  int32_t chunk;
+  int32_t kind;
+  int32_t component;
+  int32_t cmp;
+  uint64_t aux;
+  uint32_t missing;
+  uint32_t nontrivial;
+};
+
+static_assert(std::is_standard_layout<material_classification_header>::value &&
+                  std::is_trivially_copyable<material_classification_header>::value,
+              "material classification header must be a POD transfer record");
+static_assert(std::is_standard_layout<material_classification_row_result>::value &&
+                  std::is_trivially_copyable<material_classification_row_result>::value,
+              "material classification row must be a POD transfer record");
+
 void launch_material_fill(const material_fill_launch &launch, const stream &stream);
 void validate_material_absorber_headers(const unsigned char *compact_inputs,
                                         size_t compact_input_bytes,
@@ -185,6 +223,13 @@ int material_table_mirror_index_for_testing(int i, int n);
 void launch_material_conductivity(const material_conductivity_launch &launch,
                                   const stream &stream);
 void launch_material_pml(const material_pml_launch &launch, const stream &stream);
+void launch_material_classification_header(material_classification_header *result,
+                                           material_classification_header value,
+                                           const stream &stream);
+void launch_material_classification_row(
+    const unsigned char *status, size_t elements,
+    material_classification_row_result *result,
+    material_classification_row_result value, const stream &stream);
 
 static_assert(std::is_standard_layout<material_table_header>::value,
               "material table header must be standard layout");

@@ -467,7 +467,7 @@ void backend_classify_and_finalize(fields &f) {
     /* Component promotion is discovered from owned chunks, but recursive
        preparation contains collectives.  Every rank must either re-enter or
        skip it together, including ranks that own no affected chunk. */
-    const bool promoted = or_to_all(apply_classification(f, cls));
+    const bool promoted = apply_classification(f, cls);
     f.prepared_classification_hash = cls.hash;
 
     if (promoted) {

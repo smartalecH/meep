@@ -868,6 +868,14 @@ void fields::remove_susceptibilities() {
   changed_materials = true;
   for (int i = 0; i < num_chunks; i++)
     chunks[i]->remove_susceptibilities(shared_chunks);
+  /* Polarization descriptors contain ArrayIds for the internal allocations
+     released above.  CPU storage remains deliberately lazy, so the ordinary
+     StepPlan can be rebuilt before prepare_storage_if_stale() refreshes the
+     catalog.  Withdraw the installed polarization view at the ownership
+     commit point; the next per-field preparation republishes the empty
+     catalog/descriptor view without broadening removal into an eager storage
+     rebuild. */
+  if (descriptors) descriptors->polarizations.clear();
   /* The immutable geometry IR describes the susceptibility definitions that
      were just removed.  Publish its absence only after the resident preflight
      above succeeds and the non-throwing host removal has committed, so a

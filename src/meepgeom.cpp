@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <vector>
 #include "backend/backend.hpp"
+#include "backend/material_callback.hpp"
 #include "meepgeom.hpp"
 #include "backend/material_ir.hpp"
 #include "meep_internals.hpp"
@@ -112,6 +113,8 @@ void material_gc(material_type m) {
 void material_free(material_type m) {
   if (!m) return;
 
+  release_owned_material_callback(m);
+
   m->medium.E_susceptibilities.clear();
   m->medium.H_susceptibilities.clear();
   m->medium_1.E_susceptibilities.clear();
@@ -136,6 +139,15 @@ bool material_type_equal(const material_type m1, const material_type m2) {
     case material_data::MATERIAL_FILE:
     case material_data::PERFECT_METAL: return true;
     case material_data::MATERIAL_USER:
+      {
+        std::shared_ptr<const meep::OwnedMaterialCallback> owner1, owner2;
+        const bool owned1 = owned_material_callback(m1, &owner1);
+        const bool owned2 = owned_material_callback(m2, &owner2);
+        if (owned1 || owned2)
+          return owned1 && owned2 && owner1->id == owner2->id &&
+                 owner1->signature == owner2->signature &&
+                 owner1->capabilities == owner2->capabilities;
+      }
       return m1->user_func == m2->user_func && m1->user_data == m2->user_data;
     case material_data::MATERIAL_GRID:
     case material_data::MEDIUM: return medium_struct_equal(&(m1->medium), &(m2->medium));
@@ -945,7 +957,7 @@ void geom_epsilon::get_material_pt(material_type &material, const meep::vec &r) 
     // different from vacuum.
     case material_data::MATERIAL_USER:
       md->medium = medium_struct();
-      md->user_func(p, md->user_data, &(md->medium));
+      evaluate_material_user(*md, p);
       md->medium.check_offdiag_im_zero_or_abort();
       return;
 
@@ -1745,7 +1757,7 @@ void geom_epsilon::sigma_row(meep::component c, double sigrow[3], const meep::ve
 
   if (mat->which_subclass == material_data::MATERIAL_USER) {
     mat->medium = medium_struct();
-    mat->user_func(p, mat->user_data, &(mat->medium));
+    evaluate_material_user(*mat, p);
     mat->medium.check_offdiag_im_zero_or_abort();
   }
 

@@ -15,6 +15,7 @@ $(BACKEND_HDRS)
 BACKEND_HDRS = backend/lifecycle.hpp backend/diagnostics.hpp \
 backend/random_state.hpp backend/array_ref.hpp backend/halo_plan.hpp \
 backend/prepare.hpp backend/storage_plan.hpp backend/classification.hpp \
+backend/material_callback.hpp backend/material_ir.hpp backend/material_recipe.hpp \
 backend/step_plan.hpp backend/region_plan.hpp \
 backend/descriptors.hpp backend/backend.hpp \
 backend/precision.hpp backend/initialization_plan.hpp backend/cpu/cpu_backend.hpp

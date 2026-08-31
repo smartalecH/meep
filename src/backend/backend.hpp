@@ -37,6 +37,7 @@
 #include "backend/array_ref.hpp"
 #include "backend/classification.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/material_recipe.hpp"
 #include "backend/precision.hpp"
 #include "backend/random_state.hpp"
 #include "backend/step_plan.hpp"
@@ -45,7 +46,32 @@
 namespace meep {
 
 struct Executable {
+  explicit Executable(bool material_phase_active_ = false)
+      : material_phase_active(material_phase_active_) {}
   virtual ~Executable() {}
+
+  /* This is a committed, all-ranks-identical property of the compiled
+     ordinary program.  It deliberately is not recomputed from live chunk
+     state in the steady preflight path. */
+  bool material_phase_active;
+};
+
+struct MaterialFallbackStatistics {
+  uint64_t warnings;
+  uint64_t dense_rows;
+  uint64_t dense_bytes;
+  uint64_t interface_points;
+  uint64_t callback_tiles;
+  uint64_t callback_points;
+  uint64_t callback_calls;
+  uint64_t classification_launches;
+  uint64_t classification_device_to_host_calls;
+  uint64_t classification_device_to_host_bytes;
+
+  MaterialFallbackStatistics()
+      : warnings(0), dense_rows(0), dense_bytes(0), interface_points(0), callback_tiles(0),
+        callback_points(0), callback_calls(0), classification_launches(0),
+        classification_device_to_host_calls(0), classification_device_to_host_bytes(0) {}
 };
 
 /* Type-erased backend ownership. Concrete CPU/device implementations derive
@@ -67,6 +93,12 @@ struct BackendState {
         host_custom_plan_validated(false), host_custom_local_presence(false),
         host_custom_presence_validated(false), host_custom_policy_pending(false),
         host_custom_validated_plan_signature(0),
+        material_route(MaterialRecipeDisposition::device_native), material_support_reasons(0),
+        material_recipe_signature(0), material_classification_hash(0),
+        material_local_route(MaterialRecipeDisposition::device_native),
+        material_phase_active(false),
+        material_fallback_local_presence(false), material_fallback_global_presence(false),
+        material_fallback_presence_validated(false), material_fallback_policy_pending(false),
         noisy_first_stream_tag(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
@@ -108,6 +140,17 @@ struct BackendState {
      executable for this staged resident epoch has compiled successfully. */
   bool host_custom_policy_pending;
   uint64_t host_custom_validated_plan_signature;
+  MaterialRecipeDisposition material_route;
+  uint64_t material_support_reasons;
+  uint64_t material_recipe_signature;
+  uint64_t material_classification_hash;
+  MaterialRecipeDisposition material_local_route;
+  bool material_phase_active;
+  bool material_fallback_local_presence;
+  bool material_fallback_global_presence;
+  bool material_fallback_presence_validated;
+  bool material_fallback_policy_pending;
+  MaterialFallbackStatistics material_fallback_statistics;
   uint64_t noisy_first_stream_tag;
 };
 
@@ -240,12 +283,19 @@ public:
         host_custom_sessions_at_dispatch_(0), host_custom_callbacks_at_dispatch_(0),
         host_custom_completed_sessions_at_dispatch_(0), host_custom_expected_sessions_(0),
         host_custom_expected_callbacks_(0), host_custom_dispatch_plan_(NULL),
-        host_custom_next_operation_(0), host_custom_claimed_sessions_(0) {}
+        host_custom_next_operation_(0), host_custom_claimed_sessions_(0),
+        material_fallback_warning_emitted_(false), material_fallback_warning_count_(0) {}
   virtual ~ExecutionBackend() {}
 
   virtual void preflight_initialization(const InitializationPlan &) const {}
   virtual BackendState *create_state(const StoragePlan &) = 0;
   virtual void initialize(const InitializationPlan &, BackendState &) = 0;
+  /* Prepare every initialization descriptor and all host-produced values into
+     candidate-owned staging.  This hook is host-only: it performs no MPI,
+     stream submission, or device allocation.  Callers reconcile it
+     collectively before initialize() may copy or launch. */
+  virtual void prepare_initialization(const InitializationPlan &, BackendState &) {}
+  virtual bool enforces_material_fallback_policy() const { return false; }
 
   // Pass 2: report what initialization actually produced.
   virtual MaterialClassification classify_state(const StoragePlan &, BackendState &) = 0;
@@ -253,6 +303,9 @@ public:
                                 BackendState &) = 0;
 
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
+  /* Allocation-free, pre-dispatch validation. Throwing here is retryable and
+     must not enqueue work or poison the installed epoch. */
+  virtual void preflight_advance(Executable &, BackendState &, int) {}
   virtual void advance(Executable &, BackendState &, int num_steps) = 0;
 
   /* Stage backend-private noisy-RNG metadata without rebuilding storage or
@@ -286,6 +339,12 @@ public:
 
   bool host_custom_fallback_enabled() const { return host_custom_enabled_; }
   const HostCustomFallbackStats &host_custom_fallback_stats() const { return host_custom_stats_; }
+  uint64_t material_fallback_warning_count() const {
+    return material_fallback_warning_count_;
+  }
+  bool material_fallback_warning_emitted() const {
+    return material_fallback_warning_emitted_;
+  }
 
   /* A resident CW solve is one coarse operation. CPU declines this hook and
      keeps the legacy solver unchanged. preflight_cw must not invoke source
@@ -381,6 +440,11 @@ private:
       ExecutionBackend &, HostCustomFallbackCounter, uint64_t);
   friend void backend_increment_host_custom_counter_for_testing(
       ExecutionBackend &, HostCustomFallbackCounter);
+  friend void backend_publish_material_fallback_policy(fields &, BackendState &) noexcept;
+  friend std::string backend_material_fallback_policy_error(const fields &,
+                                                             MaterialRecipeDisposition);
+  friend void backend_set_material_fallback_warning_for_testing(ExecutionBackend &,
+                                                                 uint64_t, bool);
 
   bool poisoned_;
   bool host_custom_enabled_;
@@ -398,6 +462,8 @@ private:
   size_t host_custom_next_operation_;
   uint64_t host_custom_claimed_sessions_;
   HostCustomFallbackStats host_custom_stats_;
+  bool material_fallback_warning_emitted_;
+  uint64_t material_fallback_warning_count_;
 };
 
 /* RAII boundary used by the future compiled host-segment adapter. For every
@@ -475,11 +541,17 @@ void backend_set_multilevel_preflight_failure_for_testing(int rank, int mode);
 void backend_reset_multilevel_collective_count_for_testing();
 size_t backend_multilevel_collective_count_for_testing();
 void backend_note_multilevel_collective_for_testing();
+void backend_reset_material_phase_preflight_counts_for_testing();
+size_t backend_material_phase_collective_count_for_testing();
+size_t backend_material_phase_scan_count_for_testing();
+void backend_note_material_phase_collective_for_testing();
+void backend_note_material_phase_scan_for_testing();
 void backend_set_host_custom_collective_failure_for_testing(int rank, int mode);
 void backend_set_host_custom_mpi_override_for_testing(bool enabled);
 void backend_reset_host_custom_collective_count_for_testing();
 size_t backend_host_custom_collective_count_for_testing();
 void backend_note_host_custom_collective_for_testing();
+void backend_set_material_classification_failure_for_testing(int rank, int mode);
 void backend_reset_host_custom_presence_scan_count_for_testing();
 size_t backend_host_custom_presence_scan_count_for_testing();
 void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
@@ -518,6 +590,13 @@ void backend_set_host_custom_counter_for_testing(ExecutionBackend &backend,
                                                  uint64_t value);
 void backend_increment_host_custom_counter_for_testing(ExecutionBackend &backend,
                                                        HostCustomFallbackCounter counter);
+
+std::string backend_material_fallback_policy_error(const fields &f,
+                                                    MaterialRecipeDisposition global_route);
+void backend_publish_material_fallback_policy(fields &f, BackendState &state) noexcept;
+void backend_set_material_fallback_warning_for_testing(ExecutionBackend &backend,
+                                                       uint64_t count, bool emitted);
+void backend_note_material_definition_changed_for_testing(fields &f);
 
 /* Preserve resident-authoritative values and retire the old backend objects
    before a host-side field-layout mutation can delete or replace their

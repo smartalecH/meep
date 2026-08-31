@@ -194,7 +194,8 @@ private:
 enum class host_to_device_copy_kind {
   general,
   material_compact_input,
-  material_dense_output
+  material_dense_output,
+  material_tiled_output
 };
 
 void copy_host_to_device_async(device_buffer &destination, size_t destination_offset,
@@ -233,6 +234,8 @@ struct material_transfer_accounting {
   size_t compact_bytes;
   size_t dense_output_calls;
   size_t dense_output_bytes;
+  size_t tiled_output_calls;
+  size_t tiled_output_bytes;
 };
 
 enum class failure_point {
@@ -259,6 +262,9 @@ enum class failure_point {
   host_segment_after_callback,
   host_segment_after_upload,
   material_compact_allocate,
+  material_callback_prepare,
+  material_callback_dispatch,
+  material_tiled_upload,
   material_table_semantic_mutation,
   material_table_far_coordinate_mutation,
   material_table_component_mutation,
@@ -277,8 +283,12 @@ enum class failure_point {
   material_geometry_patch_launch,
   material_geometry_descriptor_mutation,
   material_geometry_compact_mutation,
+  material_classification_d2h,
+  material_classification_result_mutation,
   material_pml_launch,
   material_initialization_sync,
+  material_finalize,
+  material_compile,
   state_rebuild_sync
 };
 void fail_next(failure_point point);

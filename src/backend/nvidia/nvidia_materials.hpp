@@ -93,6 +93,7 @@ struct geometry_value_record {
 
 struct geometry_launch_common {
   void *destination;
+  unsigned char *classification;
   const unsigned char *compact_inputs;
   size_t compact_input_bytes;
   size_t object_offset;
@@ -123,6 +124,7 @@ struct geometry_launch_common {
   double metric[9];
   double inva;
   double dt;
+  double trivial_value;
   bool logical_single;
   scalar_precision precision;
 };

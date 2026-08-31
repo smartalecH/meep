@@ -34,6 +34,7 @@ std::atomic<size_t> device_to_host_calls(0), device_to_host_bytes(0);
 std::atomic<size_t> device_to_device_calls(0), device_to_device_bytes(0);
 std::atomic<size_t> material_compact_calls(0), material_compact_bytes(0);
 std::atomic<size_t> material_dense_calls(0), material_dense_bytes(0);
+std::atomic<size_t> material_tiled_calls(0), material_tiled_bytes(0);
 std::atomic<int> injected_failure(static_cast<int>(testing::failure_point::none));
 
 void update_peak(std::atomic<size_t> &peak, size_t value) {
@@ -576,7 +577,8 @@ void copy_host_to_device_async(device_buffer &destination, size_t destination_of
                                host_to_device_copy_kind kind) {
   if (kind != host_to_device_copy_kind::general &&
       kind != host_to_device_copy_kind::material_compact_input &&
-      kind != host_to_device_copy_kind::material_dense_output)
+      kind != host_to_device_copy_kind::material_dense_output &&
+      kind != host_to_device_copy_kind::material_tiled_output)
     throw std::invalid_argument("invalid NVIDIA host-to-device copy kind");
   check_range(destination.size(), destination_offset, bytes, "copy_host_to_device_async");
   if (!bytes) return;
@@ -603,6 +605,10 @@ void copy_host_to_device_async(device_buffer &destination, size_t destination_of
     case host_to_device_copy_kind::material_dense_output:
       material_dense_calls.fetch_add(1, std::memory_order_relaxed);
       material_dense_bytes.fetch_add(bytes, std::memory_order_relaxed);
+      break;
+    case host_to_device_copy_kind::material_tiled_output:
+      material_tiled_calls.fetch_add(1, std::memory_order_relaxed);
+      material_tiled_bytes.fetch_add(bytes, std::memory_order_relaxed);
       break;
     default: break;
   }
@@ -706,6 +712,8 @@ material_transfer_accounting current_material_transfer_accounting() {
   result.compact_bytes = material_compact_bytes.load(std::memory_order_relaxed);
   result.dense_output_calls = material_dense_calls.load(std::memory_order_relaxed);
   result.dense_output_bytes = material_dense_bytes.load(std::memory_order_relaxed);
+  result.tiled_output_calls = material_tiled_calls.load(std::memory_order_relaxed);
+  result.tiled_output_bytes = material_tiled_bytes.load(std::memory_order_relaxed);
   return result;
 }
 
@@ -714,6 +722,8 @@ void reset_material_transfer_accounting() {
   material_compact_bytes.store(0, std::memory_order_relaxed);
   material_dense_calls.store(0, std::memory_order_relaxed);
   material_dense_bytes.store(0, std::memory_order_relaxed);
+  material_tiled_calls.store(0, std::memory_order_relaxed);
+  material_tiled_bytes.store(0, std::memory_order_relaxed);
 }
 
 } // namespace testing

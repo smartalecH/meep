@@ -8,6 +8,7 @@
 
 #include "backend/material_recipe.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -26,9 +27,20 @@ namespace meep {
 
 namespace {
 
-const uint32_t material_recipe_format_version = 2;
+const uint32_t material_recipe_format_version = 4;
+const uint64_t material_callback_tile_points = 256;
 int material_recipe_failure_rank_for_testing = -1;
 int material_recipe_failure_mode_for_testing = 0;
+
+size_t material_route_bit(MaterialRecipeDisposition route) {
+  switch (route) {
+    case MaterialRecipeDisposition::device_native: return size_t(1) << 0;
+    case MaterialRecipeDisposition::hybrid_interface: return size_t(1) << 1;
+    case MaterialRecipeDisposition::tiled_callback: return size_t(1) << 2;
+    case MaterialRecipeDisposition::host_reference: return size_t(1) << 3;
+  }
+  throw std::invalid_argument("invalid material fallback route");
+}
 
 void mix_byte(uint64_t &hash, unsigned char value) {
   hash ^= uint64_t(value);
@@ -67,11 +79,6 @@ void mix_realnum_values(uint64_t &hash, const std::vector<unsigned char> &values
   }
 }
 
-void mix_string(uint64_t &hash, const std::string &value) {
-  mix_u64(hash, value.size());
-  if (!value.empty()) mix_bytes(hash, value.data(), value.size());
-}
-
 void mix_key(uint64_t &hash, const StorageKey &key) {
   mix_u64(hash, uint64_t(int64_t(key.chunk)));
   mix_u64(hash, uint64_t(int64_t(key.kind)));
@@ -101,18 +108,60 @@ size_t checked_host_bytes(ElementType type, size_t elements) {
   return width * elements;
 }
 
+std::vector<unsigned char> logical_default_row(const MaterialIRTopologyRow &topology,
+                                               const MaterialIR &ir) {
+  if (topology.element_type != ElementType::realnum_value ||
+      topology.logical_storage != native_precision)
+    throw std::invalid_argument("material fallback default row has a non-native type");
+  std::vector<realnum> values(topology.elements, realnum(0));
+  const array_kind kind = static_cast<array_kind>(topology.key.kind);
+  if (kind == array_kind::chi1inv || kind == array_kind::condinv) {
+    const component c = component(topology.key.component_);
+    if (component_direction(c) == direction(topology.key.aux))
+      std::fill(values.begin(), values.end(), realnum(1));
+  }
+  else if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+           kind == array_kind::pml_siginv) {
+    const MaterialIRPmlAxis *axis = NULL;
+    for (const MaterialIRPmlAxis &candidate : ir.pml_axes)
+      if (candidate.chunk == topology.key.chunk &&
+          candidate.direction == int(topology.key.aux)) {
+        if (axis) throw std::invalid_argument("material fallback PML axis is duplicated");
+        axis = &candidate;
+      }
+    if (!axis || axis->elements != topology.elements)
+      throw std::invalid_argument("material fallback PML row has no exact captured axis");
+    const std::vector<double> *source = kind == array_kind::pml_sig
+                                            ? &axis->sigma
+                                            : kind == array_kind::pml_kap ? &axis->kappa
+                                                                          : &axis->sigma_inv;
+    if (source->size() != values.size())
+      throw std::invalid_argument("material fallback PML snapshot has the wrong extent");
+    for (size_t i = 0; i < values.size(); ++i) values[i] = realnum((*source)[i]);
+  }
+  else if (kind != array_kind::chi2 && kind != array_kind::chi3 &&
+           kind != array_kind::conductivity && kind != array_kind::sigma)
+    throw std::invalid_argument("material fallback default row has an unsupported kind");
+  std::vector<unsigned char> bytes(values.size() * sizeof(realnum));
+  if (!bytes.empty()) memcpy(bytes.data(), values.data(), bytes.size());
+  return bytes;
+}
+
 uint64_t compute_signature(uint32_t version, MaterialRecipeDisposition disposition,
-                           const std::string &description, bool eps_averaging,
+                           bool eps_averaging,
                            double subpixel_tol, int subpixel_maxeval,
                            uint32_t host_callback_id, bool from_host_callback,
                            uint64_t support_reason_bits,
                            const std::vector<MaterialRecipeRow> &rows,
+                           const std::vector<MaterialRecipeRow> &dense_fallback_rows,
+                           const std::vector<MaterialCallbackTile> &callback_tiles,
+                           const std::vector<std::shared_ptr<const OwnedMaterialCallback> >
+                               &callback_owners,
                            const std::vector<MaterialIRTopologyRow> &topology,
                            const std::shared_ptr<const MaterialIR> &ir) {
   uint64_t hash = UINT64_C(1469598103934665603);
   mix_u64(hash, version);
   mix_u64(hash, uint64_t(disposition));
-  mix_string(hash, description);
   mix_u64(hash, eps_averaging ? 1 : 0);
   uint64_t tolerance_bits = 0;
   static_assert(sizeof(tolerance_bits) == sizeof(subpixel_tol), "unexpected double size");
@@ -131,6 +180,28 @@ uint64_t compute_signature(uint32_t version, MaterialRecipeDisposition dispositi
     mix_u64(hash, row.elements);
     mix_u64(hash, row.alignment);
     mix_realnum_values(hash, row.values);
+  }
+  mix_u64(hash, dense_fallback_rows.size());
+  for (const MaterialRecipeRow &row : dense_fallback_rows) {
+    mix_key(hash, row.key);
+    mix_u64(hash, uint64_t(row.role));
+    mix_u64(hash, uint64_t(row.element_type));
+    mix_u64(hash, uint64_t(row.storage));
+    mix_u64(hash, row.elements);
+    mix_u64(hash, row.alignment);
+    mix_realnum_values(hash, row.values);
+  }
+  mix_u64(hash, callback_tiles.size());
+  for (const MaterialCallbackTile &tile : callback_tiles) {
+    mix_u64(hash, tile.destination);
+    mix_u64(hash, tile.material);
+    mix_u64(hash, tile.first_point);
+    mix_u64(hash, tile.count);
+  }
+  mix_u64(hash, callback_owners.size());
+  for (const std::shared_ptr<const OwnedMaterialCallback> &owner : callback_owners) {
+    mix_u64(hash, owner ? owner->id : 0);
+    mix_u64(hash, owner ? owner->signature : 0);
   }
   mix_u64(hash, topology.size());
   for (const MaterialIRTopologyRow &row : topology) mix_topology(hash, row);
@@ -195,6 +266,10 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
   for (const MaterialIRMaterial &m : ir.materials) {
     ADD_SCALAR(m.kind);
     ADD_SCALAR(m.host_callback);
+    ADD_SCALAR(m.owned_callback);
+    ADD_SCALAR(m.callback_id);
+    ADD_SCALAR(m.callback_signature);
+    ADD_SCALAR(m.callback_capabilities);
     ADD_SCALAR(m.do_averaging);
     ADD_SCALAR(m.material_grid_kind);
     ADD_SCALAR(m.material_grid_trivial);
@@ -337,11 +412,12 @@ uint64_t compact_material_ir_bytes(const MaterialIR &ir) {
 
 MaterialSupportDecision classify_support_input(
     const std::shared_ptr<const MaterialIR> &ir,
-    const std::vector<MaterialRecipeRow> &rows) {
+    const std::vector<MaterialRecipeRow> &dense_fallback_rows,
+    const std::vector<MaterialCallbackTile> &callback_tiles) {
   MaterialSupportDecision decision = {MaterialRecipeDisposition::host_reference,
                                       material_support_no_owned_ir,
                                       0, 0, 0, 0, 0, 0};
-  for (const MaterialRecipeRow &row : rows)
+  for (const MaterialRecipeRow &row : dense_fallback_rows)
     decision.dense_fallback_bytes = checked_u64_add(
         decision.dense_fallback_bytes,
         checked_u64_bytes(row.values.size(), 1, "dense byte count"), "dense byte count");
@@ -359,33 +435,112 @@ MaterialSupportDecision classify_support_input(
       throw std::invalid_argument("material support has an invalid object material");
     used[size_t(object.material)] = 1;
   }
+  bool owned_callback = false;
+  bool borrowed_callback = false;
+  bool callback_averaging = false;
+  bool callback_capability = false;
+  bool callback_output = false;
   for (size_t i = 0; i < ir->materials.size(); ++i) {
     if (!used[i]) continue;
     const MaterialIRMaterial &material = ir->materials[i];
-    if (material.host_callback)
-      decision.reason_bits |= material_support_unowned_callback;
+    if (material.host_callback) {
+      owned_callback = owned_callback || material.owned_callback;
+      borrowed_callback = borrowed_callback || !material.owned_callback;
+      callback_averaging = callback_averaging ||
+                           (ir->eps_averaging && material.do_averaging);
+      callback_capability = callback_capability ||
+                            (material.owned_callback &&
+                             material.callback_capabilities !=
+                                 owned_material_callback_tiled_capabilities);
+    }
     if (material.kind == meep_geom::material_data::MATERIAL_GRID && material.do_averaging &&
         ir->requires_hybrid)
       decision.reason_bits |= material_support_adaptive_averaging;
   }
+  if (owned_callback) {
+    for (const MaterialIRDestination &destination : ir->destinations)
+      callback_output = callback_output ||
+                        destination.property != MaterialIRProperty::chi1inv;
+    for (const MaterialIRTopologyRow &row : ir->topology) {
+      const array_kind kind = static_cast<array_kind>(row.key.kind);
+      callback_output = callback_output || kind == array_kind::pml_sig ||
+                        kind == array_kind::pml_kap ||
+                        kind == array_kind::pml_siginv;
+    }
+  }
 
   decision.compact_input_bytes = compact_material_ir_bytes(*ir);
-  for (const MaterialIRBulkSpan &span : ir->bulk_spans)
-    decision.native_points = checked_u64_add(decision.native_points, span.count,
-                                             "native point count");
-  decision.native_points = checked_u64_add(decision.native_points,
-                                           uint64_t(ir->analytic_interfaces.size()),
-                                           "native point count");
-  decision.interface_points = checked_u64_add(
-      uint64_t(ir->analytic_interfaces.size()), uint64_t(ir->hybrid_patches.size()),
-      "interface point count");
-  if (decision.reason_bits & material_support_unowned_callback)
+  decision.interface_points = uint64_t(ir->hybrid_patches.size());
+  for (const MaterialCallbackTile &tile : callback_tiles)
+    decision.callback_points = checked_u64_add(decision.callback_points, tile.count,
+                                               "callback point count");
+  uint64_t maximum_tile_points = 0;
+  for (const MaterialCallbackTile &tile : callback_tiles)
+    maximum_tile_points = std::max(maximum_tile_points, tile.count);
+  if (maximum_tile_points)
+    decision.scratch_bytes = checked_u64_bytes(
+        size_t(maximum_tile_points), sizeof(realnum), "callback scratch bytes");
+  if (borrowed_callback) decision.reason_bits |= material_support_unowned_callback;
+  if (owned_callback) decision.reason_bits |= material_support_owned_callback;
+  if (owned_callback && (!ir->objects.empty() || callback_averaging))
+    decision.reason_bits |= material_support_callback_geometry;
+  if (callback_capability) decision.reason_bits |= material_support_callback_capability;
+  if (callback_output) decision.reason_bits |= material_support_callback_output;
+  if (borrowed_callback ||
+      (owned_callback && (!ir->objects.empty() || callback_averaging || callback_capability ||
+                          callback_output)))
     decision.disposition = MaterialRecipeDisposition::host_reference;
+  else if (owned_callback && ir->destinations.empty() && ir->topology.empty())
+    decision.disposition = MaterialRecipeDisposition::device_native;
+  else if (owned_callback) {
+    if (ir->requires_hybrid) {
+      decision.reason_bits |= material_support_composite_fallback;
+      decision.disposition = MaterialRecipeDisposition::host_reference;
+    }
+    else decision.disposition = MaterialRecipeDisposition::tiled_callback;
+  }
   else if (ir->requires_hybrid)
     decision.disposition = MaterialRecipeDisposition::hybrid_interface;
   else
     decision.disposition = MaterialRecipeDisposition::device_native;
+  if (decision.disposition == MaterialRecipeDisposition::device_native ||
+      decision.disposition == MaterialRecipeDisposition::hybrid_interface) {
+    for (const MaterialIRBulkSpan &span : ir->bulk_spans)
+      decision.native_points = checked_u64_add(decision.native_points, span.count,
+                                               "native point count");
+    decision.native_points = checked_u64_add(decision.native_points,
+                                             uint64_t(ir->analytic_interfaces.size()),
+                                             "native point count");
+  }
   return decision;
+}
+
+std::vector<MaterialCallbackTile> canonical_callback_tiles(const MaterialIR &ir) {
+  std::vector<MaterialCallbackTile> result;
+  if (ir.default_material >= ir.materials.size())
+    throw std::invalid_argument("material callback tiling has no default material");
+  const MaterialIRMaterial &material = ir.materials[ir.default_material];
+  if (!material.owned_callback ||
+      material.callback_capabilities != owned_material_callback_tiled_capabilities ||
+      !ir.objects.empty() ||
+      (ir.eps_averaging && material.do_averaging) || ir.requires_hybrid)
+    return result;
+  for (const MaterialIRDestination &destination : ir.destinations)
+    if (destination.property != MaterialIRProperty::chi1inv) return result;
+  for (const MaterialIRTopologyRow &row : ir.topology) {
+    const array_kind kind = static_cast<array_kind>(row.key.kind);
+    if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
+        kind == array_kind::pml_siginv)
+      return result;
+  }
+  for (uint32_t destination = 0; destination < ir.destinations.size(); ++destination)
+    for (uint64_t first = 0; first < ir.destinations[destination].point_count;
+         first += material_callback_tile_points)
+      result.push_back(MaterialCallbackTile{
+          destination, ir.default_material, first,
+          std::min<uint64_t>(material_callback_tile_points,
+                             ir.destinations[destination].point_count - first)});
+  return result;
 }
 
 void validate_input(const MaterialRecipeInput &input) {
@@ -394,11 +549,10 @@ void validate_input(const MaterialRecipeInput &input) {
     throw std::invalid_argument("material recipe has an invalid subpixel tolerance");
   if (input.subpixel_maxeval < 0 || (input.eps_averaging && input.subpixel_maxeval == 0))
     throw std::invalid_argument("material recipe has an invalid subpixel evaluation limit");
-  if (input.disposition == MaterialRecipeDisposition::tiled_callback)
-    throw std::invalid_argument("material recipe disposition lacks owned callback work records");
   if (input.disposition != MaterialRecipeDisposition::host_reference &&
       input.disposition != MaterialRecipeDisposition::device_native &&
-      input.disposition != MaterialRecipeDisposition::hybrid_interface)
+      input.disposition != MaterialRecipeDisposition::hybrid_interface &&
+      input.disposition != MaterialRecipeDisposition::tiled_callback)
     throw std::invalid_argument("material recipe disposition is invalid");
   if (input.from_host_callback || input.host_callback_id != invalid_array_value)
     throw std::invalid_argument("host-reference material recipe cannot contain a callback");
@@ -409,8 +563,14 @@ void validate_input(const MaterialRecipeInput &input) {
         input.subpixel_maxeval != input.ir->subpixel_maxeval)
       throw std::invalid_argument("material recipe policy differs from its immutable IR");
   }
-  const MaterialSupportDecision expected = classify_support_input(input.ir, input.rows);
-  if (input.disposition != expected.disposition ||
+  const MaterialSupportDecision expected =
+      classify_support_input(input.ir,
+                             input.dense_fallback_rows.empty() && !input.ir
+                                 ? input.rows
+                                 : input.dense_fallback_rows,
+                             input.callback_tiles);
+  if ((input.disposition != expected.disposition &&
+       input.disposition != MaterialRecipeDisposition::host_reference) ||
       input.support_reason_bits != expected.reason_bits)
     throw std::invalid_argument("material recipe support disposition is stale or inconsistent");
 
@@ -491,6 +651,61 @@ void validate_input(const MaterialRecipeInput &input) {
       }
     }
   }
+  std::set<StorageKey, StorageKeyLess> dense_keys;
+  for (const MaterialRecipeRow &row : input.dense_fallback_rows) {
+    if (row.role != array_role::material || row.element_type != ElementType::realnum_value ||
+        row.storage != native_precision || row.alignment != alignof(realnum) || !row.elements ||
+        row.values.size() != checked_host_bytes(row.element_type, row.elements) ||
+        !dense_keys.insert(row.key).second)
+      throw std::invalid_argument("dense material fallback sidecar is malformed");
+    if (input.ir) {
+      const auto expected = ir_rows.find(row.key);
+      if (expected == ir_rows.end() || expected->second->element_type != row.element_type ||
+          expected->second->logical_storage != row.storage ||
+          expected->second->elements != row.elements ||
+          expected->second->alignment != row.alignment)
+        throw std::invalid_argument("dense material fallback differs from immutable topology");
+    }
+  }
+  typedef std::pair<uint64_t, uint64_t> CallbackContract;
+  std::map<uint64_t, CallbackContract> owner_signatures;
+  uint64_t previous_owner = 0;
+  bool have_previous_owner = false;
+  for (const std::shared_ptr<const OwnedMaterialCallback> &owner : input.callback_owners) {
+    if (!owner || !owner->id || !owner->signature || !owner->capabilities ||
+        !owner->function ||
+        !owner_signatures
+             .insert(std::make_pair(
+                 owner->id, CallbackContract(owner->signature, owner->capabilities)))
+             .second)
+      throw std::invalid_argument("material callback owner sidecar is malformed");
+    if (have_previous_owner && owner->id <= previous_owner)
+      throw std::invalid_argument("material callback owner sidecar is not canonical");
+    previous_owner = owner->id;
+    have_previous_owner = true;
+  }
+  std::map<uint64_t, CallbackContract> referenced_owners;
+  if (input.ir)
+    for (const MaterialIRMaterial &material : input.ir->materials)
+      if (material.owned_callback) {
+        const CallbackContract contract(material.callback_signature,
+                                        material.callback_capabilities);
+        const auto inserted = referenced_owners.insert(
+            std::make_pair(material.callback_id, contract));
+        if (!inserted.second && inserted.first->second != contract)
+          throw std::invalid_argument("owned material callback identity has conflicting signatures");
+        const auto owner = owner_signatures.find(material.callback_id);
+        if (owner == owner_signatures.end() || owner->second != contract)
+          throw std::invalid_argument("owned material callback has no matching lifetime token");
+      }
+  if (owner_signatures != referenced_owners)
+    throw std::invalid_argument("material callback owner sidecar is not the exact referenced set");
+  if (input.disposition == MaterialRecipeDisposition::tiled_callback) {
+    if (!input.ir || input.callback_tiles != canonical_callback_tiles(*input.ir))
+      throw std::invalid_argument("material callback tiles are not canonical");
+  }
+  else if (!input.callback_tiles.empty())
+    throw std::invalid_argument("non-tiled material recipe contains callback work");
   for (const MaterialIRTopologyRow &row : input.topology) {
     if (row.key.chunk < 0 || row.element_type != ElementType::realnum_value ||
         row.logical_storage != native_precision || !row.elements ||
@@ -524,6 +739,10 @@ void validate_input(const MaterialRecipeInput &input) {
     for (const MaterialIRTopologyRow &row : input.ir->topology) expected_keys.insert(row.key);
     if (keys != expected_keys)
       throw std::invalid_argument("material recipe does not exactly cover immutable IR topology");
+    if ((input.disposition == MaterialRecipeDisposition::host_reference ||
+         !input.dense_fallback_rows.empty()) && dense_keys != expected_keys)
+      throw std::invalid_argument(
+          "dense material fallback does not exactly cover immutable IR topology");
   }
 }
 
@@ -558,13 +777,80 @@ const char *material_recipe_disposition_name(MaterialRecipeDisposition dispositi
 
 MaterialSupportDecision classify_material_support(const MaterialRecipe &recipe) {
   validate_material_recipe(recipe);
-  return classify_support_input(recipe.ir(), recipe.rows());
+  return classify_support_input(recipe.ir(),
+                                recipe.dense_fallback_rows().empty() && !recipe.ir()
+                                    ? recipe.rows()
+                                    : recipe.dense_fallback_rows(),
+                                recipe.callback_tiles());
+}
+
+MaterialSupportDecision classify_material_ir_support(
+    const std::shared_ptr<const MaterialIR> &ir) {
+  if (!ir)
+    return MaterialSupportDecision{MaterialRecipeDisposition::host_reference,
+                                   material_support_no_owned_ir, 0, 0, 0, 0, 0, 0};
+  validate_material_ir(*ir);
+  return classify_support_input(ir, std::vector<MaterialRecipeRow>(),
+                                canonical_callback_tiles(*ir));
+}
+
+bool material_recipe_has_complete_dense_fallback(const MaterialRecipe &recipe) {
+  validate_material_recipe(recipe);
+  if (recipe.ir())
+    return recipe.dense_fallback_rows().size() == recipe.ir()->topology.size();
+  if (recipe.dense_fallback_rows().empty()) {
+    for (const MaterialRecipeRow &row : recipe.rows())
+      if (row.values.size() != checked_host_bytes(row.element_type, row.elements)) return false;
+    return true;
+  }
+  return true;
+}
+
+bool material_recipe_has_local_fallback_work(
+    const MaterialRecipe &recipe, MaterialRecipeDisposition effective_route) {
+  validate_material_recipe(recipe);
+  switch (effective_route) {
+    case MaterialRecipeDisposition::device_native: return false;
+    case MaterialRecipeDisposition::host_reference:
+      return !recipe.dense_fallback_rows().empty();
+    case MaterialRecipeDisposition::hybrid_interface:
+      return recipe.ir() && !recipe.ir()->hybrid_patches.empty();
+    case MaterialRecipeDisposition::tiled_callback:
+      return !recipe.callback_tiles().empty();
+  }
+  throw std::invalid_argument("invalid effective material fallback route");
+}
+
+MaterialRecipeDisposition reconcile_material_recipe_route(
+    MaterialRecipeDisposition local_route, bool local_dense_complete) {
+  size_t local_routes = material_route_bit(local_route), routes = 0;
+  bw_or_to_all(&local_routes, &routes, 1);
+  const bool dense_complete = and_to_all(local_dense_complete);
+  const size_t native = material_route_bit(MaterialRecipeDisposition::device_native);
+  const size_t hybrid = material_route_bit(MaterialRecipeDisposition::hybrid_interface);
+  const size_t tiled = material_route_bit(MaterialRecipeDisposition::tiled_callback);
+  const size_t host = material_route_bit(MaterialRecipeDisposition::host_reference);
+  if (!routes || (routes & ~(native | hybrid | tiled | host)))
+    throw std::invalid_argument("invalid global material route set");
+  if ((routes & host) || ((routes & tiled) && (routes & hybrid))) {
+    if (!dense_complete)
+      throw std::invalid_argument("global host material route has incomplete dense fallback");
+    return MaterialRecipeDisposition::host_reference;
+  }
+  if (routes & tiled) return MaterialRecipeDisposition::tiled_callback;
+  if (routes & hybrid) return MaterialRecipeDisposition::hybrid_interface;
+  return MaterialRecipeDisposition::device_native;
 }
 
 bool MaterialRecipeRow::operator==(const MaterialRecipeRow &other) const {
   return key == other.key && role == other.role && element_type == other.element_type &&
          storage == other.storage && elements == other.elements && alignment == other.alignment &&
          values == other.values;
+}
+
+bool MaterialCallbackTile::operator==(const MaterialCallbackTile &other) const {
+  return destination == other.destination && material == other.material &&
+         first_point == other.first_point && count == other.count;
 }
 
 MaterialRecipeInput::MaterialRecipeInput()
@@ -578,20 +864,34 @@ MaterialRecipe::MaterialRecipe(const MaterialRecipeInput &input)
       subpixel_tol_(input.subpixel_tol), subpixel_maxeval_(input.subpixel_maxeval),
       host_callback_id_(input.host_callback_id), from_host_callback_(input.from_host_callback),
       support_reason_bits_(input.support_reason_bits),
-      rows_(input.rows), topology_(input.topology), ir_(input.ir), signature_(0) {
+      rows_(input.rows), dense_fallback_rows_(input.dense_fallback_rows),
+      callback_tiles_(input.callback_tiles), callback_owners_(input.callback_owners),
+      topology_(input.topology),
+      ir_(input.ir), signature_(0) {
   validate_input(input);
-  signature_ = compute_signature(version_, disposition_, description_, eps_averaging_,
+  signature_ = compute_signature(version_, disposition_, eps_averaging_,
                                  subpixel_tol_, subpixel_maxeval_, host_callback_id_,
-                                 from_host_callback_, support_reason_bits_, rows_, topology_, ir_);
+                                 from_host_callback_, support_reason_bits_, rows_,
+                                 dense_fallback_rows_, callback_tiles_, callback_owners_,
+                                 topology_, ir_);
 }
 
 bool MaterialRecipe::operator==(const MaterialRecipe &other) const {
   return version_ == other.version_ && disposition_ == other.disposition_ &&
-         description_ == other.description_ && eps_averaging_ == other.eps_averaging_ &&
+         eps_averaging_ == other.eps_averaging_ &&
          subpixel_tol_ == other.subpixel_tol_ && subpixel_maxeval_ == other.subpixel_maxeval_ &&
          host_callback_id_ == other.host_callback_id_ &&
          from_host_callback_ == other.from_host_callback_ &&
          support_reason_bits_ == other.support_reason_bits_ && rows_ == other.rows_ &&
+         dense_fallback_rows_ == other.dense_fallback_rows_ &&
+         callback_tiles_ == other.callback_tiles_ &&
+         callback_owners_.size() == other.callback_owners_.size() &&
+         std::equal(callback_owners_.begin(), callback_owners_.end(),
+                    other.callback_owners_.begin(),
+                    [](const std::shared_ptr<const OwnedMaterialCallback> &a,
+                       const std::shared_ptr<const OwnedMaterialCallback> &b) {
+                      return a && b && a->id == b->id && a->signature == b->signature;
+                    }) &&
          topology_ == other.topology_ &&
          ((!ir_ && !other.ir_) || (ir_ && other.ir_ && material_ir_equal(*ir_, *other.ir_))) &&
          signature_ == other.signature_;
@@ -608,15 +908,18 @@ void validate_material_recipe(const MaterialRecipe &recipe) {
   input.from_host_callback = recipe.from_host_callback();
   input.support_reason_bits = recipe.support_reason_bits();
   input.rows = recipe.rows();
+  input.dense_fallback_rows = recipe.dense_fallback_rows();
+  input.callback_tiles = recipe.callback_tiles();
+  input.callback_owners = recipe.callback_owners();
   input.topology = recipe.topology();
   input.ir = recipe.ir();
   validate_input(input);
   const uint64_t signature =
-      compute_signature(recipe.version(), input.disposition, input.description,
+      compute_signature(recipe.version(), input.disposition,
                         input.eps_averaging, input.subpixel_tol, input.subpixel_maxeval,
                         input.host_callback_id, input.from_host_callback,
-                        input.support_reason_bits, input.rows,
-                        input.topology, input.ir);
+                        input.support_reason_bits, input.rows, input.dense_fallback_rows,
+                        input.callback_tiles, input.callback_owners, input.topology, input.ir);
   if (recipe.version() != material_recipe_format_version || signature != recipe.signature())
     throw std::invalid_argument("material recipe has a stale or unsupported signature");
 }
@@ -665,19 +968,98 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
     for (const MaterialIRTopologyRow &row : ir->topology)
       if (!present.count(row.key)) input.topology.push_back(row), present.insert(row.key);
   }
-  const MaterialSupportDecision decision = classify_support_input(input.ir, input.rows);
+  if (input.ir) {
+    const uint32_t callback_material = input.ir->default_material;
+    const bool tiled = callback_material < input.ir->materials.size() &&
+                       input.ir->materials[callback_material].owned_callback;
+    if (tiled) input.callback_tiles = canonical_callback_tiles(*input.ir);
+    input.callback_owners = material_ir_callback_owners(*input.ir);
+    std::sort(input.callback_owners.begin(), input.callback_owners.end(),
+              [](const std::shared_ptr<const OwnedMaterialCallback> &a,
+                 const std::shared_ptr<const OwnedMaterialCallback> &b) {
+                return a && b ? a->id < b->id : bool(a);
+              });
+    std::map<StorageKey, const MaterialRecipeRow *, StorageKeyLess> dense_sources;
+    for (const MaterialRecipeRow &row : input.rows) dense_sources[row.key] = &row;
+    for (const MaterialIRTopologyRow &topology : input.ir->topology) {
+      MaterialRecipeRow dense;
+      dense.key = topology.key;
+      dense.role = array_role::material;
+      dense.element_type = topology.element_type;
+      dense.storage = topology.logical_storage;
+      dense.elements = topology.elements;
+      dense.alignment = topology.alignment;
+      const auto source = dense_sources.find(dense.key);
+      if (source != dense_sources.end()) dense.values = source->second->values;
+      else dense.values = logical_default_row(topology, *input.ir);
+      input.dense_fallback_rows.push_back(dense);
+    }
+  }
+  else input.dense_fallback_rows = input.rows;
+  const MaterialSupportDecision decision =
+      classify_support_input(input.ir, input.dense_fallback_rows, input.callback_tiles);
   input.disposition = decision.disposition;
   input.support_reason_bits = decision.reason_bits;
   if (decision.disposition == MaterialRecipeDisposition::device_native)
     input.description = "owned-ir:device-native-ready";
   else if (decision.disposition == MaterialRecipeDisposition::hybrid_interface)
     input.description = "owned-ir:hybrid-interface-ready";
+  else if (decision.disposition == MaterialRecipeDisposition::tiled_callback)
+    input.description = "owned-ir:tiled-callback-ready";
   else
     input.description = "cpu:eager-host-reference";
   if (decision.disposition == MaterialRecipeDisposition::device_native ||
-      decision.disposition == MaterialRecipeDisposition::hybrid_interface)
+      decision.disposition == MaterialRecipeDisposition::hybrid_interface ||
+      decision.disposition == MaterialRecipeDisposition::tiled_callback)
     for (MaterialRecipeRow &row : input.rows) row.values.clear();
   return MaterialRecipe(input);
+}
+
+MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
+                                            MaterialRecipeDisposition route) {
+  validate_material_recipe(recipe);
+  MaterialRecipeInput selected;
+  selected.disposition = route;
+  selected.description = std::string("selected:") + material_recipe_disposition_name(route);
+  selected.eps_averaging = recipe.eps_averaging();
+  selected.subpixel_tol = recipe.subpixel_tol();
+  selected.subpixel_maxeval = recipe.subpixel_maxeval();
+  selected.host_callback_id = recipe.host_callback_id();
+  selected.from_host_callback = recipe.from_host_callback();
+  selected.rows = recipe.rows();
+  selected.dense_fallback_rows = recipe.dense_fallback_rows();
+  selected.callback_tiles = route == MaterialRecipeDisposition::tiled_callback
+                                ? recipe.callback_tiles()
+                                : std::vector<MaterialCallbackTile>();
+  selected.callback_owners = recipe.callback_owners();
+  selected.topology = recipe.topology();
+  selected.ir = recipe.ir();
+  if (route == MaterialRecipeDisposition::host_reference) {
+    std::map<StorageKey, const MaterialRecipeRow *, StorageKeyLess> dense;
+    for (const MaterialRecipeRow &row : selected.dense_fallback_rows) dense[row.key] = &row;
+    for (MaterialRecipeRow &row : selected.rows) {
+      const auto source = dense.find(row.key);
+      if (source == dense.end())
+        throw std::invalid_argument(
+            "selected host route has incomplete dense fallback (chunk=" +
+            std::to_string(row.key.chunk) + ", kind=" + std::to_string(row.key.kind) +
+            ", component=" + std::to_string(row.key.component_) + ", cmp=" +
+            std::to_string(row.key.cmp) + ", aux=" + std::to_string(row.key.aux) + ")");
+      row.values = source->second->values;
+    }
+  }
+  else
+    {
+      for (MaterialRecipeRow &row : selected.rows) row.values.clear();
+      selected.dense_fallback_rows.clear();
+    }
+  const MaterialSupportDecision support = classify_support_input(
+      selected.ir, selected.dense_fallback_rows, selected.callback_tiles);
+  selected.support_reason_bits = support.reason_bits;
+  /* A collective host coercion can be stronger than the local proposal. */
+  if (route != MaterialRecipeDisposition::host_reference && route != support.disposition)
+    throw std::invalid_argument("selected material route disagrees with local support");
+  return MaterialRecipe(selected);
 }
 
 void mark_material_storage_provisional(const MaterialRecipe &recipe, StoragePlan &plan) {
@@ -726,7 +1108,8 @@ void resolve_material_storage(const MaterialRecipe &recipe,
   validate_plan_shape(provisional);
   if (recipe.disposition() != MaterialRecipeDisposition::host_reference &&
       recipe.disposition() != MaterialRecipeDisposition::device_native &&
-      recipe.disposition() != MaterialRecipeDisposition::hybrid_interface)
+      recipe.disposition() != MaterialRecipeDisposition::hybrid_interface &&
+      recipe.disposition() != MaterialRecipeDisposition::tiled_callback)
     throw std::invalid_argument("material storage resolver received an unsupported disposition");
   if (authoritative.arrays.size() > provisional.arrays.size())
     throw std::invalid_argument("provisional material storage lost the authoritative prefix");

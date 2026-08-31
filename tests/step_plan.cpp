@@ -1833,7 +1833,19 @@ static void test_phasing_plan() {
   s2.set_conductivity(Dz, magnetic_conductivity);
   for (int i = 0; i < s.num_chunks; ++i) {
     if (!s.chunks[i]->is_mine()) continue;
-    const size_t n = size_t(s.chunks[i]->gv.ntot());
+    structure_chunk &current = *s.chunks[i];
+    structure_chunk &target = *s2.chunks[i];
+    const size_t n = size_t(current.gv.ntot());
+    if (!current.chi1inv[Ex][X]) {
+      current.chi1inv[Ex][X] = new realnum[n];
+      std::fill(current.chi1inv[Ex][X], current.chi1inv[Ex][X] + n, realnum(1));
+      current.trivial_chi1inv[Ex][X] = true;
+    }
+    if (!target.chi1inv[Ex][X]) {
+      target.chi1inv[Ex][X] = new realnum[n];
+      std::fill(target.chi1inv[Ex][X], target.chi1inv[Ex][X] + n, realnum(1));
+      target.trivial_chi1inv[Ex][X] = true;
+    }
     delete[] s.chunks[i]->chi1inv[Ex][Y];
     s.chunks[i]->chi1inv[Ex][Y] = new realnum[n];
     std::fill(s.chunks[i]->chi1inv[Ex][Y], s.chunks[i]->chi1inv[Ex][Y] + n, realnum(0));

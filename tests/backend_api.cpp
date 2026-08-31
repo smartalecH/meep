@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <typeinfo>
@@ -38,6 +39,7 @@
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/material_ir.hpp"
+#include "backend/material_callback.hpp"
 #include "backend/prepare.hpp"
 #include "backend/precision.hpp"
 #include "backend/random_state.hpp"
@@ -62,6 +64,7 @@ static int failures = 0;
 
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static double unit_epsilon(const vec &) { return 1.0; }
+static double two_epsilon(const vec &) { return 2.0; }
 static double phase_conductivity(const vec &);
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
 static int material_ir_user_calls = 0;
@@ -256,10 +259,19 @@ struct lifetime_counts {
   int multilevel_migrations;
   bool fail_rebuild;
   bool fail_create_state;
+  int fail_create_state_on_call;
   bool fail_initialize;
+  int fail_initialize_on_call;
   bool fail_classify;
+  int fail_classify_on_call;
+  int force_promotion_on_classify_call;
+  bool force_aniso2d;
+  component_mask force_required_components;
+  int malformed_material_classification;
   bool fail_finalize;
+  int fail_finalize_on_call;
   bool fail_compile;
+  int fail_compile_on_call;
   bool fail_advance;
   bool retain_all_provisional_material_rows;
   bool corrupt_catalog_after_compile;
@@ -313,8 +325,13 @@ struct lifetime_counts {
         authoritative_value(0), migrate_multilevel_values(false),
         authoritative_population(realnum(0.625)), authoritative_p(realnum(0.375)),
         authoritative_p_prev(realnum(-0.25)), multilevel_migrations(0), fail_rebuild(false),
-        fail_create_state(false), fail_initialize(false), fail_classify(false), fail_finalize(false),
-        fail_compile(false), fail_advance(false), retain_all_provisional_material_rows(false),
+        fail_create_state(false), fail_create_state_on_call(0), fail_initialize(false),
+        fail_initialize_on_call(0), fail_classify(false), fail_classify_on_call(0),
+        force_promotion_on_classify_call(0), force_aniso2d(false),
+        force_required_components(0),
+        malformed_material_classification(0), fail_finalize(false), fail_finalize_on_call(0),
+        fail_compile(false), fail_compile_on_call(0), fail_advance(false),
+        retain_all_provisional_material_rows(false),
         corrupt_catalog_after_compile(false),
         fail_magnetic_synchronize(false), fail_magnetic_restore(false),
         fail_magnetic_synchronize_dispatch(false), fail_cw_preflight(false),
@@ -373,13 +390,17 @@ class tracking_backend : public ExecutionBackend {
 public:
   tracking_backend(fields &f_, lifetime_counts &counts_, bool magnetic_supported_ = false,
                    bool cw_supported_ = false, bool custom_supported_ = false,
-                   bool execute_custom_ = false)
+                   bool execute_custom_ = false, bool material_policy_enabled_ = false)
       : f(f_), counts(counts_), magnetic_supported(magnetic_supported_),
         cw_supported(cw_supported_), custom_supported(custom_supported_),
-        execute_custom(execute_custom_), custom_staging_prepared(false) {}
+        execute_custom(execute_custom_), material_policy_enabled(material_policy_enabled_),
+        custom_staging_prepared(false) {}
 
   BackendState *create_state(const StoragePlan &plan) override {
-    if (counts.fail_create_state) throw std::runtime_error("injected state creation failure");
+    if (counts.fail_create_state ||
+        (counts.fail_create_state_on_call &&
+         counts.states_created + 1 == counts.fail_create_state_on_call))
+      throw std::runtime_error("injected state creation failure");
     counts.arrays_at_create = plan.arrays.size();
     counts.material_arrays_at_create = 0;
     counts.provisional_material_arrays_at_create = 0;
@@ -409,11 +430,17 @@ public:
       validate_material_recipe(plan.materials[0]);
       counts.material_recipe_signature_at_initialize = plan.materials[0].signature();
     }
-    if (counts.fail_initialize) throw std::runtime_error("injected initialization failure");
+    if (counts.fail_initialize ||
+        (counts.fail_initialize_on_call && counts.initialized == counts.fail_initialize_on_call))
+      throw std::runtime_error("injected initialization failure");
   }
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &raw_state) override {
     ++counts.classified;
-    const std::string error = counts.fail_classify ? "injected material classify failure" : "";
+    const std::string error =
+        counts.fail_classify ||
+                (counts.fail_classify_on_call && counts.classified == counts.fail_classify_on_call)
+            ? "injected material classify failure"
+            : "";
     backend_reconcile_host_access(error, "tracking material classify");
     tracking_state &state = dynamic_cast<tracking_state &>(raw_state);
     CHECK(plan.arrays.size() <= state.plan.arrays.size(),
@@ -425,12 +452,34 @@ public:
         if (state.plan.arrays[i].role == array_role::material &&
             state.plan.arrays[i].classification_provisional)
           result.provisional_row_state[i] = MaterialClassification::retained;
+      refresh_material_classification_variants(f, state.plan, result);
     }
+    if (counts.malformed_material_classification == 1 &&
+        !result.provisional_row_state.empty())
+      result.provisional_row_state.pop_back();
+    if (counts.malformed_material_classification == 2)
+      result.required_components = ~component_mask(0);
+    if (counts.malformed_material_classification == 3) {
+      const ArrayId duplicate = result.elided.empty() ? ArrayId{0} : result.elided.back();
+      result.elided.push_back(duplicate);
+      result.elided.push_back(duplicate);
+    }
+    if (counts.malformed_material_classification == 4 && !result.anisotropic_eh.empty())
+      result.anisotropic_eh.pop_back();
+    if (counts.malformed_material_classification == 5 && !result.variant_facts.empty())
+      result.variant_facts.push_back(result.variant_facts.back());
+    if (counts.force_promotion_on_classify_call &&
+        counts.classified == counts.force_promotion_on_classify_call)
+      result.aniso2d = true;
+    if (counts.force_aniso2d) result.aniso2d = true;
+    result.required_components |= counts.force_required_components;
     return result;
   }
   void finalize_storage(const StoragePlan &plan, const MaterialClassification &classification,
                         BackendState &raw_state) override {
-    if (counts.fail_finalize) throw std::runtime_error("injected material finalize failure");
+    if (counts.fail_finalize ||
+        (counts.fail_finalize_on_call && counts.finalized + 1 == counts.fail_finalize_on_call))
+      throw std::runtime_error("injected material finalize failure");
     tracking_state &state = dynamic_cast<tracking_state &>(raw_state);
     CHECK(f.initialization_plan && f.initialization_plan->materials.size() == 1,
           "tracking backend did not receive one frozen material recipe");
@@ -442,7 +491,10 @@ public:
     ++counts.finalized;
   }
   Executable *compile(const StepPlan &plan, BackendState &raw_state) override {
-    if (counts.fail_compile) throw std::runtime_error("injected executable compilation failure");
+    if (counts.fail_compile ||
+        (counts.fail_compile_on_call &&
+         counts.executables_created + 1 == counts.fail_compile_on_call))
+      throw std::runtime_error("injected executable compilation failure");
     tracking_state &state = dynamic_cast<tracking_state &>(raw_state);
     counts.arrays_at_compile = f.storage_plan ? f.storage_plan->arrays.size() : 0;
     counts.retained_logical_suffix_at_compile = 0;
@@ -667,6 +719,9 @@ public:
     return c;
   }
   bool requires_full_storage_preparation() const override { return true; }
+  bool enforces_material_fallback_policy() const override {
+    return material_policy_enabled;
+  }
   void prepare_state_rebuild(BackendState &, DirtyMask) override {
     ++counts.rebuilds;
     bool migrated = false;
@@ -716,6 +771,7 @@ private:
   bool cw_supported;
   bool custom_supported;
   bool execute_custom;
+  bool material_policy_enabled;
   bool custom_staging_prepared;
 };
 
@@ -822,6 +878,15 @@ struct BackendEpochSnapshot {
   bool components_allocated, connections_valid, changed_materials;
   bool host_custom_enabled;
   HostCustomFallbackStats host_custom_stats;
+  MaterialRecipeDisposition material_global_route, material_local_route;
+  uint64_t material_support_reasons, material_recipe_signature,
+      material_state_classification_hash;
+  bool material_fallback_local_presence, material_fallback_global_presence,
+      material_fallback_presence_validated, material_fallback_policy_pending,
+      material_phase_active;
+  MaterialFallbackStatistics material_fallback_stats;
+  uint64_t material_warning_count;
+  bool material_warning_emitted;
   int time_step;
   uint64_t cw_storage_key, cw_step_key, cw_plan_key;
 
@@ -869,6 +934,29 @@ struct BackendEpochSnapshot {
         host_custom_enabled(f.backend && f.backend->host_custom_fallback_enabled()),
         host_custom_stats(f.backend ? f.backend->host_custom_fallback_stats()
                                     : HostCustomFallbackStats()),
+        material_global_route(f.backend_state ? f.backend_state->material_route
+                                              : MaterialRecipeDisposition::device_native),
+        material_local_route(f.backend_state ? f.backend_state->material_local_route
+                                             : MaterialRecipeDisposition::device_native),
+        material_support_reasons(f.backend_state ? f.backend_state->material_support_reasons : 0),
+        material_recipe_signature(f.backend_state ? f.backend_state->material_recipe_signature : 0),
+        material_state_classification_hash(
+            f.backend_state ? f.backend_state->material_classification_hash : 0),
+        material_fallback_local_presence(
+            f.backend_state && f.backend_state->material_fallback_local_presence),
+        material_fallback_global_presence(
+            f.backend_state && f.backend_state->material_fallback_global_presence),
+        material_fallback_presence_validated(
+            f.backend_state && f.backend_state->material_fallback_presence_validated),
+        material_fallback_policy_pending(
+            f.backend_state && f.backend_state->material_fallback_policy_pending),
+        material_phase_active(f.backend_state && f.backend_state->material_phase_active),
+        material_fallback_stats(f.backend_state
+                                    ? f.backend_state->material_fallback_statistics
+                                    : MaterialFallbackStatistics()),
+        material_warning_count(f.backend ? f.backend->material_fallback_warning_count() : 0),
+        material_warning_emitted(
+            f.backend && f.backend->material_fallback_warning_emitted()),
         time_step(f.t), cw_storage_key(0), cw_step_key(0),
         cw_plan_key(0) {
     steps[0] = f.step_plans[0];
@@ -1085,6 +1173,31 @@ struct BackendEpochSnapshot {
         host_custom_stats.upload_bytes != other.host_custom_stats.upload_bytes ||
         host_custom_stats.retryable_failures != other.host_custom_stats.retryable_failures ||
         host_custom_stats.poisoned_failures != other.host_custom_stats.poisoned_failures ||
+        material_global_route != other.material_global_route ||
+        material_local_route != other.material_local_route ||
+        material_support_reasons != other.material_support_reasons ||
+        material_recipe_signature != other.material_recipe_signature ||
+        material_state_classification_hash != other.material_state_classification_hash ||
+        material_fallback_local_presence != other.material_fallback_local_presence ||
+        material_fallback_global_presence != other.material_fallback_global_presence ||
+        material_fallback_presence_validated != other.material_fallback_presence_validated ||
+        material_fallback_policy_pending != other.material_fallback_policy_pending ||
+        material_phase_active != other.material_phase_active ||
+        material_fallback_stats.warnings != other.material_fallback_stats.warnings ||
+        material_fallback_stats.dense_rows != other.material_fallback_stats.dense_rows ||
+        material_fallback_stats.dense_bytes != other.material_fallback_stats.dense_bytes ||
+        material_fallback_stats.interface_points != other.material_fallback_stats.interface_points ||
+        material_fallback_stats.callback_tiles != other.material_fallback_stats.callback_tiles ||
+        material_fallback_stats.callback_points != other.material_fallback_stats.callback_points ||
+        material_fallback_stats.callback_calls != other.material_fallback_stats.callback_calls ||
+        material_fallback_stats.classification_launches !=
+            other.material_fallback_stats.classification_launches ||
+        material_fallback_stats.classification_device_to_host_calls !=
+            other.material_fallback_stats.classification_device_to_host_calls ||
+        material_fallback_stats.classification_device_to_host_bytes !=
+            other.material_fallback_stats.classification_device_to_host_bytes ||
+        material_warning_count != other.material_warning_count ||
+        material_warning_emitted != other.material_warning_emitted ||
         time_step != other.time_step ||
         cw_storage_key != other.cw_storage_key || cw_step_key != other.cw_step_key ||
         cw_plan_key != other.cw_plan_key)
@@ -3050,6 +3163,78 @@ static void test_material_phase_cpu_to_resident_preparation() {
                 target.chunks[i]->refcount == target_refs[size_t(i)],
             "resident material preparation retry changed target ownership");
     }
+}
+
+static void test_material_phase_early_fallback_preflight() {
+  const grid_volume gv = vol2d(3.0, 3.0, 10.0);
+  structure current(gv, unit_epsilon, pml(0.5));
+  structure target(gv, eps_slab, pml(0.5));
+  target.set_conductivity(Dz, phase_conductivity);
+  fields f(&current);
+  CHECK(f.phase_in_material(&target, 2.0 * f.dt) == 2,
+        "early material preflight fixture did not retain its phase countdown");
+  std::vector<structure_chunk *> current_rows(size_t(f.num_chunks), NULL);
+  std::vector<int> target_refs(size_t(target.num_chunks), 0);
+  for (int i = 0; i < f.num_chunks; ++i) {
+    current_rows[size_t(i)] = f.chunks[i]->s;
+    target_refs[size_t(i)] = target.chunks[i]->refcount;
+  }
+
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts, false, false, false, false, true);
+  f.options.strict = true;
+  f.options.fallback = fallback_policy::error;
+  bool rejected = false;
+  try { f.init_backend(); }
+  catch (const std::runtime_error &) { rejected = true; }
+  CHECK(and_to_all(rejected) && !f.backend_state && !f.executable &&
+            counts.states_created == 0 && counts.rebuilds == 0 && counts.initialized == 0,
+        "strict phased fallback rejection performed resident allocation or migration");
+  for (int i = 0; i < f.num_chunks; ++i) {
+    CHECK(f.chunks[i]->s == current_rows[size_t(i)] &&
+              target.chunks[i]->refcount == target_refs[size_t(i)],
+          "strict phased fallback rejection mutated material ownership");
+    if (f.chunks[i]->is_mine())
+      CHECK(!f.chunks[i]->s->conductivity[Dz][Z] && !f.chunks[i]->s->condinv[Dz][Z],
+            "strict phased fallback rejection allocated material-phase coefficients");
+  }
+
+  if (count_processors() > 1) {
+    using namespace meep_geom;
+    geometric_object_list empty_geometry = {0, NULL};
+    material_type ir_material = make_dielectric(2.25);
+    structure ir_source(gv, unit_epsilon, no_pml(), identity(), 2);
+    set_materials_from_geometry(&ir_source, empty_geometry, make_vector3(), false, 1e-5, 64,
+                                false, ir_material);
+    material_free(ir_material);
+    CHECK(ir_source.material_ir, "semantic mismatch fixture has no owned material IR");
+    std::shared_ptr<MaterialIR> local_ir(
+        new MaterialIR(*static_cast<const MaterialIR *>(ir_source.material_ir.get())));
+    if (my_rank() == 0) {
+      local_ir->subpixel_tol *= 2.0;
+      refresh_material_ir_signatures_for_testing(*local_ir);
+    }
+    f.material_ir = std::static_pointer_cast<const void>(local_ir);
+    f.options.strict = false;
+    f.options.fallback = fallback_policy::warn;
+    rejected = false;
+    try { f.init_backend(); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(and_to_all(rejected) && !f.backend_state && !f.executable &&
+              counts.states_created == 0 && counts.rebuilds == 0 && counts.initialized == 0,
+          "phased semantic-signature mismatch reached allocation or migration");
+    for (int i = 0; i < f.num_chunks; ++i)
+      CHECK(f.chunks[i]->s == current_rows[size_t(i)] &&
+                target.chunks[i]->refcount == target_refs[size_t(i)],
+            "phased semantic-signature mismatch mutated material ownership");
+    f.material_ir.reset();
+  }
+
+  f.options.strict = false;
+  f.options.fallback = fallback_policy::warn;
+  f.init_backend();
+  CHECK(f.backend_state && f.executable && f.phasein_time == 2,
+        "early material preflight rejection was not retryable");
 }
 
 static std::complex<double> multiply_fields(const std::complex<realnum> *values, const vec &,
@@ -7141,9 +7326,38 @@ static MaterialRecipeInput material_recipe_input(const MaterialRecipe &recipe) {
   input.from_host_callback = recipe.from_host_callback();
   input.support_reason_bits = recipe.support_reason_bits();
   input.rows = recipe.rows();
+  input.dense_fallback_rows = recipe.dense_fallback_rows();
+  input.callback_tiles = recipe.callback_tiles();
+  input.callback_owners = recipe.callback_owners();
   input.topology = recipe.topology();
   input.ir = recipe.ir();
   return input;
+}
+
+static MaterialClassificationFacts classification_facts_input(
+    const fields &f, const StoragePlan &plan, const MaterialClassification &classification) {
+  MaterialClassificationFacts facts;
+  facts.required_components = classification.required_components;
+  facts.has_nonlinearities = classification.has_nonlinearities;
+  facts.aniso2d = classification.aniso2d && f.beta == 0;
+  facts.min_decimation_factor = classification.min_decimation_factor;
+  for (size_t i = 0; i < plan.arrays.size(); ++i)
+    if (plan.arrays[i].role == array_role::material)
+      facts.rows.push_back(
+          MaterialRowClassificationFact{plan.keys[i], classification.provisional_row_state[i]});
+  for (const MaterialVariantClassificationFact &variant : classification.variant_facts)
+    if (f.chunks[variant.chunk]->is_mine()) facts.variants.push_back(variant);
+  return facts;
+}
+
+static void expect_material_classification_facts_rejected(
+    fields &f, const StoragePlan &plan, const MaterialRecipe &recipe,
+    const MaterialClassificationFacts &facts, const char *label) {
+  bool rejected = false;
+  try { (void)assemble_material_classification(f, plan, recipe, facts); }
+  catch (const std::runtime_error &) { rejected = true; }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(and_to_all(rejected), "%s was accepted", label);
 }
 
 static void expect_material_recipe_rejected(const MaterialRecipeInput &input,
@@ -7207,6 +7421,10 @@ static uint64_t expected_compact_material_ir_bytes(const MaterialIR &ir) {
   for (const MaterialIRMaterial &m : ir.materials) {
     ADD_IR_SCALAR(m.kind);
     ADD_IR_SCALAR(m.host_callback);
+    ADD_IR_SCALAR(m.owned_callback);
+    ADD_IR_SCALAR(m.callback_id);
+    ADD_IR_SCALAR(m.callback_signature);
+    ADD_IR_SCALAR(m.callback_capabilities);
     ADD_IR_SCALAR(m.do_averaging);
     ADD_IR_SCALAR(m.material_grid_kind);
     ADD_IR_SCALAR(m.material_grid_trivial);
@@ -7921,7 +8139,7 @@ static void test_geometry_backed_material_ir() {
     const MaterialRecipe &geometry_recipe = f.initialization_plan->materials[0];
     const MaterialSupportDecision support = classify_material_support(geometry_recipe);
     uint64_t exact_dense_bytes = 0;
-    for (const MaterialRecipeRow &row : geometry_recipe.rows())
+    for (const MaterialRecipeRow &row : geometry_recipe.dense_fallback_rows())
       exact_dense_bytes += row.values.size();
     CHECK(geometry_recipe.disposition() == MaterialRecipeDisposition::hybrid_interface &&
               support.disposition == MaterialRecipeDisposition::hybrid_interface &&
@@ -8705,6 +8923,8 @@ static void test_geometry_backed_material_ir_removal() {
       stale_sigma = stale_sigma || bool(recipe.ir());
       for (const MaterialRecipeRow &row : recipe.rows())
         stale_sigma = stale_sigma || row.key.kind == int(array_kind::sigma);
+      for (const MaterialRecipeRow &row : recipe.dense_fallback_rows())
+        stale_sigma = stale_sigma || row.key.kind == int(array_kind::sigma);
       for (const MaterialIRTopologyRow &row : recipe.topology())
         stale_sigma = stale_sigma || row.key.kind == int(array_kind::sigma);
     }
@@ -8785,8 +9005,9 @@ static void test_material_recipe_and_provisional_storage() {
 
   MaterialRecipeInput changed = material_recipe_input(recipe);
   changed.description += ":changed";
-  CHECK(MaterialRecipe(changed).signature() != recipe.signature(),
-        "material recipe signature ignores description");
+  CHECK(MaterialRecipe(changed).signature() == recipe.signature() &&
+            MaterialRecipe(changed) == recipe,
+        "diagnostic material description changed semantic identity");
   changed = material_recipe_input(recipe);
   changed.eps_averaging = !changed.eps_averaging;
   if (recipe.ir())
@@ -9153,6 +9374,839 @@ static void test_material_recipe_and_provisional_storage() {
   delete s;
 }
 
+static void test_owned_tiled_material_route() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(2.0, 2.0, 16.0);
+  std::shared_ptr<size_t> calls(new size_t(0));
+  std::shared_ptr<const OwnedMaterialCallback> owner(
+      new OwnedMaterialCallback(
+          UINT64_C(0x74696c65642d6964), UINT64_C(0x74696c65642d7631),
+          owned_material_callback_tiled_capabilities,
+          [calls](vector3 point, medium_struct &medium) {
+            ++*calls;
+            medium = medium_struct(2.0 + 0.125 * point.x + 0.0625 * point.y);
+          }));
+  std::shared_ptr<const OwnedMaterialCallback> equivalent_owner(
+      new OwnedMaterialCallback(
+          owner->id, owner->signature, owner->capabilities,
+          [](vector3, medium_struct &medium) { medium = medium_struct(99.0); }));
+  std::shared_ptr<const OwnedMaterialCallback> changed_owner(
+      new OwnedMaterialCallback(
+          owner->id, owner->signature + 1, owner->capabilities,
+          [](vector3, medium_struct &medium) { medium = medium_struct(99.0); }));
+  std::shared_ptr<const OwnedMaterialCallback> changed_capabilities(
+      new OwnedMaterialCallback(
+          owner->id, owner->signature,
+          owned_material_callback_pure_replay_stable,
+          [](vector3, medium_struct &medium) { medium = medium_struct(99.0); }));
+  material_type equivalent = make_owned_user_material_for_backend(equivalent_owner, false);
+  material_type changed = make_owned_user_material_for_backend(changed_owner, false);
+  material_type changed_contract =
+      make_owned_user_material_for_backend(changed_capabilities, false);
+  std::weak_ptr<const OwnedMaterialCallback> lifetime(owner);
+  material_type material = make_owned_user_material_for_backend(owner, false);
+  CHECK(material_type_equal(material, equivalent) && !material_type_equal(material, changed) &&
+            !material_type_equal(material, changed_contract),
+        "owned callback equality used owner identity instead of stable behavior signature");
+  material_free(equivalent);
+  material_free(changed);
+  material_free(changed_contract);
+  geometric_object_list geometry = {0, NULL};
+  structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 64, false,
+                              material);
+  material_free(material);
+  owner.reset();
+  const bool callback_evaluated = or_to_all(*calls > 0);
+  CHECK(!lifetime.expired() && callback_evaluated,
+        "owned material callback token did not survive eager construction");
+
+  fields f(&s);
+  f.use_real_fields();
+  f.require_component(Ez);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+  CHECK(f.initialization_plan && f.initialization_plan->materials.size() == 1,
+        "owned callback produced no material recipe");
+  if (f.initialization_plan && f.initialization_plan->materials.size() == 1) {
+    const MaterialRecipe &recipe = f.initialization_plan->materials[0];
+    fields oracle(&s);
+    oracle.use_real_fields();
+    oracle.require_component(Ez);
+    oracle.advance(1);
+    const InitializationPlan oracle_initialization = build_initialization_plan(oracle);
+    CHECK(oracle_initialization.materials.size() == 1,
+          "owned callback CPU oracle produced no unselected material recipe");
+    const MaterialRecipe unselected_recipe =
+        oracle_initialization.materials.empty()
+            ? recipe
+            : oracle_initialization.materials[0];
+    const MaterialSupportDecision support = classify_material_support(recipe);
+    uint64_t points = 0;
+    uint64_t destination_points = 0;
+    bool dense_payloads_elided = true;
+    for (const MaterialCallbackTile &tile : recipe.callback_tiles()) points += tile.count;
+    for (const MaterialIRDestination &destination : recipe.ir()->destinations)
+      destination_points += destination.point_count;
+    const size_t global_points = sum_to_all(size_t(points));
+    CHECK(f.backend_state &&
+              f.backend_state->material_fallback_local_presence ==
+                  !recipe.callback_tiles().empty(),
+          "owned callback local fallback presence did not match local tile work");
+    for (const MaterialRecipeRow &row : recipe.rows())
+      dense_payloads_elided = dense_payloads_elided && row.values.empty();
+    std::set<StorageKey, bool (*)(const StorageKey &, const StorageKey &)> primary_keys(
+        [](const StorageKey &a, const StorageKey &b) {
+          if (a.chunk != b.chunk) return a.chunk < b.chunk;
+          if (a.kind != b.kind) return a.kind < b.kind;
+          if (a.component_ != b.component_) return a.component_ < b.component_;
+          if (a.cmp != b.cmp) return a.cmp < b.cmp;
+          return a.aux < b.aux;
+        });
+    for (const MaterialRecipeRow &row : unselected_recipe.rows()) primary_keys.insert(row.key);
+    bool saw_synthesized_identity = false;
+    for (const MaterialRecipeRow &row : unselected_recipe.dense_fallback_rows()) {
+      if (primary_keys.count(row.key) || row.key.kind != int(array_kind::chi1inv) ||
+          row.key.component_ < 0 ||
+          int(row.key.aux) != int(component_direction(component(row.key.component_))))
+        continue;
+      saw_synthesized_identity = true;
+      CHECK(row.values.size() == row.elements * sizeof(realnum),
+            "synthesized chi1 identity row has the wrong byte count");
+      for (size_t point = 0; point < row.elements; ++point) {
+        realnum value = 0;
+        memcpy(&value, row.values.data() + point * sizeof(realnum), sizeof(value));
+        CHECK(value == realnum(1),
+              "dense fallback synthesized chi1 diagonal as %.17g instead of +1",
+              double(value));
+      }
+    }
+    const bool globally_saw_synthesized_identity = or_to_all(saw_synthesized_identity);
+    const MaterialRecipe coerced =
+        select_material_recipe_route(unselected_recipe,
+                                     MaterialRecipeDisposition::host_reference);
+    CHECK(coerced.dense_fallback_rows() == unselected_recipe.dense_fallback_rows() &&
+              material_recipe_has_local_fallback_work(
+                  coerced, MaterialRecipeDisposition::host_reference) ==
+                  !coerced.dense_fallback_rows().empty(),
+          "host coercion changed or misclassified its complete dense snapshot");
+    const MaterialRecipeDisposition expected_local_callback_route =
+        points ? MaterialRecipeDisposition::tiled_callback
+               : MaterialRecipeDisposition::device_native;
+    CHECK(recipe.disposition() == expected_local_callback_route &&
+              support.disposition == expected_local_callback_route &&
+              (support.reason_bits & material_support_owned_callback) &&
+              !(support.reason_bits & material_support_unowned_callback) &&
+              points == destination_points && points == support.callback_points &&
+              (recipe.callback_tiles().empty() == (points == 0)) && global_points > 256 &&
+              dense_payloads_elided && globally_saw_synthesized_identity &&
+              !lifetime.expired(),
+          "owned pointwise callback did not select a nonvacuous bounded tiled route");
+
+    MaterialRecipeInput malformed = material_recipe_input(recipe);
+    malformed.callback_owners.clear();
+    expect_material_recipe_rejected(malformed, "missing owned callback token");
+    malformed = material_recipe_input(recipe);
+    malformed.callback_owners.push_back(std::shared_ptr<const OwnedMaterialCallback>(
+        new OwnedMaterialCallback(UINT64_C(0x65787472612d6f77),
+                                  UINT64_C(0x65787472612d7369),
+                                  owned_material_callback_tiled_capabilities,
+                                  [](vector3, medium_struct &medium) {
+                                    medium = medium_struct(4.0);
+                                  })));
+    expect_material_recipe_rejected(malformed, "unreferenced owned callback token");
+    malformed = material_recipe_input(recipe);
+    malformed.callback_owners.push_back(malformed.callback_owners.front());
+    expect_material_recipe_rejected(malformed, "duplicate owned callback token");
+    if (!recipe.callback_tiles().empty()) {
+      malformed = material_recipe_input(recipe);
+      malformed.callback_tiles[0].material = uint32_t(recipe.ir()->materials.size());
+      expect_material_recipe_rejected(malformed, "wrong callback material");
+      malformed = material_recipe_input(recipe);
+      malformed.callback_tiles[0].first_point = 1;
+      expect_material_recipe_rejected(malformed, "callback tile gap");
+      malformed = material_recipe_input(recipe);
+      malformed.callback_tiles.insert(malformed.callback_tiles.begin(),
+                                      malformed.callback_tiles.front());
+      expect_material_recipe_rejected(malformed, "duplicate callback tile");
+      if (recipe.callback_tiles().size() > 1) {
+        malformed = material_recipe_input(recipe);
+        std::swap(malformed.callback_tiles[0], malformed.callback_tiles[1]);
+        expect_material_recipe_rejected(malformed, "reordered callback tiles");
+      }
+      malformed = material_recipe_input(recipe);
+      --malformed.callback_tiles.back().count;
+      expect_material_recipe_rejected(malformed, "short final callback tile");
+    }
+    malformed = material_recipe_input(recipe);
+    malformed.callback_owners[0].reset(new OwnedMaterialCallback(
+        recipe.ir()->materials[recipe.ir()->default_material].callback_id,
+        recipe.ir()->materials[recipe.ir()->default_material].callback_signature + 1,
+        owned_material_callback_tiled_capabilities,
+        [](vector3, medium_struct &medium) { medium = medium_struct(3.0); }));
+    expect_material_recipe_rejected(malformed, "callback signature mutation");
+    malformed = material_recipe_input(recipe);
+    malformed.callback_owners[0].reset(new OwnedMaterialCallback(
+        recipe.ir()->materials[recipe.ir()->default_material].callback_id,
+        recipe.ir()->materials[recipe.ir()->default_material].callback_signature,
+        owned_material_callback_pure_replay_stable,
+        [](vector3, medium_struct &medium) { medium = medium_struct(3.0); }));
+    expect_material_recipe_rejected(malformed, "callback capability mutation");
+
+    MaterialIR effective = *recipe.ir();
+    effective.eps_averaging = false;
+    effective.subpixel_maxeval = 0;
+    effective.materials[effective.default_material].do_averaging = true;
+    refresh_material_ir_signatures_for_testing(effective);
+    CHECK(classify_material_ir_support(std::shared_ptr<const MaterialIR>(new MaterialIR(effective)))
+              .disposition == expected_local_callback_route,
+          "material-local averaging enabled a tiled callback while global averaging was off");
+    effective.eps_averaging = true;
+    effective.subpixel_maxeval = 64;
+    effective.materials[effective.default_material].do_averaging = false;
+    refresh_material_ir_signatures_for_testing(effective);
+    CHECK(classify_material_ir_support(std::shared_ptr<const MaterialIR>(new MaterialIR(effective)))
+              .disposition == expected_local_callback_route,
+          "global averaging enabled a tiled callback while material averaging was off");
+    effective.materials[effective.default_material].do_averaging = true;
+    refresh_material_ir_signatures_for_testing(effective);
+    CHECK(classify_material_ir_support(std::shared_ptr<const MaterialIR>(new MaterialIR(effective)))
+              .disposition == MaterialRecipeDisposition::host_reference,
+          "effective callback averaging did not select host-reference fallback");
+
+    if (count_processors() > 1) {
+      const std::shared_ptr<const void> original_ir = f.material_ir;
+      BackendState *const live_state = f.backend_state;
+      const int rebuilds = counts.rebuilds;
+      if (my_rank() == 0) {
+        std::shared_ptr<MaterialIR> changed_ir(new MaterialIR(*recipe.ir()));
+        changed_ir->subpixel_tol *= 2.0;
+        refresh_material_ir_signatures_for_testing(*changed_ir);
+        f.material_ir = std::static_pointer_cast<const void>(changed_ir);
+      }
+      invalidate(f, MutationKind::material_values,
+                 "backend_api:rank_asymmetric_material_signature");
+      bool failed = false;
+      try { f.advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      CHECK(and_to_all(failed) && f.backend_state == live_state && counts.rebuilds == rebuilds,
+            "rank-asymmetric semantic material signature reached migration or publication");
+      f.material_ir = original_ir;
+    }
+  }
+}
+
+static void test_material_fallback_policy_transaction() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  std::shared_ptr<const OwnedMaterialCallback> owner(new OwnedMaterialCallback(
+      UINT64_C(0x706f6c6963792d69), UINT64_C(0x706f6c6963792d73),
+      owned_material_callback_tiled_capabilities,
+      [](vector3 point, medium_struct &medium) {
+        medium = medium_struct(2.0 + 0.01 * point.x);
+      }));
+  material_type material = make_owned_user_material_for_backend(owner, false);
+  geometric_object_list geometry = {0, NULL};
+  structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 64, false,
+                              material);
+  material_free(material);
+  fields f(&s);
+  f.require_component(Ez);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts, false, false, false, false, true);
+  f.options.fallback = fallback_policy::warn;
+  f.options.strict = false;
+
+  counts.fail_compile = true;
+  bool failed = false;
+  try { f.advance(1); }
+  catch (const std::exception &) { failed = true; }
+  CHECK(failed && !f.backend_state && !f.executable &&
+            f.backend->material_fallback_warning_count() == 0,
+        "failed material candidate published warning/state before commit");
+  counts.fail_compile = false;
+  f.advance(1);
+  CHECK(f.backend_state && f.executable &&
+            f.backend->material_fallback_warning_count() == 1,
+        "successful material fallback retry did not publish exactly one warning");
+  const bool any_callback_points = or_to_all(
+      f.backend_state && f.backend_state->material_fallback_statistics.callback_points > 0);
+  CHECK(f.backend_state &&
+            f.backend_state->material_route == MaterialRecipeDisposition::tiled_callback &&
+            f.backend_state->material_fallback_statistics.dense_rows == 0 &&
+            f.backend_state->material_fallback_statistics.dense_bytes == 0 &&
+            any_callback_points,
+        "tiled material route published overlapping dense/native ownership accounting");
+
+  BackendState *committed_state = f.backend_state;
+  const int rebuilds = counts.rebuilds;
+  f.options.strict = true;
+  invalidate(f, MutationKind::material_values, "backend_api:strict_material_retry");
+  failed = false;
+  try { f.advance(1); }
+  catch (const std::exception &) { failed = true; }
+  CHECK(failed && f.backend_state == committed_state && counts.rebuilds == rebuilds,
+        "strict warm material rejection ran migration or replaced the live epoch");
+
+  f.options.strict = false;
+  backend_set_material_fallback_warning_for_testing(
+      *f.backend, std::numeric_limits<uint64_t>::max(), false);
+  failed = false;
+  try { f.advance(1); }
+  catch (const std::exception &) { failed = true; }
+  CHECK(failed && f.backend_state == committed_state && counts.rebuilds == rebuilds,
+        "warning overflow ran migration or replaced the live material epoch");
+  backend_set_material_fallback_warning_for_testing(*f.backend, 1, true);
+  f.advance(1);
+  CHECK(f.backend_state != committed_state,
+        "material fallback did not recover after warning-overflow retry");
+}
+
+static void replace_isotropic_material_definition_for_testing(
+    fields &f, const std::shared_ptr<const void> &material_ir,
+    double (*epsilon)(const vec &), const char *site) {
+  backend_prepare_field_layout_change(
+      f, invalidation_closure(MutationKind::material_definition), site);
+  simple_material_function material(epsilon);
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+    FOR_COMPONENTS(c)
+      if (f.chunks[chunk]->gv.has_field(c) && (is_electric(c) || is_magnetic(c)))
+        f.chunks[chunk]->s->set_chi1inv(c, material, false, 1e-5, 0);
+    f.chunks[chunk]->s->remove_susceptibilities();
+  }
+  f.material_ir = material_ir;
+  invalidate(f, MutationKind::material_definition, site);
+  note_connections_invalidated(f);
+  mark_local_invalidation(f);
+  backend_note_material_definition_changed_for_testing(f);
+}
+
+static void test_material_fallback_route_removal() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  geometric_object_list empty_geometry = {0, NULL};
+  std::shared_ptr<const OwnedMaterialCallback> owner(new OwnedMaterialCallback(
+      UINT64_C(0x72656d6f76652d69), UINT64_C(0x72656d6f76652d73),
+      owned_material_callback_tiled_capabilities,
+      [](vector3 point, medium_struct &medium) {
+        medium = medium_struct(2.5 + 0.01 * point.x);
+      }));
+  material_type fallback_material = make_owned_user_material_for_backend(owner, false);
+  structure fallback_definition(gv, unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&fallback_definition, empty_geometry, make_vector3(), false,
+                              1e-5, 64, false, fallback_material);
+  material_free(fallback_material);
+
+  material_type native_material = make_dielectric(2.0);
+  structure native_definition(gv, unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&native_definition, empty_geometry, make_vector3(), false,
+                              1e-5, 64, false, native_material);
+  material_free(native_material);
+  structure vacuum_definition(gv, unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&vacuum_definition, empty_geometry, make_vector3(), false,
+                              1e-5, 64, false, vacuum);
+
+  fields f(&fallback_definition);
+  f.require_component(Ez);
+  lifetime_counts counts;
+  f.backend = new tracking_backend(f, counts, false, false, false, false, true);
+  f.options.strict = false;
+  f.options.fallback = fallback_policy::warn;
+  f.advance(1);
+  const bool initial_local_callback_work =
+      f.initialization_plan && f.initialization_plan->materials.size() == 1 &&
+      !f.initialization_plan->materials[0].callback_tiles().empty();
+  CHECK(f.backend_state &&
+            f.backend_state->material_route == MaterialRecipeDisposition::tiled_callback &&
+            f.backend_state->material_fallback_global_presence &&
+            f.backend_state->material_fallback_local_presence ==
+                initial_local_callback_work &&
+            f.backend->material_fallback_warning_count() == 1,
+        "fallback removal fixture did not publish its initial tiled route");
+
+  replace_isotropic_material_definition_for_testing(
+      f, native_definition.material_ir, two_epsilon,
+      "backend_api:fallback_to_native_definition");
+  f.advance(1);
+  CHECK(f.backend_state &&
+            f.backend_state->material_route == MaterialRecipeDisposition::device_native &&
+            !f.backend_state->material_fallback_global_presence &&
+            !f.backend_state->material_fallback_local_presence &&
+            f.backend_state->material_fallback_presence_validated &&
+            f.backend_state->material_fallback_statistics.warnings == 0 &&
+            f.backend_state->material_fallback_statistics.dense_rows == 0 &&
+            f.backend_state->material_fallback_statistics.callback_tiles == 0 &&
+            f.backend_state->material_fallback_statistics.callback_points == 0 &&
+            f.backend->material_fallback_warning_count() == 1,
+        "fallback-to-native replacement retained stale fallback state");
+  CHECK(f.initialization_plan && f.initialization_plan->materials.size() == 1 &&
+            f.initialization_plan->materials[0].callback_owners().empty() &&
+            f.initialization_plan->materials[0].callback_tiles().empty() &&
+            f.initialization_plan->materials[0].dense_fallback_rows().empty(),
+        "native replacement retained stale callback, tile, or dense fallback work");
+
+  replace_isotropic_material_definition_for_testing(
+      f, vacuum_definition.material_ir, unit_epsilon,
+      "backend_api:native_to_vacuum_definition");
+  f.advance(1);
+  bool stale_material_state = !f.backend_state ||
+                              f.backend_state->material_route !=
+                                  MaterialRecipeDisposition::device_native ||
+                              f.backend_state->material_fallback_global_presence ||
+                              f.backend_state->material_fallback_local_presence;
+  if (f.initialization_plan && f.initialization_plan->materials.size() == 1) {
+    const MaterialRecipe &recipe = f.initialization_plan->materials[0];
+    stale_material_state = stale_material_state || !recipe.callback_owners().empty() ||
+                           !recipe.callback_tiles().empty() ||
+                           !recipe.dense_fallback_rows().empty();
+    for (const MaterialRecipeRow &row : recipe.rows())
+      stale_material_state = stale_material_state ||
+                             row.key.kind == int(array_kind::chi2) ||
+                             row.key.kind == int(array_kind::chi3) ||
+                             row.key.kind == int(array_kind::conductivity) ||
+                             row.key.kind == int(array_kind::condinv) ||
+                             row.key.kind == int(array_kind::sigma);
+  }
+  else
+    stale_material_state = true;
+  CHECK(and_to_all(!stale_material_state) &&
+            f.backend->material_fallback_warning_count() == 1,
+        "native-to-vacuum replacement retained stale rows, callbacks, or fallback presence");
+}
+
+static void test_material_promotion_transaction() {
+  for (int failure = 0; failure < 6; ++failure) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    f->backend = new tracking_backend(*f, counts);
+    f->advance(1);
+    counts.force_promotion_on_classify_call = 2;
+    invalidate(*f, MutationKind::material_values,
+               "backend_api:warm_classification_promotion");
+    const BackendEpochSnapshot entry(*f);
+    if (failure == 0) backend_set_cw_clone_fail_after_for_testing(0);
+    counts.fail_create_state_on_call = failure == 1 ? 3 : 0;
+    counts.fail_initialize_on_call = failure == 2 ? 3 : 0;
+    counts.fail_classify_on_call = failure == 3 ? 3 : 0;
+    counts.fail_finalize_on_call = failure == 4 ? 2 : 0;
+    counts.fail_compile_on_call = failure == 5 ? 2 : 0;
+    bool failed = false;
+    try { f->advance(1); }
+    catch (const std::exception &) { failed = true; }
+    backend_set_cw_clone_fail_after_for_testing(-1);
+    CHECK(and_to_all(failed) && entry.matches(*f) && !f->backend->is_poisoned(),
+          "promotion second-pass failure %d changed the live epoch", failure);
+    counts.fail_create_state_on_call = 0;
+    counts.fail_initialize_on_call = 0;
+    counts.fail_classify_on_call = 0;
+    counts.fail_finalize_on_call = 0;
+    counts.fail_compile_on_call = 0;
+    counts.force_promotion_on_classify_call = counts.classified + 1;
+    BackendState *old_state = f->backend_state;
+    f->advance(1);
+    CHECK(f->backend_state && f->backend_state != old_state &&
+              f->classification_reentries == 1,
+          "promotion second-pass failure %d did not retry exactly once", failure);
+    delete f;
+    delete s;
+  }
+}
+
+static component_mask global_component_mask(fields &f) {
+  int local[NUM_FIELD_COMPONENTS], global[NUM_FIELD_COMPONENTS];
+  FOR_COMPONENTS(c) local[c] = f.have_component(c) ? 1 : 0;
+  or_to_all(local, global, NUM_FIELD_COMPONENTS);
+  component_mask result = 0;
+  FOR_COMPONENTS(c)
+    if (global[c]) result |= component_mask(1) << int(c);
+  return result;
+}
+
+static void check_idle_rank_material_promotion(fields &f, lifetime_counts &counts,
+                                               component_mask expected, const char *name) {
+  bool owns_chunk = false;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    owns_chunk = owns_chunk || f.chunks[chunk]->is_mine();
+  CHECK(sum_to_all(owns_chunk ? 1 : 0) == 1,
+        "%s fixture did not assign its one chunk to exactly one rank", name);
+  if (count_processors() > 1)
+    CHECK(or_to_all(!owns_chunk), "%s fixture did not include an idle rank", name);
+
+  f.backend = new tracking_backend(f, counts);
+  f.advance(1);
+  const component_mask present = global_component_mask(f);
+  CHECK((present & expected) == expected,
+        "%s promotion did not realize the globally required component layout", name);
+  CHECK(and_to_all(f.classification_reentries == 1),
+        "%s promotion did not re-enter preparation exactly once", name);
+  CHECK(counts.classified >= 1, "%s promotion never reached backend classification", name);
+  if (!owns_chunk)
+    CHECK(!f.have_component(Ex) && !f.have_component(Ez),
+          "%s idle rank acquired rank-local field storage", name);
+}
+
+static void test_material_idle_rank_component_promotion() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+    fields f(&s, 0, 0.2);
+    f._require_component(Ez, false);
+    lifetime_counts counts;
+    component_mask expected = 0;
+    FOR_COMPONENTS(c)
+      if (f.gv.has_field(c)) expected |= component_mask(1) << int(c);
+    check_idle_rank_material_promotion(f, counts, expected,
+                                       "beta/aniso2d idle-rank");
+  }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+    fields f(&s);
+    f._require_component(Ez, false);
+    lifetime_counts counts;
+    counts.force_required_components = component_mask(1) << int(Ex);
+    check_idle_rank_material_promotion(f, counts, counts.force_required_components,
+                                       "required-component idle-rank");
+  }
+}
+
+static void test_material_route_lattice() {
+  if (count_processors() < 2) return;
+  const bool first = my_rank() == 0;
+  CHECK(reconcile_material_recipe_route(
+            first ? MaterialRecipeDisposition::tiled_callback
+                  : MaterialRecipeDisposition::hybrid_interface,
+            true) == MaterialRecipeDisposition::host_reference,
+        "asymmetric tiled/hybrid routes did not reconcile to host-reference");
+  CHECK(reconcile_material_recipe_route(
+            first ? MaterialRecipeDisposition::host_reference
+                  : MaterialRecipeDisposition::device_native,
+            true) == MaterialRecipeDisposition::host_reference,
+        "host-reference did not dominate an asymmetric native route");
+  CHECK(reconcile_material_recipe_route(
+            first ? MaterialRecipeDisposition::tiled_callback
+                  : MaterialRecipeDisposition::device_native,
+            true) == MaterialRecipeDisposition::tiled_callback,
+        "tiled callback did not dominate an asymmetric native route");
+  CHECK(reconcile_material_recipe_route(
+            first ? MaterialRecipeDisposition::hybrid_interface
+                  : MaterialRecipeDisposition::device_native,
+            true) == MaterialRecipeDisposition::hybrid_interface,
+        "hybrid interface did not dominate an asymmetric native route");
+  bool rejected = false;
+  try {
+    reconcile_material_recipe_route(
+        first ? MaterialRecipeDisposition::host_reference
+              : MaterialRecipeDisposition::device_native,
+        !first);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(and_to_all(rejected),
+        "global host-reference route accepted an incomplete dense snapshot");
+}
+
+static void test_material_classification_fact_contract() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+  CHECK(f->initialization_plan && f->initialization_plan->materials.size() == 1,
+        "classification fact fixture has no material recipe");
+  if (!f->initialization_plan || f->initialization_plan->materials.size() != 1) {
+    delete f;
+    delete s;
+    return;
+  }
+  const MaterialRecipe &recipe = f->initialization_plan->materials[0];
+  const MaterialClassification classification = classify(*f, *f->storage_plan);
+  const MaterialClassificationFacts baseline =
+      classification_facts_input(*f, *f->storage_plan, classification);
+  CHECK(f->step_plans[0], "classification fixture has no rebuilt ordinary StepPlan");
+  if (f->step_plans[0])
+    validate_material_classification_consumers(*f->storage_plan, *f->initialization_plan,
+                                               *f->step_plans[0], classification);
+
+  CHECK(baseline.variants.size() > 1,
+        "classification fixture did not produce multiple exact update regions");
+  std::set<uint32_t> observed_variant_keys;
+  for (const MaterialVariantClassificationFact &variant : baseline.variants)
+    observed_variant_keys.insert(variant.variant_key);
+  CHECK(observed_variant_keys.size() > 1,
+        "classification fixture did not exercise multiple update variants");
+
+  if (f->step_plans[0] && !classification.variant_facts.empty()) {
+    MaterialClassification changed = classification;
+    const bool changed_variant_owned =
+        f->chunks[changed.variant_facts[0].chunk]->is_mine();
+    changed.variant_facts[0].variant_key ^= constitutive_has_nonlinearity;
+    bool rejected = false;
+    try {
+      validate_material_classification_consumers(*f->storage_plan, *f->initialization_plan,
+                                                 *f->step_plans[0], changed);
+    }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(or_to_all(rejected),
+          "post-plan validation accepted a changed material variant key collectively");
+    CHECK(and_to_all(!changed_variant_owned || rejected),
+          "post-plan validation accepted a changed material variant key on its owning rank");
+
+    changed = classification;
+    const bool missing_variant_owned =
+        f->chunks[changed.variant_facts.back().chunk]->is_mine();
+    changed.variant_facts.pop_back();
+    rejected = false;
+    try {
+      validate_material_classification_consumers(*f->storage_plan, *f->initialization_plan,
+                                                 *f->step_plans[0], changed);
+    }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(or_to_all(rejected),
+          "post-plan validation accepted a missing material update region collectively");
+    CHECK(and_to_all(!missing_variant_owned || rejected),
+          "post-plan validation accepted a missing material update region on its owning rank");
+
+    changed = classification;
+    changed.variant_facts.push_back(changed.variant_facts.back());
+    rejected = false;
+    try {
+      validate_material_classification_consumers(*f->storage_plan, *f->initialization_plan,
+                                                 *f->step_plans[0], changed);
+    }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected, "post-plan validation accepted an extra material update region");
+
+    int owned_chunk = -1;
+    for (const MaterialVariantClassificationFact &variant : classification.variant_facts)
+      if (f->chunks[variant.chunk]->is_mine()) {
+        owned_chunk = variant.chunk;
+        break;
+      }
+    CHECK(owned_chunk >= 0,
+          "post-plan validation fixture has no classified update region for an owned chunk");
+    if (owned_chunk >= 0) {
+      StepPlan missing_chunk = *f->step_plans[0];
+      std::vector<ConstitutiveUpdate> retained;
+      for (Operation &operation : missing_chunk.operations) {
+        if (operation.kind != OpKind::update_eh) continue;
+        const size_t begin = operation.descriptor_index;
+        const size_t end = begin + operation.descriptor_count;
+        operation.descriptor_index = uint32_t(retained.size());
+        for (size_t i = begin; i < end; ++i)
+          if (missing_chunk.eh_updates[i].region.chunk != owned_chunk)
+            retained.push_back(missing_chunk.eh_updates[i]);
+        operation.descriptor_count = uint32_t(retained.size()) - operation.descriptor_index;
+      }
+      missing_chunk.eh_updates.swap(retained);
+      rejected = false;
+      try {
+        validate_material_classification_consumers(*f->storage_plan, *f->initialization_plan,
+                                                   missing_chunk, classification);
+      }
+      catch (const std::invalid_argument &) { rejected = true; }
+      CHECK(rejected,
+            "post-plan validation accepted deletion of every update region for an owned chunk");
+    }
+  }
+
+  MaterialClassificationFacts malformed = baseline;
+  ++malformed.version;
+  expect_material_classification_facts_rejected(
+      *f, *f->storage_plan, recipe, malformed, "wrong material classification version");
+
+  malformed = baseline;
+  if (!malformed.variants.empty()) {
+    malformed.variants[0].variant_key ^= UINT32_C(1) << 31;
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "malformed material variant fact");
+  }
+
+  malformed = baseline;
+  if (malformed.variants.size() > 1) {
+    std::swap(malformed.variants[0], malformed.variants[1]);
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "reordered material update regions");
+  }
+
+  malformed = baseline;
+  if (!malformed.variants.empty()) {
+    ++malformed.variants[0].base;
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "changed material update region");
+  }
+
+  malformed = baseline;
+  if (!malformed.variants.empty()) {
+    malformed.variants.pop_back();
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "missing material update region");
+  }
+
+  malformed = baseline;
+  if (!malformed.variants.empty()) {
+    malformed.variants.push_back(malformed.variants.back());
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "extra material update region");
+  }
+
+  malformed = baseline;
+  if (!malformed.rows.empty()) {
+    malformed.rows.pop_back();
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "missing material row fact");
+  }
+
+  malformed = baseline;
+  if (!malformed.rows.empty()) {
+    malformed.rows.push_back(malformed.rows.back());
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "extra material row fact");
+  }
+
+  malformed = baseline;
+  bool changed_group = false;
+  for (MaterialRowClassificationFact &row : malformed.rows)
+    if (row.key.kind == int(array_kind::pml_sig) &&
+        row.state == MaterialClassification::retained) {
+      row.state = MaterialClassification::elided_row;
+      changed_group = true;
+      break;
+    }
+  CHECK(or_to_all(changed_group), "classification fact fixture has no retained PML group");
+  if (or_to_all(changed_group))
+    expect_material_classification_facts_rejected(
+        *f, *f->storage_plan, recipe, malformed, "broken material PML group fact");
+
+  MaterialClassificationFacts asymmetric = baseline;
+  if (my_rank() == 0) asymmetric.has_nonlinearities = true;
+  const MaterialClassification combined =
+      assemble_material_classification(*f, *f->storage_plan, recipe, asymmetric);
+  CHECK(and_to_all(combined.has_nonlinearities),
+        "rank-asymmetric scalar facts were not normalized globally");
+  uint64_t reference_hash = combined.hash;
+  broadcast(0, &reference_hash, 1);
+  CHECK(combined.hash == reference_hash,
+        "rank-asymmetric fact normalization produced different hashes");
+
+  for (int target = 0; target < count_processors(); ++target)
+    for (int mode = 1; mode <= 4; ++mode) {
+      backend_set_material_classification_failure_for_testing(target, mode);
+      bool failed = false;
+      try { (void)assemble_material_classification(*f, *f->storage_plan, recipe, baseline); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_material_classification_failure_for_testing(-1, 0);
+      CHECK(and_to_all(failed),
+            "rank-targeted material classification failure mode %d did not reconcile", mode);
+      const MaterialClassification retry =
+          assemble_material_classification(*f, *f->storage_plan, recipe, baseline);
+      CHECK(retry.hash == classification.hash,
+            "material classification failure mode %d was not retryable", mode);
+    }
+
+  StoragePlan malformed_plan = *f->storage_plan;
+  ArraySpec tombstone = malformed_plan.arrays.front();
+  tombstone.id = ArrayId{uint32_t(malformed_plan.arrays.size())};
+  tombstone.role = array_role::material;
+  tombstone.alias_of = invalid_array();
+  tombstone.classification_provisional = false;
+  tombstone.classification_elided = true;
+  malformed_plan.arrays.push_back(tombstone);
+  StorageKey tombstone_key = malformed_plan.keys.front();
+  tombstone_key.chunk = f->num_chunks + 17;
+  tombstone_key.kind = int(array_kind::chi2);
+  tombstone_key.component_ = Ez;
+  tombstone_key.cmp = -1;
+  tombstone_key.aux = 0;
+  malformed_plan.keys.push_back(tombstone_key);
+  const ArrayId tombstone_id = tombstone.id;
+  InitializationPlan empty_initialization;
+  StepPlan empty_steps;
+
+  StoragePlan alias_plan = malformed_plan;
+  alias_plan.arrays[0].alias_of = tombstone_id;
+  bool rejected = false;
+  try {
+    validate_material_classification_consumers(alias_plan, empty_initialization, empty_steps,
+                                               classification);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "material tombstone alias dependency was accepted");
+
+  InitializationPlan malformed_initialization;
+  InitOperation init = {};
+  init.kind = InitKind::zero;
+  init.destination = ArrayRef{tombstone_id, 0, 1};
+  malformed_initialization.operations.push_back(init);
+  rejected = false;
+  try {
+    validate_material_classification_consumers(malformed_plan, malformed_initialization,
+                                               empty_steps, classification);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "material tombstone initialization action was accepted");
+
+  StepPlan malformed_access;
+  Operation operation = {};
+  operation.accesses.push_back(BufferAccess{ArrayRef{tombstone_id, 0, 1}, AccessMode::read});
+  malformed_access.operations.push_back(operation);
+  rejected = false;
+  try {
+    validate_material_classification_consumers(malformed_plan, empty_initialization,
+                                               malformed_access, classification);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "material tombstone step access was accepted");
+
+  StepPlan malformed_action;
+  ConstitutiveUpdate action = {};
+  action.diagonal = tombstone_id;
+  malformed_action.eh_updates.push_back(action);
+  rejected = false;
+  try {
+    validate_material_classification_consumers(malformed_plan, empty_initialization,
+                                               malformed_action, classification);
+  }
+  catch (const std::invalid_argument &) { rejected = true; }
+  CHECK(rejected, "material tombstone direct action was accepted");
+
+  delete f;
+  delete s;
+}
+
+static void test_material_classification_collective_failures() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+  for (int target = 0; target < count_processors(); ++target)
+    for (int mode = 1; mode <= 4; ++mode) {
+      invalidate(*f, MutationKind::material_values,
+                 "backend_api:classification_collective_failure");
+      const BackendEpochSnapshot entry(*f);
+      backend_set_material_classification_failure_for_testing(target, mode);
+      bool failed = false;
+      try { f->advance(1); }
+      catch (const std::runtime_error &) { failed = true; }
+      backend_set_material_classification_failure_for_testing(-1, 0);
+      CHECK(and_to_all(failed) && entry.matches(*f) && !f->backend->is_poisoned(),
+            "classification collective failure mode %d changed the live epoch", mode);
+      BackendState *const old_state = f->backend_state;
+      f->advance(1);
+      CHECK(f->backend_state && f->backend_state != old_state,
+            "classification collective failure mode %d was not retryable", mode);
+    }
+  delete f;
+  delete s;
+}
+
 static void test_resident_material_recipe_lifecycle() {
   for (int target = 0; target < count_processors(); ++target)
     for (int mode = 1; mode <= 2; ++mode) {
@@ -9343,6 +10397,26 @@ static void test_resident_material_recipe_lifecycle() {
               counts.classified, counts.finalized);
     CHECK(retry_ok,
           "material initialize/finalize retry replaced or incompletely resolved its epoch");
+    delete f;
+    delete s;
+  }
+
+  for (int malformed = 1; malformed <= 5; ++malformed) {
+    structure *s;
+    fields *f;
+    build(&s, &f);
+    lifetime_counts counts;
+    counts.malformed_material_classification = malformed;
+    f->backend = new tracking_backend(*f, counts);
+    bool failed = false;
+    try { f->advance(1); }
+    catch (const std::runtime_error &) { failed = true; }
+    CHECK(and_to_all(failed) && !f->backend_state && !f->executable && f->t == 0,
+          "malformed classification mode %d published a partial epoch", malformed);
+    counts.malformed_material_classification = 0;
+    f->advance(1);
+    CHECK(f->backend_state && f->executable,
+          "malformed classification mode %d was not retryable", malformed);
     delete f;
     delete s;
   }
@@ -10008,6 +11082,7 @@ int main(int argc, char **argv) {
 
   if (getenv("MEEP_BACKEND_API_BETA_ONLY")) {
     test_resident_beta_fingerprint();
+    test_material_idle_rank_component_promotion();
     if (failures) return 1;
     master_printf("backend_api: beta checks passed\n");
     return 0;
@@ -10074,6 +11149,20 @@ int main(int argc, char **argv) {
     test_resident_material_recipe_lifecycle();
     if (failures) return 1;
     master_printf("backend_api: material recipe lifecycle checks passed\n");
+    return 0;
+  }
+  if (getenv("MEEP_BACKEND_API_PR54_ONLY")) {
+    test_owned_tiled_material_route();
+    test_material_fallback_policy_transaction();
+    test_material_fallback_route_removal();
+    test_material_phase_early_fallback_preflight();
+    test_material_promotion_transaction();
+    test_material_idle_rank_component_promotion();
+    test_material_route_lattice();
+    test_material_classification_fact_contract();
+    test_material_classification_collective_failures();
+    if (failures) return 1;
+    master_printf("backend_api: PR5.4 backend-neutral checks passed\n");
     return 0;
   }
   if (getenv("MEEP_BACKEND_API_NOISY_ONLY")) {
@@ -10191,6 +11280,15 @@ int main(int argc, char **argv) {
   test_material_ir_capture_atomicity();
   test_geometry_backed_material_ir_removal();
   test_material_recipe_and_provisional_storage();
+  test_owned_tiled_material_route();
+  test_material_fallback_policy_transaction();
+  test_material_fallback_route_removal();
+  test_material_phase_early_fallback_preflight();
+  test_material_promotion_transaction();
+  test_material_idle_rank_component_promotion();
+  test_material_route_lattice();
+  test_material_classification_fact_contract();
+  test_material_classification_collective_failures();
   test_resident_material_recipe_lifecycle();
   test_initialization_plan();
   test_authority_safe_state_rebuild();

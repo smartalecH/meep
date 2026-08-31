@@ -14,9 +14,7 @@ class structure;
 class fields;
 }
 
-namespace meep_geom {
-class geom_epsilon;
-}
+namespace meep_geom { class geom_epsilon; }
 
 namespace meep {
 
@@ -26,6 +24,10 @@ namespace meep {
 struct MaterialIRMaterial {
   int kind;
   bool host_callback;
+  bool owned_callback;
+  uint64_t callback_id;
+  uint64_t callback_signature;
+  uint64_t callback_capabilities;
   bool do_averaging;
   int material_grid_kind;
   bool material_grid_trivial;
@@ -300,6 +302,9 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
                                                meep_geom::geom_epsilon &geps,
                                                bool eps_averaging, double tol, int maxeval,
                                                const void *absorbers);
+struct OwnedMaterialCallback;
+std::vector<std::shared_ptr<const OwnedMaterialCallback> >
+material_ir_callback_owners(const MaterialIR &ir);
 const MaterialIR *material_ir_for(const fields &f);
 void validate_material_ir(const MaterialIR &ir);
 uint32_t material_ir_material_at_point(const MaterialIR &ir, const double point[3],
@@ -307,6 +312,15 @@ uint32_t material_ir_material_at_point(const MaterialIR &ir, const double point[
 bool material_ir_materials_equal(const MaterialIR &ir, uint32_t a, uint32_t b);
 double material_ir_grid_value_at_point(const MaterialIR &ir, const double point[3],
                                        uint32_t winning_image);
+/* Exact legacy evaluation center and destination scatter index for one
+   canonical point ordinal.  Backends use these together so shifted tensor
+   evaluations cannot drift from CPU construction semantics. */
+vec material_ir_destination_center(const MaterialIR &ir,
+                                   const MaterialIRDestination &destination,
+                                   uint64_t point);
+size_t material_ir_destination_storage_index(const MaterialIR &ir,
+                                             const MaterialIRDestination &destination,
+                                             uint64_t point);
 void finalize_material_ir_collective(MaterialIR &ir);
 void refresh_material_ir_signatures_for_testing(MaterialIR &ir);
 void set_material_ir_capture_failure_for_testing(int rank, int mode);

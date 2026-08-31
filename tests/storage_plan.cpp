@@ -46,6 +46,7 @@
 #include "backend/descriptors.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/prepare.hpp"
+#include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "meep_internals.hpp"
 
@@ -1324,16 +1325,18 @@ static void test_multilevel_growth_and_removal() {
           "field growth failed to preserve an authoritative live multilevel row");
   }
 
-  /* The distributed fields/structure clone path is a PR7 lifecycle gate: its
-     legacy structure_chunk copy constructor does not initialize non-owned
-     coefficient pointers. Exercise PR3's removal/rebuild contract in the
-     non-shared case here, and leave distributed clone/removal to PR7. */
-  if (count_processors() != 1) return;
   f.remove_susceptibilities();
-  /* Force a public field-layout rebuild here. Automatic resident lifecycle
-     selection after removal is a PR7 gate; PR3 verifies that a requested
-     storage/halo rebuild publishes no stale multilevel rows or references. */
-  f.use_bloch(X, 0.0);
+  CHECK(f.descriptors->polarizations.empty(),
+        "removed multilevel state remains in the installed descriptor set");
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    FOR_FIELD_TYPES(ft)
+      CHECK(f.chunks[chunk]->pol[ft] == NULL,
+            "removed multilevel state remains in a live polarization list");
+
+  /* Removal itself invalidates storage, halos, and the executable.  Exercise
+     that exact lazy rebuild path (without an unrelated field-layout change):
+     the StepPlan is rebuilt before the first per-field storage preparation,
+     which must not observe the freed polarization descriptors. */
   f.advance(1);
   for (size_t i = 0; i < f.array_catalog->size(); ++i)
     CHECK(f.array_catalog->key(ArrayId{uint32_t(i)}).kind !=
@@ -1347,6 +1350,19 @@ static void test_multilevel_growth_and_removal() {
       expand_scatter(plan, refs);
       CHECK(refs.empty(), "removed multilevel state remains in a polarization scatter plan");
     }
+  for (size_t i = 0; i < f.halos->arrays.size(); ++i)
+    CHECK(f.halos->arrays.spec(ArrayId{uint32_t(i)}).role != array_role::polarization,
+          "removed multilevel state remains in the canonical halo array table");
+  CHECK(f.halos->host_arrays.size() == 0,
+        "removed multilevel state remains in the host halo array table");
+  CHECK(f.descriptors->polarizations.empty(),
+        "removed multilevel descriptor was republished after storage rebuild");
+  const StepPlan after_removal = build_step_plan(f, StepProgram::ordinary);
+  CHECK(after_removal.polarization_updates.empty() &&
+            after_removal.polarization_groups.empty() &&
+            after_removal.multilevel_transition_updates.empty() &&
+            after_removal.multilevel_population_updates.empty(),
+        "removed multilevel state remains in the rebuilt StepPlan");
 }
 
 static void test_gyrotropic_storage_without_p_halos() {

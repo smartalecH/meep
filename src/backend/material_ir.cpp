@@ -9,20 +9,36 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 
 #include "material_data.hpp"
 #include "meepgeom.hpp"
+#include "backend/material_callback.hpp"
 #include "backend/material_geometry_numeric.hpp"
 #include "backend/precision.hpp"
 
 namespace meep {
 namespace {
 
-const uint32_t material_ir_version = 4;
+const uint32_t material_ir_version = 6;
 int material_ir_capture_failure_rank = -1;
 int material_ir_capture_failure_mode = 0;
+
+typedef std::vector<std::shared_ptr<const OwnedMaterialCallback> > MaterialCallbackOwners;
+std::mutex material_ir_owners_mutex;
+std::map<const MaterialIR *, std::weak_ptr<const MaterialCallbackOwners> > material_ir_owners;
+
+struct CapturedMaterialIR {
+  std::shared_ptr<MaterialIR> ir;
+  std::shared_ptr<const MaterialCallbackOwners> owners;
+
+  ~CapturedMaterialIR() {
+    std::lock_guard<std::mutex> lock(material_ir_owners_mutex);
+    material_ir_owners.erase(ir.get());
+  }
+};
 
 struct CapturedLibctlMeshBvhNode {
   vector3 bbox_low;
@@ -123,7 +139,8 @@ void note_medium(MaterialIRMaterial &out, const meep_geom::medium_struct &m) {
 }
 
 uint32_t capture_material(MaterialIR &ir, const meep_geom::material_data *md,
-                          std::map<const void *, uint32_t> &seen) {
+                          std::map<const void *, uint32_t> &seen,
+                          MaterialCallbackOwners &owners) {
   if (!md) throw std::invalid_argument("material IR contains a null material");
   if (md->which_subclass < meep_geom::material_data::MEDIUM ||
       md->which_subclass > meep_geom::material_data::PERFECT_METAL)
@@ -137,6 +154,24 @@ uint32_t capture_material(MaterialIR &ir, const meep_geom::material_data *md,
   MaterialIRMaterial record;
   record.kind = md->which_subclass;
   record.host_callback = md->which_subclass == meep_geom::material_data::MATERIAL_USER;
+  std::shared_ptr<const OwnedMaterialCallback> callback_owner;
+  record.owned_callback = record.host_callback &&
+                          meep_geom::owned_material_callback(md, &callback_owner);
+  record.callback_id = record.owned_callback ? callback_owner->id : UINT64_C(0);
+  record.callback_signature = record.owned_callback ? callback_owner->signature : UINT64_C(0);
+  record.callback_capabilities = record.owned_callback ? callback_owner->capabilities : UINT64_C(0);
+  if (record.owned_callback) {
+    bool retained = false;
+    for (const std::shared_ptr<const OwnedMaterialCallback> &existing : owners)
+      if (existing->id == callback_owner->id) {
+        if (existing->signature != callback_owner->signature ||
+            existing->capabilities != callback_owner->capabilities)
+          throw std::invalid_argument(
+              "owned material callback ID has inconsistent signatures or capabilities");
+        retained = true;
+      }
+    if (!retained) owners.push_back(callback_owner);
+  }
   record.do_averaging =
       record.host_callback || md->which_subclass == meep_geom::material_data::MATERIAL_GRID
           ? md->do_averaging
@@ -203,7 +238,8 @@ void append_matrix(std::vector<double> &out, matrix3x3 m) {
 
 void capture_object(MaterialIR &ir, const geometric_object &object, uint32_t root_identity,
                     vector3 parent_shift, std::map<const void *, uint32_t> &materials,
-                    std::map<const geometric_object *, uint32_t> &objects) {
+                    std::map<const geometric_object *, uint32_t> &objects,
+                    MaterialCallbackOwners &owners) {
   if (object.which_subclass == geometric_object::COMPOUND_GEOMETRIC_OBJECT) {
     const geometric_object_list &children =
         object.subclass.compound_geometric_object_data->component_objects;
@@ -211,7 +247,8 @@ void capture_object(MaterialIR &ir, const geometric_object &object, uint32_t roo
       throw std::invalid_argument("material IR compound has a negative child count");
     parent_shift = vector3_plus(parent_shift, object.center);
     for (int i = 0; i < children.num_items; ++i)
-      capture_object(ir, children.items[i], root_identity, parent_shift, materials, objects);
+      capture_object(ir, children.items[i], root_identity, parent_shift, materials, objects,
+                     owners);
     return;
   }
   if (object.which_subclass == geometric_object::GEOMETRIC_OBJECT_SELF) return;
@@ -239,7 +276,7 @@ void capture_object(MaterialIR &ir, const geometric_object &object, uint32_t roo
   out.bvh_offset = out.bvh_count = 0;
   out.mesh_lengthscale = 0.0;
   const uint32_t material = capture_material(
-      ir, static_cast<const meep_geom::material_data *>(object.material), materials);
+      ir, static_cast<const meep_geom::material_data *>(object.material), materials, owners);
   if (material > uint32_t(std::numeric_limits<int>::max()))
     throw std::overflow_error("material IR object material ID overflow");
   out.material = int(material);
@@ -416,6 +453,8 @@ uint64_t signature(const MaterialIR &ir, bool include_rank_layout) {
   mix_u64(h, ir.materials.size());
   for (const MaterialIRMaterial &m : ir.materials) {
     mix_tag(h, "material"); mix_i64(h, m.kind); mix_bool(h, m.host_callback);
+    mix_bool(h, m.owned_callback); mix_u64(h, m.callback_id); mix_u64(h, m.callback_signature);
+    mix_u64(h, m.callback_capabilities);
     mix_bool(h, m.do_averaging); mix_i64(h, m.material_grid_kind);
     mix_bool(h, m.material_grid_trivial);
     mix_bool(h, m.has_conductivity); mix_bool(h, m.has_chi2); mix_bool(h, m.has_chi3);
@@ -1371,6 +1410,51 @@ double material_ir_grid_value_at_point(const MaterialIR &ir, const double point[
   return grid_value_at_point(ir, {point[0], point[1], point[2]}, winning_image);
 }
 
+vec material_ir_destination_center(const MaterialIR &ir,
+                                   const MaterialIRDestination &destination,
+                                   uint64_t point) {
+  return destination_evaluation_volume(ir, destination, point).center();
+}
+
+size_t material_ir_destination_storage_index(const MaterialIR &ir,
+                                             const MaterialIRDestination &destination,
+                                             uint64_t point) {
+  if (destination.chunk_index >= ir.chunks.size())
+    throw std::invalid_argument("material destination chunk is invalid");
+  const MaterialIRChunk &chunk = ir.chunks[destination.chunk_index];
+  const component c = component(destination.component);
+  size_t extent[3];
+  for (int axis = 0; axis < 3; ++axis) {
+    const int64_t doubled = int64_t(chunk.loop_end[c][axis]) - chunk.loop_begin[c][axis];
+    if (doubled < 0 || doubled % 2)
+      throw std::invalid_argument("material destination loop extent is invalid");
+    extent[axis] = size_t(doubled / 2) + 1;
+  }
+  if (!extent[1] || !extent[2] || point >= extent[0] * extent[1] * extent[2])
+    throw std::invalid_argument("material destination point ordinal is invalid");
+  const size_t index[3] = {size_t(point / (extent[1] * extent[2])),
+                           size_t((point / extent[2]) % extent[1]),
+                           size_t(point % extent[2])};
+  size_t destination_index = 0;
+  for (int axis = 0; axis < 3; ++axis) {
+    const int64_t stagger = int64_t(chunk.loop_begin[c][axis]) - chunk.little_corner[axis];
+    if (stagger < 0 || stagger > 1 || chunk.strides[axis] < 0)
+      throw std::invalid_argument("material destination scatter metadata is invalid");
+    const size_t coordinate = size_t(stagger / 2) + index[axis];
+    const size_t stride = size_t(chunk.strides[axis]);
+    if (stride && coordinate > std::numeric_limits<size_t>::max() / stride)
+      throw std::overflow_error("material destination scatter overflows");
+    const size_t term = coordinate * stride;
+    if (term > std::numeric_limits<size_t>::max() - destination_index)
+      throw std::overflow_error("material destination scatter overflows");
+    destination_index += term;
+  }
+  if (destination.topology_index >= ir.topology.size() ||
+      destination_index >= ir.topology[destination.topology_index].elements)
+    throw std::invalid_argument("material destination scatter exceeds its row");
+  return destination_index;
+}
+
 std::shared_ptr<const void> capture_material_ir(const structure &s,
                                                meep_geom::geom_epsilon &geps,
                                                bool eps_averaging, double tol, int maxeval,
@@ -1380,7 +1464,11 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
       throw std::invalid_argument("injected material IR capture failure");
     if (material_ir_capture_failure_mode == 2) throw std::bad_alloc();
   }
-  std::shared_ptr<MaterialIR> ir(new MaterialIR);
+  std::shared_ptr<CapturedMaterialIR> captured(new CapturedMaterialIR);
+  captured->ir.reset(new MaterialIR);
+  std::shared_ptr<MaterialCallbackOwners> captured_owners(new MaterialCallbackOwners);
+  captured->owners = captured_owners;
+  std::shared_ptr<MaterialIR> ir = captured->ir;
   ir->version = material_ir_version; ir->eps_averaging = eps_averaging;
   ir->subpixel_tol = tol; ir->subpixel_maxeval = eps_averaging ? maxeval : 0;
   ir->ensure_periodicity = geps.captured_ensure_periodicity; ir->contains_host_callback = false;
@@ -1432,18 +1520,21 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
   }
   std::map<const void *, uint32_t> materials;
   std::map<const geometric_object *, uint32_t> objects;
-  ir->default_material = capture_material(*ir, &geps.owned_default_material(), materials);
+  ir->default_material =
+      capture_material(*ir, &geps.owned_default_material(), materials, *captured_owners);
   if (geps.geometry.num_items < 0)
     throw std::invalid_argument("material IR geometry has a negative root count");
   ir->root_count = uint32_t(geps.geometry.num_items);
   const vector3 no_parent_shift = {0, 0, 0};
   for (int i = 0; i < geps.geometry.num_items; ++i)
-    capture_object(*ir, geps.geometry.items[i], uint32_t(i), no_parent_shift, materials, objects);
+    capture_object(*ir, geps.geometry.items[i], uint32_t(i), no_parent_shift, materials, objects,
+                   *captured_owners);
   const meep_geom::material_type_list &extra = geps.owned_extra_materials();
   if (extra.num_items < 0)
     throw std::invalid_argument("material IR extra-material count is negative");
   for (int i = 0; i < extra.num_items; ++i)
-    ir->extra_materials.push_back(capture_material(*ir, extra.items[i], materials));
+    ir->extra_materials.push_back(
+        capture_material(*ir, extra.items[i], materials, *captured_owners));
   for (int which = 0; which < 2; ++which) {
     const field_type ft = which == 0 ? E_stuff : H_stuff;
     const std::vector<meep_geom::susceptibility> unique =
@@ -1785,7 +1876,20 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
   ir->signature = signature(*ir, false);
   ir->layout_signature = signature(*ir, true);
   validate_material_ir(*ir);
-  return std::static_pointer_cast<const void>(ir);
+  {
+    std::lock_guard<std::mutex> lock(material_ir_owners_mutex);
+    material_ir_owners[ir.get()] = captured->owners;
+  }
+  return std::shared_ptr<const void>(captured, ir.get());
+}
+
+std::vector<std::shared_ptr<const OwnedMaterialCallback> >
+material_ir_callback_owners(const MaterialIR &ir) {
+  std::lock_guard<std::mutex> lock(material_ir_owners_mutex);
+  const auto found = material_ir_owners.find(&ir);
+  if (found == material_ir_owners.end()) return MaterialCallbackOwners();
+  const std::shared_ptr<const MaterialCallbackOwners> owners = found->second.lock();
+  return owners ? *owners : MaterialCallbackOwners();
 }
 
 const MaterialIR *material_ir_for(const fields &f) {
@@ -1873,6 +1977,10 @@ void validate_material_ir(const MaterialIR &ir) {
     if (m.kind < meep_geom::material_data::MEDIUM ||
         m.kind > meep_geom::material_data::PERFECT_METAL ||
         (m.kind == meep_geom::material_data::MATERIAL_USER) != m.host_callback ||
+        (m.owned_callback && (!m.callback_id || !m.callback_signature ||
+                              !m.callback_capabilities)) ||
+        (!m.owned_callback && (m.callback_id != 0 || m.callback_signature != 0 ||
+                               m.callback_capabilities != 0)) ||
         (m.kind != meep_geom::material_data::MATERIAL_GRID &&
          (m.material_grid_kind != -1 || m.material_grid_trivial)) ||
         (m.kind != meep_geom::material_data::MATERIAL_GRID &&
@@ -2845,6 +2953,10 @@ bool material_ir_equal(const MaterialIR &a, const MaterialIR &b) {
   for (size_t i = 0; i < a.materials.size(); ++i) {
     const MaterialIRMaterial &x = a.materials[i], &y = b.materials[i];
     if (x.kind != y.kind || x.host_callback != y.host_callback ||
+        x.owned_callback != y.owned_callback ||
+        x.callback_id != y.callback_id ||
+        x.callback_signature != y.callback_signature ||
+        x.callback_capabilities != y.callback_capabilities ||
         x.do_averaging != y.do_averaging || x.material_grid_kind != y.material_grid_kind ||
         x.material_grid_trivial != y.material_grid_trivial ||
         x.has_conductivity != y.has_conductivity || x.has_chi2 != y.has_chi2 ||

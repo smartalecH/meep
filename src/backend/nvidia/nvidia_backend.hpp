@@ -16,6 +16,9 @@
 #ifndef MEEP_BACKEND_NVIDIA_NVIDIA_BACKEND_HPP
 #define MEEP_BACKEND_NVIDIA_NVIDIA_BACKEND_HPP
 
+#include <utility>
+#include <vector>
+
 #include "backend/backend.hpp"
 
 namespace meep {
@@ -30,6 +33,13 @@ struct NvidiaMaterialInitializationStatistics {
   size_t dense_oracle_bytes;
   size_t dense_output_host_to_device_calls;
   size_t dense_output_host_to_device_bytes;
+  size_t tiled_output_host_to_device_calls;
+  size_t tiled_output_host_to_device_bytes;
+  size_t logical_output_bytes;
+  size_t callback_scratch_bytes;
+  size_t upload_descriptor_bytes;
+  size_t classification_status_bytes;
+  size_t classification_result_bytes;
   size_t decoded_parameter_bytes;
   size_t absorber_profile_bytes;
   size_t pml_profile_bytes;
@@ -62,7 +72,10 @@ struct NvidiaMaterialInitializationStatistics {
   NvidiaMaterialInitializationStatistics()
       : compact_input_host_to_device_calls(0), compact_input_host_to_device_bytes(0),
         owned_ir_bytes(0), dense_oracle_bytes(0), dense_output_host_to_device_calls(0),
-        dense_output_host_to_device_bytes(0),
+        dense_output_host_to_device_bytes(0), tiled_output_host_to_device_calls(0),
+        tiled_output_host_to_device_bytes(0), logical_output_bytes(0),
+        callback_scratch_bytes(0), upload_descriptor_bytes(0),
+        classification_status_bytes(0), classification_result_bytes(0),
         decoded_parameter_bytes(0), absorber_profile_bytes(0), pml_profile_bytes(0),
         file_sample_bytes(0), grid_weight_bytes(0), geometry_object_bytes(0),
         geometry_image_bytes(0), geometry_value_bytes(0), geometry_analytic_bytes(0),
@@ -226,12 +239,16 @@ public:
 
   void preflight_initialization(const InitializationPlan &plan) const override;
   BackendState *create_state(const StoragePlan &plan) override;
+  void prepare_initialization(const InitializationPlan &plan, BackendState &state) override;
   void initialize(const InitializationPlan &plan, BackendState &state) override;
+  bool enforces_material_fallback_policy() const override { return true; }
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &state) override;
   void finalize_storage(const StoragePlan &plan, const MaterialClassification &classification,
                         BackendState &state) override;
 
   Executable *compile(const StepPlan &plan, BackendState &state) override;
+  void preflight_advance(Executable &executable, BackendState &state,
+                         int num_steps) override;
   void advance(Executable &executable, BackendState &state, int num_steps) override;
   void refresh_noisy_seed(const RandomSeedSnapshot &candidate, BackendState &state) override;
   void commit_noisy_seed(BackendState &state) noexcept override;
@@ -287,7 +304,10 @@ private:
   uint64_t next_state_token_;
   mutable size_t pending_initialization_reserve_bytes_;
   mutable size_t pending_initialization_compact_bytes_;
-  mutable bool pending_initialization_native_;
+  mutable size_t pending_initialization_scratch_bytes_;
+  mutable std::vector<std::pair<StorageKey, size_t> >
+      pending_initialization_classification_rows_;
+  mutable MaterialRecipeDisposition pending_initialization_route_;
   mutable bool pending_initialization_reserve_valid_;
 };
 
