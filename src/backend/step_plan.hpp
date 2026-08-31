@@ -118,6 +118,12 @@ struct HostHaloPlanDescriptor {
   std::vector<std::complex<realnum> > phase_values;
 };
 
+/* Convert the stable integer representation used by host-halo metadata only
+   after checking that it names a real connect phase.  In particular, callers
+   validating serialized or otherwise untrusted metadata must not first form
+   an out-of-domain C++ enum value. */
+bool decode_host_halo_phase(uint32_t serialized, connect_phase &phase);
+
 bool operator==(const HostHaloPlanDescriptor &a, const HostHaloPlanDescriptor &b);
 inline bool operator!=(const HostHaloPlanDescriptor &a, const HostHaloPlanDescriptor &b) {
   return !(a == b);

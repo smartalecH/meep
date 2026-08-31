@@ -4072,6 +4072,15 @@ bool operator==(const HostSegment &a, const HostSegment &b) {
          a.host_halo_plan_count == b.host_halo_plan_count;
 }
 
+bool decode_host_halo_phase(uint32_t serialized, connect_phase &phase) {
+  switch (serialized) {
+    case uint32_t(CONNECT_PHASE): phase = CONNECT_PHASE; return true;
+    case uint32_t(CONNECT_NEGATE): phase = CONNECT_NEGATE; return true;
+    case uint32_t(CONNECT_COPY): phase = CONNECT_COPY; return true;
+    default: return false;
+  }
+}
+
 bool operator==(const HostHaloPlanDescriptor &a, const HostHaloPlanDescriptor &b) {
   return a.ft == b.ft && a.phase == b.phase && a.chunks == b.chunks &&
          a.sequence_index == b.sequence_index && a.block_offset == b.block_offset &&
@@ -4256,18 +4265,18 @@ bool validate_host_segments(const StepPlan &plan, std::string *error) {
       if (segment.phase != HostSegmentPhase::polarization_and_halo ||
           halo.ft != expected_halo_ft)
         return host_segment_failure(error, "host halo descriptor has the wrong field family");
-      if (halo.phase != CONNECT_PHASE && halo.phase != CONNECT_NEGATE &&
-          halo.phase != CONNECT_COPY)
+      connect_phase validated_phase = CONNECT_COPY;
+      if (!decode_host_halo_phase(uint32_t(halo.phase), validated_phase))
         return host_segment_failure(error, "host halo descriptor has an invalid phase");
       if (halo.chunks.first < 0 || halo.chunks.second < 0 || !halo.block_elements ||
-          halo.sequence_index != uint32_t(halo.phase) ||
+          halo.sequence_index != uint32_t(validated_phase) ||
           halo.block_elements > std::numeric_limits<size_t>::max() - halo.block_offset)
         return host_segment_failure(error, "host halo descriptor has invalid logical metadata");
       if ((halo.gather_keys.empty() && halo.scatter_keys.empty()) ||
           (!halo.gather_keys.empty() && halo.gather_keys.size() != halo.block_elements) ||
           (!halo.scatter_keys.empty() && halo.scatter_keys.size() != halo.block_elements))
         return host_segment_failure(error, "host halo descriptor has an incomplete key sequence");
-      if ((halo.phase != CONNECT_PHASE && !halo.phase_values.empty()) ||
+      if ((validated_phase != CONNECT_PHASE && !halo.phase_values.empty()) ||
           (!halo.phase_values.empty() &&
            (halo.block_elements % 2 || halo.phase_values.size() != halo.block_elements / 2 ||
             halo.scatter_keys.empty())))
@@ -4277,7 +4286,7 @@ bool validate_host_segments(const StepPlan &plan, std::string *error) {
           if (key.chunk != chunk || key.ft != int(segment.ft) || key.state_index < 0 ||
               key.susceptibility_id < 0 || key.internal_index < 0 || key.point_index < 0 ||
               (key.complex_internal ? (key.cmp < 0 || key.cmp > 1)
-                                    : (key.cmp != -1 || halo.phase != CONNECT_COPY)))
+                                    : (key.cmp != -1 || validated_phase != CONNECT_COPY)))
             return false;
         return true;
       };
@@ -4355,19 +4364,18 @@ bool resolve_host_halo_plan(fields &f, const HostHaloPlanDescriptor &descriptor,
   resolved = NULL;
   if (error) error->clear();
   try {
+    connect_phase validated_phase = CONNECT_COPY;
     if (!f.halos || (descriptor.ft != PE_stuff && descriptor.ft != PH_stuff) ||
-        (descriptor.phase != CONNECT_PHASE && descriptor.phase != CONNECT_NEGATE &&
-         descriptor.phase != CONNECT_COPY) ||
+        !decode_host_halo_phase(uint32_t(descriptor.phase), validated_phase) ||
         descriptor.chunks.first < 0 || descriptor.chunks.first >= f.num_chunks ||
         descriptor.chunks.second < 0 || descriptor.chunks.second >= f.num_chunks ||
-        descriptor.sequence_index != uint32_t(descriptor.phase) || !descriptor.block_elements ||
+        descriptor.sequence_index != uint32_t(validated_phase) || !descriptor.block_elements ||
         descriptor.block_elements >
             std::numeric_limits<size_t>::max() - descriptor.block_offset)
       throw std::invalid_argument("host halo descriptor has invalid logical metadata");
-    const HaloPlan *live =
-        f.halos->find({descriptor.ft, descriptor.phase, descriptor.chunks});
+    const HaloPlan *live = f.halos->find({descriptor.ft, validated_phase, descriptor.chunks});
     if (!live || live->storage != HaloStorageDisposition::host_owned ||
-        live->ft != descriptor.ft || live->phase != descriptor.phase ||
+        live->ft != descriptor.ft || live->phase != validated_phase ||
         live->chunks != descriptor.chunks || live->sequence_index != descriptor.sequence_index ||
         live->block_offset != descriptor.block_offset ||
         live->block_elements != descriptor.block_elements)

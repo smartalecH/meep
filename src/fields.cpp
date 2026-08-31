@@ -635,7 +635,11 @@ void fields::figure_out_step_plan() {
 }
 
 void fields_chunk::figure_out_step_plan() {
-  FOR_COMPONENTS(cc) { have_minus_deriv[cc] = have_plus_deriv[cc] = false; }
+  FOR_COMPONENTS(cc) {
+    have_minus_deriv[cc] = have_plus_deriv[cc] = false;
+    plus_component[cc] = minus_component[cc] = NO_COMPONENT;
+    plus_deriv_direction[cc] = minus_deriv_direction[cc] = NO_DIRECTION;
+  }
   FOR_COMPONENTS(c1) {
     if (f[c1][0]) {
       const direction dc1 = component_direction(c1);

@@ -58,6 +58,23 @@ namespace meep {
    public execution API or adding a production callback hook. */
 struct StepPlanTestAccess {
   static void execute(fields &f, const StepPlan &plan) { f.execute_step_plan(plan, 0); }
+  static bool derivative_metadata_uses_sentinels(fields &f) {
+    f.figure_out_step_plan();
+    for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
+      fields_chunk &fc = *f.chunks[chunk];
+      FOR_COMPONENTS(c) {
+        if (!fc.have_plus_deriv[c] &&
+            (fc.plus_component[c] != NO_COMPONENT ||
+             fc.plus_deriv_direction[c] != NO_DIRECTION))
+          return false;
+        if (!fc.have_minus_deriv[c] &&
+            (fc.minus_component[c] != NO_COMPONENT ||
+             fc.minus_deriv_direction[c] != NO_DIRECTION))
+          return false;
+      }
+    }
+    return true;
+  }
   static ArraySpec &mutable_catalog_spec(CpuArrayCatalog &catalog, ArrayId id) {
     return catalog.specs_[id.value];
   }
@@ -134,6 +151,34 @@ static void test_no_field_type_sentinel() {
   CHECK(formatted.size() == 1 && formatted[0] == "increment_time",
         "no-field operation marker formatting changed: %s",
         formatted.empty() ? "<empty>" : formatted[0].c_str());
+}
+
+static void test_derivative_metadata_sentinels() {
+  static_assert(NUM_FIELD_COMPONENTS == 20, "field-array bounds changed");
+  static_assert(int(NO_COMPONENT) == 22, "component sentinel numeric value changed");
+  static_assert(int(NO_DIRECTION) == 5, "direction sentinel numeric value changed");
+  static_assert(int(CONNECT_PHASE) == 0 && int(CONNECT_NEGATE) == 1 && int(CONNECT_COPY) == 2,
+                "connect-phase serialized values changed");
+
+  grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+  f.require_component(Ez);
+  CHECK(StepPlanTestAccess::derivative_metadata_uses_sentinels(f),
+        "missing derivative retained non-sentinel component or direction metadata");
+
+  connect_phase decoded = CONNECT_COPY;
+  CHECK(decode_host_halo_phase(uint32_t(CONNECT_PHASE), decoded) && decoded == CONNECT_PHASE,
+        "phase transform did not survive serialized decoding");
+  CHECK(decode_host_halo_phase(uint32_t(CONNECT_NEGATE), decoded) && decoded == CONNECT_NEGATE,
+        "negate transform did not survive serialized decoding");
+  CHECK(decode_host_halo_phase(uint32_t(CONNECT_COPY), decoded) && decoded == CONNECT_COPY,
+        "copy transform did not survive serialized decoding");
+  /* Exercise malformed serialized input without first constructing an invalid
+     connect_phase, which is itself undefined behavior under enum sanitization. */
+  decoded = CONNECT_COPY;
+  CHECK(!decode_host_halo_phase(99, decoded) && decoded == CONNECT_COPY,
+        "invalid serialized host halo phase was accepted or modified the output");
 }
 
 class multitile_anisotropic_material : public material_function {
@@ -5767,11 +5812,6 @@ static void test_host_segment_schema() {
   }
   {
     StepPlan bad = plan;
-    bad.host_halo_plans[0].phase = connect_phase(99);
-    rejected(bad, "host halo with an invalid phase was accepted");
-  }
-  {
-    StepPlan bad = plan;
     ++bad.host_halo_plans[0].sequence_index;
     rejected(bad, "host halo with the wrong sequence index was accepted");
   }
@@ -6295,7 +6335,9 @@ int main(int argc, char **argv) {
   verbosity = 0;
 
   test_no_field_type_sentinel();
-  if (argc == 2 && strcmp(argv[1], "--field-type-sentinel-only") == 0) {
+  test_derivative_metadata_sentinels();
+  if (argc == 2 && (strcmp(argv[1], "--field-type-sentinel-only") == 0 ||
+                    strcmp(argv[1], "--enum-safety-only") == 0)) {
     if (failures) {
       master_printf("step_plan field_type sentinel: %d FAILURE(S)\n", failures);
       return 1;

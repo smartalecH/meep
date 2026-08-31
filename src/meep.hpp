@@ -1647,6 +1647,7 @@ public:
 private:
   friend class PreparedBackendEpoch;
   friend struct BackendEpochSnapshot;
+  friend struct StepPlanTestAccess;
   void swap_prepared_state(fields_chunk &other) noexcept;
   void release_owned_data() noexcept;
 
