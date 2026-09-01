@@ -1736,6 +1736,7 @@ void CheckpointTransaction::commit(fields &owner, const CheckpointImage &image) 
     if (std::max(owner.mutation_generation[layout_index],
                  image.mutation_generation[layout_index]) ==
             std::numeric_limits<uint64_t>::max() ||
+        owner.checkpoint_publication_generation == std::numeric_limits<uint64_t>::max() ||
         owner.connections_generation == std::numeric_limits<uint64_t>::max() ||
         owner.local_invalidation_generation == std::numeric_limits<uint64_t>::max())
       throw std::overflow_error("checkpoint publication generation overflow");
@@ -1786,6 +1787,7 @@ void CheckpointTransaction::commit(fields &owner, const CheckpointImage &image) 
   for (int i = 0; i < fields::num_mutation_kinds; ++i)
     owner.mutation_generation[i] =
         std::max(owner.mutation_generation[i], image.mutation_generation[i]);
+  ++owner.checkpoint_publication_generation;
   owner.calc_sources(owner.time());
   restore_random_seed_snapshot(*checkpoint_seed_for_rank(image));
   flux_vol *flux = owner.fluxes;

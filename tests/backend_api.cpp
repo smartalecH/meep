@@ -35,6 +35,7 @@
 
 #include "config.h"
 #include "backend/backend.hpp"
+#include "backend/adjoint_plan.hpp"
 #include "backend/checkpoint.hpp"
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/descriptors.hpp"
@@ -65,6 +66,259 @@ static int failures = 0;
     }                                                                                              \
   } while (0)
 
+static AdjointDftIdentity synthetic_adjoint_identity(int component = Ex) {
+  AdjointDftIdentity identity;
+  identity.chunk = 0;
+  identity.component = component;
+  identity.symmetry_index = 0;
+  identity.dimensions = int(D2);
+  identity.begin[X] = identity.unpadded_begin[X] = -2;
+  identity.end[X] = identity.unpadded_end[X] = 2;
+  identity.begin[Y] = identity.unpadded_begin[Y] = -2;
+  identity.end[Y] = identity.unpadded_end[Y] = 2;
+  return identity;
+}
+
+static std::shared_ptr<AdjointDftSnapshot> synthetic_adjoint_snapshot() {
+  std::shared_ptr<AdjointDftSnapshot> snapshot(new AdjointDftSnapshot);
+  snapshot->material_signature = 11;
+  snapshot->material_layout_signature = 13;
+  AdjointDftSnapshotTerm term;
+  term.identity = synthetic_adjoint_identity();
+  term.resident = ArrayRef{ArrayId{1}, 0, 4};
+  term.storage_precision = policy_for(snapshot->precision_policy).monitor;
+  term.spatial_points = 2;
+  term.frequencies = {2.0 * pi * 0.25, 2.0 * pi * 0.5};
+  term.values = {{1.0, 2.0}, {3.0, 4.0}, {5.0, 6.0}, {7.0, 8.0}};
+  snapshot->terms.push_back(term);
+  snapshot->structural_signature = adjoint_snapshot_structural_signature(*snapshot);
+  snapshot->value_signature = adjoint_snapshot_value_signature(*snapshot);
+  return snapshot;
+}
+
+static std::shared_ptr<AdjointDftSnapshot> synthetic_adjoint_snapshot_for(fields &owner) {
+  std::shared_ptr<AdjointDftSnapshot> snapshot = synthetic_adjoint_snapshot();
+  const MaterialIR *ir = material_ir_for(owner);
+  if (!ir) throw std::runtime_error("adjoint freshness fixture has no material recipe");
+  snapshot->material_signature = ir->signature;
+  snapshot->material_layout_signature = ir->layout_signature;
+  for (int i = 0; i < fields::num_mutation_kinds; ++i)
+    snapshot->mutation_generation[i] = owner.mutation_generation[i];
+  for (int d = 0; d < 5; ++d) {
+    snapshot->bloch_k[d] = owner.k[d];
+    for (int side = 0; side < 2; ++side)
+      snapshot->boundary_conditions[side][d] = int(owner.boundaries[side][d]);
+  }
+  snapshot->cylindrical_m = owner.m;
+  snapshot->precision_policy = owner.options.precision;
+  snapshot->terms[0].storage_precision = policy_for(snapshot->precision_policy).monitor;
+  snapshot->device_id = owner.options.device_id;
+  snapshot->structural_signature = adjoint_snapshot_structural_signature(*snapshot);
+  snapshot->value_signature = adjoint_snapshot_value_signature(*snapshot);
+  validate_adjoint_snapshot(*snapshot);
+  validate_adjoint_snapshot_freshness(*snapshot, owner);
+  return snapshot;
+}
+
+static bool adjoint_snapshot_is_stale(const AdjointDftSnapshot &snapshot, const fields &owner) {
+  try { validate_adjoint_snapshot_freshness(snapshot, owner); }
+  catch (const std::invalid_argument &) { return true; }
+  return false;
+}
+
+static AdjointGradientRequest synthetic_adjoint_request() {
+  AdjointGradientRequest request;
+  request.forward = synthetic_adjoint_snapshot();
+  request.adjoint = synthetic_adjoint_snapshot();
+  request.material_recipe = std::shared_ptr<const void>(new int(7), [](const void *p) {
+    delete static_cast<const int *>(p);
+  });
+  request.material_signature = request.forward->material_signature;
+  request.material_layout_signature = request.forward->material_layout_signature;
+  request.grid_shape[0] = 2;
+  request.grid_shape[1] = 1;
+  request.grid_shape[2] = 1;
+  request.grid_strides[0] = request.grid_strides[1] = request.grid_strides[2] = 1;
+  request.overlap_mode = 3;
+  request.beta = 0.0;
+  request.eta = 0.5;
+  request.output_count = 4;
+  request.frequencies = {0.25, 0.5};
+  request.finite_difference_step = 1e-3;
+  request.disposition = AdjointSupportDisposition::device_native;
+  AdjointDftTerm term;
+  term.forward_identity = request.forward->terms[0].identity;
+  term.adjoint_identity = request.forward->terms[0].identity;
+  term.forward_snapshot_term = 0;
+  term.adjoint_snapshot_term = 0;
+  term.adjoint = ArrayRef{ArrayId{1}, 0, 4};
+  term.forward_spatial_points = 2;
+  term.adjoint_spatial_points = 2;
+  term.frequencies = 2;
+  request.terms.push_back(term);
+  AdjointGradientContribution contribution;
+  contribution.output_index = 0;
+  contribution.adjoint_snapshot_term = 0;
+  contribution.adjoint_value_index = 0;
+  contribution.forward_snapshot_term = 0;
+  contribution.forward_value_indices[0] = 0;
+  contribution.forward_weights[0] = 1.0;
+  contribution.forward_value_count = 1;
+  contribution.adjoint_coefficient = {1.0, 0.0};
+  contribution.material_coefficient = {0.5, -0.25};
+  contribution.accumulation_scale = 1.0;
+  request.contributions.push_back(contribution);
+  request.structural_signature = adjoint_request_signature(request);
+  return request;
+}
+
+static void test_adjoint_plan_schema() {
+  std::shared_ptr<AdjointDftSnapshot> snapshot = synthetic_adjoint_snapshot();
+  validate_adjoint_snapshot(*snapshot);
+  CHECK(snapshot->structural_signature != snapshot->value_signature,
+        "adjoint snapshot structural and value signatures were not separated");
+  const uint64_t structure = snapshot->structural_signature;
+  snapshot->terms[0].values[0] += std::complex<double>(1.0, 0.0);
+  snapshot->value_signature = adjoint_snapshot_value_signature(*snapshot);
+  CHECK(snapshot->structural_signature == structure &&
+            snapshot->value_signature != synthetic_adjoint_snapshot()->value_signature,
+        "adjoint snapshot value mutation changed structural identity or not value identity");
+  validate_adjoint_snapshot(*snapshot);
+
+  AdjointGradientRequest request = synthetic_adjoint_request();
+  validate_adjoint_request(request);
+  std::vector<double> oracle(request.output_count, -1.0);
+  compute_adjoint_gradient_oracle(request, oracle.data(), oracle.size());
+  const std::complex<double> expected = request.adjoint->terms[0].values[0] *
+                                        request.forward->terms[0].values[0] *
+                                        request.contributions[0].material_coefficient;
+  CHECK(oracle[0] == expected.real() && oracle[1] == 0.0 && oracle[2] == 0.0 &&
+            oracle[3] == 0.0,
+        "adjoint immutable oracle changed contribution order/value");
+  const uint64_t signature = request.structural_signature;
+  request.mutation_generation[int(MutationKind::material_values)] = 1;
+  request.structural_signature = adjoint_request_signature(request);
+  CHECK(request.structural_signature != signature,
+        "adjoint request signature omitted material-value freshness");
+  validate_adjoint_request(request);
+
+  const auto rejected = [](AdjointGradientRequest malformed) {
+    bool threw = false;
+    try { validate_adjoint_request(malformed); }
+    catch (const std::exception &) { threw = true; }
+    return threw;
+  };
+  AdjointGradientRequest malformed = synthetic_adjoint_request();
+  malformed.version = 0;
+  CHECK(rejected(malformed), "adjoint request accepted an unknown version");
+  malformed = synthetic_adjoint_request();
+  malformed.grid_shape[0] = std::numeric_limits<size_t>::max();
+  malformed.grid_shape[1] = 2;
+  CHECK(rejected(malformed), "adjoint request accepted an overflowing grid shape");
+  malformed = synthetic_adjoint_request();
+  malformed.output_precision = Precision::f32;
+  CHECK(rejected(malformed), "adjoint request accepted non-f64 output");
+  malformed = synthetic_adjoint_request();
+  malformed.frequencies[0] += 0.01;
+  malformed.structural_signature = adjoint_request_signature(malformed);
+  CHECK(rejected(malformed),
+        "adjoint request accepted a same-count frequency mutation after capture");
+  malformed = synthetic_adjoint_request();
+  malformed.grid_shape[0] = std::numeric_limits<size_t>::max();
+  malformed.grid_shape[1] = malformed.grid_shape[2] = 1;
+  malformed.grid_strides[0] = malformed.grid_strides[1] = malformed.grid_strides[2] = 1;
+  malformed.output_count = std::numeric_limits<size_t>::max();
+  malformed.frequencies.resize(1);
+  CHECK(rejected(malformed), "adjoint request accepted SIZE_MAX output_count + 1 overflow");
+  malformed = synthetic_adjoint_request();
+  malformed.grid_shape[0] = std::numeric_limits<size_t>::max() - 1;
+  malformed.grid_shape[1] = malformed.grid_shape[2] = 1;
+  malformed.grid_strides[0] = malformed.grid_strides[1] = malformed.grid_strides[2] = 1;
+  malformed.output_count = std::numeric_limits<size_t>::max() - 1;
+  malformed.frequencies.resize(1);
+  CHECK(rejected(malformed), "adjoint request accepted overflowing near-limit result bytes");
+  malformed = synthetic_adjoint_request();
+  malformed.terms[0].adjoint_identity.symmetry_index = 1;
+  malformed.structural_signature = adjoint_request_signature(malformed);
+  CHECK(rejected(malformed), "adjoint request accepted a mismatched spatial DFT identity");
+
+  AdjointGradientRequest multi = synthetic_adjoint_request();
+  std::shared_ptr<AdjointDftSnapshot> multi_forward(
+      new AdjointDftSnapshot(*multi.forward));
+  std::shared_ptr<AdjointDftSnapshot> multi_adjoint(
+      new AdjointDftSnapshot(*multi.adjoint));
+  AdjointDftSnapshotTerm second = multi_forward->terms[0];
+  second.identity = synthetic_adjoint_identity(Ey);
+  second.resident.id = ArrayId{2};
+  second.values = {{9.0, 1.0}, {8.0, 2.0}, {7.0, 3.0}, {6.0, 4.0}};
+  multi_forward->terms.push_back(second);
+  multi_adjoint->terms.push_back(second);
+  multi_forward->structural_signature = adjoint_snapshot_structural_signature(*multi_forward);
+  multi_forward->value_signature = adjoint_snapshot_value_signature(*multi_forward);
+  multi_adjoint->structural_signature = adjoint_snapshot_structural_signature(*multi_adjoint);
+  multi_adjoint->value_signature = adjoint_snapshot_value_signature(*multi_adjoint);
+  multi.forward = multi_forward;
+  multi.adjoint = multi_adjoint;
+  AdjointDftTerm second_pair = multi.terms[0];
+  second_pair.forward_identity = second.identity;
+  second_pair.adjoint_identity = second.identity;
+  second_pair.forward_snapshot_term = 1;
+  second_pair.adjoint_snapshot_term = 1;
+  second_pair.adjoint.id = ArrayId{2};
+  multi.terms.push_back(second_pair);
+  AdjointGradientContribution second_contribution = multi.contributions[0];
+  second_contribution.output_index = 2;
+  second_contribution.forward_snapshot_term = 1;
+  second_contribution.adjoint_snapshot_term = 1;
+  second_contribution.forward_value_indices[0] = 3;
+  second_contribution.adjoint_value_index = 1;
+  multi.contributions.push_back(second_contribution);
+  multi.structural_signature = adjoint_request_signature(multi);
+  validate_adjoint_request(multi);
+
+  malformed = multi;
+  malformed.contributions[1].adjoint_snapshot_term = 0;
+  malformed.structural_signature = adjoint_request_signature(malformed);
+  CHECK(rejected(malformed),
+        "adjoint request accepted a valid-index contribution from a different spatial pair");
+  malformed = multi;
+  malformed.terms.push_back(malformed.terms[0]);
+  malformed.structural_signature = adjoint_request_signature(malformed);
+  CHECK(rejected(malformed), "adjoint request accepted a duplicate declared DFT pair");
+  malformed = multi;
+  malformed.contributions[1].forward_value_indices[0] = 2;
+  malformed.structural_signature = adjoint_request_signature(malformed);
+  CHECK(rejected(malformed), "adjoint request accepted a cross-frequency multi-term load");
+
+  AdjointGradientRequest remote = synthetic_adjoint_request();
+  remote.disposition = AdjointSupportDisposition::host_fallback;
+  remote.support_reasons = adjoint_support_remote_term;
+  std::shared_ptr<AdjointDftSnapshot> remote_adjoint(new AdjointDftSnapshot(*remote.adjoint));
+  remote_adjoint->terms[0].resident = ArrayRef{invalid_array(), 0, 0};
+  remote_adjoint->structural_signature = adjoint_snapshot_structural_signature(*remote_adjoint);
+  remote_adjoint->value_signature = adjoint_snapshot_value_signature(*remote_adjoint);
+  remote.adjoint = remote_adjoint;
+  remote.terms[0].adjoint = ArrayRef{invalid_array(), 0, 0};
+  remote.structural_signature = adjoint_request_signature(remote);
+  validate_adjoint_request(remote);
+  std::vector<double> remote_oracle(remote.output_count, -1.0);
+  compute_adjoint_gradient_oracle(remote, remote_oracle.data(), remote_oracle.size());
+  CHECK(remote_oracle == oracle,
+        "remote adjoint term did not retain its exact accounted host fallback");
+  remote.disposition = AdjointSupportDisposition::device_native;
+  remote.structural_signature = adjoint_request_signature(remote);
+  CHECK(rejected(remote), "remote adjoint term was admitted as device-native");
+
+  std::shared_ptr<AdjointDftSnapshot> duplicate = synthetic_adjoint_snapshot();
+  duplicate->terms.push_back(duplicate->terms.front());
+  duplicate->structural_signature = adjoint_snapshot_structural_signature(*duplicate);
+  duplicate->value_signature = adjoint_snapshot_value_signature(*duplicate);
+  bool duplicate_rejected = false;
+  try { validate_adjoint_snapshot(*duplicate); }
+  catch (const std::exception &) { duplicate_rejected = true; }
+  CHECK(duplicate_rejected, "adjoint snapshot accepted a duplicate spatial identity");
+}
+
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static double unit_epsilon(const vec &) { return 1.0; }
 static double two_epsilon(const vec &) { return 2.0; }
@@ -78,6 +332,43 @@ static int material_ir_user_calls = 0;
 static void material_ir_user_function(vector3, void *, meep_geom::medium_struct *medium) {
   ++material_ir_user_calls;
   medium->epsilon_diag = meep_geom::make_vector3(2.0, 2.0, 2.0);
+}
+
+static void test_adjoint_reversible_semantic_freshness() {
+  using namespace meep_geom;
+  geometric_object_list empty_geometry = {0, NULL};
+
+  material_type planar_material = make_dielectric(2.0);
+  structure planar_structure(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&planar_structure, empty_geometry, make_vector3(), false, 1e-5, 64,
+                              false, planar_material);
+  material_free(planar_material);
+  fields planar(&planar_structure);
+  planar.use_bloch(X, 0.23);
+  const std::shared_ptr<AdjointDftSnapshot> bloch = synthetic_adjoint_snapshot_for(planar);
+  planar.use_bloch(X, -0.23);
+  planar.use_bloch(X, 0.23);
+  CHECK(!adjoint_snapshot_is_stale(*bloch, planar),
+        "restored nonzero Bloch-k transition rejected the host adjoint fallback");
+  planar.use_bloch(X, 0.24);
+  CHECK(adjoint_snapshot_is_stale(*bloch, planar),
+        "genuine Bloch-k mutation retained a stale adjoint snapshot");
+
+  material_type cylindrical_material = make_dielectric(2.0);
+  structure cylindrical_structure(volcyl(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&cylindrical_structure, empty_geometry, make_vector3(), false, 1e-5,
+                              64, false, cylindrical_material);
+  material_free(cylindrical_material);
+  fields cylindrical(&cylindrical_structure, 2.0);
+  const std::shared_ptr<AdjointDftSnapshot> angular =
+      synthetic_adjoint_snapshot_for(cylindrical);
+  cylindrical.change_m(-2.0);
+  cylindrical.change_m(2.0);
+  CHECK(!adjoint_snapshot_is_stale(*angular, cylindrical),
+        "restored nonzero cylindrical-m transition rejected the host adjoint fallback");
+  cylindrical.change_m(3.0);
+  CHECK(adjoint_snapshot_is_stale(*angular, cylindrical),
+        "genuine cylindrical-m mutation retained a stale adjoint snapshot");
 }
 
 class lifecycle_custom_susceptibility : public lorentzian_susceptibility {
@@ -10634,6 +10925,27 @@ static void test_initialization_plan() {
             RegionalSupportReason::empty,
         "empty regional restriction lacks its distinct reason code");
 
+  {
+    using namespace meep_geom;
+    geometric_object_list empty_geometry = {0, NULL};
+    material_type material = make_dielectric(2.0);
+    structure owned_region(vol2d(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
+    set_materials_from_geometry(&owned_region, empty_geometry, make_vector3(), false, 1e-5, 64,
+                                false, material);
+    material_free(material);
+    fields regional_owner(&owned_region);
+    const std::shared_ptr<AdjointDftSnapshot> before_region =
+        synthetic_adjoint_snapshot_for(regional_owner);
+    invalidate(regional_owner, MutationKind::field_layout,
+               "adjoint forward-to-adjoint layout churn fixture");
+    CHECK(!adjoint_snapshot_is_stale(*before_region, regional_owner),
+          "ordinary forward-to-adjoint field-layout churn invalidated an owned snapshot");
+    invalidate_material_region(regional_owner, InitRegion(0, ivec(0, 0), ivec(2, 2)),
+                               "adjoint regional freshness fixture");
+    CHECK(adjoint_snapshot_is_stale(*before_region, regional_owner),
+          "regional material invalidation retained a stale adjoint snapshot");
+  }
+
   master_printf("init plan: %zu ops (%zu zero, %zu material, %zu pml), restricted to %zu\n",
                 plan.operations.size(), zero_ops, material_ops, pml_ops, sub.operations.size());
   delete f;
@@ -11280,6 +11592,40 @@ static void test_checkpoint_metadata_boundaries() {
   try { (void)checkpoint_decode_signed_for_testing(std::numeric_limits<uint64_t>::max()); }
   catch (const std::invalid_argument &) { wide_rejected = true; }
   CHECK(wide_rejected, "checkpoint signed-key decoder accepted an out-of-domain disk integer");
+}
+
+static void test_checkpoint_adjoint_snapshot_invalidation() {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  geometric_object_list empty_geometry = {0, NULL};
+  material_type material = make_dielectric(2.0);
+  structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+  set_materials_from_geometry(&s, empty_geometry, make_vector3(), false, 1e-5, 64, false,
+                              material);
+  material_free(material);
+  fields owner(&s);
+  owner.require_component(Ez);
+  owner.advance(1);
+  const std::shared_ptr<AdjointDftSnapshot> before_load =
+      synthetic_adjoint_snapshot_for(owner);
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-adjoint-checkpoint-%ld-%d.h5", long(getpid()),
+           my_rank());
+  owner.dump(filename, false);
+  owner.checkpoint_publication_generation = std::numeric_limits<uint64_t>::max();
+  bool overflow_rejected = false;
+  try { owner.load(filename, false); }
+  catch (const std::runtime_error &) { overflow_rejected = true; }
+  CHECK(overflow_rejected && owner.checkpoint_publication_generation ==
+                                 std::numeric_limits<uint64_t>::max(),
+        "checkpoint adjoint epoch overflow was not rejected before publication");
+  owner.checkpoint_publication_generation = 0;
+  CHECK(!adjoint_snapshot_is_stale(*before_load, owner),
+        "failed checkpoint load invalidated the current adjoint snapshot");
+  owner.load(filename, false);
+  CHECK(adjoint_snapshot_is_stale(*before_load, owner),
+        "checkpoint publication retained a stale adjoint snapshot");
+  std::remove(filename);
 }
 
 static void test_checkpoint_susceptibility_identity() {
@@ -12381,6 +12727,7 @@ int main(int argc, char **argv) {
 #ifdef HAVE_HDF5
     test_backend_safe_host_access();
     test_checkpoint_metadata_boundaries();
+    test_checkpoint_adjoint_snapshot_invalidation();
     test_checkpoint_susceptibility_identity();
     test_checkpoint_dft_identity_precision_and_order();
     test_checkpoint_transient_rejections();
@@ -12558,8 +12905,18 @@ int main(int argc, char **argv) {
     master_printf("backend_api: regional initialization checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_ADJOINT_ONLY")) {
+    test_adjoint_plan_schema();
+    test_adjoint_reversible_semantic_freshness();
+    failures = sum_to_all(failures);
+    if (failures) return 1;
+    master_printf("backend_api: adjoint plan checks passed\n");
+    return 0;
+  }
 
   test_selection();
+  test_adjoint_plan_schema();
+  test_adjoint_reversible_semantic_freshness();
   test_susceptibility_clone_coefficients();
   test_construction_equivalence();
   test_read_write_roundtrip();
@@ -12616,6 +12973,7 @@ int main(int argc, char **argv) {
   test_authority_safe_state_rebuild();
   test_cpu_state_rebuild_is_safe_noop();
   test_backend_safe_host_access();
+  test_checkpoint_adjoint_snapshot_invalidation();
 #ifdef HAVE_HDF5
   test_checkpoint_metadata_boundaries();
   test_checkpoint_susceptibility_identity();

@@ -15,7 +15,11 @@
 */
 
 #include <algorithm>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 #include <vector>
+#include "backend/adjoint_plan.hpp"
 #include "backend/backend.hpp"
 #include "backend/material_callback.hpp"
 #include "meepgeom.hpp"
@@ -3028,230 +3032,467 @@ static bool ivec_in_box(const meep::ivec &p, const meep::ivec &lo, const meep::i
   return true;
 }
 
-/* Find the dft_chunk in `chunks` covering the same region as `adj`.
+namespace {
 
-   loop_in_chunks() emits one dft_chunk per (fields_chunk, symmetry image,
-   lattice shift) triple, so that triple identifies a chunk uniquely. It is
-   *not* safe to pair chunks by position in the next_in_dft list: a fields
-   chunk contributes a dft_chunk for a given component only if the monitor
-   overlaps that component's owned grid there, and the yee shifts differ
-   between components, so the per-component lists can have different lengths
-   and different orderings near the edges of the monitor. Returns NULL when
-   this fields chunk holds no data for the requested component. */
-static meep::dft_chunk *matching_dft_chunk(const std::vector<meep::dft_chunk *> &chunks,
-                                           const meep::dft_chunk *adj) {
-  for (size_t i = 0; i < chunks.size(); ++i)
-    if (chunks[i]->fc == adj->fc && chunks[i]->sn == adj->sn && chunks[i]->shift == adj->shift)
-      return chunks[i];
-  return NULL;
-}
+struct AdjointForwardLoad {
+  size_t indices[2];
+  double weights[2];
+  uint32_t count;
 
-/* Look up the forward DFT at point p, or zero if p is outside this chunk.
-
-   The restriction stencil reaches half a pixel (unit_a*2 cancels against the yee
-   shift), so it wants the four forward nodes around the adjoint node. With the
-   persist pad clamped to the component's own grid (see dft.cpp) those all lie
-   inside this chunk's box, the outermost of them being the chunk's ghost layer,
-   which step_boundaries() keeps current, so a lookup should only fall outside
-   it at the cell boundary, where zero is the right answer. */
-static std::complex<meep::realnum> forward_dft_value(const meep::dft_chunk *ch,
-                                                     const meep::grid_volume &gv_fwd,
-                                                     meep::grid_volume &gv, const meep::ivec &p,
-                                                     size_t nf, size_t f_i) {
-  if (ivec_in_box(p, ch->is, ch->ie, gv.dim)) {
-    ptrdiff_t i = gv_fwd.index(ch->c, p);
-    if (i >= 0 && (size_t)i < ch->N) return ch->dft[nf * i + f_i];
+  AdjointForwardLoad() : count(0) {
+    indices[0] = indices[1] = std::numeric_limits<size_t>::max();
+    weights[0] = weights[1] = 0.0;
   }
-  return 0;
+};
+
+size_t checked_adjoint_product(size_t left, size_t right, const char *what) {
+  if (left && right > std::numeric_limits<size_t>::max() / left)
+    throw std::overflow_error(std::string(what) + " overflows");
+  return left * right;
 }
+
+size_t checked_adjoint_add(size_t left, size_t right, const char *what) {
+  if (right > std::numeric_limits<size_t>::max() - left)
+    throw std::overflow_error(std::string(what) + " overflows");
+  return left + right;
+}
+
+void validate_adjoint_frequency_binding(const meep::AdjointDftSnapshot &snapshot,
+                                        const double *frequencies, size_t count,
+                                        const char *which) {
+  for (const meep::AdjointDftSnapshotTerm &term : snapshot.terms) {
+    if (term.frequencies.size() != count)
+      throw std::invalid_argument(std::string(which) +
+                                  " DFT frequency count does not match request");
+    for (size_t i = 0; i < count; ++i)
+      if (term.frequencies[i] != 2.0 * meep::pi * frequencies[i])
+        throw std::invalid_argument(std::string(which) +
+                                    " DFT frequencies do not match request");
+  }
+}
+
+meep::fields *adjoint_owner(const std::vector<meep::dft_fields *> &monitors,
+                            const char *which) {
+  meep::fields *owner = NULL;
+  for (meep::dft_fields *monitor : monitors) {
+    if (!monitor) throw std::invalid_argument(std::string(which) + " monitor is null");
+    meep::fields *candidate = monitor->monitor_lifetime ? monitor->monitor_lifetime->owner : NULL;
+    if (!candidate)
+      throw std::invalid_argument(std::string(which) + " monitor has no live fields owner");
+    if (owner && owner != candidate)
+      throw std::invalid_argument(std::string(which) + " monitors have different owners");
+    owner = candidate;
+  }
+  return owner;
+}
+
+size_t adjoint_snapshot_term(const meep::AdjointDftSnapshot &snapshot,
+                             const meep::AdjointDftIdentity &identity) {
+  for (size_t i = 0; i < snapshot.terms.size(); ++i)
+    if (snapshot.terms[i].identity == identity) return i;
+  throw std::invalid_argument("adjoint request cannot resolve a DFT snapshot identity");
+}
+
+void set_adjoint_grid_metadata(meep::AdjointGradientRequest &request, const material_data &grid,
+                               size_t ng, bool &initialized) {
+  const double dimensions[3] = {grid.grid_size.x, grid.grid_size.y, grid.grid_size.z};
+  size_t count = 1;
+  size_t shape[3];
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!std::isfinite(dimensions[axis]) || dimensions[axis] < 1.0 ||
+        std::floor(dimensions[axis]) != dimensions[axis] ||
+        dimensions[axis] > double(std::numeric_limits<size_t>::max()))
+      throw std::invalid_argument("adjoint material grid has an invalid shape");
+    shape[axis] = size_t(dimensions[axis]);
+    if (count > std::numeric_limits<size_t>::max() / shape[axis])
+      throw std::overflow_error("adjoint material grid shape overflows");
+    count *= shape[axis];
+  }
+  if (count != ng)
+    throw std::invalid_argument("adjoint gradient output does not match the material grid shape");
+  if (!initialized) {
+    std::copy(shape, shape + 3, request.grid_shape);
+    request.grid_strides[2] = 1;
+    request.grid_strides[1] = shape[2];
+    request.grid_strides[0] = shape[1] * shape[2];
+    request.overlap_mode = grid.material_grid_kinds;
+    request.beta = grid.beta;
+    request.eta = grid.eta;
+    request.damping = grid.damping;
+    initialized = true;
+  }
+  else if (!std::equal(shape, shape + 3, request.grid_shape) ||
+           request.overlap_mode != grid.material_grid_kinds || request.beta != grid.beta ||
+           request.eta != grid.eta || request.damping != grid.damping)
+    throw std::invalid_argument("adjoint design region contains incompatible material grids");
+}
+
+void append_adjoint_grid_contributions(
+    meep::AdjointGradientRequest &request, size_t ng, size_t frequency_index,
+    size_t adjoint_term, size_t adjoint_value_index, size_t forward_term,
+    const AdjointForwardLoad &forward, double rx, double ry, double rz, double scale,
+    material_data *grid, double uval, meep::vec point, geom_epsilon *geps,
+    meep::component adjoint_c, meep::component forward_c, double frequency,
+    std::complex<double> adjoint_coefficient, meep::grid_volume &gv, double du,
+    bool &grid_initialized) {
+  set_adjoint_grid_metadata(request, *grid, ng, grid_initialized);
+  const int nx = int(grid->grid_size.x), ny = int(grid->grid_size.y), nz = int(grid->grid_size.z);
+  int x1, y1, z1, x2, y2, z2;
+  double dx, dy, dz;
+  meep::map_coordinates(rx, ry, rz, nx, ny, nz, x1, y1, z1, x2, y2, z2, dx, dy, dz);
+  const int x_list[2] = {x1, x2}, y_list[2] = {y1, y2}, z_list[2] = {z1, z2};
+  const int lx = x1 == x2 ? 1 : 2, ly = y1 == y2 ? 1 : 2, lz = z1 == z2 ? 1 : 2;
+  const int kind = grid->material_grid_kinds;
+  const auto index = [ny, nz](int x, int y, int z) {
+    return (size_t(x) * size_t(ny) + size_t(y)) * size_t(nz) + size_t(z);
+  };
+  const auto weight = [&](int x, int y, int z) { return grid->weights[index(x, y, z)]; };
+  const double u =
+      (((weight(x1, y1, z1) * (1.0 - dx) + weight(x2, y1, z1) * dx) * (1.0 - dy) +
+        (weight(x1, y2, z1) * (1.0 - dx) + weight(x2, y2, z1) * dx) * dy) *
+           (1.0 - dz) +
+       ((weight(x1, y1, z2) * (1.0 - dx) + weight(x2, y1, z2) * dx) * (1.0 - dy) +
+        (weight(x1, y2, z2) * (1.0 - dx) + weight(x2, y2, z2) * dx) * dy) * dz);
+  if (kind == material_data::U_MIN && u != uval) return;
+  if (kind == material_data::U_PROD) scale *= uval / u;
+
+  for (int xi = 0; xi < lx; ++xi)
+    for (int yi = 0; yi < ly; ++yi)
+      for (int zi = 0; zi < lz; ++zi) {
+        const size_t weight_index = index(x_list[xi], y_list[yi], z_list[zi]);
+        meep::AdjointGradientContribution contribution;
+        contribution.output_index = ng * frequency_index + weight_index;
+        contribution.adjoint_snapshot_term = uint32_t(adjoint_term);
+        contribution.adjoint_value_index = adjoint_value_index;
+        contribution.forward_snapshot_term = uint32_t(forward_term);
+        contribution.forward_value_count = forward.count;
+        for (uint32_t i = 0; i < forward.count; ++i) {
+          contribution.forward_value_indices[i] = forward.indices[i];
+          contribution.forward_weights[i] = forward.weights[i];
+        }
+        contribution.adjoint_coefficient = adjoint_coefficient;
+        contribution.material_coefficient =
+            get_material_gradient(point, adjoint_c, forward_c, std::complex<double>(1.0, 0.0),
+                                  frequency, geps, gv, du, grid->weights, int(weight_index));
+        contribution.accumulation_scale = scale;
+        if (request.contributions.size() == request.contributions.max_size())
+          throw std::length_error("adjoint gradient contribution count exceeds vector capacity");
+        request.contributions.push_back(contribution);
+      }
+}
+
+void append_adjoint_point_contributions(
+    meep::AdjointGradientRequest &request, size_t ng, size_t frequency_index,
+    size_t adjoint_term, size_t adjoint_value_index, size_t forward_term,
+    const AdjointForwardLoad &forward, vector3 p, double scalegrad, geom_epsilon *geps,
+    meep::component adjoint_c, meep::component forward_c, double frequency,
+    std::complex<double> adjoint_coefficient, meep::grid_volume &gv, double du,
+    bool &grid_initialized) {
+  geom_box_tree tp = NULL;
+  int oi = 0, ois = 0;
+  material_data *grid = NULL;
+  tp = geom_tree_search(p, geps->geometry_tree, &oi);
+  if (tp && is_material_grid((material_type)tp->objects[oi].o->material))
+    grid = (material_data *)tp->objects[oi].o->material;
+  else if (!tp && is_material_grid((material_type)default_material))
+    grid = (material_data *)default_material;
+  else
+    return;
+
+  const int kind = grid->material_grid_kinds;
+  double uval = 0.0;
+  if (tp && kind == material_data::U_MEAN) {
+    int count = 0;
+    geom_box_tree cursor = geom_tree_search(p, geps->geometry_tree, &ois);
+    do {
+      ++count;
+      cursor = geom_tree_search_next(p, cursor, &ois);
+    } while (cursor && is_material_grid((material_data *)cursor->objects[ois].o->material));
+    scalegrad /= count;
+  }
+  else if (tp && (kind == material_data::U_MIN || kind == material_data::U_PROD)) {
+    throw std::invalid_argument(
+        "adjoint gradient does not support overlapping U_MIN/U_PROD material grids");
+  }
+
+  if (tp) {
+    uval = tanh_projection(matgrid_val(p, tp, oi, grid), grid->beta, grid->eta);
+    do {
+      const vector3 local = to_geom_box_coords(p, &tp->objects[oi]);
+      append_adjoint_grid_contributions(
+          request, ng, frequency_index, adjoint_term, adjoint_value_index, forward_term,
+          forward, local.x, local.y, local.z, scalegrad, grid, uval, vector3_to_vec(p), geps,
+          adjoint_c, forward_c, frequency, adjoint_coefficient, gv, du, grid_initialized);
+      if (kind == material_data::U_DEFAULT) break;
+      tp = geom_tree_search_next(p, tp, &oi);
+      if (tp) grid = (material_data *)tp->objects[oi].o->material;
+    } while (tp && is_material_grid(grid));
+  }
+  else {
+    map_lattice_coordinates(p.x, p.y, p.z);
+    uval = tanh_projection(material_grid_val(p, grid), grid->beta, grid->eta);
+    append_adjoint_grid_contributions(
+        request, ng, frequency_index, adjoint_term, adjoint_value_index, forward_term, forward,
+        p.x, p.y, p.z, scalegrad, grid, uval, vector3_to_vec(p), geps, adjoint_c, forward_c,
+        frequency, adjoint_coefficient, gv, du, grid_initialized);
+  }
+}
+
+AdjointForwardLoad adjoint_forward_load(const meep::dft_chunk &chunk,
+                                        const meep::grid_volume &subvolume,
+                                        const meep::grid_volume &gv,
+                                        const meep::ivec *points, const double *weights,
+                                        uint32_t count, size_t nf, size_t frequency) {
+  AdjointForwardLoad result;
+  result.count = count;
+  for (uint32_t i = 0; i < count; ++i) {
+    result.weights[i] = weights[i];
+    if (!ivec_in_box(points[i], chunk.is, chunk.ie, gv.dim)) {
+      result.indices[i] = std::numeric_limits<size_t>::max();
+      continue;
+    }
+    const ptrdiff_t index = subvolume.index(chunk.c, points[i]);
+    result.indices[i] = index >= 0 && size_t(index) < chunk.N
+                            ? nf * size_t(index) + frequency
+                            : std::numeric_limits<size_t>::max();
+  }
+  return result;
+}
+
+meep::AdjointGradientRequest build_adjoint_gradient_request(
+    size_t ng, size_t nf, const std::vector<meep::dft_fields *> &fields_a,
+    const std::vector<meep::dft_fields *> &fields_f, const double *frequencies,
+    double scalegrad, meep::grid_volume &gv, geom_epsilon *geps, double du) {
+  if (fields_a.size() != 3 || fields_f.size() != 3 || !frequencies || !geps || !ng || !nf)
+    throw std::invalid_argument("adjoint gradient inputs are incomplete");
+  if (!(du > 0.0) || !std::isfinite(du) || !std::isfinite(scalegrad))
+    throw std::invalid_argument("adjoint gradient scalar is invalid");
+  const size_t output_count = checked_adjoint_product(ng, nf, "adjoint gradient output size");
+  checked_adjoint_add(output_count, size_t(1), "adjoint gradient offset count");
+  checked_adjoint_product(output_count, sizeof(double), "adjoint gradient result bytes");
+  checked_adjoint_product(checked_adjoint_add(output_count, size_t(1),
+                                              "adjoint gradient offset count"),
+                          sizeof(uint64_t), "adjoint gradient offset bytes");
+  if (output_count > std::vector<double>().max_size())
+    throw std::length_error("adjoint gradient result exceeds vector capacity");
+  meep::fields *owner = adjoint_owner(fields_a, "adjoint");
+  if (adjoint_owner(fields_f, "forward") != owner)
+    throw std::invalid_argument("forward and adjoint monitors have different fields owners");
+  if (!geps->recipe_matches(*owner))
+    throw std::invalid_argument("adjoint material compatibility handle is stale");
+
+  std::shared_ptr<const meep::AdjointDftSnapshot> forward;
+  for (meep::dft_fields *monitor : fields_f) {
+    if (!monitor->adjoint_snapshot) continue;
+    const std::shared_ptr<const meep::AdjointDftSnapshot> candidate =
+        std::static_pointer_cast<const meep::AdjointDftSnapshot>(monitor->adjoint_snapshot);
+    if (forward && forward.get() != candidate.get())
+      throw std::invalid_argument("forward monitors reference different adjoint snapshots");
+    forward = candidate;
+  }
+  if (!forward) forward = meep::capture_adjoint_dft_snapshot(fields_f);
+  for (meep::dft_fields *monitor : fields_f)
+    if (monitor->adjoint_snapshot.get() != forward.get())
+      throw std::invalid_argument("forward adjoint snapshot is incomplete");
+  meep::validate_adjoint_snapshot_freshness(*forward, *owner);
+  validate_adjoint_frequency_binding(*forward, frequencies, nf, "forward");
+  std::shared_ptr<const meep::AdjointDftSnapshot> adjoint;
+  for (meep::dft_fields *monitor : fields_a) {
+    if (!monitor->adjoint_snapshot) continue;
+    const std::shared_ptr<const meep::AdjointDftSnapshot> candidate =
+        std::static_pointer_cast<const meep::AdjointDftSnapshot>(monitor->adjoint_snapshot);
+    if (adjoint && adjoint.get() != candidate.get())
+      throw std::invalid_argument("adjoint monitors reference different immutable snapshots");
+    adjoint = candidate;
+  }
+  if (!adjoint) adjoint = meep::capture_adjoint_dft_snapshot(fields_a);
+  for (meep::dft_fields *monitor : fields_a)
+    if (monitor->adjoint_snapshot.get() != adjoint.get())
+      throw std::invalid_argument("adjoint immutable snapshot is incomplete");
+  meep::validate_adjoint_snapshot_freshness(*adjoint, *owner);
+  validate_adjoint_frequency_binding(*adjoint, frequencies, nf, "adjoint");
+
+  meep::AdjointGradientRequest request;
+  request.forward = forward;
+  request.adjoint = adjoint;
+  request.material_recipe = owner->material_ir;
+  const meep::MaterialIR *ir = meep::material_ir_for(*owner);
+  request.material_signature = ir ? ir->signature : 0;
+  request.material_layout_signature = ir ? ir->layout_signature : 0;
+  for (int i = 0; i < meep::fields::num_mutation_kinds; ++i)
+    request.mutation_generation[i] = owner->mutation_generation[i];
+  request.output_count = output_count;
+  request.frequencies.assign(frequencies, frequencies + nf);
+  request.scale = scalegrad;
+  request.finite_difference_step = du;
+  request.cylindrical_measure = gv.dim == meep::Dcyl;
+  request.output_precision = meep::Precision::f64;
+  request.disposition = meep::AdjointSupportDisposition::device_native;
+  request.support_reasons = meep::adjoint_support_none;
+  if (request.cylindrical_measure) request.support_reasons |= meep::adjoint_support_cylindrical;
+
+  bool grid_initialized = false;
+  for (size_t frequency = 0; frequency < nf; ++frequency)
+    for (int adjoint_component = 0; adjoint_component < 3; ++adjoint_component)
+      for (meep::dft_chunk *adj_chunk = fields_a[adjoint_component]->chunks; adj_chunk;
+           adj_chunk = adj_chunk->next_in_dft) {
+        if (adj_chunk->omega.size() != nf)
+          throw std::invalid_argument("adjoint DFT frequency count does not match request");
+        const meep::AdjointDftIdentity adj_identity = meep::adjoint_dft_identity(*owner, *adj_chunk);
+        const size_t adj_term = adjoint_snapshot_term(*adjoint, adj_identity);
+        meep::grid_volume gv_adj = gv.subvolume(adj_chunk->is, adj_chunk->ie, adj_chunk->c);
+        for (int forward_component = 0; forward_component < 3; ++forward_component) {
+          meep::dft_chunk *fwd_chunk = NULL;
+          for (meep::dft_chunk *candidate = fields_f[forward_component]->chunks; candidate;
+               candidate = candidate->next_in_dft)
+            if (candidate->fc == adj_chunk->fc && candidate->sn == adj_chunk->sn &&
+                candidate->shift == adj_chunk->shift) {
+              fwd_chunk = candidate;
+              break;
+            }
+          if (!fwd_chunk) continue;
+          if (fwd_chunk->omega.size() != nf)
+            throw std::invalid_argument("forward DFT frequency count does not match request");
+          const meep::AdjointDftIdentity fwd_identity =
+              meep::adjoint_dft_identity(*owner, *fwd_chunk);
+          const size_t fwd_term = adjoint_snapshot_term(*forward, fwd_identity);
+          checked_adjoint_product(fwd_chunk->N, nf, "adjoint forward DFT extent");
+          const size_t adjoint_extent =
+              checked_adjoint_product(adj_chunk->N, nf, "adjoint reverse DFT extent");
+          if (frequency == 0) {
+            meep::AdjointDftTerm pair;
+            pair.forward_identity = fwd_identity;
+            pair.adjoint_identity = adj_identity;
+            pair.forward_snapshot_term = uint32_t(fwd_term);
+            pair.adjoint_snapshot_term = uint32_t(adj_term);
+            pair.adjoint = meep::ArrayRef{meep::invalid_array(), 0, 0};
+            meep::ArrayId adjoint_id = meep::invalid_array();
+            ptrdiff_t adjoint_offset = 0;
+            if (owner->array_catalog &&
+                owner->array_catalog->locate(adj_chunk->dft, adjoint_id, adjoint_offset) &&
+                adjoint_offset >= 0)
+              pair.adjoint =
+                  meep::ArrayRef{adjoint_id, size_t(adjoint_offset), adjoint_extent};
+            else if (!adj_chunk->fc->is_mine())
+              request.support_reasons |= meep::adjoint_support_remote_term;
+            else
+              request.support_reasons |= meep::adjoint_support_layout;
+            pair.forward_spatial_points = fwd_chunk->N;
+            pair.adjoint_spatial_points = adj_chunk->N;
+            pair.frequencies = nf;
+            if (request.terms.size() == request.terms.max_size())
+              throw std::length_error("adjoint gradient DFT pair count exceeds vector capacity");
+            request.terms.push_back(pair);
+          }
+          if (adj_chunk->sn != 0 || fwd_chunk->sn != 0)
+            request.support_reasons |= meep::adjoint_support_symmetry;
+
+          const meep::component adjoint_c = adj_chunk->c;
+          const meep::component forward_c = fwd_chunk->c;
+          meep::grid_volume gv_fwd = gv.subvolume(fwd_chunk->is, fwd_chunk->ie, forward_c);
+          LOOP_OVER_IVECS(gv_adj, adj_chunk->is_old, adj_chunk->ie_old, idx_adj) {
+            IVEC_LOOP_ILOC(gv_adj, ip);
+            IVEC_LOOP_LOC(gv_adj, p);
+            const ptrdiff_t adj_index = gv_adj.index(adjoint_c, ip);
+            if (adj_index < 0 || size_t(adj_index) >= adj_chunk->N) continue;
+            const size_t adj_value = nf * size_t(adj_index) + frequency;
+            material_type md;
+            geps->get_material_pt(md, p);
+            const std::complex<double> adjoint_coefficient =
+                md->trivial ? std::complex<double>(1.0, 0.0)
+                            : cond_cmp(adjoint_c, p, frequencies[frequency], geps);
+            if (!md->trivial) request.support_reasons |= meep::adjoint_support_dispersion;
+            if (has_offdiag(&md->medium_1) || has_offdiag(&md->medium_2))
+              request.support_reasons |= meep::adjoint_support_offdiagonal;
+            double cyl_scale = gv.dim == meep::Dcyl ? 2 * p.r() : 1.0;
+            if (forward_c == adjoint_c) {
+              const meep::ivec points[1] = {ip};
+              const double weights[1] = {1.0};
+              const AdjointForwardLoad load = adjoint_forward_load(
+                  *fwd_chunk, gv_fwd, gv, points, weights, 1, nf, frequency);
+              append_adjoint_point_contributions(
+                  request, ng, frequency, adj_term, adj_value, fwd_term, load,
+                  vec_to_vector3(p), scalegrad * cyl_scale, geps, adjoint_c, forward_c,
+                  frequencies[frequency], adjoint_coefficient, gv, du, grid_initialized);
+            }
+            else if (md->do_averaging || !is_material_grid(md) || has_offdiag(&md->medium_1) ||
+                     has_offdiag(&md->medium_2)) {
+              const meep::ivec fwd_p =
+                  ip + gv.iyee_shift(forward_c) - gv.iyee_shift(adjoint_c);
+              const meep::ivec unit_a =
+                  unit_ivec(gv.dim, component_direction(adjoint_c));
+              const meep::ivec unit_f =
+                  unit_ivec(gv.dim, component_direction(forward_c));
+              const meep::ivec fwd_pa = fwd_p + unit_a * 2;
+              const meep::ivec fwd_pf = fwd_p - unit_f * 2;
+              const meep::ivec fwd_paf = fwd_p + unit_a * 2 - unit_f * 2;
+              const meep::ivec left[2] = {fwd_p, fwd_pa};
+              const meep::ivec right[2] = {fwd_pf, fwd_paf};
+              const meep::ivec eps[2] = {(fwd_p + fwd_pf) / 2, (fwd_pa + fwd_paf) / 2};
+              for (int node = 0; node < 2; ++node) {
+                const meep::ivec points[2] = {left[node], right[node]};
+                const double weights[2] = {0.5, 0.5};
+                const AdjointForwardLoad load = adjoint_forward_load(
+                    *fwd_chunk, gv_fwd, gv, points, weights, 2, nf, frequency);
+                const meep::vec eps_point = gv[eps[node]];
+                cyl_scale = gv.dim == meep::Dcyl ? eps_point.r() : 1.0;
+                append_adjoint_point_contributions(
+                    request, ng, frequency, adj_term, adj_value, fwd_term, load,
+                    vec_to_vector3(eps_point), scalegrad * cyl_scale * 0.5, geps, adjoint_c,
+                    forward_c, frequencies[frequency], adjoint_coefficient, gv, du,
+                    grid_initialized);
+              }
+            }
+          }
+        }
+      }
+  if (!grid_initialized) {
+    request.grid_shape[0] = ng;
+    request.grid_shape[1] = request.grid_shape[2] = 1;
+    request.grid_strides[0] = request.grid_strides[1] = request.grid_strides[2] = 1;
+    request.overlap_mode = material_data::U_DEFAULT;
+  }
+  if (request.overlap_mode != material_data::U_DEFAULT)
+    request.support_reasons |= meep::adjoint_support_overlap_mode;
+  if (request.support_reasons)
+    request.disposition = meep::AdjointSupportDisposition::host_fallback;
+  request.structural_signature = meep::adjoint_request_signature(request);
+  meep::validate_adjoint_request(request);
+  return request;
+}
+
+} // namespace
 
 void material_grids_addgradient(double *v, size_t ng, size_t nf,
                                 std::vector<meep::dft_fields *> fields_a,
                                 std::vector<meep::dft_fields *> fields_f, double *frequencies,
                                 double scalegrad, meep::grid_volume &gv, geom_epsilon *geps,
                                 double du) {
-  /* ------------------------------------------------------------ */
-  // initialize local gradient array
-  /* ------------------------------------------------------------ */
-  double *v_local = new double[ng * nf];
-  for (int i = 0; i < ng * nf; i++) {
-    v_local[i] = 0;
-  }
+  if (!v) throw std::invalid_argument("adjoint gradient output is null");
+  meep::AdjointGradientRequest request = build_adjoint_gradient_request(
+      ng, nf, fields_a, fields_f, frequencies, scalegrad, gv, geps, du);
+  meep::adjoint_failure_checkpoint();
+  std::vector<double> local(request.output_count, 0.0);
+  std::vector<double> reduced(request.output_count, 0.0);
+  meep::fields *owner = adjoint_owner(fields_a, "adjoint");
+  if (!meep::backend_try_compute_adjoint_gradient(*owner, request, local.data(), local.size(),
+                                                   "material_grids_addgradient"))
+    meep::compute_adjoint_gradient_oracle(request, local.data(), local.size());
+  meep::adjoint_failure_checkpoint();
+  meep::sum_to_all(local.data(), reduced.data(), reduced.size());
+  meep::adjoint_failure_checkpoint();
+  std::copy(reduced.begin(), reduced.end(), v);
 
-  /* ------------------------------------------------------------ */
-  // store chunk info in vectors for simplicity
-  /* ------------------------------------------------------------ */
-  std::vector<std::vector<meep::dft_chunk *> > adjoint_dft_chunks;
-  std::vector<std::vector<meep::dft_chunk *> > forward_dft_chunks;
-  for (int i = 0; i < 3; i++) {
-    std::vector<meep::dft_chunk *> c_adjoint_dft_chunks;
-    std::vector<meep::dft_chunk *> c_forward_dft_chunks;
-    meep::dft_chunk *current_adjoint_chunk = fields_a[i]->chunks;
-    meep::dft_chunk *current_forward_chunk = fields_f[i]->chunks;
-    while (current_adjoint_chunk) {
-      current_adjoint_chunk->sync_dft_to_host();
-      if (current_adjoint_chunk->omega.size() != nf)
-        meep::abort("Supplied frequencies %d don't match dft frequencies %d\n", nf,
-                    current_adjoint_chunk->omega.size());
-      c_adjoint_dft_chunks.push_back(current_adjoint_chunk);
-      current_adjoint_chunk = current_adjoint_chunk->next_in_dft;
+  /* Publication succeeded. Only now consume the adjoint monitor chunks. */
+  for (meep::dft_fields *monitor : fields_a) {
+    while (monitor->chunks) {
+      meep::dft_chunk *next = monitor->chunks->next_in_dft;
+      delete monitor->chunks;
+      monitor->chunks = next;
     }
-    while (current_forward_chunk) {
-      current_forward_chunk->sync_dft_to_host();
-      if (current_forward_chunk->omega.size() != nf)
-        meep::abort("Supplied frequencies %d don't match dft frequencies %d\n", nf,
-                    current_forward_chunk->omega.size());
-      c_forward_dft_chunks.push_back(current_forward_chunk);
-      current_forward_chunk = current_forward_chunk->next_in_dft;
-    }
-    /* NOTE: the adjoint and forward chunk counts may legitimately differ, both
-       from each other and between components -- see matching_dft_chunk(). The
-       chunks are paired spatially below, so this is not an error. */
-    adjoint_dft_chunks.push_back(c_adjoint_dft_chunks);
-    forward_dft_chunks.push_back(c_forward_dft_chunks);
+    monitor->adjoint_snapshot.reset();
   }
-
-  /* ------------------------------------------------------------ */
-  // Begin looping
-  /* ------------------------------------------------------------ */
-
-  // loop over frequency
-  for (size_t f_i = 0; f_i < nf; f_i++) {
-
-    // loop over adjoint components
-    for (int ci_adjoint = 0; ci_adjoint < 3; ci_adjoint++) {
-      int num_chunks = adjoint_dft_chunks[ci_adjoint].size();
-      if (num_chunks == 0) continue;
-
-      // loop over each chunk
-      for (int cur_chunk = 0; cur_chunk < num_chunks; cur_chunk++) {
-        meep::dft_chunk *adj_chunk = adjoint_dft_chunks[ci_adjoint][cur_chunk];
-        meep::component adjoint_c = adj_chunk->c;
-        meep::grid_volume gv_adj = gv.subvolume(adj_chunk->is, adj_chunk->ie, adjoint_c);
-
-        // loop over forward components
-        for (int ci_forward = 0; ci_forward < 3; ci_forward++) {
-          /* pair the forward chunk with this adjoint chunk *spatially*, not by
-             position in the per-component chunk list */
-          meep::dft_chunk *fwd_chunk =
-              matching_dft_chunk(forward_dft_chunks[ci_forward], adj_chunk);
-          if (!fwd_chunk) continue;
-          meep::component forward_c = fwd_chunk->c;
-          meep::grid_volume gv_fwd = gv.subvolume(fwd_chunk->is, fwd_chunk->ie, forward_c);
-
-          // loop over each point of interest
-          LOOP_OVER_IVECS(gv_adj, adj_chunk->is_old, adj_chunk->ie_old, idx_adj) {
-            double cyl_scale;
-            IVEC_LOOP_ILOC(gv_adj, ip);
-            IVEC_LOOP_LOC(gv_adj, p);
-            /* Index the DFT array by position, NOT by the LOOP_OVER_IVECS counter.
-               The `persist` pad clamps is/ie to fc->gv, whose corners live on the
-               centered grid, so `is` can land off this component's yee lattice.
-               update_dft() and grid_volume::index() both absorb that consistently
-               (index() subtracts iyee_shift, see vec.cpp:476), but the loop
-               counter's idx0 does not, so when (is_old - is) is odd it is off by a
-               whole stride. The clamp only bites where the monitor meets a chunk
-               boundary, which is what made the gradient depend on the chunk
-               division. */
-            ptrdiff_t adj_idx = gv_adj.index(adjoint_c, ip);
-            std::complex<meep::realnum> adj = (adj_idx >= 0 && (size_t)adj_idx < adj_chunk->N)
-                                                  ? adj_chunk->dft[nf * adj_idx + f_i]
-                                                  : std::complex<meep::realnum>(0, 0);
-            material_type md;
-            geps->get_material_pt(md, p);
-            /* if we have conductivities (e.g. for damping)
-            then we need to make sure we correctly account
-            for that here */
-            if (!md->trivial) adj *= cond_cmp(adjoint_c, p, frequencies[f_i], geps);
-
-            /**************************************/
-            /*            Main Routine            */
-            /**************************************/
-
-            /********* compute -λᵀAᵤx *************/
-
-            /* trivial case, no interpolation/restriction needed        */
-            if (forward_c == adjoint_c) {
-              /* index the forward chunk with its *own* index for this point;
-                 idx_adj is an index into gv_adj and is only valid here because
-                 the paired chunks share a fields chunk */
-              std::complex<meep::realnum> fwd =
-                  forward_dft_value(fwd_chunk, gv_fwd, gv, ip, nf, f_i);
-              cyl_scale = (gv.dim == meep::Dcyl) ? 2 * p.r()
-                                                 : 1; // the pi is already factored in near2far.cpp
-              material_grids_addgradient_point(v_local + ng * f_i, vec_to_vector3(p),
-                                               scalegrad * cyl_scale, geps, adjoint_c, forward_c,
-                                               fwd, adj, frequencies[f_i], gv, du);
-              /* more complicated case requires interpolation/restriction */
-            }
-            else if ((md->do_averaging) ||             /* account for subpixel smoothing     */
-                     (!is_material_grid(md)) ||        /* account for edge effects of mg     */
-                     (has_offdiag(&(md->medium_1))) || /* account for offdiagonal components */
-                     (has_offdiag(&(md->medium_2)))) {
-              /* we need to restrict the adjoint fields to
-              the two nodes of interest (which requires a factor
-              of 0.5 to scale), and interpolate the forward fields
-              to the same two nodes (which requires another factor of 0.5).
-              Then we perform our inner product at these nodes.
-              */
-              std::complex<meep::realnum> fwd_avg, fwd1, fwd2;
-
-              // identify the first corner of the forward fields
-              meep::ivec fwd_p = ip + gv.iyee_shift(forward_c) - gv.iyee_shift(adjoint_c);
-              // identify the other three corners
-              meep::ivec unit_a = unit_ivec(gv.dim, component_direction(adjoint_c));
-              meep::ivec unit_f = unit_ivec(gv.dim, component_direction(forward_c));
-              meep::ivec fwd_pa = (fwd_p + unit_a * 2);
-              meep::ivec fwd_pf = (fwd_p - unit_f * 2);
-              meep::ivec fwd_paf = (fwd_p + unit_a * 2 - unit_f * 2);
-
-              // store in vector for convenience
-              std::vector<meep::ivec> fwd_pl = {fwd_p, fwd_pa};
-              std::vector<meep::ivec> fwd_pr = {fwd_pf, fwd_paf};
-
-              // identify the two eps points
-              std::vector<meep::ivec> ieps = {(fwd_p + fwd_pf) / 2, (fwd_pa + fwd_paf) / 2};
-
-// operate on the each eps node
-#pragma unroll
-              for (int node = 0; node < 2; node++) { // two nodes
-                fwd1 = forward_dft_value(fwd_chunk, gv_fwd, gv, fwd_pl[node], nf, f_i);
-                fwd2 = forward_dft_value(fwd_chunk, gv_fwd, gv, fwd_pr[node], nf, f_i);
-                fwd_avg = std::complex<meep::realnum>(0.5, 0) * (fwd1 + fwd2);
-                meep::vec eps1 = gv[ieps[node]];
-                cyl_scale = (gv.dim == meep::Dcyl) ? eps1.r() : 1;
-                material_grids_addgradient_point(v_local + ng * f_i, vec_to_vector3(eps1),
-                                                 scalegrad * cyl_scale, geps, adjoint_c, forward_c,
-                                                 fwd_avg, std::complex<meep::realnum>(0.5, 0) * adj,
-                                                 frequencies[f_i], gv, du);
-              }
-            }
-            /********* compute λᵀbᵤ ***************/
-            /* not yet implemented/needed */
-            /**************************************/
-          }
-        }
-      }
-    }
-  }
-
-  /* ------------------------------------------------------------ */
-  // Broadcast results
-  /* ------------------------------------------------------------ */
-  meep::sum_to_all(v_local, v, ng * nf);
-
-  /* ------------------------------------------------------------ */
-  // cleanup
-  /* ------------------------------------------------------------ */
-  // clear the array used for local sum to all
-  delete[] v_local;
-
-  // clear all the dft data structures
-  for (int i = 0; i < 3; i++) {
-    for (int ii = 0; ii < adjoint_dft_chunks[i].size(); ii++) {
-      delete adjoint_dft_chunks[i][ii];
-    }
-  }
+  for (meep::dft_fields *monitor : fields_f) monitor->adjoint_snapshot.reset();
 
 } // material_grids_addgradient
 

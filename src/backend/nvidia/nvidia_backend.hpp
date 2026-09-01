@@ -366,6 +366,10 @@ public:
   bool supports_compact_dft_reductions() const override { return true; }
   void reduce_dft(const DftReductionRequest &request, std::complex<double> *local_result,
                   size_t result_count) override;
+  bool supports_adjoint_gradient(const AdjointGradientRequest &request,
+                                 std::string &why) const override;
+  void compute_adjoint_gradient(const AdjointGradientRequest &request, double *local_result,
+                                size_t result_count, BackendState &state) override;
   void synchronize() override;
   backend_capabilities capabilities() const override;
   bool requires_full_storage_preparation() const override { return true; }

@@ -24,6 +24,7 @@
 #include <memory>
 #include "meep.hpp"
 #include "meep_internals.hpp"
+#include "backend/adjoint_plan.hpp"
 #include "backend/backend.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/precision.hpp"
@@ -1235,6 +1236,14 @@ dft_fields::dft_fields(dft_chunk *chunks_, const double *freq_, size_t Nfreq, co
 }
 
 void dft_fields::scale_dfts(complex<double> scale) { chunks->scale_dft(scale); }
+
+void dft_fields::capture_adjoint_snapshot(dft_fields *second, dft_fields *third) {
+  std::vector<dft_fields *> monitors;
+  monitors.push_back(this);
+  if (second) monitors.push_back(second);
+  if (third) monitors.push_back(third);
+  capture_adjoint_dft_snapshot(monitors);
+}
 
 void dft_fields::remove() {
   begin_dft_monitor_removal(monitor_lifetime, attached_dft_chain(chunks), "dft_fields::remove");

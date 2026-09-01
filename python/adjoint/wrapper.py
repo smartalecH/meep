@@ -160,6 +160,7 @@ class MeepJaxWrapper:
         }
         self.simulation.run(**sim_run_args)
 
+        utils.capture_adjoint_forward_snapshots(fwd_design_region_monitors)
         monitor_values = utils.gather_monitor_values(self.monitors)
         return (jnp.asarray(monitor_values), fwd_design_region_monitors)
 

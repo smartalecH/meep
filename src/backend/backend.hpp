@@ -45,6 +45,8 @@
 
 namespace meep {
 
+struct AdjointGradientRequest;
+
 struct Executable {
   explicit Executable(bool material_phase_active_ = false)
       : material_phase_active(material_phase_active_) {}
@@ -427,6 +429,15 @@ public:
   virtual void reduce_dft(const DftReductionRequest &, std::complex<double> *, size_t) {
     throw std::logic_error("backend does not support compact DFT reductions");
   }
+  virtual bool supports_adjoint_gradient(const AdjointGradientRequest &,
+                                         std::string &why) const {
+    why = "backend does not implement adjoint gradients";
+    return false;
+  }
+  virtual void compute_adjoint_gradient(const AdjointGradientRequest &, double *, size_t,
+                                        BackendState &) {
+    throw std::logic_error("backend does not implement adjoint gradients");
+  }
   virtual void synchronize() = 0;
   virtual backend_capabilities capabilities() const = 0;
 
@@ -686,6 +697,8 @@ void backend_cw_clone_checkpoint();
 void backend_set_cw_plan_corruption_for_testing(bool enabled);
 void backend_set_material_candidate_plan_failure_for_testing(int rank, int mode);
 void backend_set_initialization_only_for_testing(bool enabled);
+void set_adjoint_failure_after_for_testing(int checkpoints);
+void set_nvidia_adjoint_failure_for_testing(const char *point);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI
@@ -693,6 +706,9 @@ void backend_set_initialization_only_for_testing(bool enabled);
 bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
                             std::complex<double> *local_result, size_t result_count,
                             std::string &local_error, const char *site);
+bool backend_try_compute_adjoint_gradient(fields &owner, const AdjointGradientRequest &request,
+                                          double *local_result, size_t result_count,
+                                          const char *site);
 
 /* A checkpoint load may replace array allocations. Preserve authoritative
    resident state before those host pointers change, then retire the stale

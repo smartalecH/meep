@@ -24,6 +24,7 @@ different split, not what the gradient assembly contributes; see the comment on
 `tol` below.
 """
 
+import os
 import unittest
 
 import numpy as np
@@ -37,7 +38,18 @@ DESIGN_N = 6
 SEED = 0
 
 
-def _gradient(num_chunks):
+def _gradient(
+    num_chunks,
+    retry_after_failure=False,
+    stale_after_forward=False,
+    nvidia_failures=(),
+    nvidia_auto_failure=None,
+    mutate_frequency_after_forward=False,
+    use_symmetry=False,
+    k_point=False,
+    weights_override=None,
+    need_gradient=True,
+):
     """Adjoint gradient of |alpha|^2 for a fixed problem at a forced chunk count."""
     si, clad = mp.Medium(index=3.48), mp.Medium(index=1.44)
     pml, port_pad, side_pad = 0.5, 0.8, 0.5
@@ -47,7 +59,11 @@ def _gradient(num_chunks):
     sy = 2 * pml + 2 * side_pad + design
     sz = 2 * pml + 2 * side_pad + thickness
 
-    weights = np.random.default_rng(SEED).uniform(0.2, 0.8, size=DESIGN_N * DESIGN_N)
+    weights = (
+        np.asarray(weights_override, dtype=np.float64).reshape(-1)
+        if weights_override is not None
+        else np.random.default_rng(SEED).uniform(0.2, 0.8, size=DESIGN_N * DESIGN_N)
+    )
     grid = mp.MaterialGrid(
         mp.Vector3(DESIGN_N, DESIGN_N, 1),
         clad,
@@ -87,6 +103,8 @@ def _gradient(num_chunks):
         ],
         eps_averaging=False,
         num_chunks=num_chunks,
+        symmetries=[mp.Mirror(mp.Y)] if use_symmetry else [],
+        k_point=k_point,
     )
     monitor = mpa.EigenmodeCoefficient(
         sim,
@@ -101,11 +119,191 @@ def _gradient(num_chunks):
         frequencies=[fcen],
         decay_by=1e-6,
     )
-    f0, gradient = opt([weights], need_gradient=True)
+    if (
+        retry_after_failure
+        or stale_after_forward
+        or nvidia_failures
+        or nvidia_auto_failure
+        or mutate_frequency_after_forward
+    ):
+        opt.update_design([weights])
+        opt.forward_run()
+        if stale_after_forward:
+            region.update_design_parameters(np.clip(weights + 0.01, 0.0, 1.0))
+            sim.set_materials()
+        if mutate_frequency_after_forward:
+            opt.frequencies = np.asarray([fcen * 1.01])
+        opt.adjoint_run()
+        if stale_after_forward:
+            stale_rejected = False
+            try:
+                opt.calculate_gradient()
+            except RuntimeError:
+                stale_rejected = True
+            return float(np.squeeze(opt.f0)), stale_rejected
+        if mutate_frequency_after_forward:
+            frequency_rejected = False
+            try:
+                opt.calculate_gradient()
+            except RuntimeError:
+                frequency_rejected = True
+            return float(np.squeeze(opt.f0)), frequency_rejected
+        if nvidia_auto_failure:
+            previous_mode = os.environ.get("MEEP_NVIDIA_ADJOINT_MODE")
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "auto"
+            mp._set_nvidia_adjoint_failure_for_testing(nvidia_auto_failure)
+            try:
+                opt.calculate_gradient()
+            finally:
+                mp._set_nvidia_adjoint_failure_for_testing("clear")
+                if previous_mode is None:
+                    os.environ.pop("MEEP_NVIDIA_ADJOINT_MODE", None)
+                else:
+                    os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = previous_mode
+            f0, gradient = opt.f0, opt.gradient
+            return (
+                float(np.squeeze(f0)),
+                np.asarray(np.real(np.squeeze(gradient)), dtype=np.float64).reshape(-1),
+            )
+        if retry_after_failure:
+            for checkpoint in (0, 1, 2):
+                mp._set_adjoint_failure_after_for_testing(checkpoint)
+                failed = False
+                try:
+                    opt.calculate_gradient()
+                except RuntimeError:
+                    failed = True
+                finally:
+                    mp._set_adjoint_failure_after_for_testing(-1)
+                if not failed:
+                    raise AssertionError(
+                        f"injected adjoint checkpoint {checkpoint} did not propagate"
+                    )
+        for point in nvidia_failures:
+            mp._set_nvidia_adjoint_failure_for_testing(point)
+            failed = False
+            try:
+                opt.calculate_gradient()
+            except RuntimeError:
+                failed = True
+            finally:
+                mp._set_nvidia_adjoint_failure_for_testing("clear")
+            if not failed:
+                raise AssertionError(f"injected NVIDIA adjoint {point} failure did not propagate")
+        # The failed transaction must leave the same snapshots and adjoint
+        # chunks available for a clean retry.
+        previous_mode = os.environ.get("MEEP_NVIDIA_ADJOINT_MODE")
+        if nvidia_failures:
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "host"
+        opt.calculate_gradient()
+        if nvidia_failures:
+            if previous_mode is None:
+                os.environ.pop("MEEP_NVIDIA_ADJOINT_MODE", None)
+            else:
+                os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = previous_mode
+        f0, gradient = opt.f0, opt.gradient
+    else:
+        f0, gradient = opt([weights], need_gradient=need_gradient)
+        if not need_gradient:
+            return float(np.squeeze(f0)), None
     return (
         float(np.squeeze(f0)),
         np.asarray(np.real(np.squeeze(gradient)), dtype=np.float64).reshape(-1),
     )
+
+
+def _nonzero_m_gradient():
+    """Small cylindrical host-oracle regression for the reversible m flip."""
+    fcen = 0.8
+    weights = np.asarray([0.25, 0.45, 0.65, 0.75], dtype=np.float64)
+    grid = mp.MaterialGrid(
+        mp.Vector3(2, 0, 2),
+        mp.Medium(index=1.4),
+        mp.Medium(index=2.4),
+        weights=weights.reshape(2, 1, 2),
+        do_averaging=False,
+    )
+    region = mpa.DesignRegion(
+        grid,
+        volume=mp.Volume(center=mp.Vector3(0.55, 0, 0), size=mp.Vector3(0.7, 0, 0.7)),
+    )
+    sim = mp.Simulation(
+        cell_size=mp.Vector3(1.5, 0, 1.5),
+        dimensions=mp.CYLINDRICAL,
+        m=1.0,
+        resolution=8,
+        boundary_layers=[mp.PML(0.2)],
+        geometry=[mp.Block(center=region.center, size=region.size, material=grid)],
+        sources=[
+            mp.Source(
+                mp.GaussianSource(fcen, fwidth=0.3),
+                component=mp.Er,
+                center=mp.Vector3(0.45, 0, -0.45),
+            )
+        ],
+    )
+    monitor = mpa.FourierFields(
+        sim,
+        mp.Volume(center=mp.Vector3(0.55, 0, 0.35), size=mp.Vector3(0.5, 0, 0)),
+        mp.Er,
+    )
+    opt = mpa.OptimizationProblem(
+        simulation=sim,
+        objective_functions=lambda values: npa.sum(npa.abs(values) ** 2),
+        objective_arguments=[monitor],
+        design_regions=[region],
+        frequencies=[fcen],
+        decay_by=1e-3,
+        maximum_run_time=30,
+    )
+    _, gradient = opt([weights])
+    return np.asarray(np.real(np.squeeze(gradient)), dtype=np.float64).reshape(-1)
+
+
+def _small_cartesian_gradient():
+    """Compact native-CUDA adjoint integration fixture."""
+    fcen = 0.8
+    weights = np.asarray([0.25, 0.45, 0.65, 0.75], dtype=np.float64)
+    grid = mp.MaterialGrid(
+        mp.Vector3(2, 2),
+        mp.Medium(index=1.4),
+        mp.Medium(index=2.4),
+        weights=weights.reshape(2, 2),
+        do_averaging=False,
+    )
+    region = mpa.DesignRegion(
+        grid, volume=mp.Volume(center=mp.Vector3(), size=mp.Vector3(0.7, 0.7))
+    )
+    sim = mp.Simulation(
+        cell_size=mp.Vector3(1.5, 1.5),
+        resolution=8,
+        accelerator_strict=False,
+        boundary_layers=[mp.PML(0.2)],
+        geometry=[mp.Block(center=region.center, size=region.size, material=grid)],
+        sources=[
+            mp.Source(
+                mp.GaussianSource(fcen, fwidth=0.3),
+                component=mp.Ez,
+                center=mp.Vector3(-0.45, 0),
+            )
+        ],
+    )
+    monitor = mpa.FourierFields(
+        sim, mp.Volume(center=mp.Vector3(0.35, 0), size=mp.Vector3(0, 0.5)), mp.Ez
+    )
+    opt = mpa.OptimizationProblem(
+        simulation=sim,
+        objective_functions=lambda values: npa.sum(npa.abs(values) ** 2),
+        objective_arguments=[monitor],
+        design_regions=[region],
+        frequencies=[fcen],
+        decay_by=1e-3,
+        maximum_run_time=30,
+    )
+    objective, gradient = opt([weights])
+    return float(np.squeeze(objective)), np.asarray(
+        np.real(np.squeeze(gradient)), dtype=np.float64
+    ).reshape(-1)
 
 
 class TestAdjointChunks(unittest.TestCase):
@@ -135,6 +333,141 @@ class TestAdjointChunks(unittest.TestCase):
         self.assertLess(
             rel, tol, f"gradient changed by {rel:.3e} under a different chunk split"
         )
+
+    def test_gradient_failure_preserves_snapshot_and_adjoint_chunks(self):
+        _, expected = _gradient(num_chunks=mp.count_processors())
+        _, retried = _gradient(
+            num_chunks=mp.count_processors(), retry_after_failure=True
+        )
+        tol = 1e-5 if mp.is_single_precision() else 1e-12
+        self.assertLess(
+            np.linalg.norm(expected - retried) / np.linalg.norm(expected), tol
+        )
+
+    def test_material_mutation_rejects_stale_forward_snapshot(self):
+        _, stale_rejected = _gradient(
+            num_chunks=mp.count_processors(), stale_after_forward=True
+        )
+        self.assertTrue(stale_rejected)
+
+    def test_frequency_mutation_rejects_stale_forward_snapshot(self):
+        _, stale_rejected = _gradient(
+            num_chunks=mp.count_processors(), mutate_frequency_after_forward=True
+        )
+        self.assertTrue(stale_rejected)
+
+    def test_nonzero_bloch_k_restores_host_fallback_snapshot(self):
+        previous_mode = os.environ.get("MEEP_NVIDIA_ADJOINT_MODE")
+        try:
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "host"
+            _, gradient = _gradient(
+                num_chunks=mp.count_processors(), k_point=mp.Vector3(0.07, 0.03, 0.0)
+            )
+            self.assertTrue(np.all(np.isfinite(gradient)))
+        finally:
+            if previous_mode is None:
+                os.environ.pop("MEEP_NVIDIA_ADJOINT_MODE", None)
+            else:
+                os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = previous_mode
+
+    def test_nonzero_cylindrical_m_restores_host_fallback_snapshot(self):
+        previous_mode = os.environ.get("MEEP_NVIDIA_ADJOINT_MODE")
+        try:
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "host"
+            gradient = _nonzero_m_gradient()
+            self.assertTrue(np.all(np.isfinite(gradient)))
+        finally:
+            if previous_mode is None:
+                os.environ.pop("MEEP_NVIDIA_ADJOINT_MODE", None)
+            else:
+                os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = previous_mode
+
+    @unittest.skipUnless(
+        os.environ.get("MEEP_TEST_ADJOINT_FD"), "expensive finite-difference gate"
+    )
+    def test_directional_finite_difference(self):
+        weights = np.random.default_rng(SEED).uniform(
+            0.2, 0.8, size=DESIGN_N * DESIGN_N
+        )
+        direction = np.random.default_rng(SEED + 1).normal(size=weights.size)
+        direction /= np.linalg.norm(direction)
+        step = 1e-4
+        f0, gradient = _gradient(
+            num_chunks=mp.count_processors(), weights_override=weights
+        )
+        perturbed, _ = _gradient(
+            num_chunks=mp.count_processors(),
+            weights_override=weights + step * direction,
+            need_gradient=False,
+        )
+        adjoint_delta = step * np.dot(gradient, direction)
+        finite_delta = perturbed - f0
+        relative = abs(adjoint_delta - finite_delta) / max(
+            abs(adjoint_delta), abs(finite_delta), 1e-15
+        )
+        self.assertLess(relative, 0.03)
+
+    @unittest.skipUnless(
+        os.environ.get("MEEP_TEST_NVIDIA_ADJOINT_FAILURES"),
+        "requires the NVIDIA adjoint backend",
+    )
+    def test_nvidia_failures_preserve_retry_state(self):
+        expected = None
+        for failures in (("allocation", "upload", "download"), ("launch",)):
+            _, retried = _gradient(
+                num_chunks=mp.count_processors(), nvidia_failures=failures
+            )
+            tol = 1e-5 if mp.is_single_precision() else 1e-12
+            if expected is None:
+                expected = retried
+            else:
+                self.assertLess(
+                    np.linalg.norm(expected - retried) / np.linalg.norm(expected), tol
+                )
+        _, automatic = _gradient(
+            num_chunks=mp.count_processors(), nvidia_auto_failure="allocation"
+        )
+        self.assertLess(
+            np.linalg.norm(expected - automatic) / np.linalg.norm(expected), tol
+        )
+
+    @unittest.skipUnless(
+        os.environ.get("MEEP_TEST_NVIDIA_ADJOINT_FAILURES"),
+        "requires the NVIDIA adjoint backend",
+    )
+    def test_nvidia_support_policy_is_explicit(self):
+        previous_mode = os.environ.get("MEEP_NVIDIA_ADJOINT_MODE")
+        try:
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "required"
+            with self.assertRaises(RuntimeError):
+                _gradient(num_chunks=mp.count_processors(), use_symmetry=True)
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "auto"
+            _, gradient = _gradient(
+                num_chunks=mp.count_processors(), use_symmetry=True
+            )
+            self.assertTrue(np.all(np.isfinite(gradient)))
+        finally:
+            if previous_mode is None:
+                os.environ.pop("MEEP_NVIDIA_ADJOINT_MODE", None)
+            else:
+                os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = previous_mode
+
+    @unittest.skipUnless(
+        os.environ.get("MEEP_TEST_NVIDIA_ADJOINT_REQUIRED"),
+        "requires the NVIDIA adjoint backend",
+    )
+    def test_nvidia_required_compact_gradient(self):
+        previous_mode = os.environ.get("MEEP_NVIDIA_ADJOINT_MODE")
+        try:
+            os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = "required"
+            objective, gradient = _small_cartesian_gradient()
+            self.assertTrue(np.isfinite(objective))
+            self.assertTrue(np.all(np.isfinite(gradient)))
+        finally:
+            if previous_mode is None:
+                os.environ.pop("MEEP_NVIDIA_ADJOINT_MODE", None)
+            else:
+                os.environ["MEEP_NVIDIA_ADJOINT_MODE"] = previous_mode
 
 
 if __name__ == "__main__":

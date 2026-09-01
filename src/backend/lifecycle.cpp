@@ -165,6 +165,7 @@ void lifecycle_init(fields &f) {
   f.dirty_mask = dirty_none;
   for (int i = 0; i < fields::num_mutation_kinds; ++i)
     f.mutation_generation[i] = 0;
+  f.checkpoint_publication_generation = 0;
   f.connections_generation = 0;
   f.connections_built_generation = 0;
   f.local_invalidation_generation = 0;

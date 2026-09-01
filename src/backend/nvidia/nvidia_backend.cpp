@@ -7,6 +7,8 @@
 */
 
 #include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/adjoint_plan.hpp"
+#include "backend/nvidia/nvidia_adjoint.hpp"
 #include "backend/nvidia/nvidia_coordinates.hpp"
 #include "backend/nvidia/nvidia_cw.hpp"
 
@@ -12951,6 +12953,159 @@ void NvidiaBackend::reduce_dft(const DftReductionRequest &request,
   const double *values = static_cast<const double *>(state.staging_.data());
   for (size_t i = 0; i < result_count; ++i)
     local_result[i] = std::complex<double>(values[2 * i], values[2 * i + 1]);
+}
+
+bool NvidiaBackend::supports_adjoint_gradient(const AdjointGradientRequest &request,
+                                              std::string &why) const {
+  try {
+    validate_adjoint_request(request);
+    validate_adjoint_snapshot_freshness(*request.forward, f_);
+    validate_adjoint_snapshot_freshness(*request.adjoint, f_);
+    const MaterialIR *ir = material_ir_for(f_);
+    if (!ir || request.material_recipe.get() != f_.material_ir.get() ||
+        request.material_signature != ir->signature ||
+        request.material_layout_signature != ir->layout_signature)
+      throw std::invalid_argument("adjoint material recipe is stale");
+    if (request.disposition != AdjointSupportDisposition::device_native ||
+        request.support_reasons != adjoint_support_none)
+      throw std::invalid_argument("adjoint request is outside the native support matrix");
+    for (const AdjointDftTerm &term : request.terms)
+      if (!is_valid(term.adjoint.id))
+        throw std::invalid_argument("adjoint request has no resident adjoint array");
+    why.clear();
+    return true;
+  }
+  catch (const std::exception &error) {
+    why = error.what();
+    return false;
+  }
+}
+
+void NvidiaBackend::compute_adjoint_gradient(const AdjointGradientRequest &request,
+                                             double *local_result, size_t result_count,
+                                             BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  std::string why;
+  if (!supports_adjoint_gradient(request, why)) throw std::invalid_argument(why);
+  if (!local_result || result_count != request.output_count)
+    throw std::invalid_argument("NVIDIA adjoint output-count mismatch");
+  if (state.transfer_failed_)
+    throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
+  if (request.contributions.empty()) {
+    std::fill(local_result, local_result + result_count, 0.0);
+    return;
+  }
+
+  const size_t forward_base_count =
+      checked_add(request.forward->terms.size(), size_t(1),
+                  "sizing NVIDIA adjoint forward offsets");
+  const size_t adjoint_base_count =
+      checked_add(request.adjoint->terms.size(), size_t(1),
+                  "sizing NVIDIA adjoint reverse offsets");
+  std::vector<size_t> forward_base(forward_base_count, 0);
+  std::vector<size_t> adjoint_base(adjoint_base_count, 0);
+  std::vector<nvidia::adjoint_complex64> forward_values;
+  std::vector<nvidia::adjoint_complex64> adjoint_values;
+  for (size_t i = 0; i < request.forward->terms.size(); ++i) {
+    forward_base[i] = forward_values.size();
+    for (const std::complex<double> value : request.forward->terms[i].values)
+      forward_values.push_back(nvidia::adjoint_complex64{value.real(), value.imag()});
+  }
+  forward_base.back() = forward_values.size();
+  for (size_t i = 0; i < request.adjoint->terms.size(); ++i) {
+    adjoint_base[i] = adjoint_values.size();
+    for (const std::complex<double> value : request.adjoint->terms[i].values)
+      adjoint_values.push_back(nvidia::adjoint_complex64{value.real(), value.imag()});
+  }
+  adjoint_base.back() = adjoint_values.size();
+
+  const size_t offset_count =
+      checked_add(result_count, size_t(1), "sizing NVIDIA adjoint output offsets");
+  std::vector<uint64_t> offsets(offset_count, 0);
+  for (const AdjointGradientContribution &source : request.contributions) {
+    if (offsets[source.output_index + 1] == UINT64_MAX)
+      throw std::overflow_error("NVIDIA adjoint output contribution count overflows");
+    ++offsets[source.output_index + 1];
+  }
+  for (size_t i = 0; i < result_count; ++i) {
+    if (offsets[i + 1] > UINT64_MAX - offsets[i])
+      throw std::overflow_error("NVIDIA adjoint contribution prefix overflows");
+    offsets[i + 1] += offsets[i];
+  }
+  std::vector<uint64_t> cursor(offsets.begin(), offsets.end() - 1);
+  std::vector<nvidia::adjoint_contribution> contributions(request.contributions.size());
+  for (const AdjointGradientContribution &source : request.contributions) {
+    nvidia::adjoint_contribution destination = {};
+    destination.adjoint_index =
+        adjoint_base[source.adjoint_snapshot_term] + source.adjoint_value_index;
+    destination.forward_count = source.forward_value_count;
+    for (uint32_t i = 0; i < source.forward_value_count; ++i) {
+      destination.forward_index[i] =
+          source.forward_value_indices[i] == std::numeric_limits<size_t>::max()
+              ? UINT64_MAX
+              : forward_base[source.forward_snapshot_term] + source.forward_value_indices[i];
+      destination.forward_weight[i] = source.forward_weights[i];
+    }
+    destination.adjoint_coefficient_real = source.adjoint_coefficient.real();
+    destination.adjoint_coefficient_imag = source.adjoint_coefficient.imag();
+    destination.material_coefficient_real = source.material_coefficient.real();
+    destination.material_coefficient_imag = source.material_coefficient.imag();
+    destination.accumulation_scale = source.accumulation_scale;
+    contributions[size_t(cursor[source.output_index]++)] = destination;
+  }
+
+  const size_t forward_bytes = checked_product(forward_values.size(),
+                                               sizeof(nvidia::adjoint_complex64),
+                                               "sizing NVIDIA adjoint forward snapshot");
+  const size_t adjoint_bytes = checked_product(adjoint_values.size(),
+                                               sizeof(nvidia::adjoint_complex64),
+                                               "sizing NVIDIA adjoint field snapshot");
+  const size_t contribution_bytes = checked_product(contributions.size(),
+                                                    sizeof(nvidia::adjoint_contribution),
+                                                    "sizing NVIDIA adjoint contributions");
+  const size_t offset_bytes = checked_product(offsets.size(), sizeof(uint64_t),
+                                              "sizing NVIDIA adjoint offsets");
+  const size_t result_bytes = checked_product(result_count, sizeof(double),
+                                              "sizing NVIDIA adjoint result");
+  nvidia::device_buffer forward_device(forward_bytes, device_);
+  nvidia::device_buffer adjoint_device(adjoint_bytes, device_);
+  nvidia::device_buffer contribution_device(contribution_bytes, device_);
+  nvidia::device_buffer offset_device(offset_bytes, device_);
+  nvidia::device_buffer result_device(result_bytes, device_);
+  state.ensure_staging(result_bytes);
+
+  bool enqueued = false;
+  try {
+    nvidia::copy_host_to_device_async(forward_device, 0, forward_values.data(), forward_bytes,
+                                      *state.transfer_);
+    enqueued = true;
+    nvidia::copy_host_to_device_async(adjoint_device, 0, adjoint_values.data(), adjoint_bytes,
+                                      *state.transfer_);
+    nvidia::copy_host_to_device_async(contribution_device, 0, contributions.data(),
+                                      contribution_bytes, *state.transfer_);
+    nvidia::copy_host_to_device_async(offset_device, 0, offsets.data(), offset_bytes,
+                                      *state.transfer_);
+    nvidia::adjoint_launch launch = {
+        static_cast<const nvidia::adjoint_complex64 *>(forward_device.opaque_handle()),
+        static_cast<const nvidia::adjoint_complex64 *>(adjoint_device.opaque_handle()),
+        static_cast<const nvidia::adjoint_contribution *>(contribution_device.opaque_handle()),
+        static_cast<const uint64_t *>(offset_device.opaque_handle()),
+        static_cast<double *>(result_device.opaque_handle()),
+        forward_values.size(), adjoint_values.size(), contributions.size(), result_count};
+    nvidia::launch_adjoint_gradient(launch, *state.transfer_);
+    nvidia::copy_device_to_host_async(state.staging_.data(), result_device, 0, result_bytes,
+                                      *state.transfer_);
+    state.transfer_->synchronize();
+    std::copy(static_cast<const double *>(state.staging_.data()),
+              static_cast<const double *>(state.staging_.data()) + result_count, local_result);
+  }
+  catch (...) {
+    if (enqueued) {
+      state.transfer_failed_ = true;
+      poison();
+    }
+    throw;
+  }
 }
 
 void NvidiaBackend::synchronize() {

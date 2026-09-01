@@ -77,6 +77,16 @@ class DesignRegion:
         return onp.squeeze(grad).T
 
 
+def capture_adjoint_forward_snapshots(
+    forward_fields: List[List[mp.DftFields]],
+) -> None:
+    """Freeze persistent forward DFT values before monitor removal."""
+    for region_fields in forward_fields:
+        if len(region_fields) != 3:
+            raise ValueError("adjoint design region requires exactly three field monitors")
+        mp._capture_adjoint_forward(*(field.swigobj for field in region_fields))
+
+
 def _check_if_cylindrical(sim: mp.Simulation) -> bool:
     return sim.is_cylindrical or (sim.dimensions == mp.CYLINDRICAL)
 

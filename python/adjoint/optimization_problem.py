@@ -280,6 +280,10 @@ class OptimizationProblem:
                 ),
             )
 
+        utils.capture_adjoint_forward_snapshots(
+            self.forward_design_region_monitors
+        )
+
         # record objective quantities from user specified monitors
         self.results_list = [m() for m in self.objective_arguments]
         # evaluate objectives
@@ -308,7 +312,6 @@ class OptimizationProblem:
     def adjoint_run(self):
         # set up adjoint sources and monitors
         self.prepare_adjoint_run()
-
         # flip the m number
         if utils._check_if_cylindrical(self.sim):
             self.sim.change_m(-self.sim.m)

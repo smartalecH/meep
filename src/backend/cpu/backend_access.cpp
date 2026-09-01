@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -23,6 +24,7 @@
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/backend.hpp"
+#include "backend/adjoint_plan.hpp"
 #include "backend/cpu/cpu_backend.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/halo_plan.hpp"
@@ -2858,6 +2860,60 @@ bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
 
   backend_reconcile_host_access(local_error, site);
   return true;
+}
+
+bool backend_try_compute_adjoint_gradient(fields &owner, const AdjointGradientRequest &request,
+                                          double *local_result, size_t result_count,
+                                          const char *site) {
+  bool parse_valid = true;
+  AdjointExecutionMode mode = AdjointExecutionMode::automatic;
+  const char *setting = std::getenv("MEEP_NVIDIA_ADJOINT_MODE");
+  if (setting && *setting) {
+    if (std::strcmp(setting, "auto") == 0)
+      mode = AdjointExecutionMode::automatic;
+    else if (std::strcmp(setting, "required") == 0)
+      mode = AdjointExecutionMode::required;
+    else if (std::strcmp(setting, "host") == 0)
+      mode = AdjointExecutionMode::host;
+    else
+      parse_valid = false;
+  }
+  if (or_to_all(!parse_valid))
+    throw std::invalid_argument(parse_valid
+                                    ? "NVIDIA adjoint mode was invalid on another rank"
+                                    : "invalid NVIDIA adjoint mode (expected auto, required, or host)");
+  const int minimum_mode = min_to_all(int(mode));
+  const int maximum_mode = max_to_all(int(mode));
+  if (minimum_mode != maximum_mode)
+    throw std::invalid_argument("NVIDIA adjoint mode differs across MPI ranks");
+  if (mode == AdjointExecutionMode::host) return false;
+
+  std::string why;
+  const bool local_supported = owner.backend && owner.backend_state &&
+                               owner.backend->requires_full_storage_preparation() &&
+                               owner.backend->supports_adjoint_gradient(request, why);
+  if (!and_to_all(local_supported)) {
+    if (mode == AdjointExecutionMode::required)
+      throw std::runtime_error(local_supported ? "adjoint offload is unsupported on another rank"
+                                               : why);
+    return false;
+  }
+
+  std::string local_error;
+  try {
+    owner.backend->compute_adjoint_gradient(request, local_result, result_count,
+                                            *owner.backend_state);
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown adjoint backend failure"; }
+  const bool any_error = or_to_all(!local_error.empty());
+  const bool any_poison = or_to_all(owner.backend->is_poisoned());
+  if (!any_error) return true;
+  if (mode == AdjointExecutionMode::required || any_poison)
+    throw std::runtime_error(local_error.empty()
+                                 ? std::string(site) + ": adjoint backend failed on another rank"
+                                 : std::string(site) + ": " + local_error);
+  return false;
 }
 
 void backend_prepare_checkpoint_load(fields &f) {

@@ -872,7 +872,41 @@ meep::volume_list *make_volume_list(const meep::volume &v, int c,
 // typemaps needed for material grid
 //--------------------------------------------------
 
+%exception _capture_adjoint_forward {
+  try {
+    $action
+  } catch (const std::exception &e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    SWIG_fail;
+  }
+}
+
+%exception _get_gradient {
+  try {
+    $action
+  } catch (const std::exception &e) {
+    PyErr_SetString(PyExc_RuntimeError, e.what());
+    SWIG_fail;
+  }
+}
+
 %inline %{
+void _capture_adjoint_forward(meep::dft_fields *fields_f_0,
+                              meep::dft_fields *fields_f_1,
+                              meep::dft_fields *fields_f_2) {
+    if (!fields_f_0 || !fields_f_1 || !fields_f_2)
+        throw std::invalid_argument("adjoint forward snapshot requires three monitors");
+    fields_f_0->capture_adjoint_snapshot(fields_f_1, fields_f_2);
+}
+
+void _set_adjoint_failure_after_for_testing(int checkpoints) {
+    meep::set_adjoint_failure_after_for_testing(checkpoints);
+}
+
+void _set_nvidia_adjoint_failure_for_testing(const char *point) {
+    meep::set_nvidia_adjoint_failure_for_testing(point);
+}
+
 void _get_gradient(PyObject *grad, double scalegrad,
                    meep::dft_fields *fields_a_0, meep::dft_fields *fields_a_1, meep::dft_fields *fields_a_2,
                    meep::dft_fields *fields_f_0, meep::dft_fields *fields_f_1, meep::dft_fields *fields_f_2,
@@ -1488,6 +1522,8 @@ void _get_gradient(PyObject *grad, double scalegrad,
 %ignore meep::dft_force::monitor_lifetime;
 %ignore meep::dft_near2far::monitor_lifetime;
 %ignore meep::dft_fields::monitor_lifetime;
+%ignore meep::dft_fields::adjoint_snapshot;
+%ignore meep::dft_fields::capture_adjoint_snapshot;
 %ignore meep::fields::dirty_mask;
 %ignore meep::fields::mutation_generation;
 %ignore meep::fields::connections_generation;
@@ -1516,6 +1552,7 @@ void _get_gradient(PyObject *grad, double scalegrad,
 %ignore meep_geom::geom_epsilon::owned_recipe_signature;
 %ignore meep_geom::geom_epsilon::has_owned_recipe;
 %ignore meep_geom::geom_epsilon::recipe_matches;
+%ignore meep_geom::geom_epsilon::owned_unique_susceptibilities;
 %ignore meep_geom::geom_epsilon::bind_owned_recipe;
 
 // template instantiations

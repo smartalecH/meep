@@ -1539,12 +1539,17 @@ public:
                                              const std::complex<double> *dJ);
   void scale_dfts(std::complex<double> scale);
 
+  /* Backend-private adjoint handoff. The implementation stores an immutable
+     snapshot behind the opaque shared owner; SWIG hides both members. */
+  void capture_adjoint_snapshot(dft_fields *second, dft_fields *third);
+
   void remove();
 
   std::vector<double> freq;
   dft_chunk *chunks;
   volume where;
   std::shared_ptr<dft_monitor_lifetime> monitor_lifetime;
+  std::shared_ptr<const void> adjoint_snapshot;
 };
 
 // data for each susceptibility
@@ -2123,6 +2128,10 @@ public:
   static const int num_mutation_kinds = 14;
   uint32_t dirty_mask;
   uint64_t mutation_generation[num_mutation_kinds];
+  /* Local epoch for a complete checkpoint replacement. It is deliberately
+     not serialized and distinguishes load publication from the ordinary
+     forward-to-adjoint field-layout rebuild. */
+  uint64_t checkpoint_publication_generation;
   /* Shadows `chunk_connections_valid`: connectivity is current iff these two
      agree. connect_chunks() catches the second up to the first. */
   uint64_t connections_generation;

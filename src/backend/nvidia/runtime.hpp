@@ -296,6 +296,7 @@ enum class failure_point {
   material_finalize,
   material_compile,
   state_rebuild_sync,
+  adjoint_launch,
   graph_create,
   graph_begin_capture,
   graph_end_capture,
