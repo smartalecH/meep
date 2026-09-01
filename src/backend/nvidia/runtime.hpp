@@ -294,6 +294,9 @@ enum class failure_point {
   graph_begin_capture,
   graph_end_capture,
   graph_instantiate,
+  magnetic_graph_instantiate,
+  cw_graph_capture,
+  cw_graph_instantiate,
   graph_update,
   graph_scalar_write,
   graph_launch,
@@ -301,6 +304,7 @@ enum class failure_point {
   graph_exec_destroy
 };
 void fail_next(failure_point point);
+void fail_next_then(failure_point point, failure_point followup);
 void clear_failure();
 bool consume_failure_for_testing(failure_point point);
 transfer_accounting current_transfer_accounting();

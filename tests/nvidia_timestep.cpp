@@ -1929,6 +1929,8 @@ static void run_magnetic_sync_case(const char *name, precision_policy_kind polic
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options, 0, 0, true, 0, 0, scaled_k);
   if (real_fields) {
     cpu.use_real_fields();
@@ -1963,6 +1965,16 @@ static void run_magnetic_sync_case(const char *name, precision_policy_kind polic
   cpu.advance(1);
   cpu.t = 0;
   gpu.init_backend();
+  require_selected_graph_mode(gpu);
+  NvidiaBackend *graph_backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  if (getenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED")) {
+    const NvidiaGraphStatistics stats =
+        graph_backend ? graph_backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
+    require(graph_backend && stats.magnetic_segment_count > 0 &&
+                stats.magnetic_capture_count == stats.magnetic_segment_count &&
+                stats.magnetic_instantiate_count == stats.magnetic_segment_count,
+            "NVIDIA magnetic graph capture/instantiate accounting is incomplete");
+  }
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
   initialize_fields(cpu, gpu, narrowed);
@@ -1993,6 +2005,13 @@ static void run_magnetic_sync_case(const char *name, precision_policy_kind polic
   cpu.restore_magnetic_fields();
   gpu.restore_magnetic_fields();
   compare_fields(cpu, gpu, tolerance);
+
+  if (getenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED")) {
+    const NvidiaGraphStatistics stats = graph_backend->graph_statistics_for_testing();
+    require(stats.magnetic_scalar_write_count > 0 && stats.magnetic_launch_count > 0 &&
+                stats.magnetic_boundary_count > 0,
+            "NVIDIA magnetic graph replay accounting is empty");
+  }
   cpu.restore_magnetic_fields();
   gpu.restore_magnetic_fields();
   compare_fields(cpu, gpu, tolerance);
@@ -2024,6 +2043,10 @@ static void test_magnetic_pre_step_and_recompile() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -2038,6 +2061,7 @@ static void test_magnetic_pre_step_and_recompile() {
   gpu.synchronize_magnetic_fields();
   require(gpu.backend_state && gpu.executable,
           "NVIDIA pre-step magnetic synchronization did not prepare resident execution");
+  require_selected_graph_mode(gpu);
   compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
 
   /* A non-integrated source changes only source descriptors/executable shape.
@@ -2069,14 +2093,30 @@ static void test_magnetic_pre_step_and_recompile() {
   cpu.add_point_source(Hz, trailing, vec(0.23, 0.21), 0.11);
   gpu.add_point_source(Hz, trailing, vec(0.23, 0.21), 0.11);
   old_executable = gpu.executable;
-  cpu.advance(1);
-  gpu.advance(1);
+  if (getenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED")) {
+    bool rejected = false;
+    try { gpu.advance(1); }
+    catch (const std::exception &error) {
+      rejected = std::string(error.what()).find("magnetic snapshot is live") !=
+                 std::string::npos;
+    }
+    require(rejected && gpu.executable == old_executable &&
+                is_dirty(gpu, dirty_executable) && !gpu.backend->is_poisoned(),
+            "NVIDIA graph replacement was not rejected with a live magnetic snapshot");
+    cpu.restore_magnetic_fields();
+    gpu.restore_magnetic_fields();
+    cpu.advance(1);
+    gpu.advance(1);
+  }
+  else {
+    cpu.advance(1);
+    gpu.advance(1);
+    cpu.restore_magnetic_fields();
+    gpu.restore_magnetic_fields();
+  }
   require(gpu.executable && gpu.executable != old_executable &&
               !is_dirty(gpu, dirty_executable),
-          "NVIDIA live-snapshot source mutation did not recompile for advance");
-  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
-  cpu.restore_magnetic_fields();
-  gpu.restore_magnetic_fields();
+          "NVIDIA source mutation did not recompile after magnetic restore");
   compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
   master_printf("nvidia_timestep: magnetic pre-step/recompile PASS\n");
 }
@@ -2109,8 +2149,13 @@ static void test_magnetic_historical_host_backups() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   migrating.select_backend(options);
   migrating.init_backend();
+  require_selected_graph_mode(migrating);
   reference.advance(2);
   migrating.advance(2);
   compare_live_fields_by_key(reference, migrating,
@@ -2124,6 +2169,82 @@ static void test_magnetic_historical_host_backups() {
   compare_live_fields_by_key(reference, migrating,
                              sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
   master_printf("nvidia_timestep: magnetic historical host backups PASS\n");
+}
+
+static void test_magnetic_graph_launch_failures() {
+  for (int restore = 0; restore < 2; ++restore) {
+    const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    options.precision = precision_policy_kind::native;
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ez);
+    gpu.init_backend();
+    require_selected_graph_mode(gpu);
+    if (restore) gpu.synchronize_magnetic_fields();
+    const int entry_t = gpu.t;
+    nvidia::testing::fail_next(nvidia::testing::failure_point::graph_launch);
+    bool rejected = false;
+    try {
+      if (restore) gpu.restore_magnetic_fields();
+      else gpu.synchronize_magnetic_fields();
+    }
+    catch (const std::exception &error) {
+      rejected = std::string(error.what()).find("graph launch") != std::string::npos;
+    }
+    nvidia::testing::clear_failure();
+    require(rejected && gpu.backend->is_poisoned() && gpu.t == entry_t,
+            restore ? "NVIDIA magnetic restore graph failure did not poison"
+                    : "NVIDIA magnetic synchronize graph failure did not poison");
+  }
+  master_printf("nvidia_timestep: magnetic graph launch failures PASS\n");
+}
+
+static void test_magnetic_graph_compile_modes() {
+  const auto run = [](const char *mode, bool expect_rejection) {
+    setenv("MEEP_NVIDIA_GRAPH_MODE", mode, 1);
+    const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ez);
+    nvidia::testing::fail_next(
+        nvidia::testing::failure_point::magnetic_graph_instantiate);
+    bool rejected = false;
+    try { gpu.init_backend(); }
+    catch (const std::exception &error) {
+      rejected = std::string(error.what()).find("magnetic graph instantiate") !=
+                 std::string::npos;
+    }
+    nvidia::testing::clear_failure();
+    if (expect_rejection) {
+      require(rejected && gpu.t == 0,
+              "required magnetic graph instantiate failure was not rejected");
+      return;
+    }
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    const NvidiaGraphStatistics stats =
+        backend ? backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
+    require(!rejected && backend && stats.valid && !stats.enabled &&
+                !gpu.backend->is_poisoned(),
+            "automatic magnetic graph failure did not select whole-program eager");
+    gpu.advance(1);
+    gpu.synchronize_magnetic_fields();
+    gpu.restore_magnetic_fields();
+    require(gpu.t == 1 && !gpu.backend->is_poisoned(),
+            "automatic magnetic eager fallback was not dispatchable");
+  };
+  run("auto", false);
+  run("required", true);
+  master_printf("nvidia_timestep: magnetic graph compile modes PASS\n");
 }
 
 static void require_material_targets_host_only(fields &gpu) {
@@ -4598,9 +4719,11 @@ static void test_graph_teardown_lifetime() {
     const NvidiaGraphStatistics stats =
         backend ? backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
     require(backend && stats.enabled && stats.segment_count > 0 &&
-                stats.instantiate_count == stats.segment_count,
+                stats.instantiate_count == stats.segment_count &&
+                stats.magnetic_segment_count > 0 &&
+                stats.magnetic_instantiate_count == stats.magnetic_segment_count,
             "NVIDIA graph teardown fixture did not own executable graphs");
-    instantiated = stats.instantiate_count;
+    instantiated = stats.instantiate_count + stats.magnetic_instantiate_count;
   }
   const nvidia::graph_accounting graph_after = nvidia::testing::current_graph_accounting();
   const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
@@ -6571,6 +6694,10 @@ static void test_magnetic_compile_rejections() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   const std::vector<double> scaled_k{0.17, -0.11, 0.07};
   fields gpu(&s, options, 0, 0, true, 0, 0, scaled_k);
   gpu.use_bloch(vec(0.17, 0.11));
@@ -9444,6 +9571,22 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_GRAPH_ONLY")) {
     test_graph_execution_integration();
     master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_GRAPH_MAGNETIC_ONLY")) {
+    const precision_policy_kind graph_policies[] = {
+        precision_policy_kind::native, precision_policy_kind::mixed,
+        precision_policy_kind::f32};
+    for (precision_policy_kind policy : graph_policies) {
+      run_magnetic_sync_case("real-pml-conductive-bfast", policy, true, true);
+      run_magnetic_sync_case("complex-pml-conductive", policy, false, false);
+    }
+    test_magnetic_pre_step_and_recompile();
+    test_magnetic_historical_host_backups();
+    test_magnetic_compile_rejections();
+    test_magnetic_graph_compile_modes();
+    test_magnetic_graph_launch_failures();
+    master_printf("nvidia_timestep: magnetic graph PASS\n");
     return 0;
   }
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))

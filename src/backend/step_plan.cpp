@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 
@@ -4012,10 +4013,18 @@ CwPlan build_cw_plan(fields &f, const StepPlan &step_plan) {
   }
   if (live_dft_index != f.descriptors->dfts.size())
     throw std::invalid_argument("CW final DFT order differs from the live monitor order");
+  std::map<int, uint32_t> final_dft_cadence_slots;
   for (size_t i = 0; i < f.descriptors->dfts.size(); ++i) {
     const DftDescriptor &d = f.descriptors->dfts[i];
     if (d.decimation_factor < 1)
       throw std::invalid_argument("CW final DFT has an invalid decimation factor");
+    const std::pair<std::map<int, uint32_t>::iterator, bool> cadence =
+        final_dft_cadence_slots.insert(std::make_pair(
+            d.decimation_factor, uint32_t(final_dft_cadence_slots.size())));
+    if (final_dft_cadence_slots.size() > cw_dft_predicate_capacity)
+      throw std::overflow_error("CW final DFT predicate capacity exceeded");
+    if (d.due_scalar_slot != cadence.first->second)
+      throw std::invalid_argument("CW final DFT due slot differs from canonical cadence order");
     plan.final_dfts.push_back(CwDftDescriptorRef{uint32_t(i), d.chunk, d.c,
                                                  d.decimation_factor, d.due_scalar_slot});
     cw_add_access(f, plan.final_dft_accesses, d.accumulator, AccessMode::read_write);

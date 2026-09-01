@@ -721,7 +721,6 @@ public:
   nvidia::device_buffer material_classification_result_;
   size_t material_classification_result_bytes_;
   MaterialClassificationFacts material_classification_facts_;
-  std::unique_ptr<NvidiaCwWorkspace> cw_workspace_;
   nvidia::device_buffer noisy_seed_slots_;
   int noisy_seed_active_slot_;
   int noisy_seed_staged_slot_;
@@ -831,6 +830,43 @@ struct NvidiaCompiledGraphSegment {
   NvidiaCompiledGraphSegment &operator=(const NvidiaCompiledGraphSegment &) = delete;
 };
 
+struct NvidiaCapturedGraph {
+  nvidia::graph definition;
+  nvidia::graph_exec executable;
+
+  NvidiaCapturedGraph() {}
+  NvidiaCapturedGraph(NvidiaCapturedGraph &&) noexcept = default;
+  NvidiaCapturedGraph &operator=(NvidiaCapturedGraph &&) noexcept = default;
+  NvidiaCapturedGraph(const NvidiaCapturedGraph &) = delete;
+  NvidiaCapturedGraph &operator=(const NvidiaCapturedGraph &) = delete;
+};
+
+void remember_cw_graph_cleanup_error(std::string &error, const std::exception &failure) {
+  if (error.empty()) error = failure.what();
+}
+
+bool cleanup_cw_graph(NvidiaCapturedGraph &graph, std::string &error) {
+  try { graph.executable.reset(); }
+  catch (const std::exception &failure) { remember_cw_graph_cleanup_error(error, failure); }
+  catch (...) {
+    if (error.empty()) error = "unknown CUDA CW graph executable cleanup failure";
+  }
+  try { graph.definition.reset(); }
+  catch (const std::exception &failure) { remember_cw_graph_cleanup_error(error, failure); }
+  catch (...) {
+    if (error.empty()) error = "unknown CUDA CW graph definition cleanup failure";
+  }
+  return !graph.executable.opaque_handle() && !graph.definition.opaque_handle() &&
+         !graph.definition.capturing();
+}
+
+bool cleanup_cw_graphs(std::vector<NvidiaCapturedGraph> &graphs, std::string &error) {
+  bool released = true;
+  for (NvidiaCapturedGraph &graph : graphs)
+    released = cleanup_cw_graph(graph, error) && released;
+  return released;
+}
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, StepProgram program, uint64_t signature,
@@ -905,7 +941,7 @@ public:
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
         material_target_signature_(material_target_signature),
         source_scalar_count_(source_scalar_count), host_segments_(host_segments),
-        graph_enabled_(false) {
+        graph_enabled_(false), cw_workspace_(NULL) {
     for (const nvidia::compiled_polarization_update &update : polarization_updates_)
       has_noisy_updates_ = has_noisy_updates_ ||
                            update.kind ==
@@ -1063,6 +1099,9 @@ public:
        Destroy executable graphs and their definitions while every captured
        allocation is still alive; member reverse-order destruction would do
        the opposite because graph_segments_ precedes those buffers. */
+    magnetic_restore_graph_segments_.clear();
+    magnetic_half_graph_segments_.clear();
+    magnetic_auxiliary_graphs_.clear();
     graph_segments_.clear();
   }
 
@@ -1105,8 +1144,17 @@ public:
   std::vector<NvidiaCompiledHostSegment> host_segments_;
   GraphProgram graph_program_;
   std::vector<NvidiaCompiledGraphSegment> graph_segments_;
+  std::vector<size_t> graph_cw_timestep_launches_;
+  std::vector<size_t> graph_cw_finite_launches_;
+  GraphProgram magnetic_half_graph_program_;
+  std::vector<NvidiaCompiledGraphSegment> magnetic_half_graph_segments_;
+  GraphProgram magnetic_restore_graph_program_;
+  std::vector<NvidiaCompiledGraphSegment> magnetic_restore_graph_segments_;
+  std::vector<NvidiaCapturedGraph> magnetic_auxiliary_graphs_;
   nvidia::device_buffer step_scalars_;
+  nvidia::device_buffer magnetic_step_scalars_;
   bool graph_enabled_;
+  NvidiaCwWorkspace *cw_workspace_;
   NvidiaGraphStatistics graph_statistics_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
@@ -1148,7 +1196,9 @@ public:
                      const std::vector<nvidia::source_point> &source_points,
                      const std::vector<nvidia::dft_launch> &final_dfts,
                      const std::vector<double> &dft_omega,
+                     const std::vector<CwDftDescriptorRef> &final_dft_refs,
                      const CwUnpackDescriptorRefs &unpack,
+                     std::unique_ptr<NvidiaCwWorkspace> workspace,
                      std::unique_ptr<NvidiaExecutable> timestep, NvidiaBackendState &state)
       : owner_(owner), layout_storage_fingerprint_(layout_storage_fingerprint),
         device_storage_fingerprint_(device_storage_fingerprint),
@@ -1156,10 +1206,15 @@ public:
         cw_plan_signature_(cw_plan_signature),
         precision_(precision), real_count_(real_count), rows_(rows), zeroes_(zeroes),
         rhs_stages_(rhs_stages), rhs_sources_(rhs_sources), final_dfts_(final_dfts),
-        unpack_skip_w_components_(unpack.skip_w_components), timestep_(std::move(timestep)) {
+        unpack_skip_w_components_(unpack.skip_w_components), workspace_(std::move(workspace)),
+        timestep_(std::move(timestep)) {
     unpack_operations_[0] = unpack.first_boundary.operation_index;
     unpack_operations_[1] = unpack.constitutive.operation_index;
     unpack_operations_[2] = unpack.second_boundary.operation_index;
+    timestep_->cw_workspace_ = workspace_.get();
+    final_dft_due_slots_.reserve(final_dft_refs.size());
+    for (const CwDftDescriptorRef &reference : final_dft_refs)
+      final_dft_due_slots_.push_back(reference.due_scalar_slot);
     nvidia::device_scope scope(state.device_);
     if (!source_points.empty()) {
       source_points_.allocate(checked_product(source_points.size(), sizeof(source_points[0]),
@@ -1184,6 +1239,41 @@ public:
     if (!source_points.empty() || !dft_omega.empty()) state.transfer_->synchronize();
   }
 
+  ~NvidiaCwExecutable() override {
+    /* Every graph is gone before its scalar block, nested timestep, workspace,
+       descriptor buffers, or backend state can be retired. */
+    std::string cleanup_error;
+    bool released = cleanup_cw_graphs(rhs_stage_graphs_, cleanup_error);
+    released = cleanup_cw_graphs(vector_graphs_, cleanup_error) && released;
+    released = cleanup_cw_graphs(reduction_graphs_, cleanup_error) && released;
+    released = cleanup_cw_graph(final_dft_graph_, cleanup_error) && released;
+    released = cleanup_cw_graph(operator_finalize_graph_, cleanup_error) && released;
+    released = cleanup_cw_graph(operator_prelude_graph_, cleanup_error) && released;
+    released = cleanup_cw_graph(pack_graph_, cleanup_error) && released;
+    released = cleanup_cw_graph(rhs_zero_graph_, cleanup_error) && released;
+    if (!released || !cleanup_error.empty()) {
+      /* Failure injection is one-shot. Retry while the captured buffers are
+         still members of this owner; the graph RAII destructors remain the
+         final best-effort path for a persistent CUDA failure. */
+      cleanup_error.clear();
+      released = cleanup_cw_graphs(rhs_stage_graphs_, cleanup_error);
+      released = cleanup_cw_graphs(vector_graphs_, cleanup_error) && released;
+      released = cleanup_cw_graphs(reduction_graphs_, cleanup_error) && released;
+      released = cleanup_cw_graph(final_dft_graph_, cleanup_error) && released;
+      released = cleanup_cw_graph(operator_finalize_graph_, cleanup_error) && released;
+      released = cleanup_cw_graph(operator_prelude_graph_, cleanup_error) && released;
+      released = cleanup_cw_graph(pack_graph_, cleanup_error) && released;
+      released = cleanup_cw_graph(rhs_zero_graph_, cleanup_error) && released;
+    }
+    if (released) {
+      rhs_stage_graphs_.clear();
+      rhs_stage_reconciliation_kernel_counts_.clear();
+      vector_graphs_.clear();
+      reduction_graphs_.clear();
+    }
+    timestep_.reset();
+  }
+
   const NvidiaBackend *owner_;
   uint64_t layout_storage_fingerprint_;
   uint64_t device_storage_fingerprint_;
@@ -1197,11 +1287,37 @@ public:
   std::vector<Stage> rhs_stages_;
   std::vector<nvidia::cw_source_batch_launch> rhs_sources_;
   std::vector<nvidia::dft_launch> final_dfts_;
+  std::vector<uint32_t> final_dft_due_slots_;
   uint32_t unpack_operations_[3];
   bool unpack_skip_w_components_;
   nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
+  std::unique_ptr<NvidiaCwWorkspace> workspace_;
   std::unique_ptr<NvidiaExecutable> timestep_;
+  nvidia::device_buffer graph_scalars_;
+  nvidia::device_buffer final_dft_scalars_;
+  NvidiaCapturedGraph rhs_zero_graph_;
+  std::vector<NvidiaCapturedGraph> rhs_stage_graphs_;
+  std::vector<size_t> rhs_stage_reconciliation_kernel_counts_;
+  NvidiaCapturedGraph operator_prelude_graph_;
+  NvidiaCapturedGraph pack_graph_;
+  NvidiaCapturedGraph operator_finalize_graph_;
+  std::vector<NvidiaCapturedGraph> vector_graphs_;
+  std::vector<NvidiaCapturedGraph> reduction_graphs_;
+  NvidiaCapturedGraph final_dft_graph_;
+  bool graphs_enabled_ = false;
+  size_t graph_capture_count_ = 0;
+  size_t graph_instantiate_count_ = 0;
+  size_t graph_launch_count_ = 0;
+  size_t graph_scalar_write_count_ = 0;
+  size_t graph_rhs_launch_count_ = 0;
+  size_t graph_unpack_launch_count_ = 0;
+  size_t graph_pack_launch_count_ = 0;
+  size_t graph_vector_launch_count_ = 0;
+  size_t graph_reduction_launch_count_ = 0;
+  size_t graph_operator_launch_count_ = 0;
+  size_t graph_final_dft_launch_count_ = 0;
+  size_t graph_operator_reconciliation_kernel_count_ = 0;
 };
 
 namespace {
@@ -8914,7 +9030,7 @@ const ArraySpec &validate_cw_field_array(const NvidiaBackendState &state, ArrayI
 }
 
 nvidia::cw_workspace_shape cw_workspace_shape(size_t real_count, int L,
-                                              nvidia::scalar_precision precision) {
+                                               nvidia::scalar_precision precision) {
   if (!real_count) throw std::invalid_argument("NVIDIA solve_cw state vector is empty");
   if (L < 1) throw std::invalid_argument("NVIDIA solve_cw requires L >= 1");
   const size_t two_l = checked_product(size_t(L), size_t(2),
@@ -8939,13 +9055,336 @@ nvidia::cw_workspace_shape cw_workspace_shape(size_t real_count, int L,
   return shape;
 }
 
-void ensure_cw_workspace(NvidiaBackendState &state, const nvidia::cw_workspace_shape &shape,
-                         nvidia::scalar_precision precision, int L) {
-  if (state.cw_workspace_ && state.cw_workspace_->accommodates(shape, precision, L)) return;
-  std::unique_ptr<NvidiaCwWorkspace> replacement(
-      new NvidiaCwWorkspace(shape, precision, L, state.device_));
-  state.cw_workspace_.swap(replacement);
-  ++state.cw_workspace_allocations_;
+size_t launch_cw_reconciliation_device(NvidiaCwExecutable &cw, NvidiaBackendState &state,
+                                       uint32_t operation_index, bool skip_w_components) {
+  if (operation_index >= cw.timestep_->operations_.size())
+    throw std::logic_error("NVIDIA solve_cw reconciliation operation is out of range");
+  const NvidiaCompiledOperation &op = cw.timestep_->operations_[operation_index];
+  size_t launches = 0;
+  if (op.kind == OpKind::transfer_halo) {
+    for (size_t i = op.first; i < op.first + op.count; ++i) {
+      nvidia::launch_zero(cw.timestep_->zero_updates_[i], *state.transfer_);
+      ++launches;
+    }
+    for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+      nvidia::launch_halo_gather(cw.timestep_->halo_plans_[i].gather,
+                                 cw.timestep_->halo_gathers_.opaque_handle(),
+                                 cw.timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
+      ++launches;
+    }
+    for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+      nvidia::launch_halo_scatter(cw.timestep_->halo_plans_[i].scatter,
+                                  cw.timestep_->halo_scatters_.opaque_handle(),
+                                  cw.timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
+      ++launches;
+    }
+    return launches;
+  }
+  if (op.kind == OpKind::update_eh) {
+    if (op.copy_count || op.subtraction_count || op.source_count)
+      throw std::logic_error("NVIDIA solve_cw constitutive operation retained source state");
+    for (size_t i = op.first; i < op.first + op.count; ++i) {
+      const nvidia::constitutive_launch &update = cw.timestep_->constitutive_updates_[i];
+      if (skip_w_components && update.target_w) continue;
+      nvidia::launch_constitutive(update, *state.transfer_);
+      ++launches;
+    }
+    return launches;
+  }
+  throw std::logic_error("NVIDIA solve_cw reconciliation reference has the wrong kind");
+}
+
+class CwGraphCleanupFailure : public std::runtime_error {
+public:
+  explicit CwGraphCleanupFailure(const std::string &message) : std::runtime_error(message) {}
+};
+
+template <typename Launch>
+NvidiaCapturedGraph capture_cw_graph(NvidiaBackendState &state, const std::string &label,
+                                     Launch launch) {
+  NvidiaCapturedGraph captured;
+  try {
+    captured.definition.begin_capture(*state.transfer_, label);
+    launch();
+    captured.definition.end_capture(*state.transfer_);
+  }
+  catch (...) {
+    std::string cleanup_error;
+    cleanup_cw_graph(captured, cleanup_error);
+    if (!cleanup_error.empty())
+      throw CwGraphCleanupFailure(std::string("CUDA CW graph capture rollback failed: ") +
+                                  cleanup_error);
+    throw;
+  }
+  return captured;
+}
+
+void clear_cw_device_graphs(NvidiaCwExecutable &cw) {
+  cw.graphs_enabled_ = false;
+  std::string cleanup_error;
+  bool released = cleanup_cw_graphs(cw.rhs_stage_graphs_, cleanup_error);
+  released = cleanup_cw_graphs(cw.vector_graphs_, cleanup_error) && released;
+  released = cleanup_cw_graphs(cw.reduction_graphs_, cleanup_error) && released;
+  released = cleanup_cw_graph(cw.final_dft_graph_, cleanup_error) && released;
+  released = cleanup_cw_graph(cw.operator_finalize_graph_, cleanup_error) && released;
+  released = cleanup_cw_graph(cw.operator_prelude_graph_, cleanup_error) && released;
+  released = cleanup_cw_graph(cw.pack_graph_, cleanup_error) && released;
+  released = cleanup_cw_graph(cw.rhs_zero_graph_, cleanup_error) && released;
+  if (released && cleanup_error.empty()) {
+    cw.rhs_stage_graphs_.clear();
+    cw.rhs_stage_reconciliation_kernel_counts_.clear();
+    cw.vector_graphs_.clear();
+    cw.reduction_graphs_.clear();
+    try {
+      cw.graph_scalars_.reset();
+      cw.final_dft_scalars_.reset();
+    }
+    catch (const std::exception &failure) {
+      remember_cw_graph_cleanup_error(cleanup_error, failure);
+    }
+    catch (...) { cleanup_error = "unknown CUDA CW graph scalar cleanup failure"; }
+  }
+  reconcile_graph_stage(cleanup_error, "CUDA CW workspace graph cleanup failed on another rank");
+  cw.graph_capture_count_ = 0;
+  cw.graph_instantiate_count_ = 0;
+  cw.graph_operator_reconciliation_kernel_count_ = 0;
+}
+
+bool configure_cw_device_graphs(NvidiaCwExecutable &cw, NvidiaBackendState &state,
+                                GraphExecutionMode requested) {
+  bool runtime_supported = false;
+  std::string local_error;
+  try { runtime_supported = nvidia::query_graph_capability().capture_supported; }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW workspace graph capability-query failure"; }
+  reconcile_graph_stage(local_error,
+                        "CUDA CW workspace graph capability query failed on another rank");
+  if (!reconcile_graph_support(requested, runtime_supported)) return false;
+
+  nvidia::device_buffer scalars;
+  nvidia::device_buffer final_dft_scalars;
+  NvidiaCapturedGraph rhs_zero;
+  std::vector<NvidiaCapturedGraph> rhs_stages;
+  std::vector<size_t> rhs_reconciliation_launches;
+  NvidiaCapturedGraph prelude;
+  NvidiaCapturedGraph pack;
+  NvidiaCapturedGraph finalize;
+  std::vector<NvidiaCapturedGraph> vectors;
+  std::vector<NvidiaCapturedGraph> reductions;
+  NvidiaCapturedGraph final_dft;
+  size_t captures = 0;
+  size_t reconciliation_launches = 0;
+  bool capture_cleanup_failed = false;
+  const auto discard_candidates = [&]() {
+    std::string cleanup_error;
+    bool released = cleanup_cw_graphs(rhs_stages, cleanup_error);
+    released = cleanup_cw_graphs(vectors, cleanup_error) && released;
+    released = cleanup_cw_graphs(reductions, cleanup_error) && released;
+    released = cleanup_cw_graph(final_dft, cleanup_error) && released;
+    released = cleanup_cw_graph(finalize, cleanup_error) && released;
+    released = cleanup_cw_graph(prelude, cleanup_error) && released;
+    released = cleanup_cw_graph(pack, cleanup_error) && released;
+    released = cleanup_cw_graph(rhs_zero, cleanup_error) && released;
+    if (released && cleanup_error.empty()) {
+      rhs_stages.clear();
+      vectors.clear();
+      reductions.clear();
+      try {
+        scalars.reset();
+        final_dft_scalars.reset();
+        state.transfer_->synchronize();
+      }
+      catch (const std::exception &failure) {
+        remember_cw_graph_cleanup_error(cleanup_error, failure);
+      }
+      catch (...) { cleanup_error = "unknown CUDA CW graph candidate cleanup failure"; }
+    }
+    reconcile_graph_stage(cleanup_error,
+                          "CUDA CW workspace graph candidate cleanup failed on another rank");
+  };
+  local_error.clear();
+  try {
+    scalars.allocate(sizeof(nvidia::cw_graph_scalars), state.device_);
+    final_dft_scalars.allocate(sizeof(StepScalars), state.device_);
+    state.transfer_->synchronize();
+    const nvidia::cw_graph_scalars *device_scalars =
+        static_cast<const nvidia::cw_graph_scalars *>(scalars.opaque_handle());
+    const StepScalars *device_dft_scalars =
+        static_cast<const StepScalars *>(final_dft_scalars.opaque_handle());
+    rhs_zero = capture_cw_graph(state, "cw-rhs-zero", [&]() {
+      for (const nvidia::cw_zero_launch &zero : cw.zeroes_)
+        nvidia::launch_cw_zero(zero, *state.transfer_);
+    });
+    ++captures;
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::cw_graph_capture))
+      throw std::runtime_error("injected CUDA CW graph capture failure");
+    rhs_stages.reserve(cw.rhs_stages_.size());
+    rhs_reconciliation_launches.reserve(cw.rhs_stages_.size());
+    for (size_t stage_index = 0; stage_index < cw.rhs_stages_.size(); ++stage_index) {
+      const NvidiaCwExecutable::Stage &stage = cw.rhs_stages_[stage_index];
+      size_t stage_reconciliation = 0;
+      std::ostringstream label;
+      label << "cw-rhs-stage-" << stage_index;
+      rhs_stages.push_back(capture_cw_graph(state, label.str(), [&]() {
+        for (size_t i = stage.source_first;
+             i < stage.source_first + stage.source_count; ++i)
+          nvidia::launch_cw_source_batch(cw.rhs_sources_[i],
+                                         cw.timestep_->source_scalars_.opaque_handle(),
+                                         *state.transfer_);
+        stage_reconciliation += launch_cw_reconciliation_device(
+            cw, state, stage.boundary_operation, false);
+        stage_reconciliation += launch_cw_reconciliation_device(
+            cw, state, stage.constitutive_operation, false);
+      }));
+      rhs_reconciliation_launches.push_back(stage_reconciliation);
+      ++captures;
+    }
+    prelude = capture_cw_graph(state, "cw-unpack-reconciliation", [&]() {
+      for (const nvidia::cw_state_row_launch &row : cw.rows_)
+        nvidia::launch_cw_unpack_graph(row, device_scalars, cw.real_count_, *state.transfer_);
+      for (int i = 0; i < 3; ++i)
+        reconciliation_launches += launch_cw_reconciliation_device(
+            cw, state, cw.unpack_operations_[i],
+            i == 1 && cw.unpack_skip_w_components_);
+    });
+    ++captures;
+    pack = capture_cw_graph(state, "cw-pack", [&]() {
+      for (const nvidia::cw_state_row_launch &row : cw.rows_)
+        nvidia::launch_cw_pack_graph(row, device_scalars, cw.real_count_, *state.transfer_);
+    });
+    ++captures;
+    nvidia::cw_operator_launch operator_launch = {
+        NULL, NULL, NULL, cw.real_count_, 0.0, 0.0, 0.0, cw.precision_};
+    finalize = capture_cw_graph(state, "cw-operator-finalize", [&]() {
+      nvidia::launch_cw_operator_finalize_graph(operator_launch, device_scalars,
+                                                *state.transfer_);
+    });
+    ++captures;
+    vectors.reserve(5);
+    for (int operation = int(nvidia::cw_vector_operation::copy);
+         operation <= int(nvidia::cw_vector_operation::linear_f64_coefficient); ++operation) {
+      nvidia::cw_vector_launch launch = {
+          NULL, NULL, NULL, cw.real_count_, 0.0, cw.precision_,
+          nvidia::cw_vector_operation(operation)};
+      std::ostringstream label;
+      label << "cw-vector-" << operation;
+      vectors.push_back(capture_cw_graph(state, label.str(), [&]() {
+        nvidia::launch_cw_vector_graph(launch, device_scalars, *state.transfer_);
+      }));
+      ++captures;
+    }
+    const size_t reduction_blocks =
+        std::min<size_t>(128, checked_add(cw.real_count_, size_t(255),
+                                          "sizing CW graph reduction") /
+                                  256);
+    reductions.reserve(3);
+    for (int operation = 0; operation < 3; ++operation) {
+      nvidia::cw_reduction_launch launch = {
+          NULL, NULL, cw.workspace_->reduction_partials_.opaque_handle(),
+          cw.workspace_->reduction_result_.opaque_handle(), cw.real_count_,
+          reduction_blocks, 1.0, cw.precision_};
+      std::ostringstream label;
+      label << "cw-reduction-" << operation;
+      reductions.push_back(capture_cw_graph(state, label.str(), [&]() {
+        if (operation == 0)
+          nvidia::launch_cw_dot_graph(launch, device_scalars, *state.transfer_);
+        else if (operation == 1)
+          nvidia::launch_cw_max_abs_graph(launch, device_scalars, *state.transfer_);
+        else
+          nvidia::launch_cw_scaled_norm_sum_graph(launch, device_scalars,
+                                                  *state.transfer_);
+      }));
+      ++captures;
+    }
+    if (!cw.final_dfts_.empty()) {
+      if (cw.final_dfts_.size() != cw.final_dft_due_slots_.size())
+        throw std::logic_error("NVIDIA CW final DFT graph authority is incomplete");
+      final_dft = capture_cw_graph(state, "cw-final-dft", [&]() {
+        for (size_t i = 0; i < cw.final_dfts_.size(); ++i) {
+          const uint32_t slot = cw.final_dft_due_slots_[i];
+          nvidia::launch_dft_graph(cw.final_dfts_[i], device_dft_scalars, slot / 64,
+                                   slot % 64, *state.transfer_);
+        }
+      });
+      ++captures;
+    }
+  }
+  catch (const CwGraphCleanupFailure &error) {
+    local_error = error.what();
+    capture_cleanup_failed = true;
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW workspace graph capture failure"; }
+  if (or_to_all(!local_error.empty())) {
+    discard_candidates();
+    reconcile_graph_stage(capture_cleanup_failed ? local_error : std::string(),
+                          "CUDA CW graph capture rollback failed on another rank");
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty()
+                                   ? "CUDA CW workspace graph capture failed on another rank"
+                                   : local_error);
+    return false;
+  }
+
+  size_t instantiates = 0;
+  local_error.clear();
+  try {
+    rhs_zero.executable.instantiate(rhs_zero.definition);
+    ++instantiates;
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::cw_graph_instantiate))
+      throw std::runtime_error("injected CUDA CW graph instantiate failure");
+    for (NvidiaCapturedGraph &stage : rhs_stages) {
+      stage.executable.instantiate(stage.definition);
+      ++instantiates;
+    }
+    prelude.executable.instantiate(prelude.definition);
+    ++instantiates;
+    pack.executable.instantiate(pack.definition);
+    ++instantiates;
+    finalize.executable.instantiate(finalize.definition);
+    ++instantiates;
+    for (NvidiaCapturedGraph &vector : vectors) {
+      vector.executable.instantiate(vector.definition);
+      ++instantiates;
+    }
+    for (NvidiaCapturedGraph &reduction : reductions) {
+      reduction.executable.instantiate(reduction.definition);
+      ++instantiates;
+    }
+    if (!cw.final_dfts_.empty()) {
+      final_dft.executable.instantiate(final_dft.definition);
+      ++instantiates;
+    }
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW workspace graph instantiate failure"; }
+  if (or_to_all(!local_error.empty())) {
+    discard_candidates();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty()
+                                   ? "CUDA CW workspace graph instantiate failed on another rank"
+                                   : local_error);
+    return false;
+  }
+
+  cw.graph_scalars_ = std::move(scalars);
+  cw.final_dft_scalars_ = std::move(final_dft_scalars);
+  cw.rhs_zero_graph_ = std::move(rhs_zero);
+  cw.rhs_stage_graphs_ = std::move(rhs_stages);
+  cw.rhs_stage_reconciliation_kernel_counts_ = std::move(rhs_reconciliation_launches);
+  cw.operator_prelude_graph_ = std::move(prelude);
+  cw.pack_graph_ = std::move(pack);
+  cw.operator_finalize_graph_ = std::move(finalize);
+  cw.vector_graphs_ = std::move(vectors);
+  cw.reduction_graphs_ = std::move(reductions);
+  cw.final_dft_graph_ = std::move(final_dft);
+  cw.graph_capture_count_ = captures;
+  cw.graph_instantiate_count_ = instantiates;
+  cw.graph_operator_reconciliation_kernel_count_ = reconciliation_launches;
+  cw.graphs_enabled_ = true;
+  return true;
 }
 
 } // namespace
@@ -9157,10 +9596,11 @@ Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
         existing->cw_plan_signature_ != cw_plan.signature ||
         existing->precision_ != precision || existing->real_count_ != layout.real_count)
       throw std::invalid_argument("NVIDIA solve_cw cache entry has the wrong identity");
-    ensure_cw_workspace(state, shape, precision, request.L);
-    return existing;
+    if (existing->workspace_->accommodates(shape, precision, request.L)) return existing;
   }
 
+  std::unique_ptr<NvidiaCwWorkspace> workspace(
+      new NvidiaCwWorkspace(shape, precision, request.L, state.device_));
   std::unique_ptr<Executable> compiled_step(compile(step_plan, state));
   NvidiaExecutable *timestep = dynamic_cast<NvidiaExecutable *>(compiled_step.get());
   if (!timestep) throw std::logic_error("NVIDIA solve_cw compiler returned the wrong type");
@@ -9169,9 +9609,15 @@ Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
   std::unique_ptr<NvidiaCwExecutable> compiled_cw(new NvidiaCwExecutable(
       this, layout.storage_fingerprint, state.fingerprint_, step_plan.signature,
       cw_plan.signature, precision, layout.real_count, rows, zeroes, rhs_stages, rhs_sources,
-      source_points, final_dfts, dft_omega, cw_plan.unpack,
-      std::move(timestep_owner), state));
-  ensure_cw_workspace(state, shape, precision, request.L);
+      source_points, final_dfts, dft_omega, cw_plan.final_dfts, cw_plan.unpack,
+      std::move(workspace), std::move(timestep_owner), state));
+  const GraphExecutionMode requested =
+      reconcile_graph_mode(graph_mode_, graph_mode_parse_valid_);
+  if (configure_cw_device_graphs(*compiled_cw, state, requested)) {
+    configure_cw_graph_execution(step_plan, cw_plan, *compiled_cw->timestep_, state);
+    if (!compiled_cw->timestep_->graph_enabled_) clear_cw_device_graphs(*compiled_cw);
+  }
+  ++state.cw_workspace_allocations_;
   return compiled_cw.release();
 }
 
@@ -9184,15 +9630,14 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
   nvidia::device_scope device_scope(state.device_);
   NvidiaCwExecutable *cw = dynamic_cast<NvidiaCwExecutable *>(&raw_cw);
   if (!cw || cw->owner_ != this || cw->state_token_ != state.state_token_ ||
-      !cw->timestep_ || cw->timestep_->state_token_ != state.state_token_ ||
-      !state.cw_workspace_)
+      !cw->timestep_ || cw->timestep_->state_token_ != state.state_token_ || !cw->workspace_)
     throw std::invalid_argument("NVIDIA solve_cw received an invalid compiled artifact");
   if (cw->layout_storage_fingerprint_ != step_plan.cw_state_layout.storage_fingerprint ||
       cw->device_storage_fingerprint_ != state.fingerprint_ ||
       cw->step_plan_signature_ != step_plan.signature ||
       cw->cw_plan_signature_ != cw_plan.signature || cw->real_count_ == 0)
     throw std::logic_error("NVIDIA solve_cw executable is stale");
-  NvidiaCwWorkspace &workspace = *state.cw_workspace_;
+  NvidiaCwWorkspace &workspace = *cw->workspace_;
   if (!workspace.accommodates(cw_workspace_shape(cw->real_count_, request.L, cw->precision_),
                               cw->precision_, request.L))
     throw std::logic_error("NVIDIA solve_cw workspace is too small");
@@ -9240,6 +9685,18 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
   workspace.diagnostic_d2h_calls_ = 0;
   workspace.diagnostic_d2h_bytes_ = 0;
   workspace.final_dft_kernel_launches_ = 0;
+  cw->graph_launch_count_ = 0;
+  cw->graph_scalar_write_count_ = 0;
+  cw->graph_rhs_launch_count_ = 0;
+  cw->graph_unpack_launch_count_ = 0;
+  cw->graph_pack_launch_count_ = 0;
+  cw->graph_vector_launch_count_ = 0;
+  cw->graph_reduction_launch_count_ = 0;
+  cw->graph_operator_launch_count_ = 0;
+  cw->graph_final_dft_launch_count_ = 0;
+  cw->timestep_->graph_statistics_.scalar_write_count = 0;
+  cw->timestep_->graph_statistics_.launch_count = 0;
+  cw->timestep_->graph_statistics_.boundary_count = 0;
   state.cw_statistics_ = NvidiaCwStatistics();
   const nvidia::testing::transfer_accounting transfer_start =
       nvidia::testing::current_transfer_accounting();
@@ -9263,14 +9720,62 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
            workspace.timestep_kernel_launches_ + workspace.final_dft_kernel_launches_;
   };
 
+  const std::complex<double> iomega =
+      (1.0 - std::exp(std::complex<double>(0.0, -1.0) *
+                      (2 * pi * request.frequency) * f_.dt)) *
+      (1.0 / f_.dt);
+  const auto write_graph_scalars = [&](void *output, const void *left, const void *right,
+                                       double coefficient, double reduction_scale) {
+    nvidia::cw_graph_scalars scalars = {};
+    scalars.abi_version = nvidia::cw_graph_scalars_abi_version;
+    scalars.byte_size = sizeof(scalars);
+    scalars.output = output;
+    scalars.x = left;
+    scalars.y = right;
+    scalars.coefficient = coefficient;
+    scalars.reduction_scale = reduction_scale;
+    scalars.dt_inverse = 1.0 / f_.dt;
+    scalars.iomega_real = iomega.real();
+    scalars.iomega_imaginary = iomega.imag();
+    nvidia::launch_cw_graph_scalars_write(cw->graph_scalars_, scalars, *state.transfer_);
+    ++cw->graph_scalar_write_count_;
+  };
+
   const auto vector_op = [&](void *output, const void *left, const void *right, double coefficient,
                              nvidia::cw_vector_operation operation) {
-    nvidia::cw_vector_launch launch = {output, left, right, n, coefficient, cw->precision_,
-                                       operation};
-    nvidia::launch_cw_vector(launch, *state.transfer_);
+    if (!output || !left ||
+        ((operation == nvidia::cw_vector_operation::subtract_field ||
+          operation == nvidia::cw_vector_operation::linear_f64_coefficient) && !right))
+      throw std::logic_error("NVIDIA solve_cw vector graph received an invalid operand");
+    if (cw->graphs_enabled_) {
+      const size_t index = size_t(operation);
+      if (index >= cw->vector_graphs_.size())
+        throw std::logic_error("NVIDIA solve_cw vector graph is missing");
+      write_graph_scalars(output, left, right, coefficient, 1.0);
+      cw->vector_graphs_[index].executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_vector_launch_count_;
+    }
+    else {
+      nvidia::cw_vector_launch launch = {output, left, right, n, coefficient, cw->precision_,
+                                         operation};
+      nvidia::launch_cw_vector(launch, *state.transfer_);
+    }
     ++workspace.vector_kernel_launches_;
   };
   const auto pack = [&](void *destination) {
+    if (cw->graphs_enabled_) {
+      if (!destination) throw std::logic_error("NVIDIA solve_cw graph pack has no destination");
+      write_graph_scalars(destination, destination, NULL, 0.0, 1.0);
+      cw->pack_graph_.executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_pack_launch_count_;
+      workspace.pack_kernel_launches_ += cw->rows_.size();
+      if (nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::cw_pack))
+        throw std::runtime_error("injected NVIDIA solve_cw pack failure");
+      return;
+    }
     for (const nvidia::cw_state_row_launch &row : cw->rows_) {
       nvidia::launch_cw_pack(row, destination, n, *state.transfer_);
       ++workspace.pack_kernel_launches_;
@@ -9280,6 +9785,20 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
     }
   };
   const auto unpack = [&](const void *source) {
+    if (cw->graphs_enabled_) {
+      if (!source) throw std::logic_error("NVIDIA solve_cw graph unpack has no source");
+      write_graph_scalars(NULL, source, NULL, 0.0, 1.0);
+      cw->operator_prelude_graph_.executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_unpack_launch_count_;
+      workspace.unpack_kernel_launches_ += cw->rows_.size();
+      workspace.reconciliation_kernel_launches_ +=
+          cw->graph_operator_reconciliation_kernel_count_;
+      if (nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::cw_unpack))
+        throw std::runtime_error("injected NVIDIA solve_cw unpack failure");
+      return;
+    }
     for (const nvidia::cw_state_row_launch &row : cw->rows_) {
       nvidia::launch_cw_unpack(row, source, n, *state.transfer_);
       ++workspace.unpack_kernel_launches_;
@@ -9357,16 +9876,13 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
     }
     throw std::logic_error("NVIDIA solve_cw reconciliation reference has the wrong kind");
   };
-  const std::complex<double> iomega =
-      (1.0 - std::exp(std::complex<double>(0.0, -1.0) *
-                      (2 * pi * request.frequency) * f_.dt)) *
-      (1.0 / f_.dt);
   const auto apply_operator = [&](const void *input, void *output) {
-    unpack(input);
     const size_t reconciliation_before = workspace.reconciliation_kernel_launches_;
-    for (int i = 0; i < 3; ++i)
-      execute_reconciliation(cw->unpack_operations_[i],
-                             i == 1 && cw->unpack_skip_w_components_);
+    unpack(input);
+    if (!cw->graphs_enabled_)
+      for (int i = 0; i < 3; ++i)
+        execute_reconciliation(cw->unpack_operations_[i],
+                               i == 1 && cw->unpack_skip_w_components_);
     const size_t reconciliation_launches =
         workspace.reconciliation_kernel_launches_ - reconciliation_before;
     if (!state.cw_statistics_.reconciliation_kernel_launches_per_operator)
@@ -9386,20 +9902,41 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
     else if (state.cw_statistics_.timestep_kernel_launches_per_operator != timestep_launches)
       throw std::logic_error("NVIDIA solve_cw operator launch shape changed during solve");
     pack(output);
-    nvidia::cw_operator_launch launch = {output, output, input, n, 1.0 / f_.dt,
-                                         iomega.real(), iomega.imag(), cw->precision_};
-    nvidia::launch_cw_operator_finalize(launch, *state.transfer_);
+    if (cw->graphs_enabled_) {
+      write_graph_scalars(output, input, NULL, 0.0, 1.0);
+      cw->operator_finalize_graph_.executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_operator_launch_count_;
+    }
+    else {
+      nvidia::cw_operator_launch launch = {output, output, input, n, 1.0 / f_.dt,
+                                           iomega.real(), iomega.imag(), cw->precision_};
+      nvidia::launch_cw_operator_finalize(launch, *state.transfer_);
+    }
     ++workspace.operator_kernel_launches_;
     ++workspace.operator_applications_;
   };
   const size_t reduction_blocks = std::min<size_t>(128, (n + 255) / 256);
   const auto reduce = [&](const void *left, const void *right, double scale, int operation) {
-    nvidia::cw_reduction_launch launch = {
-        left, right, workspace.reduction_partials_.opaque_handle(),
-        workspace.reduction_result_.opaque_handle(), n, reduction_blocks, scale, cw->precision_};
-    if (operation == 0) nvidia::launch_cw_dot(launch, *state.transfer_);
-    else if (operation == 1) nvidia::launch_cw_max_abs(launch, *state.transfer_);
-    else nvidia::launch_cw_scaled_norm_sum(launch, *state.transfer_);
+    if (!left || (operation == 0 && !right) || operation < 0 || operation > 2 ||
+        (operation == 2 && (!std::isfinite(scale) || scale <= 0.0)))
+      throw std::logic_error("NVIDIA solve_cw reduction graph received invalid operands");
+    if (cw->graphs_enabled_) {
+      if (size_t(operation) >= cw->reduction_graphs_.size())
+        throw std::logic_error("NVIDIA solve_cw reduction graph is missing");
+      write_graph_scalars(NULL, left, right, 0.0, scale);
+      cw->reduction_graphs_[size_t(operation)].executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_reduction_launch_count_;
+    }
+    else {
+      nvidia::cw_reduction_launch launch = {
+          left, right, workspace.reduction_partials_.opaque_handle(),
+          workspace.reduction_result_.opaque_handle(), n, reduction_blocks, scale, cw->precision_};
+      if (operation == 0) nvidia::launch_cw_dot(launch, *state.transfer_);
+      else if (operation == 1) nvidia::launch_cw_max_abs(launch, *state.transfer_);
+      else nvidia::launch_cw_scaled_norm_sum(launch, *state.transfer_);
+    }
     workspace.reduction_kernel_launches_ += 2;
     if (nvidia::testing::consume_failure_for_testing(
             nvidia::testing::failure_point::cw_reduction))
@@ -9440,20 +9977,41 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
        the initial guess before RHS construction. */
     advance(*cw->timestep_, state, 1);
     pack(x);
-    for (const nvidia::cw_zero_launch &zero : cw->zeroes_) {
-      nvidia::launch_cw_zero(zero, *state.transfer_);
-      ++workspace.zero_kernel_launches_;
+    if (cw->graphs_enabled_) {
+      cw->rhs_zero_graph_.executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_rhs_launch_count_;
+      workspace.zero_kernel_launches_ += cw->zeroes_.size();
     }
-    for (const NvidiaCwExecutable::Stage &stage : cw->rhs_stages_) {
-      upload_source_scalars(stage.source_time_offset);
-      for (size_t i = stage.source_first; i < stage.source_first + stage.source_count; ++i) {
-        nvidia::launch_cw_source_batch(cw->rhs_sources_[i],
-                                       cw->timestep_->source_scalars_.opaque_handle(),
-                                       *state.transfer_);
-        ++workspace.rhs_source_kernel_launches_;
+    else
+      for (const nvidia::cw_zero_launch &zero : cw->zeroes_) {
+        nvidia::launch_cw_zero(zero, *state.transfer_);
+        ++workspace.zero_kernel_launches_;
       }
-      execute_reconciliation(stage.boundary_operation, false);
-      execute_reconciliation(stage.constitutive_operation, false);
+    for (size_t stage_index = 0; stage_index < cw->rhs_stages_.size(); ++stage_index) {
+      const NvidiaCwExecutable::Stage &stage = cw->rhs_stages_[stage_index];
+      upload_source_scalars(stage.source_time_offset);
+      if (cw->graphs_enabled_) {
+        if (stage_index >= cw->rhs_stage_graphs_.size() ||
+            stage_index >= cw->rhs_stage_reconciliation_kernel_counts_.size())
+          throw std::logic_error("NVIDIA solve_cw RHS graph schedule is incomplete");
+        cw->rhs_stage_graphs_[stage_index].executable.launch(*state.transfer_);
+        ++cw->graph_launch_count_;
+        ++cw->graph_rhs_launch_count_;
+        workspace.rhs_source_kernel_launches_ += stage.source_count;
+        workspace.reconciliation_kernel_launches_ +=
+            cw->rhs_stage_reconciliation_kernel_counts_[stage_index];
+      }
+      else {
+        for (size_t i = stage.source_first; i < stage.source_first + stage.source_count; ++i) {
+          nvidia::launch_cw_source_batch(cw->rhs_sources_[i],
+                                         cw->timestep_->source_scalars_.opaque_handle(),
+                                         *state.transfer_);
+          ++workspace.rhs_source_kernel_launches_;
+        }
+        execute_reconciliation(stage.boundary_operation, false);
+        execute_reconciliation(stage.constitutive_operation, false);
+      }
     }
     pack(b);
     vector_op(b, b, NULL, -1.0 / f_.dt,
@@ -9663,9 +10221,10 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
   {
     NvtxRange install_range(profile_api, "meep.solve_cw.install_and_sync");
     unpack(x);
-    for (int i = 0; i < 3; ++i)
-      execute_reconciliation(cw->unpack_operations_[i],
-                             i == 1 && cw->unpack_skip_w_components_);
+    if (!cw->graphs_enabled_)
+      for (int i = 0; i < 3; ++i)
+        execute_reconciliation(cw->unpack_operations_[i],
+                               i == 1 && cw->unpack_skip_w_components_);
     advance(*cw->timestep_, state, 1);
     session.restore_before_final_dft();
     if (profile_only) state.transfer_->synchronize();
@@ -9673,12 +10232,38 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
   size_t final_dft_kernel_launches = 0;
   {
     NvtxRange dft_range(profile_api, "meep.solve_cw.final_dft");
-    for (const nvidia::dft_launch &dft : cw->final_dfts_) {
-      if ((f_.t % dft.decimation_factor) != 0) continue;
-      const double sample_time = dft.magnetic ? f_.time() - 0.5 * f_.dt : f_.time();
-      nvidia::launch_dft(dft, sample_time, *state.transfer_);
-      ++workspace.final_dft_kernel_launches_;
-      ++final_dft_kernel_launches;
+    if (cw->graphs_enabled_ && !cw->final_dfts_.empty()) {
+      StepScalars scalars = {};
+      scalars.abi_version = step_scalars_abi_version;
+      scalars.byte_size = sizeof(scalars);
+      scalars.entry_timestep = f_.t;
+      scalars.post_increment_timestep = int64_t(f_.t) + 1;
+      scalars.dft_timestep = f_.t;
+      scalars.source_times[1] = f_.time() - 0.5 * f_.dt;
+      scalars.source_times[2] = f_.time();
+      scalars.graph_variant = uint32_t(GraphVariantKind::cw_operator);
+      for (size_t i = 0; i < cw->final_dfts_.size(); ++i) {
+        const uint32_t slot = cw->final_dft_due_slots_[i];
+        if ((f_.t % cw->final_dfts_[i].decimation_factor) == 0) {
+          scalars.predicate_words[slot / 64] |= uint64_t(1) << (slot % 64);
+          ++workspace.final_dft_kernel_launches_;
+          ++final_dft_kernel_launches;
+        }
+      }
+      nvidia::launch_step_scalars_write(cw->final_dft_scalars_, scalars, *state.transfer_);
+      ++cw->graph_scalar_write_count_;
+      cw->final_dft_graph_.executable.launch(*state.transfer_);
+      ++cw->graph_launch_count_;
+      ++cw->graph_final_dft_launch_count_;
+    }
+    else {
+      for (const nvidia::dft_launch &dft : cw->final_dfts_) {
+        if ((f_.t % dft.decimation_factor) != 0) continue;
+        const double sample_time = dft.magnetic ? f_.time() - 0.5 * f_.dt : f_.time();
+        nvidia::launch_dft(dft, sample_time, *state.transfer_);
+        ++workspace.final_dft_kernel_launches_;
+        ++final_dft_kernel_launches;
+      }
     }
     state.transfer_->synchronize();
   }
@@ -9830,6 +10415,25 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
                                                   workspace.shape_.reduction_partial_bytes +
                                                   2 * sizeof(double);
   state.cw_statistics_.workspace_allocations = state.cw_workspace_allocations_;
+  state.cw_statistics_.graph_enabled =
+      cw->graphs_enabled_ && cw->timestep_->graph_enabled_;
+  state.cw_statistics_.graph_count =
+      cw->graph_capture_count_ + cw->timestep_->graph_segments_.size();
+  state.cw_statistics_.graph_capture_count =
+      cw->graph_capture_count_ + cw->timestep_->graph_statistics_.capture_count;
+  state.cw_statistics_.graph_instantiate_count =
+      cw->graph_instantiate_count_ + cw->timestep_->graph_statistics_.instantiate_count;
+  state.cw_statistics_.graph_scalar_write_count =
+      cw->graph_scalar_write_count_ + cw->timestep_->graph_statistics_.scalar_write_count;
+  state.cw_statistics_.graph_launch_count =
+      cw->graph_launch_count_ + cw->timestep_->graph_statistics_.launch_count;
+  state.cw_statistics_.graph_rhs_launch_count = cw->graph_rhs_launch_count_;
+  state.cw_statistics_.graph_unpack_launch_count = cw->graph_unpack_launch_count_;
+  state.cw_statistics_.graph_pack_launch_count = cw->graph_pack_launch_count_;
+  state.cw_statistics_.graph_vector_launch_count = cw->graph_vector_launch_count_;
+  state.cw_statistics_.graph_reduction_launch_count = cw->graph_reduction_launch_count_;
+  state.cw_statistics_.graph_operator_launch_count = cw->graph_operator_launch_count_;
+  state.cw_statistics_.graph_final_dft_launch_count = cw->graph_final_dft_launch_count_;
   state.cw_statistics_.valid = true;
   return result;
 }
@@ -9868,6 +10472,64 @@ void NvidiaBackend::execute_magnetic_half_step(NvidiaExecutable &executable,
   f_.step_source_times[0] = f_.time();
   f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
   f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
+  if (executable.graph_enabled_) {
+    StepScalars scalars = {};
+    scalars.abi_version = step_scalars_abi_version;
+    scalars.byte_size = sizeof(StepScalars);
+    scalars.entry_timestep = f_.t;
+    scalars.post_increment_timestep = int64_t(f_.t) + 1;
+    scalars.noisy_counter_time = uint64_t(f_.t);
+    for (int i = 0; i < 3; ++i) scalars.source_times[i] = f_.step_source_times[i];
+    scalars.batch_count = 1;
+    scalars.dft_timestep = int64_t(f_.t) + 1;
+    scalars.graph_variant = uint32_t(GraphVariantKind::magnetic_half_step);
+    nvidia::launch_step_scalars_write(executable.magnetic_step_scalars_, scalars,
+                                      *state.transfer_);
+    ++executable.graph_statistics_.magnetic_scalar_write_count;
+    ++state.graph_statistics_.magnetic_scalar_write_count;
+    for (const GraphScheduleEntry &entry : executable.magnetic_half_graph_program_.schedule) {
+      if (entry.kind == GraphScheduleKind::segment) {
+        if (entry.index >= executable.magnetic_half_graph_segments_.size())
+          throw std::logic_error("NVIDIA magnetic graph segment is out of range");
+        executable.magnetic_half_graph_segments_[entry.index].executable.launch(
+            *state.transfer_);
+        ++executable.graph_statistics_.magnetic_launch_count;
+        ++state.graph_statistics_.magnetic_launch_count;
+        continue;
+      }
+      if (entry.index >= executable.magnetic_half_graph_program_.boundaries.size())
+        throw std::logic_error("NVIDIA magnetic graph boundary is out of range");
+      const GraphBoundary &boundary =
+          executable.magnetic_half_graph_program_.boundaries[entry.index];
+      ++executable.graph_statistics_.magnetic_boundary_count;
+      ++state.graph_statistics_.magnetic_boundary_count;
+      if (boundary.kind != GraphBoundaryKind::source_evaluation ||
+          boundary.first_operation >= executable.operations_.size())
+        throw std::logic_error("NVIDIA magnetic graph has an invalid host boundary");
+      const NvidiaCompiledOperation &op = executable.operations_[boundary.first_operation];
+      evaluate_supported_source_scalars(f_, op.source_time_offset);
+      const SourcePlan &source_plan = f_.descriptors->sources;
+      if (source_plan.scalars.size() != executable.source_scalar_count_ ||
+          op.count != executable.source_scalar_count_)
+        throw std::logic_error("NVIDIA magnetic source scalar block changed after compilation");
+      if (!op.count) continue;
+      nvidia::source_scalar *staging =
+          static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+          op.source_staging_offset;
+      for (size_t i = 0; i < op.count; ++i) {
+        staging[i].current_real = source_plan.scalars[i].current.real();
+        staging[i].current_imag = source_plan.scalars[i].current.imag();
+        staging[i].dipole_real = source_plan.scalars[i].dipole.real();
+        staging[i].dipole_imag = source_plan.scalars[i].dipole.imag();
+      }
+      nvidia::copy_host_to_device_async(
+          executable.source_scalars_, 0, staging,
+          checked_product(op.count, sizeof(nvidia::source_scalar),
+                          "uploading NVIDIA magnetic source scalars"),
+          *state.transfer_);
+    }
+    return;
+  }
   const uint32_t schedule[] = {
       executable.magnetic_half_step_.evaluate_b_sources,
       executable.magnetic_half_step_.update_b,
@@ -9973,18 +10635,32 @@ void NvidiaBackend::synchronize_magnetic_fields(Executable &raw_executable,
   NvidiaExecutable &executable = checked_executable(raw_executable, state);
   nvidia::device_scope scope(state.device_);
   char *backup = static_cast<char *>(state.magnetic_snapshot_.opaque_handle());
-  for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
-    nvidia::launch_magnetic_backup(
-        nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
-                                      row.precision},
-        *state.transfer_);
-  execute_magnetic_half_step(executable, state);
-  for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
-    if (row.average)
-      nvidia::launch_magnetic_average(
+  if (executable.graph_enabled_) {
+    if (executable.magnetic_auxiliary_graphs_.size() != 2)
+      throw std::logic_error("NVIDIA magnetic graph auxiliary set is incomplete");
+    executable.magnetic_auxiliary_graphs_[0].executable.launch(*state.transfer_);
+    ++executable.graph_statistics_.magnetic_launch_count;
+    ++state.graph_statistics_.magnetic_launch_count;
+  }
+  else
+    for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+      nvidia::launch_magnetic_backup(
           nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
                                         row.precision},
           *state.transfer_);
+  execute_magnetic_half_step(executable, state);
+  if (executable.graph_enabled_) {
+    executable.magnetic_auxiliary_graphs_[1].executable.launch(*state.transfer_);
+    ++executable.graph_statistics_.magnetic_launch_count;
+    ++state.graph_statistics_.magnetic_launch_count;
+  }
+  else
+    for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+      if (row.average)
+        nvidia::launch_magnetic_average(
+            nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
+                                          row.precision},
+            *state.transfer_);
   state.transfer_->synchronize();
   state.magnetic_snapshot_bytes_ = executable.magnetic_snapshot_bytes_;
   state.magnetic_snapshot_layout_fingerprint_ = executable.magnetic_layout_fingerprint_;
@@ -9998,11 +10674,19 @@ void NvidiaBackend::restore_magnetic_fields(Executable &raw_executable,
   NvidiaExecutable &executable = checked_executable(raw_executable, state);
   nvidia::device_scope scope(state.device_);
   char *backup = static_cast<char *>(state.magnetic_snapshot_.opaque_handle());
-  for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
-    nvidia::launch_magnetic_restore(
-        nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
-                                      row.precision},
-        *state.transfer_);
+  if (executable.graph_enabled_) {
+    if (executable.magnetic_restore_graph_segments_.size() != 1)
+      throw std::logic_error("NVIDIA magnetic restore graph set is incomplete");
+    executable.magnetic_restore_graph_segments_[0].executable.launch(*state.transfer_);
+    ++executable.graph_statistics_.magnetic_launch_count;
+    ++state.graph_statistics_.magnetic_launch_count;
+  }
+  else
+    for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+      nvidia::launch_magnetic_restore(
+          nvidia::magnetic_state_launch{row.live, backup + row.backup_offset, row.elements,
+                                        row.precision},
+          *state.transfer_);
   state.transfer_->synchronize();
   state.magnetic_snapshot_valid_ = false;
   state.device_authoritative_ = true;
@@ -10066,7 +10750,7 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
                                             const StepScalars *graph_scalars,
                                             bool account_cw) {
   const auto count_cw_kernel = [&]() {
-    if (account_cw) ++state.cw_workspace_->timestep_kernel_launches_;
+    if (account_cw) ++executable.cw_workspace_->timestep_kernel_launches_;
   };
   const auto accumulate_legacy_flux = [&]() {
     for (size_t i = op.legacy_flux_first;
@@ -10267,9 +10951,17 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
                                       executable.finite_result_.opaque_handle(),
                                       *state.transfer_);
       }
-      if (account_cw) state.cw_workspace_->timestep_kernel_launches_ += op.count;
-      if (account_cw) state.cw_workspace_->finite_check_kernel_launches_ += op.count;
+      if (account_cw) executable.cw_workspace_->timestep_kernel_launches_ += op.count;
+      if (account_cw) executable.cw_workspace_->finite_check_kernel_launches_ += op.count;
       return true;
+    case OpKind::pack_state:
+    case OpKind::unpack_state:
+    case OpKind::reduction:
+      /* These neutral CW markers carry authority for the separately owned
+         workspace graphs.  The StepProgram graph must retain their order,
+         but the concrete pack/unpack/reduction launches are compiled from
+         CwPlan and issued by solve_cw, not duplicated here. */
+      return executable.program_ == StepProgram::solve_cw;
     default: return false;
   }
 }
@@ -10284,6 +10976,9 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
   const GraphExecutionMode requested =
       reconcile_graph_mode(graph_mode_, graph_mode_parse_valid_);
   executable.graph_statistics_.requested = requested;
+  if (requested != GraphExecutionMode::eager && state.magnetic_snapshot_valid_)
+    throw std::logic_error(
+        "NVIDIA graph executable replacement is forbidden while a magnetic snapshot is live");
   const int local_program = int(plan.program);
   const int minimum_program = min_to_all(local_program);
   const int maximum_program = max_to_all(local_program);
@@ -10291,18 +10986,22 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     throw std::invalid_argument("NVIDIA timestep program differs across ranks");
 
   if (plan.program != StepProgram::ordinary) {
-    if (requested == GraphExecutionMode::required)
-      throw std::runtime_error("required CUDA graph mode does not yet support solve_cw");
     return;
   }
 
   GraphLoweringAuthorities authority;
   GraphProgram graph_program;
+  GraphProgram magnetic_half_program;
+  GraphProgram magnetic_restore_program;
   std::string local_error;
   try {
     authority = build_graph_lowering_authorities(plan, f_.halos, f_.array_catalog,
                                                   f_.is_real ? 1 : 2);
     graph_program = build_graph_program(plan, authority, GraphVariantKind::ordinary);
+    magnetic_half_program =
+        build_graph_program(plan, authority, GraphVariantKind::magnetic_half_step);
+    magnetic_restore_program =
+        build_graph_program(plan, authority, GraphVariantKind::magnetic_restore);
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -10319,14 +11018,26 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     if (!validate_graph_program(plan, authority, graph_program, &graph_error))
       throw std::invalid_argument(graph_error.empty() ? "invalid NVIDIA graph program"
                                                        : graph_error);
-    program_graphable = graph_required_compatible(graph_program);
-    for (const GraphBoundary &boundary : graph_program.boundaries)
-      if (boundary.kind == GraphBoundaryKind::remote_halo) program_graphable = false;
-    for (const GraphSegment &segment : graph_program.segments)
-      for (const GraphOperationRef &operation : segment.operations)
-        if (operation.operation.guard.kind == GuardKind::device_predicate &&
-            operation.operation.kind != OpKind::update_dft)
-          program_graphable = false;
+    if (!validate_graph_program(plan, authority, magnetic_half_program, &graph_error) ||
+        !validate_graph_program(plan, authority, magnetic_restore_program, &graph_error))
+      throw std::invalid_argument(graph_error.empty() ? "invalid NVIDIA magnetic graph program"
+                                                       : graph_error);
+    program_graphable = graph_required_compatible(graph_program) &&
+                        graph_required_compatible(magnetic_half_program) &&
+                        graph_required_compatible(magnetic_restore_program) &&
+                        !executable.magnetic_states_.empty() &&
+                        executable.magnetic_snapshot_bytes_ != 0;
+    const GraphProgram *programs[] = {
+        &graph_program, &magnetic_half_program, &magnetic_restore_program};
+    for (const GraphProgram *candidate : programs) {
+      for (const GraphBoundary &boundary : candidate->boundaries)
+        if (boundary.kind == GraphBoundaryKind::remote_halo) program_graphable = false;
+      for (const GraphSegment &segment : candidate->segments)
+        for (const GraphOperationRef &operation : segment.operations)
+          if (operation.operation.guard.kind == GuardKind::device_predicate &&
+              operation.operation.kind != OpKind::update_dft)
+            program_graphable = false;
+    }
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -10357,18 +11068,40 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     executable.graph_statistics_.segment_count = 0;
     executable.graph_statistics_.capture_count = 0;
     executable.graph_statistics_.instantiate_count = 0;
+    executable.graph_statistics_.magnetic_segment_count = 0;
+    executable.graph_statistics_.magnetic_capture_count = 0;
+    executable.graph_statistics_.magnetic_instantiate_count = 0;
     std::string cleanup_error;
     const auto remember_cleanup_error = [&](const std::exception &error) {
       if (cleanup_error.empty()) cleanup_error = error.what();
     };
-    for (NvidiaCompiledGraphSegment &segment : executable.graph_segments_) {
-      try { segment.executable.reset(); }
+    const auto reset_segments = [&](std::vector<NvidiaCompiledGraphSegment> &segments) {
+      for (NvidiaCompiledGraphSegment &segment : segments) {
+        try { segment.executable.reset(); }
+        catch (const std::exception &error) { remember_cleanup_error(error); }
+        catch (...) {
+          if (cleanup_error.empty())
+            cleanup_error = "unknown CUDA graph executable cleanup failure";
+        }
+        try { segment.definition.reset(); }
+        catch (const std::exception &error) { remember_cleanup_error(error); }
+        catch (...) {
+          if (cleanup_error.empty())
+            cleanup_error = "unknown CUDA graph definition cleanup failure";
+        }
+      }
+    };
+    reset_segments(executable.graph_segments_);
+    reset_segments(executable.magnetic_half_graph_segments_);
+    reset_segments(executable.magnetic_restore_graph_segments_);
+    for (NvidiaCapturedGraph &graph : executable.magnetic_auxiliary_graphs_) {
+      try { graph.executable.reset(); }
       catch (const std::exception &error) { remember_cleanup_error(error); }
       catch (...) {
         if (cleanup_error.empty())
           cleanup_error = "unknown CUDA graph executable cleanup failure";
       }
-      try { segment.definition.reset(); }
+      try { graph.definition.reset(); }
       catch (const std::exception &error) { remember_cleanup_error(error); }
       catch (...) {
         if (cleanup_error.empty())
@@ -10376,14 +11109,30 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
       }
     }
     bool graphs_released = true;
-    for (const NvidiaCompiledGraphSegment &segment : executable.graph_segments_)
-      graphs_released = graphs_released && !segment.executable.opaque_handle() &&
-                        !segment.definition.opaque_handle() && !segment.definition.capturing();
+    const auto segments_released = [&](const std::vector<NvidiaCompiledGraphSegment> &segments) {
+      bool released = true;
+      for (const NvidiaCompiledGraphSegment &segment : segments)
+        released = released && !segment.executable.opaque_handle() &&
+                   !segment.definition.opaque_handle() && !segment.definition.capturing();
+      return released;
+    };
+    graphs_released = segments_released(executable.graph_segments_) &&
+                      segments_released(executable.magnetic_half_graph_segments_) &&
+                      segments_released(executable.magnetic_restore_graph_segments_);
+    for (const NvidiaCapturedGraph &graph : executable.magnetic_auxiliary_graphs_)
+      graphs_released = graphs_released && !graph.executable.opaque_handle() &&
+                        !graph.definition.opaque_handle() && !graph.definition.capturing();
     if (graphs_released) {
       executable.graph_segments_.clear();
+      executable.magnetic_half_graph_segments_.clear();
+      executable.magnetic_restore_graph_segments_.clear();
+      executable.magnetic_auxiliary_graphs_.clear();
       executable.graph_program_ = GraphProgram();
+      executable.magnetic_half_graph_program_ = GraphProgram();
+      executable.magnetic_restore_graph_program_ = GraphProgram();
       try {
         executable.step_scalars_.reset();
+        executable.magnetic_step_scalars_.reset();
         state.transfer_->synchronize();
       }
       catch (const std::exception &error) { remember_cleanup_error(error); }
@@ -10394,10 +11143,24 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     reconcile_graph_stage(cleanup_error, "CUDA graph cleanup failed on another rank");
   };
 
+  nvidia::device_buffer staged_magnetic_snapshot;
+  void *magnetic_snapshot = state.magnetic_snapshot_.opaque_handle();
+  bool publish_magnetic_snapshot = false;
   local_error.clear();
   try {
     executable.graph_program_ = graph_program;
+    executable.magnetic_half_graph_program_ = magnetic_half_program;
+    executable.magnetic_restore_graph_program_ = magnetic_restore_program;
     executable.step_scalars_.allocate(sizeof(StepScalars), state.device_);
+    executable.magnetic_step_scalars_.allocate(sizeof(StepScalars), state.device_);
+    if (state.magnetic_snapshot_.size() < executable.magnetic_snapshot_bytes_) {
+      if (state.magnetic_snapshot_.size())
+        throw std::logic_error(
+            "NVIDIA magnetic graph snapshot growth requires a replacement epoch");
+      staged_magnetic_snapshot.allocate(executable.magnetic_snapshot_bytes_, state.device_);
+      magnetic_snapshot = staged_magnetic_snapshot.opaque_handle();
+      publish_magnetic_snapshot = true;
+    }
     state.transfer_->synchronize();
   }
   catch (const std::exception &error) {
@@ -10438,6 +11201,75 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
       compiled.definition.end_capture(*state.transfer_);
       ++executable.graph_statistics_.capture_count;
     }
+
+    executable.magnetic_auxiliary_graphs_.reserve(2);
+    executable.magnetic_auxiliary_graphs_.push_back(NvidiaCapturedGraph());
+    NvidiaCapturedGraph &backup = executable.magnetic_auxiliary_graphs_.back();
+    backup.definition.begin_capture(*state.transfer_, "magnetic-backup");
+    char *snapshot = static_cast<char *>(magnetic_snapshot);
+    for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+      nvidia::launch_magnetic_backup(
+          nvidia::magnetic_state_launch{row.live, snapshot + row.backup_offset, row.elements,
+                                        row.precision},
+          *state.transfer_);
+    backup.definition.end_capture(*state.transfer_);
+    ++executable.graph_statistics_.magnetic_capture_count;
+
+    executable.magnetic_half_graph_segments_.reserve(magnetic_half_program.segments.size());
+    const StepScalars *magnetic_scalars =
+        static_cast<const StepScalars *>(executable.magnetic_step_scalars_.opaque_handle());
+    for (size_t i = 0; i < magnetic_half_program.segments.size(); ++i) {
+      std::ostringstream label;
+      label << "magnetic-half-step-segment-" << i;
+      executable.magnetic_half_graph_segments_.push_back(
+          NvidiaCompiledGraphSegment(magnetic_half_program.segments[i]));
+      NvidiaCompiledGraphSegment &compiled = executable.magnetic_half_graph_segments_.back();
+      compiled.definition.begin_capture(*state.transfer_, label.str());
+      for (const GraphOperationRef &operation : compiled.plan.operations) {
+        if (operation.operation_index >= executable.operations_.size())
+          throw std::logic_error("NVIDIA magnetic graph operation index is out of range");
+        if (!launch_device_operation(executable, state,
+                                     executable.operations_[operation.operation_index],
+                                     magnetic_scalars, false))
+          throw std::logic_error("NVIDIA magnetic graph segment contains a host-only operation");
+      }
+      compiled.definition.end_capture(*state.transfer_);
+      ++executable.graph_statistics_.magnetic_capture_count;
+    }
+
+    executable.magnetic_auxiliary_graphs_.push_back(NvidiaCapturedGraph());
+    NvidiaCapturedGraph &average = executable.magnetic_auxiliary_graphs_.back();
+    average.definition.begin_capture(*state.transfer_, "magnetic-average");
+    for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+      if (row.average)
+        nvidia::launch_magnetic_average(
+            nvidia::magnetic_state_launch{row.live, snapshot + row.backup_offset, row.elements,
+                                          row.precision},
+            *state.transfer_);
+    average.definition.end_capture(*state.transfer_);
+    ++executable.graph_statistics_.magnetic_capture_count;
+
+    executable.magnetic_restore_graph_segments_.reserve(
+        magnetic_restore_program.segments.size());
+    for (size_t i = 0; i < magnetic_restore_program.segments.size(); ++i) {
+      std::ostringstream label;
+      label << "magnetic-restore-segment-" << i;
+      executable.magnetic_restore_graph_segments_.push_back(
+          NvidiaCompiledGraphSegment(magnetic_restore_program.segments[i]));
+      NvidiaCompiledGraphSegment &compiled = executable.magnetic_restore_graph_segments_.back();
+      compiled.definition.begin_capture(*state.transfer_, label.str());
+      for (const GraphOperationRef &operation : compiled.plan.operations) {
+        if (operation.operation.kind != OpKind::restore_magnetic_fields)
+          throw std::logic_error("NVIDIA magnetic restore graph has an invalid operation");
+        for (const NvidiaCompiledMagneticState &row : executable.magnetic_states_)
+          nvidia::launch_magnetic_restore(
+              nvidia::magnetic_state_launch{row.live, snapshot + row.backup_offset, row.elements,
+                                            row.precision},
+              *state.transfer_);
+      }
+      compiled.definition.end_capture(*state.transfer_);
+      ++executable.graph_statistics_.magnetic_capture_count;
+    }
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -10456,9 +11288,28 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
 
   local_error.clear();
   try {
-    for (NvidiaCompiledGraphSegment &compiled : executable.graph_segments_) {
-      compiled.executable.instantiate(compiled.definition);
-      ++executable.graph_statistics_.instantiate_count;
+    const auto instantiate_segments = [&](std::vector<NvidiaCompiledGraphSegment> &segments) {
+      for (NvidiaCompiledGraphSegment &compiled : segments) {
+        compiled.executable.instantiate(compiled.definition);
+        ++executable.graph_statistics_.instantiate_count;
+      }
+    };
+    instantiate_segments(executable.graph_segments_);
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::magnetic_graph_instantiate))
+      throw std::runtime_error("injected CUDA magnetic graph instantiate failure");
+    const auto instantiate_magnetic_segments =
+        [&](std::vector<NvidiaCompiledGraphSegment> &segments) {
+          for (NvidiaCompiledGraphSegment &compiled : segments) {
+            compiled.executable.instantiate(compiled.definition);
+            ++executable.graph_statistics_.magnetic_instantiate_count;
+          }
+        };
+    instantiate_magnetic_segments(executable.magnetic_half_graph_segments_);
+    instantiate_magnetic_segments(executable.magnetic_restore_graph_segments_);
+    for (NvidiaCapturedGraph &graph : executable.magnetic_auxiliary_graphs_) {
+      graph.executable.instantiate(graph.definition);
+      ++executable.graph_statistics_.magnetic_instantiate_count;
     }
   }
   catch (const std::exception &error) {
@@ -10473,6 +11324,203 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     if (requested == GraphExecutionMode::required)
       throw std::runtime_error(local_error.empty()
                                    ? "CUDA graph instantiate failed on another rank"
+                                   : local_error);
+    return;
+  }
+
+  if (publish_magnetic_snapshot) {
+    void *const expected = staged_magnetic_snapshot.opaque_handle();
+    state.magnetic_snapshot_ = std::move(staged_magnetic_snapshot);
+    if (state.magnetic_snapshot_.opaque_handle() != expected) {
+      discard_graph_state();
+      throw std::runtime_error("NVIDIA magnetic graph snapshot publication failed");
+    }
+  }
+  executable.graph_enabled_ = true;
+  executable.graph_statistics_.enabled = true;
+  executable.graph_statistics_.segment_count = executable.graph_segments_.size();
+  executable.graph_statistics_.magnetic_segment_count =
+      executable.magnetic_half_graph_segments_.size() +
+      executable.magnetic_restore_graph_segments_.size() +
+      executable.magnetic_auxiliary_graphs_.size();
+}
+
+void NvidiaBackend::configure_cw_graph_execution(const StepPlan &plan, const CwPlan &cw_plan,
+                                                 NvidiaExecutable &executable,
+                                                 NvidiaBackendState &state) {
+  const GraphExecutionMode requested =
+      reconcile_graph_mode(graph_mode_, graph_mode_parse_valid_);
+  executable.graph_statistics_ = NvidiaGraphStatistics();
+  executable.graph_statistics_.requested = requested;
+  executable.graph_statistics_.valid = true;
+
+  GraphLoweringAuthorities authority;
+  GraphProgram program;
+  std::string local_error;
+  try {
+    authority = build_graph_lowering_authorities(plan, f_.halos, f_.array_catalog,
+                                                  f_.is_real ? 1 : 2, &cw_plan);
+    program = build_graph_program(plan, authority, GraphVariantKind::cw_operator);
+    std::string graph_error;
+    if (!validate_graph_program(plan, authority, program, &graph_error))
+      throw std::invalid_argument(graph_error.empty() ? "invalid NVIDIA CW graph program"
+                                                       : graph_error);
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown NVIDIA CW graph lowering failure";
+  }
+  reconcile_graph_stage(local_error, "NVIDIA CW graph lowering failed on another rank");
+
+  bool graphable = graph_required_compatible(program);
+  for (const GraphBoundary &boundary : program.boundaries)
+    if (boundary.kind == GraphBoundaryKind::remote_halo) graphable = false;
+  for (const GraphSegment &segment : program.segments)
+    for (const GraphOperationRef &operation : segment.operations)
+      if (operation.operation.guard.kind == GuardKind::device_predicate &&
+          operation.operation.kind != OpKind::update_dft &&
+          operation.operation.kind != OpKind::finite_value_check)
+        graphable = false;
+
+  bool runtime_supported = false;
+  local_error.clear();
+  try { runtime_supported = nvidia::query_graph_capability().capture_supported; }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW graph capability-query failure"; }
+  reconcile_graph_stage(local_error, "CUDA CW graph capability query failed on another rank");
+  if (!reconcile_graph_support(requested, runtime_supported && graphable)) return;
+
+  const auto discard = [&]() {
+    executable.graph_enabled_ = false;
+    executable.graph_statistics_.enabled = false;
+    std::string cleanup_error;
+    for (NvidiaCompiledGraphSegment &segment : executable.graph_segments_) {
+      try { segment.executable.reset(); }
+      catch (const std::exception &error) {
+        if (cleanup_error.empty()) cleanup_error = error.what();
+      }
+      try { segment.definition.reset(); }
+      catch (const std::exception &error) {
+        if (cleanup_error.empty()) cleanup_error = error.what();
+      }
+    }
+    bool released = true;
+    for (const NvidiaCompiledGraphSegment &segment : executable.graph_segments_)
+      released = released && !segment.executable.opaque_handle() &&
+                 !segment.definition.opaque_handle() && !segment.definition.capturing();
+    if (released) {
+      executable.graph_segments_.clear();
+      executable.graph_cw_timestep_launches_.clear();
+      executable.graph_cw_finite_launches_.clear();
+      executable.graph_program_ = GraphProgram();
+      try { executable.step_scalars_.reset(); }
+      catch (const std::exception &error) {
+        if (cleanup_error.empty()) cleanup_error = error.what();
+      }
+    }
+    reconcile_graph_stage(cleanup_error, "CUDA CW graph cleanup failed on another rank");
+  };
+
+  local_error.clear();
+  try {
+    executable.graph_program_ = program;
+    executable.step_scalars_.allocate(sizeof(StepScalars), state.device_);
+    state.transfer_->synchronize();
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW graph scalar-allocation failure"; }
+  if (or_to_all(!local_error.empty())) {
+    discard();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty()
+                                   ? "CUDA CW graph scalar allocation failed on another rank"
+                                   : local_error);
+    return;
+  }
+
+  local_error.clear();
+  try {
+    executable.graph_segments_.reserve(program.segments.size());
+    executable.graph_cw_timestep_launches_.reserve(program.segments.size());
+    executable.graph_cw_finite_launches_.reserve(program.segments.size());
+    const StepScalars *device_scalars =
+        static_cast<const StepScalars *>(executable.step_scalars_.opaque_handle());
+    for (size_t i = 0; i < program.segments.size(); ++i) {
+      std::ostringstream label;
+      label << "cw-operator-segment-" << i;
+      executable.graph_segments_.push_back(NvidiaCompiledGraphSegment(program.segments[i]));
+      NvidiaCompiledGraphSegment &compiled = executable.graph_segments_.back();
+      compiled.definition.begin_capture(*state.transfer_, label.str());
+      size_t timestep_launches = 0;
+      size_t finite_launches = 0;
+      for (const GraphOperationRef &operation : compiled.plan.operations) {
+        if (operation.operation_index >= executable.operations_.size() ||
+            !launch_device_operation(executable, state,
+                                     executable.operations_[operation.operation_index],
+                                     device_scalars, false))
+          throw std::logic_error("NVIDIA CW graph segment contains an invalid operation at " +
+                                 std::to_string(operation.operation_index) + " kind " +
+                                 std::to_string(int(operation.operation.kind)));
+        const NvidiaCompiledOperation &op =
+            executable.operations_[operation.operation_index];
+        switch (op.kind) {
+          case OpKind::update_db:
+            for (size_t j = op.first; j < op.first + op.count; ++j) {
+              ++timestep_launches;
+              timestep_launches += executable.curl_updates_[j].radial_prefix_index != UINT32_MAX;
+              timestep_launches += executable.curl_updates_[j].bfast_update_index != UINT32_MAX;
+            }
+            timestep_launches += op.beta_count + op.cylindrical_m_count +
+                                 op.cylindrical_origin_count;
+            break;
+          case OpKind::update_eh:
+            timestep_launches += op.copy_count + op.subtraction_count + op.source_count + op.count;
+            break;
+          case OpKind::update_polarization: timestep_launches += op.polarization_count; break;
+          case OpKind::apply_sources:
+          case OpKind::zero_boundary: timestep_launches += op.count; break;
+          case OpKind::transfer_halo:
+            timestep_launches += op.count + 2 * op.halo_count;
+            break;
+          case OpKind::finite_value_check:
+            timestep_launches += op.count;
+            finite_launches += op.count;
+            break;
+          default: break;
+        }
+      }
+      compiled.definition.end_capture(*state.transfer_);
+      executable.graph_cw_timestep_launches_.push_back(timestep_launches);
+      executable.graph_cw_finite_launches_.push_back(finite_launches);
+      ++executable.graph_statistics_.capture_count;
+    }
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW graph capture failure"; }
+  if (or_to_all(!local_error.empty())) {
+    discard();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty() ? "CUDA CW graph capture failed on another rank"
+                                                   : local_error);
+    return;
+  }
+
+  local_error.clear();
+  try {
+    for (NvidiaCompiledGraphSegment &segment : executable.graph_segments_) {
+      segment.executable.instantiate(segment.definition);
+      ++executable.graph_statistics_.instantiate_count;
+    }
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown CUDA CW graph instantiate failure"; }
+  if (or_to_all(!local_error.empty())) {
+    discard();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty()
+                                   ? "CUDA CW graph instantiate failed on another rank"
                                    : local_error);
     return;
   }
@@ -10499,11 +11547,12 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   const FiniteCheckMode finite_mode = finite_check_mode();
   try {
     nvidia::device_scope scope(state.device_);
-    const bool account_cw = executable.program_ == StepProgram::solve_cw && state.cw_workspace_;
+    const bool account_cw = executable.program_ == StepProgram::solve_cw &&
+                            executable.cw_workspace_;
     const auto count_cw_source_upload = [&](size_t bytes) {
       if (!account_cw) return;
-      ++state.cw_workspace_->source_scalar_h2d_calls_;
-      state.cw_workspace_->source_scalar_h2d_bytes_ += bytes;
+      ++executable.cw_workspace_->source_scalar_h2d_calls_;
+      executable.cw_workspace_->source_scalar_h2d_bytes_ += bytes;
     };
     const auto upload_material = [&](const NvidiaCompiledOperation &op) {
       char *staging = static_cast<char *>(executable.material_staging_.data());
@@ -10536,8 +11585,8 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                                         executable.finite_result_, 0, sizeof(uint64_t),
                                         *state.transfer_);
       if (account_cw) {
-        ++state.cw_workspace_->diagnostic_d2h_calls_;
-        state.cw_workspace_->diagnostic_d2h_bytes_ += sizeof(uint64_t);
+        ++executable.cw_workspace_->diagnostic_d2h_calls_;
+        executable.cw_workspace_->diagnostic_d2h_bytes_ += sizeof(uint64_t);
       }
       state.transfer_->synchronize();
       uint64_t first_bad = std::numeric_limits<uint64_t>::max();
@@ -10595,7 +11644,9 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         scalars.active_noisy_seed_slot = state.noisy_seed_active_slot_;
         scalars.finite_check_mode = uint32_t(finite_mode);
         scalars.finite_check_due = finite_due ? 1u : 0u;
-        scalars.graph_variant = uint32_t(GraphVariantKind::ordinary);
+        scalars.graph_variant = uint32_t(executable.program_ == StepProgram::solve_cw
+                                             ? GraphVariantKind::cw_operator
+                                             : GraphVariantKind::ordinary);
         for (const StepScalarSlot &slot : executable.graph_program_.scalar_layout.slots) {
           bool value = false;
           if (slot.semantic == StepScalarSemantic::dft_due_predicate)
@@ -10620,6 +11671,15 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             executable.graph_segments_[entry.index].executable.launch(*state.transfer_);
             ++executable.graph_statistics_.launch_count;
             ++state.graph_statistics_.launch_count;
+            if (account_cw) {
+              if (entry.index >= executable.graph_cw_timestep_launches_.size() ||
+                  entry.index >= executable.graph_cw_finite_launches_.size())
+                throw std::logic_error("NVIDIA CW graph launch accounting is incomplete");
+              executable.cw_workspace_->timestep_kernel_launches_ +=
+                  executable.graph_cw_timestep_launches_[entry.index];
+              executable.cw_workspace_->finite_check_kernel_launches_ +=
+                  executable.graph_cw_finite_launches_[entry.index];
+            }
             /* Preserve the existing post-dispatch failure seams.  Captured
                nodes no longer pass through their launch wrappers at replay,
                so consume these test-only failures immediately after the
@@ -10687,6 +11747,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               if (graph_segment_guard) upload_material(op);
               break;
             case OpKind::evaluate_source_scalars: {
+              if (state.cw_skip_source_evaluation_) break;
               evaluate_supported_source_scalars(f_, op.source_time_offset);
               const SourcePlan &source_plan = f_.descriptors->sources;
               if (source_plan.scalars.size() != executable.source_scalar_count_ ||
@@ -11185,6 +12246,14 @@ NvidiaExecutable &NvidiaBackend::checked_executable(Executable &raw_executable,
 NvidiaCwStatistics NvidiaBackend::cw_statistics_for_testing() const {
   NvidiaBackendState *state = current_state();
   return state ? state->cw_statistics_ : NvidiaCwStatistics();
+}
+
+void NvidiaBackend::clear_cw_graphs_for_testing() {
+  NvidiaBackendState *state = current_state();
+  NvidiaCwExecutable *cw =
+      state ? dynamic_cast<NvidiaCwExecutable *>(state->cw_executable) : NULL;
+  if (!cw) throw std::logic_error("NVIDIA CW graph cleanup test has no resident executable");
+  clear_cw_device_graphs(*cw);
 }
 
 NvidiaHostFallbackStatistics NvidiaBackend::host_fallback_statistics_for_testing() const {

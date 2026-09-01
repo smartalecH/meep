@@ -16,6 +16,8 @@
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/nvidia_cw.hpp"
+#include "backend/nvidia/nvidia_graph.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
 #include "backend/nvidia/runtime.hpp"
 #include "meep_internals.hpp"
@@ -154,6 +156,19 @@ static void test_first_cw_compile_retry() {
     }
     nvidia::testing::clear_failure();
     const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+    if (!(rejected && rejection.find(operation) != std::string::npos &&
+          !gpu.backend->is_poisoned() && gpu.backend_state == live_state &&
+          gpu.executable == live_executable &&
+          after.device_bytes_current == before.device_bytes_current &&
+          after.pinned_bytes_current == before.pinned_bytes_current))
+      master_printf("CW compile rollback mismatch point=%d rejected=%d rejection=%s "
+                    "poisoned=%d state_same=%d executable_same=%d device=%zu/%zu "
+                    "pinned=%zu/%zu\n",
+                    int(point), int(rejected), rejection.c_str(),
+                    int(gpu.backend->is_poisoned()), int(gpu.backend_state == live_state),
+                    int(gpu.executable == live_executable), after.device_bytes_current,
+                    before.device_bytes_current, after.pinned_bytes_current,
+                    before.pinned_bytes_current);
     require(rejected && rejection.find(operation) != std::string::npos &&
                 !gpu.backend->is_poisoned() && gpu.backend_state == live_state &&
                 gpu.executable == live_executable &&
@@ -398,6 +413,25 @@ static void test_profile_workload() {
 }
 
 static void test_mpi_rejection() {
+  nvidia::testing::graph_collective_probe required = {
+      "required", true, true, true, true, true, true, true, true, true, true};
+  required.instantiate_valid = my_rank() != count_processors() - 1;
+  bool graph_rejected = false;
+  try { (void)nvidia::testing::reconcile_graph_execution_for_testing(required); }
+  catch (const std::exception &) { graph_rejected = true; }
+  require(and_to_all(graph_rejected),
+          "rank-asymmetric required CW graph instantiate failure was not collective");
+  nvidia::testing::graph_collective_probe automatic = required;
+  automatic.mode = "auto";
+  bool graph_fell_back = false;
+  try {
+    graph_fell_back =
+        !nvidia::testing::reconcile_graph_execution_for_testing(automatic).use_graph;
+  }
+  catch (...) {}
+  require(and_to_all(graph_fell_back),
+          "rank-asymmetric automatic CW graph failure did not fall back collectively");
+
   const grid_volume gv = vol2d(2.0, 2.0, 8.0);
   structure s(gv, one, no_pml());
   execution_options options;
@@ -441,6 +475,369 @@ static void test_mpi_rejection() {
   master_printf("nvidia_cw: MPI rejection PASS at np=%d\n", count_processors());
 }
 
+struct cw_graph_outcome {
+  CwSolveResult result;
+  NvidiaCwStatistics statistics;
+  std::complex<double> field;
+  std::vector<std::complex<realnum> > dft;
+  std::vector<std::complex<realnum> > not_due_dft;
+  std::vector<double> source_times;
+  double dt;
+};
+
+static cw_graph_outcome run_cw_graph_fixture(const char *mode,
+                                             precision_policy_kind precision_policy) {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", mode, 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  custom_source_trace trace;
+  traced_continuous_source source(0.30, &trace);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), std::complex<double>(1.0, 0.2));
+  component monitor_component = Ez;
+  dft_fields monitor = gpu.add_dft_fields(&monitor_component, 1,
+                                          volume(vec(0.5, 0.5), vec(1.5, 1.5)),
+                                          0.30, 0.30, 1, true, 2);
+  dft_fields not_due_monitor = gpu.add_dft_fields(&monitor_component, 1,
+                                                  volume(vec(0.5, 0.5), vec(1.5, 1.5)),
+                                                  0.30, 0.30, 1, true, 3);
+  gpu.t = 2;
+  (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend != NULL, "CW graph fixture did not retain NVIDIA");
+  cw_graph_outcome outcome;
+  outcome.statistics = backend->cw_statistics_for_testing();
+  outcome.result = outcome.statistics.result;
+  outcome.field = gpu.get_field(Ez, vec(1.0, 1.0));
+  outcome.dft = dft_values(gpu, monitor, monitor_component);
+  outcome.not_due_dft = dft_values(gpu, not_due_monitor, monitor_component);
+  outcome.source_times = trace.times;
+  outcome.dt = gpu.dt;
+  return outcome;
+}
+
+static void test_cw_graph_operator_fixture(precision_policy_kind precision_policy) {
+  const cw_graph_outcome eager = run_cw_graph_fixture("eager", precision_policy);
+  nvidia::testing::reset_graph_accounting();
+  const cw_graph_outcome graph = run_cw_graph_fixture("required", precision_policy);
+  const nvidia::graph_accounting teardown = nvidia::testing::current_graph_accounting();
+  require(eager.statistics.valid && !eager.statistics.graph_enabled &&
+              graph.statistics.valid && graph.statistics.graph_enabled,
+          "required CW graph mode was not retained after admission");
+  require(graph.statistics.graph_count > 3 &&
+              graph.statistics.graph_capture_count == graph.statistics.graph_count &&
+              graph.statistics.graph_instantiate_count == graph.statistics.graph_count &&
+              graph.statistics.graph_launch_count > 0 &&
+              graph.statistics.graph_scalar_write_count > 0,
+          "CW graph fixture has incomplete capture/instantiate/replay accounting");
+  require(graph.statistics.graph_pack_launch_count > 0 &&
+              graph.statistics.graph_unpack_launch_count > 0 &&
+              graph.statistics.graph_rhs_launch_count > 0 &&
+              graph.statistics.graph_vector_launch_count > 0 &&
+              graph.statistics.graph_reduction_launch_count > 0 &&
+              graph.statistics.graph_operator_launch_count > 0 &&
+              graph.statistics.graph_final_dft_launch_count == 1 &&
+              graph.statistics.pack_kernel_launches > 0 &&
+              graph.statistics.unpack_kernel_launches > 0 &&
+              graph.statistics.rhs_source_kernel_launches > 0 &&
+              graph.statistics.vector_kernel_launches > 0 &&
+              graph.statistics.reduction_kernel_launches > 0 &&
+              graph.statistics.operator_kernel_launches > 0,
+          "CW graph variants omitted required workspace or CwPlan-owned work");
+  require(eager.result.status == graph.result.status &&
+              eager.result.iterations == graph.result.iterations &&
+              eager.result.operator_applications == graph.result.operator_applications,
+          "CW eager/required solver status or iteration accounting differs");
+  const double error = std::abs(eager.field - graph.field);
+  const double tolerance = precision_policy == precision_policy_kind::native &&
+                                   sizeof(realnum) == sizeof(double)
+                               ? 2e-6
+                               : 2e-3;
+  require(error <= tolerance * (1.0 + std::abs(eager.field)),
+          "CW eager/required operator graph field differs");
+  compare_dft_values(eager.dft, graph.dft, tolerance);
+  compare_dft_values(eager.not_due_dft, graph.not_due_dft, tolerance);
+  require(eager.source_times == graph.source_times,
+          "CW graph changed host-custom source callback ordering");
+  require_canonical_cw_times(graph.source_times, graph.dt);
+  require(teardown.end_captures == teardown.graph_destroys &&
+              teardown.instantiates == teardown.executable_destroys,
+          "CW graph fixture did not tear down every graph owner");
+  master_printf("nvidia_cw graph operator: graphs=%zu launches=%zu field_error=%.9g PASS\n",
+                graph.statistics.graph_count, graph.statistics.graph_launch_count, error);
+}
+
+static void test_cw_graph_compile_rollback() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), 1.0);
+  gpu.advance(1);
+  BackendState *const state = gpu.backend_state;
+  Executable *const ordinary = gpu.executable;
+  Executable *const prior_cw = state->cw_executable;
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_graph_accounting();
+  const nvidia::graph_accounting graphs_before = nvidia::testing::current_graph_accounting();
+  nvidia::testing::fail_next(nvidia::testing::failure_point::cw_graph_instantiate);
+  bool rejected = false;
+  try {
+    (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2);
+  }
+  catch (const std::exception &) { rejected = true; }
+  nvidia::testing::clear_failure();
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  const nvidia::graph_accounting graphs_after = nvidia::testing::current_graph_accounting();
+  if (!(rejected && !gpu.backend->is_poisoned() && gpu.backend_state == state &&
+        gpu.executable == ordinary && state->cw_executable == prior_cw &&
+        memory_after.device_bytes_current == memory_before.device_bytes_current &&
+        memory_after.pinned_bytes_current == memory_before.pinned_bytes_current &&
+        graphs_after.end_captures - graphs_after.graph_destroys ==
+            graphs_before.end_captures - graphs_before.graph_destroys &&
+        graphs_after.instantiates - graphs_after.executable_destroys ==
+            graphs_before.instantiates - graphs_before.executable_destroys))
+    master_printf("CW graph rollback rejected=%d poison=%d state=%d ordinary=%d cw=%d "
+                  "device=%zu/%zu pinned=%zu/%zu graph=%zu/%zu exec=%zu/%zu\n",
+                  int(rejected), int(gpu.backend->is_poisoned()), int(gpu.backend_state == state),
+                  int(gpu.executable == ordinary), int(state->cw_executable == prior_cw),
+                  memory_after.device_bytes_current, memory_before.device_bytes_current,
+                  memory_after.pinned_bytes_current, memory_before.pinned_bytes_current,
+                  graphs_after.end_captures, graphs_after.graph_destroys,
+                  graphs_after.instantiates, graphs_after.executable_destroys);
+  require(rejected && !gpu.backend->is_poisoned() && gpu.backend_state == state &&
+              gpu.executable == ordinary && state->cw_executable == prior_cw &&
+              memory_after.device_bytes_current == memory_before.device_bytes_current &&
+              memory_after.pinned_bytes_current == memory_before.pinned_bytes_current &&
+              graphs_after.end_captures - graphs_after.graph_destroys ==
+                  graphs_before.end_captures - graphs_before.graph_destroys &&
+              graphs_after.instantiates - graphs_after.executable_destroys ==
+                  graphs_before.instantiates - graphs_before.executable_destroys,
+          "failed CW graph preflight published or leaked a replacement");
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && backend->cw_statistics_for_testing().graph_enabled,
+          "CW graph preflight was not retryable after rollback");
+}
+
+static void test_cw_graph_auto_fallback() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "auto", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), 1.0);
+  gpu.advance(1);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::cw_graph_instantiate);
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2);
+  nvidia::testing::clear_failure();
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  const NvidiaCwStatistics stats =
+      backend ? backend->cw_statistics_for_testing() : NvidiaCwStatistics();
+  require(backend && stats.valid && !stats.graph_enabled &&
+              stats.graph_launch_count == 0 && stats.pack_kernel_launches > 0 &&
+              stats.reduction_kernel_launches > 0 && !gpu.backend->is_poisoned(),
+          "automatic CW graph instantiate failure did not select whole-variant eager");
+}
+
+static void test_cw_graph_local_cleanup_failure(
+    nvidia::testing::failure_point primary,
+    nvidia::testing::failure_point cleanup, const char *name) {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "auto", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), 1.0);
+  gpu.advance(1);
+  BackendState *const state = gpu.backend_state;
+  Executable *const ordinary = gpu.executable;
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_graph_accounting();
+  nvidia::testing::fail_next_then(primary, cleanup);
+  bool rejected = false;
+  try { (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2); }
+  catch (const std::exception &) { rejected = true; }
+  nvidia::testing::clear_failure();
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  const nvidia::graph_accounting graphs = nvidia::testing::current_graph_accounting();
+  require(rejected && !gpu.backend->is_poisoned() && gpu.backend_state == state &&
+              gpu.executable == ordinary && !state->cw_executable &&
+              memory_after.device_bytes_current == memory_before.device_bytes_current &&
+              memory_after.pinned_bytes_current == memory_before.pinned_bytes_current &&
+              graphs.end_captures == graphs.graph_destroys &&
+              graphs.instantiates == graphs.executable_destroys,
+          "automatic CW graph candidate cleanup failure did not fail closed and roll back");
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && backend->cw_statistics_for_testing().graph_enabled,
+          "CW graph candidate cleanup failure was not retryable");
+  master_printf("nvidia_cw graph local rollback (%s): PASS\n", name);
+}
+
+static void test_cw_graph_checked_clear(nvidia::testing::failure_point failure,
+                                        const char *name, bool alternate_device) {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), 1.0);
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  const NvidiaCwStatistics stats =
+      backend ? backend->cw_statistics_for_testing() : NvidiaCwStatistics();
+  require(backend && stats.graph_enabled && stats.graph_count > 0,
+          "CW checked-clear fixture did not publish graph owners");
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  nvidia::testing::reset_graph_accounting();
+  bool rejected = false;
+  nvidia::testing::fail_next(failure);
+  if (alternate_device) {
+    const std::vector<nvidia::device_properties> devices = nvidia::enumerate_devices();
+    require(devices.size() > 1, "CW device-restore cleanup test requires two visible GPUs");
+    const int selected = backend->device_ordinal_for_testing();
+    const int alternate = selected == 0 ? 1 : 0;
+    nvidia::device_scope scope(alternate);
+    try { backend->clear_cw_graphs_for_testing(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+  }
+  else {
+    try { backend->clear_cw_graphs_for_testing(); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+  }
+  const nvidia::graph_accounting failed = nvidia::testing::current_graph_accounting();
+  const nvidia::memory_accounting memory_failed = nvidia::current_memory_accounting();
+  require(rejected && memory_failed.device_bytes_current == memory_before.device_bytes_current &&
+              memory_failed.pinned_bytes_current == memory_before.pinned_bytes_current,
+          "CW checked clear did not retain captured scalar/workspace lifetimes");
+  if (failure == nvidia::testing::failure_point::graph_exec_destroy)
+    require(failed.graph_destroys > 0 &&
+                failed.executable_destroys + 1 == failed.graph_destroys,
+            "CW executable-destroy failure did not retain exactly one retryable owner");
+  else if (failure == nvidia::testing::failure_point::graph_destroy)
+    require(failed.executable_destroys > 0 &&
+                failed.graph_destroys + 1 == failed.executable_destroys,
+            "CW definition-destroy failure did not retain exactly one retryable owner");
+  else
+    require(failed.executable_destroys > 0 &&
+                failed.executable_destroys == failed.graph_destroys,
+            "CW device-restore failure changed graph release accounting");
+
+  backend->clear_cw_graphs_for_testing();
+  const nvidia::graph_accounting retried = nvidia::testing::current_graph_accounting();
+  const nvidia::memory_accounting memory_retried = nvidia::current_memory_accounting();
+  const size_t expected_graphs =
+      std::max(failed.executable_destroys, failed.graph_destroys);
+  require(retried.executable_destroys == expected_graphs &&
+              retried.graph_destroys == expected_graphs &&
+              memory_retried.device_bytes_current < memory_before.device_bytes_current &&
+              memory_retried.pinned_bytes_current == memory_before.pinned_bytes_current,
+          "CW checked clear was not exactly retryable");
+  master_printf("nvidia_cw graph checked clear (%s): PASS\n", name);
+}
+
+static void test_cw_graph_workspace_replacement() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), 1.0);
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 1);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  BackendState *const state = gpu.backend_state;
+  Executable *const first = state ? state->cw_executable : NULL;
+  NvidiaCwStatistics stats =
+      backend ? backend->cw_statistics_for_testing() : NvidiaCwStatistics();
+  require(backend && first && stats.graph_enabled && stats.workspace_allocations == 1,
+          "initial CW graph workspace was not published once");
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 1);
+  stats = backend->cw_statistics_for_testing();
+  require(gpu.backend_state == state && state->cw_executable == first &&
+              stats.workspace_allocations == 1,
+          "same-shape CW graph solve did not reuse the current executable/workspace");
+
+  const nvidia::memory_accounting before = nvidia::current_memory_accounting();
+  nvidia::testing::fail_next(nvidia::testing::failure_point::cw_graph_instantiate);
+  bool rejected = false;
+  try { (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 3); }
+  catch (const std::exception &) { rejected = true; }
+  nvidia::testing::clear_failure();
+  const nvidia::memory_accounting after = nvidia::current_memory_accounting();
+  require(rejected && !gpu.backend->is_poisoned() && gpu.backend_state == state &&
+              state->cw_executable == first &&
+              after.device_bytes_current == before.device_bytes_current &&
+              after.pinned_bytes_current == before.pinned_bytes_current,
+          "failed CW graph workspace growth retired the current executable");
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 1);
+  require(state->cw_executable == first,
+          "current CW graph executable was unusable after failed replacement");
+  (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 3);
+  stats = backend->cw_statistics_for_testing();
+  require(state->cw_executable != first && stats.graph_enabled &&
+              stats.workspace_allocations == 2,
+          "successful CW graph workspace growth did not publish one replacement");
+}
+
+static void test_cw_graph_launch_failure() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30);
+  source.is_integrated = false;
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), 1.0);
+  gpu.advance(1);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::graph_launch);
+  bool failed = false;
+  try {
+    (void)gpu.solve_cw(1e-4, 10, std::complex<double>(0.30, 0.0), 2);
+  }
+  catch (const std::exception &) { failed = true; }
+  nvidia::testing::clear_failure();
+  require(failed && gpu.backend->is_poisoned(),
+          "CW graph launch failure did not poison the backend");
+}
+
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   if (count_processors() > 1) {
@@ -466,6 +863,29 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
     require(sizeof(realnum) == sizeof(float) && precision_policy == precision_policy_kind::native,
             "native-single validation requires a single-precision native build");
+  if (getenv("MEEP_NVIDIA_CW_GRAPH_ONLY")) {
+    require(count_processors() == 1, "CW graph fixture requires one MPI rank");
+    test_cw_graph_compile_rollback();
+    test_cw_graph_local_cleanup_failure(
+        nvidia::testing::failure_point::cw_graph_capture,
+        nvidia::testing::failure_point::graph_destroy, "capture/definition-destroy");
+    test_cw_graph_local_cleanup_failure(
+        nvidia::testing::failure_point::cw_graph_instantiate,
+        nvidia::testing::failure_point::graph_exec_destroy,
+        "instantiate/executable-destroy");
+    test_cw_graph_auto_fallback();
+    test_cw_graph_checked_clear(nvidia::testing::failure_point::graph_exec_destroy,
+                                "graph-exec-destroy", false);
+    test_cw_graph_checked_clear(nvidia::testing::failure_point::graph_destroy,
+                                "graph-destroy", false);
+    if (nvidia::enumerate_devices().size() > 1)
+      test_cw_graph_checked_clear(nvidia::testing::failure_point::device_restore,
+                                  "device-restore", true);
+    test_cw_graph_workspace_replacement();
+    test_cw_graph_operator_fixture(precision_policy);
+    test_cw_graph_launch_failure();
+    return 0;
+  }
   require(count_processors() == 1, "initial slice requires one MPI rank");
   test_first_cw_compile_retry();
   test_normal_breakdown();

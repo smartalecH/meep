@@ -96,6 +96,24 @@ struct cw_reduction_launch {
   scalar_precision precision;
 };
 
+const uint32_t cw_graph_scalars_abi_version = 1;
+
+/* Mutable values consumed by fixed-address CW graph kernels.  The complete
+   block is written by one same-stream kernel before each graph replay, so no
+   captured node depends on pageable/pinned host staging or stale host values. */
+struct cw_graph_scalars {
+  uint32_t abi_version;
+  uint32_t byte_size;
+  void *output;
+  const void *x;
+  const void *y;
+  double coefficient;
+  double reduction_scale;
+  double dt_inverse;
+  double iomega_real;
+  double iomega_imaginary;
+};
+
 void launch_cw_pack(const cw_state_row_launch &launch, void *vector, size_t real_elements,
                     const stream &stream);
 void launch_cw_unpack(const cw_state_row_launch &launch, const void *vector,
@@ -108,6 +126,27 @@ void launch_cw_operator_finalize(const cw_operator_launch &launch, const stream 
 void launch_cw_dot(const cw_reduction_launch &launch, const stream &stream);
 void launch_cw_max_abs(const cw_reduction_launch &launch, const stream &stream);
 void launch_cw_scaled_norm_sum(const cw_reduction_launch &launch, const stream &stream);
+void launch_cw_graph_scalars_write(device_buffer &destination,
+                                   const cw_graph_scalars &values,
+                                   const stream &stream);
+void launch_cw_pack_graph(const cw_state_row_launch &launch,
+                          const cw_graph_scalars *scalars, size_t real_elements,
+                          const stream &stream);
+void launch_cw_unpack_graph(const cw_state_row_launch &launch,
+                            const cw_graph_scalars *scalars, size_t real_elements,
+                            const stream &stream);
+void launch_cw_vector_graph(const cw_vector_launch &launch,
+                            const cw_graph_scalars *scalars, const stream &stream);
+void launch_cw_operator_finalize_graph(const cw_operator_launch &launch,
+                                       const cw_graph_scalars *scalars,
+                                       const stream &stream);
+void launch_cw_dot_graph(const cw_reduction_launch &launch,
+                         const cw_graph_scalars *scalars, const stream &stream);
+void launch_cw_max_abs_graph(const cw_reduction_launch &launch,
+                             const cw_graph_scalars *scalars, const stream &stream);
+void launch_cw_scaled_norm_sum_graph(const cw_reduction_launch &launch,
+                                     const cw_graph_scalars *scalars,
+                                     const stream &stream);
 
 } // namespace nvidia
 } // namespace meep

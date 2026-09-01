@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
+#include <map>
 #include <set>
 #include <tuple>
 #include <vector>
@@ -436,12 +437,19 @@ static void test_dfts() {
   }
 
   size_t descriptor_index = 0;
+  std::map<int, uint32_t> cadence_slots;
   for (int chunk = 0; chunk < f.num_chunks; ++chunk) {
     if (!f.chunks[chunk]->is_mine()) continue;
     int di = 0;
     for (dft_chunk *cur = f.chunks[chunk]->dft_chunks; cur;
          cur = cur->next_in_chunk, ++di, ++descriptor_index) {
       const DftDescriptor &d = dfts[descriptor_index];
+      const std::pair<std::map<int, uint32_t>::iterator, bool> cadence =
+          cadence_slots.insert(std::make_pair(d.decimation_factor,
+                                              uint32_t(cadence_slots.size())));
+      CHECK(d.due_scalar_slot == cadence.first->second,
+            "DFT descriptor cadence %d has noncanonical due slot %u", d.decimation_factor,
+            d.due_scalar_slot);
       const ArrayId phase =
           f.array_catalog->find({chunk, int(array_kind::dft_phase), int(cur->c), -1, di});
       CHECK(d.phase_scratch == phase && is_valid(phase),

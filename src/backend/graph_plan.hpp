@@ -197,6 +197,8 @@ bool validate_graph_lowering_authorities(const StepPlan &plan,
    decimation factor gets its own bit. */
 const uint32_t step_scalars_abi_version = 1;
 const size_t step_scalar_predicate_word_count = 64;
+static_assert(step_scalar_predicate_word_count * 64 == cw_dft_predicate_capacity,
+              "CW final-DFT predicate capacity must match StepScalars");
 
 struct StepScalars {
   uint32_t abi_version;

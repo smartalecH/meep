@@ -25,6 +25,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <set>
 #include <stdexcept>
 #include <typeinfo>
@@ -437,6 +438,7 @@ uint64_t source_plan_signature(const SourcePlan &plan) {
 
 void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out) {
   out.clear();
+  std::map<int, uint32_t> cadence_slots;
   for (int i = 0; i < f.num_chunks; ++i) {
     if (!f.chunks[i]->is_mine()) continue;
     int di = 0;
@@ -473,7 +475,12 @@ void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out) {
       d.is_old = cur->persist ? cur->is_old : cur->is;
       d.ie_old = cur->persist ? cur->ie_old : cur->ie;
       d.decimation_factor = cur->get_decimation_factor();
-      d.due_scalar_slot = 0;
+      const std::pair<std::map<int, uint32_t>::iterator, bool> cadence =
+          cadence_slots.insert(std::make_pair(d.decimation_factor,
+                                              uint32_t(cadence_slots.size())));
+      if (cadence_slots.size() > cw_dft_predicate_capacity)
+        throw std::overflow_error("DFT decimation predicate capacity exceeded");
+      d.due_scalar_slot = cadence.first->second;
       d.weights = BoundaryWeights(cur->s0, cur->s1, cur->e0, cur->e1);
       d.dV0 = cur->dV0;
       d.dV1 = cur->dV1;

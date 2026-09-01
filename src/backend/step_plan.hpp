@@ -923,6 +923,9 @@ struct CwDftDescriptorRef {
   uint32_t due_scalar_slot;
 };
 
+/* CW final-DFT predicates occupy the fixed StepScalars predicate bitset. */
+const uint32_t cw_dft_predicate_capacity = 64u * 64u;
+
 /* Source/monitor-dependent extension of CwStateLayout. Source and DFT indices
    refer to the DescriptorSet owned by the same prepared fields object (and,
    later, its compiled ordinary executable); the fingerprints bind that owner.

@@ -36,6 +36,7 @@ std::atomic<size_t> material_compact_calls(0), material_compact_bytes(0);
 std::atomic<size_t> material_dense_calls(0), material_dense_bytes(0);
 std::atomic<size_t> material_tiled_calls(0), material_tiled_bytes(0);
 std::atomic<int> injected_failure(static_cast<int>(testing::failure_point::none));
+std::atomic<int> injected_followup_failure(static_cast<int>(testing::failure_point::none));
 
 void update_peak(std::atomic<size_t> &peak, size_t value) {
   size_t observed = peak.load(std::memory_order_relaxed);
@@ -90,9 +91,16 @@ std::string uuid_string(const cudaUUID_t &uuid) {
 
 bool consume_failure(testing::failure_point point) {
   int expected = static_cast<int>(point);
-  return injected_failure.compare_exchange_strong(
+  const bool consumed = injected_failure.compare_exchange_strong(
       expected, static_cast<int>(testing::failure_point::none), std::memory_order_relaxed,
       std::memory_order_relaxed);
+  if (consumed) {
+    const int followup = injected_followup_failure.exchange(
+        static_cast<int>(testing::failure_point::none), std::memory_order_relaxed);
+    if (followup != static_cast<int>(testing::failure_point::none))
+      injected_failure.store(followup, std::memory_order_relaxed);
+  }
+  return consumed;
 }
 
 void report_cleanup_failure(const char *operation, cudaError_t result) noexcept {
@@ -677,11 +685,20 @@ memory_accounting current_memory_accounting() {
 namespace testing {
 
 void fail_next(failure_point point) {
+  injected_followup_failure.store(static_cast<int>(failure_point::none),
+                                  std::memory_order_relaxed);
+  injected_failure.store(static_cast<int>(point), std::memory_order_relaxed);
+}
+
+void fail_next_then(failure_point point, failure_point followup) {
+  injected_followup_failure.store(static_cast<int>(followup), std::memory_order_relaxed);
   injected_failure.store(static_cast<int>(point), std::memory_order_relaxed);
 }
 
 void clear_failure() {
   injected_failure.store(static_cast<int>(failure_point::none), std::memory_order_relaxed);
+  injected_followup_failure.store(static_cast<int>(failure_point::none),
+                                  std::memory_order_relaxed);
 }
 
 bool consume_failure_for_testing(failure_point point) { return consume_failure(point); }

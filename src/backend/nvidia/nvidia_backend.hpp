@@ -118,11 +118,20 @@ struct NvidiaGraphStatistics {
   size_t scalar_write_count;
   size_t launch_count;
   size_t boundary_count;
+  size_t magnetic_segment_count;
+  size_t magnetic_capture_count;
+  size_t magnetic_instantiate_count;
+  size_t magnetic_scalar_write_count;
+  size_t magnetic_launch_count;
+  size_t magnetic_boundary_count;
 
   NvidiaGraphStatistics()
       : requested(GraphExecutionMode::automatic), enabled(false), valid(false),
         segment_count(0), capture_count(0), instantiate_count(0), scalar_write_count(0),
-        launch_count(0), boundary_count(0) {}
+        launch_count(0), boundary_count(0), magnetic_segment_count(0),
+        magnetic_capture_count(0), magnetic_instantiate_count(0),
+        magnetic_scalar_write_count(0), magnetic_launch_count(0),
+        magnetic_boundary_count(0) {}
 };
 
 struct NvidiaCwStatistics {
@@ -176,6 +185,19 @@ struct NvidiaCwStatistics {
   size_t reconciliation_kernel_launches_per_operator;
   size_t workspace_capacity_bytes;
   size_t workspace_allocations;
+  bool graph_enabled;
+  size_t graph_count;
+  size_t graph_capture_count;
+  size_t graph_instantiate_count;
+  size_t graph_scalar_write_count;
+  size_t graph_launch_count;
+  size_t graph_rhs_launch_count;
+  size_t graph_unpack_launch_count;
+  size_t graph_pack_launch_count;
+  size_t graph_vector_launch_count;
+  size_t graph_reduction_launch_count;
+  size_t graph_operator_launch_count;
+  size_t graph_final_dft_launch_count;
   bool valid;
 
   NvidiaCwStatistics()
@@ -202,7 +224,12 @@ struct NvidiaCwStatistics {
         iteration_operator_kernel_launches(0), iteration_reduction_kernel_launches(0),
         iteration_timestep_kernel_launches(0), timestep_kernel_launches_per_operator(0),
         reconciliation_kernel_launches_per_operator(0), workspace_capacity_bytes(0),
-        workspace_allocations(0), valid(false) {}
+        workspace_allocations(0), graph_enabled(false), graph_count(0),
+        graph_capture_count(0), graph_instantiate_count(0), graph_scalar_write_count(0),
+        graph_launch_count(0), graph_rhs_launch_count(0), graph_unpack_launch_count(0),
+        graph_pack_launch_count(0), graph_vector_launch_count(0),
+        graph_reduction_launch_count(0), graph_operator_launch_count(0),
+        graph_final_dft_launch_count(0), valid(false) {}
 };
 
 namespace nvidia {
@@ -325,6 +352,7 @@ public:
   NvidiaMaterialInitializationStatistics material_initialization_statistics_for_testing() const;
   NvidiaGraphStatistics graph_statistics_for_testing() const;
   int device_ordinal_for_testing() const { return device_; }
+  void clear_cw_graphs_for_testing();
 
 private:
   friend class NvidiaBackendState;
@@ -341,6 +369,8 @@ private:
                                bool account_cw);
   void configure_graph_execution(const StepPlan &plan, NvidiaExecutable &executable,
                                  NvidiaBackendState &state);
+  void configure_cw_graph_execution(const StepPlan &plan, const CwPlan &cw_plan,
+                                    NvidiaExecutable &executable, NvidiaBackendState &state);
   void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
   fields &f_;
   execution_options options_;
