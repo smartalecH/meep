@@ -2399,6 +2399,8 @@ class Simulation:
             False,
             None,
         )
+        if self.fields is not None:
+            mp._bind_material_recipe(self.fields, self.structure, self.geps)
 
     def dump_structure(self, fname: str = None, single_parallel_file: bool = True):
         """

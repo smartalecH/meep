@@ -6380,9 +6380,41 @@ static void test_native_geometry_cuda_mpi_initialization() {
         nvidia::testing::current_transfer_accounting();
     const nvidia::testing::material_transfer_accounting material =
         nvidia::testing::current_material_transfer_accounting();
-    require(backend && backend->device_ordinal_for_testing() == my_global_rank() &&
-                !gpu.backend_state && !gpu.executable && material.compact_calls != 0 &&
-                material.dense_output_calls == 0 && transfers.host_to_device_calls != 0,
+    const InitializationPlan regional_source = build_initialization_plan(gpu);
+    const InitOperation *regional_target = NULL;
+    for (const InitOperation &operation : regional_source.operations)
+      if (operation.kind == InitKind::material_geometry && !operation.region.whole) {
+        regional_target = &operation;
+        break;
+      }
+    InitializationPlan regional;
+    if (regional_target) {
+      ivec end = regional_target->region.begin;
+      LOOP_OVER_DIRECTIONS(end.dim, d)
+        end.set_direction(
+            d, std::min(regional_target->region.end.in_direction(d),
+                        regional_target->region.begin.in_direction(d) + 2));
+      regional = regional_source.restrict_to(
+          InitRegion(regional_target->region.chunk, regional_target->region.begin, end));
+    }
+    const bool accepted =
+        backend && backend->device_ordinal_for_testing() == my_global_rank() &&
+        !gpu.backend_state && !gpu.executable && material.compact_calls != 0 &&
+        material.dense_output_calls == 0 && transfers.host_to_device_calls != 0 &&
+        regional_target && !regional.regional_supported &&
+        regional.regional_reason == RegionalSupportReason::remote_dependency;
+    if (!accepted)
+      fprintf(stderr,
+              "regional MPI rank=%d backend=%d device=%d/%d state=%d exec=%d compact=%zu "
+              "dense=%zu h2d=%zu plan=%d target=%d supported=%d reason=%d remote=%d\n",
+              my_rank(), int(backend != NULL), backend ? backend->device_ordinal_for_testing() : -1,
+              my_global_rank(), int(gpu.backend_state != NULL), int(gpu.executable != NULL),
+              material.compact_calls, material.dense_output_calls,
+              transfers.host_to_device_calls, int(gpu.initialization_plan != NULL),
+              int(regional_target != NULL), int(regional.regional_supported),
+              int(regional.regional_reason),
+              int(regional_source.requires_remote_transport));
+    require(accepted,
             "CUDA MPI geometry initialization did not map one rank per GPU");
   }
 
@@ -6726,7 +6758,6 @@ static void test_material_value_refresh_preserves_host_edit(precision_policy_kin
   const NvidiaExecutableCacheStatistics stable_cache =
       backend->executable_cache_statistics_for_testing();
   const nvidia::graph_accounting stable_graphs = nvidia::testing::current_graph_accounting();
-
   ArrayId target = invalid_array();
   realnum *host = NULL;
   StorageKey key;
@@ -6787,6 +6818,544 @@ static void test_material_value_refresh_preserves_host_edit(precision_policy_kin
               region_graphs.executable_destroys == stable_graphs.executable_destroys,
           "stable-classification material_region replaced the resident executable");
   master_printf("nvidia_timestep: material host-value refresh PASS\n");
+}
+
+static void test_regional_material_refresh(precision_policy_kind precision) {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.25, 1.0, 10.0);
+  double borrowed_base = 2.375;
+  material_type material =
+      make_user_material(pr54_borrowed_material, &borrowed_base, false);
+  geometric_object_list geometry = {0, NULL};
+  structure s(gv, isotropic_eps, pml(0.25, X), identity(), 1);
+  set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 64,
+                              false, material);
+  material_free(material);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  gaussian_src_time source(0.31, 0.09);
+  f.add_point_source(Ez, source, vec(0.11, -0.13));
+  component monitored = Ez;
+  const double frequency = 0.27;
+  dft_fields monitor = f.add_dft_fields(&monitored, 1, f.v, &frequency, 1);
+  (void)monitor;
+  f.add_flux_vol(X, volume(vec(0.1, -0.35), vec(0.1, 0.35)));
+  f.init_backend();
+  require(f.backend_state && f.executable,
+          "regional fixture did not publish a resident epoch before refresh");
+  require(f.initialization_plan && f.initialization_plan->materials.size() == 1 &&
+              f.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::host_reference &&
+              material_ir_for(f),
+          "regional fixture did not select owned-IR host-reference material");
+  for (const InitOperation &operation : f.initialization_plan->operations)
+    require(operation.destination.id.value < f.storage_plan->arrays.size() &&
+                !f.storage_plan->arrays[operation.destination.id.value].classification_elided,
+            "cold initialization plan retained an action for an authoritative tombstone");
+  NvidiaBackend *const backend = dynamic_cast<NvidiaBackend *>(f.backend);
+  require(backend, "regional material fixture has no NVIDIA backend");
+  BackendState *const stable_state = f.backend_state;
+  Executable *const stable_executable = f.executable;
+  const NvidiaExecutableCacheStatistics stable_cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting stable_graphs = nvidia::testing::current_graph_accounting();
+  require(f.step_plans[0] && f.descriptors,
+          "regional fixture did not publish timestep/monitor descriptors");
+  const uint64_t stable_step_signature = f.step_plans[0]->signature;
+  const uint64_t stable_source_signature = source_plan_signature(f.descriptors->sources);
+  const uint64_t stable_dft_signature = dft_plan_signature(f.descriptors->dfts);
+  const uint64_t stable_flux_signature = legacy_flux_definition_signature(f);
+  std::vector<uint8_t> installed_elision;
+  size_t installed_tombstones = 0;
+  for (const ArraySpec &spec : f.storage_plan->arrays) {
+    installed_elision.push_back(spec.classification_elided ? 1 : 0);
+    installed_tombstones += spec.classification_elided ? 1 : 0;
+  }
+  require(installed_tombstones > 0,
+          "regional fixture does not exercise resolved tombstone identities");
+
+  const InitOperation *target_operation = NULL;
+  for (const InitOperation &operation : f.initialization_plan->operations)
+    if (operation.kind == InitKind::material_geometry && !operation.region.whole) {
+      target_operation = &operation;
+      break;
+    }
+  require(target_operation, "regional material fixture has no coordinate-backed destination");
+  ivec end = target_operation->region.begin;
+  LOOP_OVER_DIRECTIONS(end.dim, d) {
+    const int begin = target_operation->region.begin.in_direction(d);
+    end.set_direction(d, std::min(target_operation->region.end.in_direction(d), begin + 2));
+  }
+  const InitRegion requested(target_operation->region.chunk,
+                             target_operation->region.begin, end);
+  const InitializationPlan restricted = f.initialization_plan->restrict_to(requested);
+  const InitOperation *selected = NULL;
+  for (const InitOperation &operation : restricted.operations)
+    if (operation.kind == InitKind::material_geometry &&
+        operation.descriptor_index == target_operation->descriptor_index) {
+      selected = &operation;
+      break;
+    }
+  require(restricted.regional_supported && selected && !selected->point_spans.empty(),
+          "regional material fixture did not produce clipped point spans");
+  ArrayId unchanged_pml = invalid_array();
+  for (const InitOperation &operation : restricted.operations)
+    if (operation.kind == InitKind::pml_profile &&
+        operation.destination.id.value < f.storage_plan->arrays.size() &&
+        f.storage_plan->arrays[operation.destination.id.value].elements) {
+      unchanged_pml = operation.destination.id;
+      break;
+    }
+  require(is_valid(unchanged_pml),
+          "regional material fixture has no full-row PML producer");
+  const size_t unchanged_pml_elements =
+      f.storage_plan->arrays[unchanged_pml.value].elements;
+  std::vector<realnum> unchanged_pml_before(unchanged_pml_elements);
+  f.backend->read(ArrayRef{unchanged_pml, 0, unchanged_pml_elements},
+                  unchanged_pml_before.data(),
+                  unchanged_pml_before.size() * sizeof(realnum));
+
+  /* The stable-address gate must not trust the prepared upload descriptors: it
+     re-derives the canonical restricted plan and physical byte ranges from the
+     full candidate.  Exercise malformed authorities directly while the live
+     state is still host-readable and before any update is enqueued. */
+  const InitializationPlan admission_candidate = build_initialization_plan(f);
+  const InitializationPlan admission_restricted =
+      admission_candidate.restrict_to(requested);
+  CpuArrayCatalog admission_catalog;
+  StoragePlan admission_authoritative;
+  build_storage_catalog(f, admission_catalog, admission_authoritative);
+  StoragePlan admission_storage = admission_authoritative;
+  mark_material_storage_provisional(admission_candidate.materials[0],
+                                    admission_storage);
+  const auto admission_accepts = [&](const InitializationPlan &execution,
+                                     const StoragePlan &candidate_storage,
+                                     int upload_mutation) {
+    try {
+      backend->preflight_initialization(execution);
+      backend->prepare_initialization(execution, *f.backend_state);
+      MaterialClassification exact;
+      backend->preview_prepared_material_classification(
+          candidate_storage, *f.backend_state, exact);
+      if (upload_mutation >= 0)
+        backend->mutate_prepared_initialization_upload_for_testing(
+            *f.backend_state, upload_mutation);
+      return backend->prepared_material_classification_preserves_storage(
+          admission_candidate, execution, admission_authoritative,
+          candidate_storage, exact, *f.backend_state);
+    }
+    catch (...) { return false; }
+  };
+  require(admission_accepts(admission_restricted, admission_storage, -1),
+          "canonical regional upload authority failed stable-address admission");
+
+  InitializationPlan malformed = admission_restricted;
+  size_t malformed_operation = malformed.operations.size();
+  for (size_t i = 0; i < malformed.operations.size(); ++i)
+    if (malformed.operations[i].kind == InitKind::material_geometry &&
+        !malformed.operations[i].point_spans.empty()) {
+      malformed_operation = i;
+      break;
+    }
+  require(malformed_operation < malformed.operations.size(),
+          "regional admission fixture has no material operation");
+  const uint32_t original_descriptor =
+      malformed.operations[malformed_operation].descriptor_index;
+  bool found_wrong_descriptor = false;
+  for (uint32_t descriptor = 0;
+       descriptor < admission_candidate.materials[0].ir()->destinations.size();
+       ++descriptor) {
+    if (descriptor == original_descriptor) continue;
+    const MaterialIRDestination &other =
+        admission_candidate.materials[0].ir()->destinations[descriptor];
+    const InitPointSpan &span =
+        malformed.operations[malformed_operation].point_spans.back();
+    if (span.first <= other.point_count && span.count <= other.point_count - span.first) {
+      malformed.operations[malformed_operation].descriptor_index = descriptor;
+      found_wrong_descriptor = true;
+      break;
+    }
+  }
+  require(found_wrong_descriptor &&
+              !admission_accepts(malformed, admission_storage, -1),
+          "regional admission accepted a wrong operation descriptor/key mapping");
+
+  malformed = admission_restricted;
+  InitOperation &missing_span = malformed.operations[malformed_operation];
+  if (missing_span.point_spans.back().count > 1)
+    --missing_span.point_spans.back().count;
+  else
+    missing_span.point_spans.pop_back();
+  require(!admission_accepts(malformed, admission_storage, -1),
+          "regional admission accepted a missing point span");
+
+  malformed = admission_restricted;
+  malformed.operations[malformed_operation].point_spans.push_back(
+      malformed.operations[malformed_operation].point_spans.front());
+  require(!admission_accepts(malformed, admission_storage, -1),
+          "regional admission accepted an overlapping point span");
+
+  StoragePlan malformed_storage = admission_storage;
+  require(malformed_storage.arrays.size() > admission_authoritative.arrays.size(),
+          "regional admission fixture has no provisional suffix identity");
+  const size_t suffix = admission_authoritative.arrays.size();
+  malformed_storage.keys[suffix].aux ^= UINT64_C(0x4000000000000000);
+  require(!admission_accepts(admission_restricted, malformed_storage, -1),
+          "regional admission accepted a changed provisional suffix key");
+
+  for (int upload_mutation = 0; upload_mutation != 5; ++upload_mutation)
+    require(!admission_accepts(admission_restricted, admission_storage,
+                               upload_mutation),
+            "regional admission accepted a malformed prepared upload map");
+
+  const MaterialIR &ir = *material_ir_for(f);
+  const MaterialIRDestination &destination = ir.destinations[selected->descriptor_index];
+  const size_t physical = material_ir_destination_storage_index(
+      ir, destination, selected->point_spans[0].first);
+  uint64_t outside_point = destination.point_count;
+  for (uint64_t point = 0; point < destination.point_count; ++point) {
+    bool included = false;
+    for (const InitPointSpan &span : selected->point_spans)
+      included |= point >= span.first && point - span.first < span.count;
+    if (!included) {
+      outside_point = point;
+      break;
+    }
+  }
+  require(outside_point < destination.point_count,
+          "regional material fixture selected the complete destination");
+  const size_t outside_physical =
+      material_ir_destination_storage_index(ir, destination, outside_point);
+  realnum *const host = f.array_catalog->resolve<realnum>(selected->destination.id);
+  require(host && physical < f.storage_plan->arrays[selected->destination.id.value].elements &&
+              outside_physical <
+                  f.storage_plan->arrays[selected->destination.id.value].elements,
+          "regional material fixture resolved an invalid host point");
+  std::vector<realnum> outside_before(1);
+  f.backend->read(ArrayRef{selected->destination.id, outside_physical, 1},
+                  outside_before.data(), sizeof(realnum));
+  const realnum sentinel = host[physical] + realnum(0.125);
+  host[physical] = sentinel;
+
+  invalidate_material_region(f, requested, "NVIDIA clipped regional material refresh");
+  nvidia::testing::fail_next(
+      nvidia::testing::failure_point::material_refresh_before_upload);
+  bool preflight_rejected = false;
+  try { f.init_backend(); }
+  catch (const std::exception &) { preflight_rejected = true; }
+  nvidia::testing::clear_failure();
+  require(preflight_rejected && f.backend_state == stable_state &&
+              f.executable == stable_executable && !f.backend->is_poisoned() &&
+              pending_material_region(f, NULL),
+          "pre-enqueue regional refresh failure changed or consumed the live transaction");
+  nvidia::testing::reset_material_transfer_accounting();
+  f.init_backend();
+  const nvidia::testing::material_transfer_accounting transfers =
+      nvidia::testing::current_material_transfer_accounting();
+  std::vector<realnum> observed(1);
+  f.backend->read(ArrayRef{selected->destination.id, physical, 1}, observed.data(),
+                  sizeof(realnum));
+  std::vector<realnum> outside_after(1);
+  f.backend->read(ArrayRef{selected->destination.id, outside_physical, 1},
+                  outside_after.data(), sizeof(realnum));
+  std::vector<realnum> unchanged_pml_after(unchanged_pml_elements);
+  f.backend->read(ArrayRef{unchanged_pml, 0, unchanged_pml_elements},
+                  unchanged_pml_after.data(),
+                  unchanged_pml_after.size() * sizeof(realnum));
+  const realnum expected = precision == precision_policy_kind::native
+                               ? sentinel
+                               : realnum(float(sentinel));
+  const NvidiaExecutableCacheStatistics cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting graphs = nvidia::testing::current_graph_accounting();
+  size_t full_material_bytes = 0;
+  for (const MaterialRecipeRow &row : f.initialization_plan->materials[0].rows())
+    full_material_bytes += row.values.size();
+  const bool retained = observed[0] == expected && outside_after == outside_before &&
+              unchanged_pml_after == unchanged_pml_before &&
+              f.backend_state == stable_state &&
+              f.executable == stable_executable &&
+              cache.ordinary_resource_generation == stable_cache.ordinary_resource_generation &&
+              cache.executable_build_count == stable_cache.executable_build_count &&
+              graphs.creates == stable_graphs.creates &&
+              graphs.instantiates == stable_graphs.instantiates &&
+              graphs.graph_destroys == stable_graphs.graph_destroys &&
+              graphs.executable_destroys == stable_graphs.executable_destroys &&
+              f.step_plans[0] && f.step_plans[0]->signature == stable_step_signature &&
+              f.descriptors &&
+              source_plan_signature(f.descriptors->sources) == stable_source_signature &&
+              dft_plan_signature(f.descriptors->dfts) == stable_dft_signature &&
+              legacy_flux_definition_signature(f) == stable_flux_signature &&
+              transfers.dense_output_calls > 0 &&
+              transfers.dense_output_bytes > 0 &&
+              transfers.dense_output_bytes < full_material_bytes;
+  if (!retained)
+    fprintf(stderr,
+            "regional retain observed=%g expected=%g state=%d exec=%d resource=%llu/%llu "
+            "builds=%zu/%zu graphs=%zu/%zu inst=%zu/%zu destroy=%zu/%zu exec_destroy=%zu/%zu "
+            "dense=%zu/%zu full=%zu\n",
+            double(observed[0]), double(expected), int(f.backend_state == stable_state),
+            int(f.executable == stable_executable),
+            (unsigned long long)cache.ordinary_resource_generation,
+            (unsigned long long)stable_cache.ordinary_resource_generation,
+            cache.executable_build_count, stable_cache.executable_build_count,
+            graphs.creates, stable_graphs.creates, graphs.instantiates,
+            stable_graphs.instantiates, graphs.graph_destroys,
+            stable_graphs.graph_destroys, graphs.executable_destroys,
+            stable_graphs.executable_destroys, transfers.dense_output_calls,
+            transfers.dense_output_bytes, full_material_bytes);
+  require(retained,
+          "clipped regional material refresh did not retain graphs and bounded transfers");
+  require(f.storage_plan->arrays.size() == installed_elision.size(),
+          "regional refresh changed the resolved storage identity count");
+  for (size_t i = 0; i < installed_elision.size(); ++i)
+    require(uint8_t(f.storage_plan->arrays[i].classification_elided ? 1 : 0) ==
+                installed_elision[i],
+            "regional refresh drifted a retained/tombstoned destination identity");
+  require(!pending_material_region(f, NULL),
+          "successful regional material refresh retained stale pending authority");
+
+  host[physical] = sentinel + realnum(0.03125);
+  invalidate_material_region(f, requested, "NVIDIA regional post-enqueue poison");
+  nvidia::testing::fail_next(
+      nvidia::testing::failure_point::material_refresh_after_upload);
+  bool post_enqueue_rejected = false;
+  try { f.init_backend(); }
+  catch (const std::exception &) { post_enqueue_rejected = true; }
+  nvidia::testing::clear_failure();
+  require(post_enqueue_rejected && f.backend->is_poisoned() &&
+              f.backend_state == stable_state && f.executable == stable_executable &&
+              pending_material_region(f, NULL),
+          "post-enqueue regional refresh did not poison while retaining owned resources");
+  master_printf("nvidia_timestep: regional material/%s PASS\n",
+                precision_policy_name(precision));
+}
+
+static void test_regional_pml_mutation_rebuild(precision_policy_kind precision) {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.25, 1.0, 10.0);
+  double borrowed_base = 2.125;
+  material_type material =
+      make_user_material(pr54_borrowed_material, &borrowed_base, false);
+  geometric_object_list geometry = {0, NULL};
+  structure s(gv, isotropic_eps, pml(0.25, X), identity(), 1);
+  set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 64,
+                              false, material);
+  material_free(material);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.init_backend();
+  NvidiaBackend *const backend = dynamic_cast<NvidiaBackend *>(f.backend);
+  require(backend && f.backend_state && f.executable && f.initialization_plan,
+          "regional PML fixture did not publish a resident epoch");
+
+  const InitOperation *material_operation = NULL;
+  const InitOperation *pml_operation = NULL;
+  for (const InitOperation &operation : f.initialization_plan->operations) {
+    if (!material_operation && operation.kind == InitKind::material_geometry &&
+        !operation.region.whole)
+      material_operation = &operation;
+    if (!pml_operation && operation.kind == InitKind::pml_profile &&
+        operation.destination.id.value < f.storage_plan->arrays.size() &&
+        f.storage_plan->arrays[operation.destination.id.value].elements > 1)
+      pml_operation = &operation;
+  }
+  require(material_operation && pml_operation,
+          "regional PML fixture lacks material/PML producer authority");
+  ivec end = material_operation->region.begin;
+  LOOP_OVER_DIRECTIONS(end.dim, d)
+    end.set_direction(
+        d, std::min(material_operation->region.end.in_direction(d),
+                    material_operation->region.begin.in_direction(d) + 2));
+  const InitRegion requested(material_operation->region.chunk,
+                             material_operation->region.begin, end);
+  const InitializationPlan restricted =
+      f.initialization_plan->restrict_to(requested);
+  bool selected_pml = false;
+  for (const InitOperation &operation : restricted.operations)
+    selected_pml = selected_pml ||
+                   (operation.kind == InitKind::pml_profile &&
+                    operation.destination.id == pml_operation->destination.id &&
+                    operation.point_spans.empty());
+  require(selected_pml,
+          "regional PML fixture did not select its whole-row producer");
+
+  const ArrayId pml_id = pml_operation->destination.id;
+  const size_t pml_elements = f.storage_plan->arrays[pml_id.value].elements;
+  realnum *const host_pml = f.array_catalog->resolve<realnum>(pml_id);
+  require(host_pml && pml_elements > 1,
+          "regional PML fixture could not resolve a mutable profile row");
+  const size_t outside = pml_elements - 1;
+  host_pml[outside] += realnum(0.0625);
+  const realnum expected = precision == precision_policy_kind::native
+                               ? host_pml[outside]
+                               : realnum(float(host_pml[outside]));
+
+  BackendState *const old_state = f.backend_state;
+  Executable *const old_executable = f.executable;
+  const NvidiaExecutableCacheStatistics before_cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting before_graphs =
+      nvidia::testing::current_graph_accounting();
+  invalidate_material_region(f, requested,
+                             "NVIDIA out-of-region PML mutation");
+  f.init_backend();
+  std::vector<realnum> observed(1);
+  f.backend->read(ArrayRef{pml_id, outside, 1}, observed.data(), sizeof(realnum));
+  const NvidiaExecutableCacheStatistics after_cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting after_graphs =
+      nvidia::testing::current_graph_accounting();
+  require(!f.backend->is_poisoned() && !pending_material_region(f, NULL) &&
+              observed[0] == expected &&
+              after_cache.ordinary_resource_generation >
+                  before_cache.ordinary_resource_generation &&
+              after_graphs.instantiates > before_graphs.instantiates &&
+              after_graphs.graph_destroys > before_graphs.graph_destroys &&
+              after_graphs.executable_destroys >
+                  before_graphs.executable_destroys &&
+              (f.backend_state != old_state || f.executable != old_executable ||
+               after_cache.executable_build_count >
+                   before_cache.executable_build_count),
+          "out-of-region PML mutation did not force transactional replacement");
+  master_printf("nvidia_timestep: regional PML replacement/%s PASS\n",
+                precision_policy_name(precision));
+}
+
+static void test_regional_native_rebuild(precision_policy_kind precision) {
+  using namespace meep_geom;
+  const grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  material_type grid = make_geometry_grid_material(false, material_data::U_DEFAULT);
+  geometric_object object =
+      make_block(grid, make_vector3(), make_vector3(1, 0, 0), make_vector3(0, 1, 0),
+                 make_vector3(0, 0, 1), make_vector3(0.75, 0.75, 1.0));
+  geometric_object_list geometry = {1, &object};
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  set_materials_from_geometry(&s, geometry, make_vector3(), false, 1e-5, 128,
+                              false, vacuum);
+  geometric_object_destroy(object);
+  material_free(grid);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  fields f(&s, options);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.init_backend();
+  f.advance(1);
+  require(f.initialization_plan && f.initialization_plan->materials.size() == 1 &&
+              f.initialization_plan->materials[0].disposition() ==
+                  MaterialRecipeDisposition::device_native,
+          "native regional rebuild fixture selected a non-native route");
+  const InitOperation *target = NULL;
+  for (const InitOperation &operation : f.initialization_plan->operations)
+    if (operation.kind == InitKind::material_geometry && !operation.region.whole) {
+      target = &operation;
+      break;
+    }
+  require(target, "native regional rebuild fixture has no coordinate destination");
+  ivec end = target->region.begin;
+  LOOP_OVER_DIRECTIONS(end.dim, d)
+    end.set_direction(
+        d, std::min(target->region.end.in_direction(d),
+                    target->region.begin.in_direction(d) + 2));
+  const InitRegion requested(target->region.chunk, target->region.begin, end);
+  NvidiaBackend *const backend = dynamic_cast<NvidiaBackend *>(f.backend);
+  require(backend, "native regional rebuild fixture lost its backend");
+
+  BackendState *const no_op_state = f.backend_state;
+  Executable *const no_op_executable = f.executable;
+  const nvidia::graph_accounting no_op_graphs = nvidia::testing::current_graph_accounting();
+  invalidate_material_region(f, requested, "NVIDIA regional no-op");
+  f.init_backend();
+  const nvidia::graph_accounting after_no_op = nvidia::testing::current_graph_accounting();
+  require(f.backend_state == no_op_state && f.executable == no_op_executable &&
+              after_no_op.creates == no_op_graphs.creates &&
+              after_no_op.instantiates == no_op_graphs.instantiates &&
+              after_no_op.graph_destroys == no_op_graphs.graph_destroys &&
+              after_no_op.executable_destroys == no_op_graphs.executable_destroys &&
+              !pending_material_region(f, NULL),
+          "regional no-op changed the live epoch or graph owners");
+
+  std::shared_ptr<MaterialIR> changed(
+      new MaterialIR(*static_cast<const MaterialIR *>(f.material_ir.get())));
+  bool changed_weight = false;
+  for (MaterialIRMaterial &entry : changed->materials)
+    if (entry.kind == material_data::MATERIAL_GRID && !entry.samples.empty()) {
+      entry.samples[0] = entry.samples[0] < 0.75 ? entry.samples[0] + 0.125
+                                                 : entry.samples[0] - 0.125;
+      changed_weight = true;
+      break;
+    }
+  require(changed_weight, "native regional rebuild fixture found no MaterialGrid weight");
+  refresh_material_ir_signatures_for_testing(*changed);
+  f.material_ir = std::static_pointer_cast<const void>(changed);
+  BackendState *const old_state = f.backend_state;
+  Executable *const old_executable = f.executable;
+  const NvidiaExecutableCacheStatistics cache_before_failure =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting before_failure = nvidia::testing::current_graph_accounting();
+  invalidate_material_region(f, requested, "NVIDIA native regional replacement");
+  nvidia::testing::fail_next(nvidia::testing::failure_point::device_allocate);
+  bool rejected = false;
+  try { f.init_backend(); }
+  catch (const std::exception &) { rejected = true; }
+  nvidia::testing::clear_failure();
+  const nvidia::graph_accounting after_failure = nvidia::testing::current_graph_accounting();
+  require(rejected && f.backend_state == old_state && f.executable == old_executable &&
+              !f.backend->is_poisoned() && pending_material_region(f, NULL) &&
+              after_failure.creates == before_failure.creates &&
+              after_failure.instantiates == before_failure.instantiates &&
+              after_failure.graph_destroys == before_failure.graph_destroys &&
+              after_failure.executable_destroys == before_failure.executable_destroys,
+          "failed native regional replacement changed the usable live epoch");
+
+  f.init_backend();
+  const nvidia::graph_accounting after_rebuild = nvidia::testing::current_graph_accounting();
+  const NvidiaExecutableCacheStatistics cache_after_rebuild =
+      backend->executable_cache_statistics_for_testing();
+  const bool rebuilt =
+              !pending_material_region(f, NULL) &&
+              cache_after_rebuild.ordinary_resource_generation >
+                  cache_before_failure.ordinary_resource_generation &&
+              after_rebuild.instantiates > after_failure.instantiates &&
+              after_rebuild.graph_destroys > after_failure.graph_destroys &&
+              after_rebuild.executable_destroys > after_failure.executable_destroys;
+  if (!rebuilt)
+    fprintf(stderr,
+            "regional rebuild state=%d exec=%d pending=%d resource=%llu/%llu "
+            "graph=%zu/%zu inst=%zu/%zu "
+            "destroy=%zu/%zu exec_destroy=%zu/%zu\n",
+            int(f.backend_state != old_state), int(f.executable != old_executable),
+            int(pending_material_region(f, NULL)),
+            (unsigned long long)cache_after_rebuild.ordinary_resource_generation,
+            (unsigned long long)cache_before_failure.ordinary_resource_generation,
+            after_rebuild.creates,
+            after_failure.creates, after_rebuild.instantiates,
+            after_failure.instantiates, after_rebuild.graph_destroys,
+            after_failure.graph_destroys, after_rebuild.executable_destroys,
+            after_failure.executable_destroys);
+  require(rebuilt,
+          "unsupported native regional kernel did not rebuild transactionally");
+  master_printf("nvidia_timestep: regional native rebuild/%s PASS\n",
+                precision_policy_name(precision));
 }
 
 static void test_material_collective_preflight() {
@@ -10047,6 +10616,11 @@ int main(int argc, char **argv) {
     return 0;
   }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
+  if (getenv("MEEP_NVIDIA_REGIONAL_NATIVE_REBUILD_ONLY")) {
+    test_regional_native_rebuild(precision_policy_kind::native);
+    test_regional_native_rebuild(precision_policy_kind::f32);
+    return 0;
+  }
   if (getenv("MEEP_NVIDIA_GRAPH_ONLY")) {
     test_graph_execution_integration();
     master_printf("nvidia_timestep: PASS\n");
@@ -10092,6 +10666,16 @@ int main(int argc, char **argv) {
     for (precision_policy_kind policy : policies)
       test_material_value_refresh_preserves_host_edit(policy);
     master_printf("nvidia_timestep: value-only reuse PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_REGIONAL_ONLY")) {
+    test_regional_material_refresh(precision_policy_kind::native);
+    test_regional_material_refresh(precision_policy_kind::f32);
+    test_regional_pml_mutation_rebuild(precision_policy_kind::native);
+    test_regional_pml_mutation_rebuild(precision_policy_kind::f32);
+    test_regional_native_rebuild(precision_policy_kind::native);
+    test_regional_native_rebuild(precision_policy_kind::f32);
+    master_printf("nvidia_timestep: regional material PASS\n");
     return 0;
   }
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))

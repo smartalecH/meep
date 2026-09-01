@@ -573,6 +573,11 @@ struct NvidiaInitializationUpload {
   size_t staging_offset;
   size_t logical_offset;
   bool material;
+  struct Range {
+    size_t offset;
+    size_t bytes;
+  };
+  std::vector<Range> ranges;
 };
 
 struct NvidiaMaterialClassificationRow {
@@ -4128,6 +4133,13 @@ void NvidiaBackend::preflight_initialization(const InitializationPlan &initializ
     throw std::invalid_argument("NVIDIA initialization requires one frozen material recipe");
   const MaterialRecipe &recipe = initialization.materials[0];
   validate_material_recipe(recipe);
+  if (initialization.regional) {
+    if (!initialization.regional_supported)
+      throw std::invalid_argument(std::string("unsupported regional initialization: ") +
+                                  regional_support_reason_name(initialization.regional_reason));
+    if (recipe.disposition() != MaterialRecipeDisposition::host_reference)
+      throw std::invalid_argument("regional initialization requires clipped host row kernels");
+  }
   pending_initialization_classification_rows_ =
       logical_material_classification_rows(recipe);
   const MaterialSupportDecision support = classify_material_support(recipe);
@@ -6975,7 +6987,24 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
   const CpuArrayCatalog &catalog = *f_.array_catalog;
   if (catalog.size() > state.plan_.arrays.size())
     throw std::logic_error("CPU catalog exceeds the provisional NVIDIA storage plan");
-  state.prepared_authoritative_arrays_ = catalog.size();
+  /* The authoritative prefix is fixed when the state is created. A resolved
+     live catalog also contains classification tombstones; promoting that
+     larger size here would silently turn previously elidable rows into
+     retained rows during a regional/value refresh. */
+  if (!state.initialized_) state.prepared_authoritative_arrays_ = catalog.size();
+  else if (catalog.size() < state.prepared_authoritative_arrays_)
+    throw std::logic_error("NVIDIA live catalog lost its authoritative prefix");
+
+  std::map<uint32_t, const InitOperation *> regional_operations;
+  if (initialization.regional)
+    for (const InitOperation &operation : initialization.operations) {
+      if (operation.kind != InitKind::material_geometry &&
+          operation.kind != InitKind::pml_profile)
+        throw std::invalid_argument("regional initialization contains a non-material producer");
+      if (!regional_operations.insert(
+              std::make_pair(operation.destination.id.value, &operation)).second)
+        throw std::invalid_argument("regional initialization repeats a destination");
+    }
 
   MaterialCompactPack compact_inputs;
   if (native_material && !state.material_classification_rows_.empty())
@@ -7005,11 +7034,48 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
         throw std::logic_error("NVIDIA storage alias does not match the CPU catalog alias");
       continue;
     }
+    const auto regional_operation = regional_operations.find(device_spec.id.value);
+    if (initialization.regional &&
+        (device_spec.role != array_role::material ||
+         regional_operation == regional_operations.end() || device_spec.classification_elided))
+      continue;
     if (native_material && device_spec.role == array_role::material) continue;
     const size_t bytes = storage_bytes(device_spec);
-    state.initialization_uploads_.push_back(
-        NvidiaInitializationUpload{device_spec.id.value, bytes, cursor, size_t(-1),
-                                   device_spec.role == array_role::material});
+    NvidiaInitializationUpload upload = {
+        device_spec.id.value, bytes, cursor, size_t(-1),
+        device_spec.role == array_role::material, {}};
+    if (!initialization.regional || regional_operation->second->point_spans.empty())
+      upload.ranges.push_back(NvidiaInitializationUpload::Range{0, bytes});
+    else {
+      if (!material.ir() ||
+          regional_operation->second->descriptor_index >= material.ir()->destinations.size())
+        throw std::invalid_argument("regional upload has no canonical destination");
+      const MaterialIRDestination &destination =
+          material.ir()->destinations[regional_operation->second->descriptor_index];
+      const size_t element_bytes = storage_bytes(device_spec) / device_spec.elements;
+      std::vector<size_t> physical;
+      for (const InitPointSpan &span : regional_operation->second->point_spans)
+        for (uint64_t logical = span.first; logical - span.first < span.count; ++logical)
+          physical.push_back(
+              material_ir_destination_storage_index(*material.ir(), destination, logical));
+      std::sort(physical.begin(), physical.end());
+      physical.erase(std::unique(physical.begin(), physical.end()), physical.end());
+      for (size_t index : physical) {
+        if (index >= device_spec.elements)
+          throw std::out_of_range("regional upload point exceeds destination storage");
+        const size_t offset = material_checked_product(
+            index, element_bytes, "laying out regional material upload");
+        if (!upload.ranges.empty() &&
+            upload.ranges.back().offset + upload.ranges.back().bytes == offset)
+          upload.ranges.back().bytes = material_checked_add(
+              upload.ranges.back().bytes, element_bytes,
+              "coalescing regional material upload");
+        else
+          upload.ranges.push_back(NvidiaInitializationUpload::Range{offset, element_bytes});
+      }
+      if (upload.ranges.empty()) continue;
+    }
+    state.initialization_uploads_.push_back(upload);
     cursor = material_checked_add(cursor, bytes, "laying out NVIDIA initialization uploads");
   }
   state.prepared_compact_staging_offset_ = cursor;
@@ -7050,7 +7116,9 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
                                sizeof(NvidiaInitializationUpload),
                                "laying out NVIDIA initialization descriptors"),
       "laying out NVIDIA initialization descriptors");
-  if (cursor != state.initialization_staging_bytes_ || state.staging_.size() != cursor)
+  if ((!initialization.regional && cursor != state.initialization_staging_bytes_) ||
+      cursor > state.initialization_staging_bytes_ ||
+      state.staging_.size() != state.initialization_staging_bytes_)
     throw std::logic_error(
         "NVIDIA initialization staging differs from pre-allocation admission");
 
@@ -7146,7 +7214,10 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
     realnum *const scratch = reinterpret_cast<realnum *>(
         staging + state.prepared_callback_scratch_offset_);
     const size_t scratch_points = size_t(support.scratch_bytes) / sizeof(realnum);
-    for (const MaterialCallbackTile &tile : material.callback_tiles()) {
+    const std::vector<MaterialCallbackTile> &callback_tiles =
+        initialization.regional ? initialization.material_callback_tiles
+                                : material.callback_tiles();
+    for (const MaterialCallbackTile &tile : callback_tiles) {
       if (tile.destination >= ir.destinations.size())
         throw std::logic_error("tiled callback destination is out of range");
       const MaterialIRDestination &destination = ir.destinations[tile.destination];
@@ -7202,9 +7273,23 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
       const NvidiaInitializationUpload *upload = NULL;
       for (const NvidiaInitializationUpload &candidate : state.initialization_uploads_)
         if (candidate.material && candidate.allocation == row.allocation) upload = &candidate;
-      if (!upload || upload->logical_offset == size_t(-1))
-        throw std::logic_error("material classification row has no logical output");
-      const unsigned char *logical = staging + upload->logical_offset;
+      const unsigned char *logical = NULL;
+      if (upload && upload->logical_offset != size_t(-1))
+        logical = staging + upload->logical_offset;
+      else if (initialization.regional) {
+        for (const MaterialRecipeRow &candidate : material.rows())
+          if (candidate.key == row.key && !candidate.values.empty()) {
+            logical = candidate.values.data();
+            break;
+          }
+        if (!logical)
+          for (const MaterialRecipeRow &candidate : material.dense_fallback_rows())
+            if (candidate.key == row.key && !candidate.values.empty()) {
+              logical = candidate.values.data();
+              break;
+            }
+      }
+      if (!logical) throw std::logic_error("material classification row has no logical output");
       unsigned char *status = staging + state.prepared_status_staging_offset_ + row.status_offset;
       for (size_t i = 0; i < row.logical_elements; ++i) {
         realnum value;
@@ -7340,24 +7425,30 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
               : state.prepared_material_route_ == MaterialRecipeDisposition::host_reference
                     ? nvidia::host_to_device_copy_kind::material_dense_output
                     : nvidia::host_to_device_copy_kind::material_tiled_output;
-      state.arenas_->copy_from_host_async(
-          upload.allocation, 0,
-          static_cast<const unsigned char *>(state.staging_.data()) + upload.staging_offset,
-          upload.bytes, *state.transfer_, copy_kind);
+      for (const NvidiaInitializationUpload::Range &range : upload.ranges)
+        state.arenas_->copy_from_host_async(
+            upload.allocation, range.offset,
+            static_cast<const unsigned char *>(state.staging_.data()) +
+                upload.staging_offset + range.offset,
+            range.bytes, *state.transfer_, copy_kind);
       if (upload.material) {
         if (copy_kind == nvidia::host_to_device_copy_kind::material_dense_output) {
-          ++state.material_initialization_statistics_.dense_output_host_to_device_calls;
-          state.material_initialization_statistics_.dense_output_host_to_device_bytes =
-              material_checked_add(
-                  state.material_initialization_statistics_.dense_output_host_to_device_bytes,
-                  upload.bytes, "accounting dense material output uploads");
+          state.material_initialization_statistics_.dense_output_host_to_device_calls +=
+              upload.ranges.size();
+          for (const NvidiaInitializationUpload::Range &range : upload.ranges)
+            state.material_initialization_statistics_.dense_output_host_to_device_bytes =
+                material_checked_add(
+                    state.material_initialization_statistics_.dense_output_host_to_device_bytes,
+                    range.bytes, "accounting dense material output uploads");
         }
         else {
-          ++state.material_initialization_statistics_.tiled_output_host_to_device_calls;
-          state.material_initialization_statistics_.tiled_output_host_to_device_bytes =
-              material_checked_add(
-                  state.material_initialization_statistics_.tiled_output_host_to_device_bytes,
-                  upload.bytes, "accounting tiled material output uploads");
+          state.material_initialization_statistics_.tiled_output_host_to_device_calls +=
+              upload.ranges.size();
+          for (const NvidiaInitializationUpload::Range &range : upload.ranges)
+            state.material_initialization_statistics_.tiled_output_host_to_device_bytes =
+                material_checked_add(
+                    state.material_initialization_statistics_.tiled_output_host_to_device_bytes,
+                    range.bytes, "accounting tiled material output uploads");
         }
       }
     }
@@ -7537,7 +7628,9 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
             "NVIDIA material classification producer coverage is incomplete");
       const ArraySpec &spec = state.plan_.arrays[expected.allocation];
       const uint8_t row_state = expected.allocation < state.prepared_authoritative_arrays_ ||
-                                        !spec.classification_provisional || actual.nontrivial
+                                        (!spec.classification_provisional &&
+                                         !spec.classification_elided) ||
+                                        actual.nontrivial
                                     ? uint8_t(MaterialClassification::retained)
                                     : uint8_t(MaterialClassification::elided_row);
       state.material_classification_facts_.rows.push_back(
@@ -7565,6 +7658,369 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
   state.initialized_ = true;
   state.material_refresh_pending_ = live_refresh;
   state.device_authoritative_ = false;
+}
+
+bool NvidiaBackend::preview_prepared_material_classification(
+    const StoragePlan &plan, BackendState &raw_state, MaterialClassification &result) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  if (!state.initialization_prepared_ || state.transfer_failed_)
+    throw std::logic_error("NVIDIA material preview requires prepared usable staging");
+  if (!f_.initialization_plan || f_.initialization_plan->materials.size() != 1)
+    throw std::logic_error("NVIDIA material preview has no installed recipe authority");
+  MaterialClassificationFacts facts;
+  const unsigned char *const status =
+      static_cast<const unsigned char *>(state.staging_.data()) +
+      state.prepared_status_staging_offset_;
+  for (const NvidiaMaterialClassificationRow &row : state.material_classification_rows_) {
+    bool missing = false;
+    bool nontrivial = false;
+    for (size_t i = 0; i < row.logical_elements; ++i) {
+      missing = missing || !(status[row.status_offset + i] & 1u);
+      nontrivial = nontrivial || (status[row.status_offset + i] & 2u);
+    }
+    if (missing)
+      throw std::invalid_argument("NVIDIA prepared regional row has incomplete coverage");
+    const ArraySpec &spec = state.plan_.arrays[row.allocation];
+    const uint8_t row_state = row.allocation < state.prepared_authoritative_arrays_ ||
+                                      (!spec.classification_provisional &&
+                                       !spec.classification_elided) ||
+                                      nontrivial
+                                  ? uint8_t(MaterialClassification::retained)
+                                  : uint8_t(MaterialClassification::elided_row);
+    facts.rows.push_back(MaterialRowClassificationFact{row.key, row_state});
+  }
+  const MaterialClassificationFacts installed = state.material_classification_facts_;
+  state.material_classification_facts_ = facts;
+  try { result = classify_state(plan, state); }
+  catch (...) {
+    state.material_classification_facts_ = installed;
+    throw;
+  }
+  state.material_classification_facts_ = installed;
+  return true;
+}
+
+namespace {
+
+bool same_regional_ivec(const ivec &a, const ivec &b) {
+  if (a.dim != b.dim) return false;
+  LOOP_OVER_DIRECTIONS(a.dim, d)
+    if (a.in_direction(d) != b.in_direction(d)) return false;
+  return true;
+}
+
+bool same_regional_region(const InitRegion &a, const InitRegion &b) {
+  return a.chunk == b.chunk && a.whole == b.whole &&
+         (a.whole || (same_regional_ivec(a.begin, b.begin) &&
+                      same_regional_ivec(a.end, b.end)));
+}
+
+bool same_regional_operation(const InitOperation &a, const InitOperation &b) {
+  if (a.kind != b.kind || a.destination.id != b.destination.id ||
+      a.destination.offset != b.destination.offset ||
+      a.destination.elements != b.destination.elements ||
+      a.descriptor_index != b.descriptor_index ||
+      !same_regional_region(a.region, b.region) ||
+      a.point_spans.size() != b.point_spans.size())
+    return false;
+  for (size_t i = 0; i < a.point_spans.size(); ++i)
+    if (a.point_spans[i].first != b.point_spans[i].first ||
+        a.point_spans[i].count != b.point_spans[i].count)
+      return false;
+  return true;
+}
+
+bool same_pml_recipe(const PmlRecipe &a, const PmlRecipe &b) {
+  return a.chunk == b.chunk && a.direction_ == b.direction_ &&
+         a.sigma == b.sigma && a.kappa == b.kappa &&
+         a.sigma_inv == b.sigma_inv;
+}
+
+bool same_regional_authority(const InitializationPlan &actual,
+                             const InitializationPlan &expected) {
+  if (!actual.regional || !expected.regional ||
+      actual.material_values_generation != expected.material_values_generation ||
+      actual.material_region_generation != expected.material_region_generation ||
+      actual.requires_remote_transport != expected.requires_remote_transport ||
+      actual.regional_supported != expected.regional_supported ||
+      actual.regional_reason != expected.regional_reason ||
+      actual.regional_unsupported_reason != expected.regional_unsupported_reason ||
+      !same_regional_region(actual.requested_region, expected.requested_region) ||
+      actual.operations.size() != expected.operations.size() ||
+      actual.materials.size() != expected.materials.size() ||
+      actual.pml.size() != expected.pml.size() ||
+      actual.host_callbacks.size() != expected.host_callbacks.size() ||
+      actual.material_destinations != expected.material_destinations ||
+      actual.material_bulk_spans != expected.material_bulk_spans ||
+      actual.material_analytic_interfaces != expected.material_analytic_interfaces ||
+      actual.material_hybrid_patches != expected.material_hybrid_patches ||
+      actual.material_callback_tiles != expected.material_callback_tiles)
+    return false;
+  for (size_t i = 0; i < actual.operations.size(); ++i)
+    if (!same_regional_operation(actual.operations[i], expected.operations[i])) return false;
+  for (size_t i = 0; i < actual.materials.size(); ++i)
+    if (actual.materials[i].signature() != expected.materials[i].signature()) return false;
+  for (size_t i = 0; i < actual.pml.size(); ++i)
+    if (!same_pml_recipe(actual.pml[i], expected.pml[i])) return false;
+  for (size_t i = 0; i < actual.host_callbacks.size(); ++i)
+    if (actual.host_callbacks[i].id != expected.host_callbacks[i].id ||
+        actual.host_callbacks[i].description != expected.host_callbacks[i].description)
+      return false;
+  return true;
+}
+
+bool same_array_spec(const ArraySpec &a, const ArraySpec &b) {
+  return a.id == b.id && a.role == b.role && a.element_type == b.element_type &&
+         a.storage == b.storage && a.elements == b.elements &&
+         a.alignment == b.alignment && a.alias_of == b.alias_of &&
+         a.classification_provisional == b.classification_provisional &&
+         a.classification_elided == b.classification_elided;
+}
+
+bool pml_storage_key(const StorageKey &key) {
+  return key.kind == int(array_kind::pml_sig) ||
+         key.kind == int(array_kind::pml_kap) ||
+         key.kind == int(array_kind::pml_siginv);
+}
+
+struct RegionalExpectedUpload {
+  size_t bytes;
+  size_t staging_offset;
+  size_t logical_offset;
+  std::vector<NvidiaInitializationUpload::Range> ranges;
+};
+
+bool append_regional_expected_upload(
+    const InitializationPlan &canonical, const InitOperation &operation,
+    const StoragePlan &resolved, const MaterialIR &ir,
+    std::map<uint32_t, RegionalExpectedUpload> &expected) {
+  if (!is_valid(operation.destination.id) ||
+      operation.destination.id.value >= resolved.arrays.size())
+    return false;
+  const uint32_t id = operation.destination.id.value;
+  const ArraySpec &spec = resolved.arrays[id];
+  if (spec.id.value != id || spec.role != array_role::material ||
+      is_valid(spec.alias_of) || spec.classification_provisional ||
+      operation.destination.offset != 0 ||
+      operation.destination.elements != spec.elements)
+    return false;
+  if (spec.classification_elided) return true;
+  if (expected.count(id)) return false;
+  const size_t bytes = storage_bytes(spec);
+  if (!spec.elements || bytes % spec.elements) return false;
+  std::vector<NvidiaInitializationUpload::Range> ranges;
+  if (operation.kind == InitKind::pml_profile) {
+    if (!operation.point_spans.empty() || !pml_storage_key(resolved.keys[id])) return false;
+    ranges.push_back(NvidiaInitializationUpload::Range{0, bytes});
+  }
+  else if (operation.kind == InitKind::material_geometry) {
+    if (operation.descriptor_index >= ir.destinations.size() ||
+        !(ir.destinations[operation.descriptor_index].key == resolved.keys[id]) ||
+        operation.point_spans.empty())
+      return false;
+    const MaterialIRDestination &destination =
+        ir.destinations[operation.descriptor_index];
+    const size_t element_bytes = bytes / spec.elements;
+    std::vector<size_t> physical;
+    uint64_t prior_end = 0;
+    bool have_prior = false;
+    for (const InitPointSpan &span : operation.point_spans) {
+      if (!span.count || span.first >= destination.point_count ||
+          span.count > destination.point_count - span.first ||
+          (have_prior && span.first < prior_end))
+        return false;
+      prior_end = span.first + span.count;
+      have_prior = true;
+      for (uint64_t logical = span.first; logical < prior_end; ++logical) {
+        const size_t index =
+            material_ir_destination_storage_index(ir, destination, logical);
+        if (index >= spec.elements) return false;
+        physical.push_back(index);
+      }
+    }
+    std::sort(physical.begin(), physical.end());
+    if (std::adjacent_find(physical.begin(), physical.end()) != physical.end()) return false;
+    for (size_t index : physical) {
+      const size_t offset = material_checked_product(
+          index, element_bytes, "validating regional material upload");
+      if (!ranges.empty() && ranges.back().offset + ranges.back().bytes == offset)
+        ranges.back().bytes = material_checked_add(
+            ranges.back().bytes, element_bytes,
+            "coalescing validated regional material upload");
+      else
+        ranges.push_back(NvidiaInitializationUpload::Range{offset, element_bytes});
+    }
+  }
+  else return false;
+  if (ranges.empty()) return false;
+  expected.insert(std::make_pair(
+      id, RegionalExpectedUpload{bytes, 0, size_t(-1), ranges}));
+  (void)canonical;
+  return true;
+}
+
+} // namespace
+
+bool NvidiaBackend::prepared_material_classification_preserves_storage(
+    const InitializationPlan &candidate, const InitializationPlan &execution,
+    const StoragePlan &authoritative, const StoragePlan &candidate_storage,
+    const MaterialClassification &classification, BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  if (candidate.materials.size() != 1 || execution.materials.size() != 1 ||
+      authoritative.arrays.size() > candidate_storage.arrays.size() ||
+      candidate_storage.arrays.size() != state.plan_.arrays.size() ||
+      candidate_storage.keys.size() != candidate_storage.arrays.size() ||
+      authoritative.keys.size() != authoritative.arrays.size() ||
+      classification.provisional_row_state.size() != candidate_storage.arrays.size())
+    return false;
+
+  StoragePlan expected_storage = candidate_storage;
+  try {
+    apply_precision_policy(expected_storage, policy_for(options_.precision));
+    resolve_material_storage(candidate.materials[0], classification, authoritative,
+                             expected_storage, policy_for(options_.precision));
+  }
+  catch (...) { return false; }
+  if (expected_storage.arrays.size() != state.plan_.arrays.size() ||
+      expected_storage.keys.size() != state.plan_.keys.size())
+    return false;
+  std::set<uint32_t> installed_ids;
+  for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
+    const ArraySpec &installed = state.plan_.arrays[i];
+    if (installed.id.value != i || !installed_ids.insert(installed.id.value).second ||
+        !(expected_storage.keys[i] == state.plan_.keys[i]) ||
+        !same_array_spec(expected_storage.arrays[i], installed) ||
+        (is_valid(installed.alias_of) &&
+         (installed.alias_of.value >= state.plan_.arrays.size() ||
+          state.plan_.arrays[installed.alias_of.value].classification_elided)))
+      return false;
+  }
+
+  if (execution.regional) {
+    InitializationPlan canonical;
+    try { canonical = candidate.restrict_to(execution.requested_region); }
+    catch (...) { return false; }
+    if (!canonical.regional_supported ||
+        canonical.regional_reason != RegionalSupportReason::supported ||
+        !same_regional_authority(execution, canonical) ||
+        candidate.materials[0].disposition() !=
+            MaterialRecipeDisposition::host_reference ||
+        !f_.initialization_plan)
+      return false;
+    std::string preservation_error;
+    if (!regional_replacement_preserves_unselected(
+            *f_.initialization_plan, candidate, canonical, &preservation_error))
+      return false;
+    const MaterialIR *ir = candidate.materials[0].ir().get();
+    if (!ir) return false;
+    std::map<uint32_t, RegionalExpectedUpload> expected_uploads;
+    try {
+      for (const InitOperation &operation : canonical.operations)
+        if (!append_regional_expected_upload(canonical, operation, expected_storage,
+                                             *ir, expected_uploads))
+          return false;
+    }
+    catch (...) { return false; }
+    size_t staging_cursor = 0;
+    try {
+      for (auto &entry : expected_uploads) {
+        entry.second.staging_offset = staging_cursor;
+        staging_cursor = material_checked_add(
+            staging_cursor, entry.second.bytes,
+            "validating regional upload staging layout");
+      }
+      if (staging_cursor != state.prepared_compact_staging_offset_) return false;
+      size_t logical_cursor = staging_cursor;
+      for (auto &entry : expected_uploads) {
+        entry.second.logical_offset = logical_cursor;
+        const ArraySpec &spec = expected_storage.arrays[entry.first];
+        logical_cursor = material_checked_add(
+            logical_cursor,
+            material_checked_product(spec.elements, sizeof(realnum),
+                                     "validating regional logical staging layout"),
+            "validating regional logical staging layout");
+      }
+      if (logical_cursor != state.prepared_status_staging_offset_ ||
+          state.prepared_status_staging_offset_ > state.staging_.size())
+        return false;
+    }
+    catch (...) { return false; }
+    if (expected_uploads.size() != state.initialization_uploads_.size()) return false;
+    std::set<uint32_t> actual_ids;
+    for (const NvidiaInitializationUpload &upload : state.initialization_uploads_) {
+      if (upload.allocation >= state.plan_.arrays.size() || !upload.material ||
+          upload.bytes != storage_bytes(state.plan_.arrays[upload.allocation]) ||
+          !actual_ids.insert(upload.allocation).second)
+        return false;
+      const auto expected = expected_uploads.find(upload.allocation);
+      if (expected == expected_uploads.end() ||
+          upload.bytes != expected->second.bytes ||
+          upload.staging_offset != expected->second.staging_offset ||
+          upload.logical_offset != expected->second.logical_offset ||
+          upload.ranges.size() != expected->second.ranges.size())
+        return false;
+      size_t prior_end = 0;
+      for (size_t i = 0; i < upload.ranges.size(); ++i) {
+        const NvidiaInitializationUpload::Range &actual = upload.ranges[i];
+        const NvidiaInitializationUpload::Range &wanted = expected->second.ranges[i];
+        if (!actual.bytes || actual.offset < prior_end ||
+            actual.offset > upload.bytes || actual.bytes > upload.bytes - actual.offset ||
+            actual.offset != wanted.offset || actual.bytes != wanted.bytes)
+          return false;
+        prior_end = actual.offset + actual.bytes;
+      }
+    }
+    return actual_ids.size() == expected_uploads.size();
+  }
+
+  std::set<uint32_t> upload_ids;
+  for (const NvidiaInitializationUpload &upload : state.initialization_uploads_) {
+    if (upload.allocation >= state.plan_.arrays.size() ||
+        !upload_ids.insert(upload.allocation).second)
+      return false;
+    size_t prior_end = 0;
+    for (const NvidiaInitializationUpload::Range &range : upload.ranges) {
+      if (!range.bytes || range.offset < prior_end || range.offset > upload.bytes ||
+          range.bytes > upload.bytes - range.offset)
+        return false;
+      prior_end = range.offset + range.bytes;
+    }
+  }
+  return true;
+}
+
+void NvidiaBackend::mutate_prepared_initialization_upload_for_testing(
+    BackendState &raw_state, int mode) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  if (!state.initialization_prepared_ || state.initialization_uploads_.empty())
+    throw std::logic_error("NVIDIA test upload mutation requires a prepared upload");
+  NvidiaInitializationUpload &upload = state.initialization_uploads_[0];
+  switch (mode) {
+    case 0:
+      state.initialization_uploads_.pop_back();
+      break;
+    case 1:
+      {
+        const NvidiaInitializationUpload duplicate = upload;
+        state.initialization_uploads_.push_back(duplicate);
+      }
+      break;
+    case 2:
+      upload.allocation = upload.allocation + 1 < state.plan_.arrays.size()
+                              ? upload.allocation + 1
+                              : uint32_t(state.plan_.arrays.size());
+      break;
+    case 3:
+      if (upload.ranges.empty())
+        throw std::logic_error("NVIDIA test upload mutation found no range");
+      ++upload.ranges[0].offset;
+      break;
+    case 4:
+      ++upload.staging_offset;
+      break;
+    default:
+      throw std::invalid_argument("unknown NVIDIA prepared-upload test mutation");
+  }
 }
 
 

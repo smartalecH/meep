@@ -2081,6 +2081,22 @@ ResidentCandidateResult build_resident_epoch_candidate(
     resolve_material_storage(candidate.initialization->materials[0], candidate.classification,
                              *candidate.host_storage, *candidate.resolved_storage);
     candidate.catalog->publish_resolved_plan(*candidate.resolved_storage);
+    /* Classification-elided rows remain as stable tombstone IDs in the
+       resolved catalog, but have no allocation and therefore no later
+       initialization producer. Consumer validation below separately proves
+       that no timestep operation depends on one. */
+    candidate.initialization->operations.erase(
+        std::remove_if(candidate.initialization->operations.begin(),
+                       candidate.initialization->operations.end(),
+                       [&](const InitOperation &operation) {
+                         return is_valid(operation.destination.id) &&
+                                operation.destination.id.value <
+                                    candidate.resolved_storage->arrays.size() &&
+                                candidate.resolved_storage
+                                    ->arrays[operation.destination.id.value]
+                                    .classification_elided;
+                       }),
+        candidate.initialization->operations.end());
   }
   catch (const std::exception &e) {
     local_error = e.what();
@@ -3046,6 +3062,10 @@ void fields::init_backend() {
        generation(*this, MutationKind::material_region) != 0);
   if (material_value_candidate) {
     std::unique_ptr<InitializationPlan> refreshed;
+    std::unique_ptr<InitializationPlan> regional;
+    std::unique_ptr<StoragePlan> refresh_authoritative_plan;
+    std::unique_ptr<StoragePlan> refresh_classification_plan;
+    const InitializationPlan *refresh_execution = NULL;
     MaterialClassification preview;
     std::string refresh_error;
     try {
@@ -3062,9 +3082,52 @@ void fields::init_backend() {
         throw std::logic_error("resident material-value refresh changed material route");
       refreshed->materials[0] =
           select_material_recipe_route(refreshed->materials[0], local_route);
+      InitRegion requested;
+      const bool has_regional_request = pending_material_region(*this, &requested);
+      if (has_regional_request && initialization_plan &&
+          initialization_plan->materials.size() == 1 &&
+          initialization_plan->materials[0].signature() ==
+              refreshed->materials[0].signature()) {
+        delete initialization_plan;
+        initialization_plan = refreshed.release();
+        clear_dirty(*this, material_value_mask);
+        clear_pending_material_region(*this);
+        return;
+      }
+      CpuArrayCatalog preview_catalog;
+      refresh_authoritative_plan.reset(new StoragePlan);
+      build_storage_catalog(*this, preview_catalog, *refresh_authoritative_plan);
+      refresh_classification_plan.reset(new StoragePlan(*refresh_authoritative_plan));
+      mark_material_storage_provisional(refreshed->materials[0],
+                                        *refresh_classification_plan);
+      if (has_regional_request) {
+        regional.reset(new InitializationPlan(refreshed->restrict_to(requested)));
+        if (regional->regional_supported &&
+            regional->regional_reason == RegionalSupportReason::supported) {
+          const bool clipped_host_route =
+              local_route == MaterialRecipeDisposition::host_reference;
+          std::string preservation_error;
+          const bool preserves_unselected =
+              clipped_host_route && initialization_plan &&
+              regional_replacement_preserves_unselected(
+                  *initialization_plan, *refreshed, *regional, &preservation_error);
+          if (preserves_unselected) refresh_execution = regional.get();
+          else {
+            regional->regional_supported = false;
+            regional->regional_reason = clipped_host_route
+                                            ? RegionalSupportReason::incomplete_group
+                                            : RegionalSupportReason::whole_row_kernel;
+            regional->regional_unsupported_reason =
+                clipped_host_route
+                    ? preservation_error
+                    : "selected material route uses a whole-row device kernel";
+          }
+        }
+      }
+      if (!regional) refresh_execution = refreshed.get();
       InitializationPlan *const old_initialization = initialization_plan;
       initialization_plan = refreshed.get();
-      try { preview = classify(*this, *storage_plan); }
+      try { preview = classify(*this, *refresh_classification_plan); }
       catch (...) {
         initialization_plan = old_initialization;
         throw;
@@ -3080,11 +3143,28 @@ void fields::init_backend() {
     backend_reconcile_host_access(refresh_error,
                                   "fields::init_backend material-value preclassification");
 
-    if (preview.hash == prepared_classification_hash) {
+    if (refresh_execution &&
+        (regional || preview.hash == prepared_classification_hash)) {
       refresh_error.clear();
+      bool prepared_classification_matches = true;
       try {
-        backend->preflight_initialization(*refreshed);
-        backend->prepare_initialization(*refreshed, *backend_state);
+        backend->preflight_initialization(*refresh_execution);
+        backend->prepare_initialization(*refresh_execution, *backend_state);
+        MaterialClassification exact_preview;
+        if (backend->preview_prepared_material_classification(
+                *refresh_classification_plan, *backend_state, exact_preview)) {
+          validate_material_classification(*this, *refresh_classification_plan,
+                                           refreshed->materials[0], exact_preview);
+          const bool same_hash =
+              exact_preview.hash == backend_state->material_classification_hash;
+          const bool same_storage =
+              backend->prepared_material_classification_preserves_storage(
+                  *refreshed, *refresh_execution, *refresh_authoritative_plan,
+                  *refresh_classification_plan, exact_preview, *backend_state);
+          prepared_classification_matches =
+              same_hash && same_storage;
+          preview = exact_preview;
+        }
       }
       catch (const std::exception &e) {
         refresh_error = e.what();
@@ -3094,23 +3174,46 @@ void fields::init_backend() {
       }
       backend_reconcile_host_access(refresh_error,
                                     "fields::init_backend material-value refresh preparation");
+      prepared_classification_matches = and_to_all(prepared_classification_matches);
 
       bool initialized_refresh = false;
       refresh_error.clear();
-      try {
-        backend->initialize(*refreshed, *backend_state);
+      if (prepared_classification_matches) try {
+        backend->initialize(*refresh_execution, *backend_state);
         initialized_refresh = true;
-        MaterialClassification observed = backend->classify_state(*storage_plan, *backend_state);
-        validate_material_classification(*this, *storage_plan, refreshed->materials[0], observed);
-        if (observed.hash != preview.hash)
+        MaterialClassification observed =
+            backend->classify_state(*refresh_classification_plan, *backend_state);
+        validate_material_classification(*this, *refresh_classification_plan,
+                                         refreshed->materials[0], observed);
+        if (observed.hash != preview.hash) {
+          size_t first_row = std::numeric_limits<size_t>::max();
+          const size_t common =
+              std::min(observed.provisional_row_state.size(),
+                       preview.provisional_row_state.size());
+          for (size_t i = 0; i < common; ++i)
+            if (observed.provisional_row_state[i] != preview.provisional_row_state[i]) {
+              first_row = i;
+              break;
+            }
           throw std::logic_error(
-              "resident material-value device classification differs from preflight");
-        backend->finalize_storage(*storage_plan, observed, *backend_state);
+              "resident material-value device classification differs from preflight (observed=" +
+              std::to_string(observed.hash) + ", preview=" +
+              std::to_string(preview.hash) + ", installed=" +
+              std::to_string(prepared_classification_hash) + ", first-row=" +
+              (first_row == std::numeric_limits<size_t>::max()
+                   ? std::string("none")
+                   : std::to_string(first_row) + ":" +
+                         std::to_string(preview.provisional_row_state[first_row]) + "/" +
+                         std::to_string(observed.provisional_row_state[first_row])) +
+              ")");
+        }
+        backend->finalize_storage(*refresh_authoritative_plan, observed, *backend_state);
         delete initialization_plan;
         initialization_plan = refreshed.release();
         prepared_classification_hash = observed.hash;
         backend_state->material_classification_hash = observed.hash;
         clear_dirty(*this, material_value_mask);
+        clear_pending_material_region(*this);
         return;
       }
       catch (const std::exception &e) {
@@ -3119,13 +3222,15 @@ void fields::init_backend() {
       catch (...) {
         refresh_error = "unknown resident material-value refresh failure";
       }
-      size_t local_poison = size_t(backend->is_poisoned() ||
-                                   (!refresh_error.empty() && initialized_refresh));
-      size_t global_poison = 0;
-      bw_or_to_all(&local_poison, &global_poison, 1);
-      if (global_poison) backend->poison();
-      backend_reconcile_host_access(refresh_error,
-                                    "fields::init_backend material-value refresh");
+      if (prepared_classification_matches) {
+        size_t local_poison = size_t(backend->is_poisoned() ||
+                                     (!refresh_error.empty() && initialized_refresh));
+        size_t global_poison = 0;
+        bw_or_to_all(&local_poison, &global_poison, 1);
+        if (global_poison) backend->poison();
+        backend_reconcile_host_access(refresh_error,
+                                      "fields::init_backend material-value refresh");
+      }
     }
   }
 
@@ -3268,7 +3373,10 @@ void fields::init_backend() {
     const ResidentCandidateResult first_result = build_resident_epoch_candidate(
         *this, completed, local_custom, any_custom, any_multilevel, any_flux, *entry,
         material_preflight, &promotion_classification);
-    if (first_result == ResidentCandidateResult::committed) return;
+    if (first_result == ResidentCandidateResult::committed) {
+      clear_pending_material_region(*this);
+      return;
+    }
 
     std::unique_ptr<PreparedBackendEpoch> promotion_epoch;
     try {
@@ -3316,6 +3424,7 @@ void fields::init_backend() {
     if (second_result != ResidentCandidateResult::committed)
       throw std::logic_error("material classification requested a second component promotion");
     promotion_epoch->commit();
+    clear_pending_material_region(*this);
     return;
   }
 
@@ -3543,6 +3652,8 @@ void fields::init_backend() {
     backend_state->host_custom_preflight_required = any_custom;
     backend_state->host_custom_policy_pending = true;
   }
+  if (!is_dirty(*this, dirty_initialization) && !is_dirty(*this, dirty_classification))
+    clear_pending_material_region(*this);
 }
 
 bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResult &result) {

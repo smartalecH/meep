@@ -316,6 +316,13 @@ public:
   void preflight_initialization(const InitializationPlan &plan) const override;
   BackendState *create_state(const StoragePlan &plan) override;
   void prepare_initialization(const InitializationPlan &plan, BackendState &state) override;
+  bool preview_prepared_material_classification(const StoragePlan &plan,
+                                                BackendState &state,
+                                                MaterialClassification &result) override;
+  bool prepared_material_classification_preserves_storage(
+      const InitializationPlan &candidate, const InitializationPlan &execution,
+      const StoragePlan &authoritative, const StoragePlan &candidate_storage,
+      const MaterialClassification &classification, BackendState &state) override;
   void initialize(const InitializationPlan &plan, BackendState &state) override;
   bool enforces_material_fallback_policy() const override { return true; }
   bool supports_stable_material_refresh() const override { return true; }
@@ -369,6 +376,7 @@ public:
   NvidiaMaterialInitializationStatistics material_initialization_statistics_for_testing() const;
   NvidiaGraphStatistics graph_statistics_for_testing() const;
   NvidiaExecutableCacheStatistics executable_cache_statistics_for_testing() const;
+  void mutate_prepared_initialization_upload_for_testing(BackendState &state, int mode);
   void set_next_executable_generation_for_testing(uint64_t generation) {
     next_executable_generation_ = generation;
   }

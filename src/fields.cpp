@@ -256,6 +256,7 @@ fields::fields(const fields &thef)
 }
 
 fields::~fields() {
+  clear_pending_material_region(*this);
   /* Persistent DFT chunks survive their fields object for adjoint workflows.
      Materialize their last resident values before severing the owner token. */
   for (int i = 0; i < num_chunks; ++i)

@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -8869,6 +8870,84 @@ static void test_material_ir_capture_atomicity() {
   material_free(dielectric);
 }
 
+static void test_material_recipe_compatibility_handle() {
+  using namespace meep_geom;
+  geom_initialize();
+  dimensions = 2;
+  geometry_center = make_vector3();
+  ensure_periodicity = false;
+  set_default_material(vacuum);
+  geometry_lattice.size = make_vector3(1.5, 1.25, 0.0);
+  geometry_lattice.basis_size = make_vector3(1, 1, 1);
+  geometry_lattice.basis1 = make_vector3(1, 0, 0);
+  geometry_lattice.basis2 = make_vector3(0, 1, 0);
+  geometry_lattice.basis3 = make_vector3(0, 0, 1);
+  geom_fix_lattice();
+
+  const grid_volume gv = vol2d(1.5, 1.25, 8.0);
+  material_type dielectric = make_dielectric(2.75);
+  geometric_object object =
+      make_block(dielectric, make_vector3(), make_vector3(1, 0, 0),
+                 make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                 make_vector3(0.5, 0.5, 1.0));
+  geometric_object_list geometry = {1, &object};
+  structure s(gv, unit_epsilon, no_pml(), identity(), 2);
+  geom_epsilon *geps =
+      make_geom_epsilon(&s, &geometry, make_vector3(), false, vacuum);
+  set_materials_from_geom_epsilon(&s, geps, true, 1e-5, 256);
+  fields f(&s);
+
+  const uint64_t first_signature = geps->owned_recipe_signature();
+  std::shared_ptr<const void> first_recipe = s.material_ir;
+  std::weak_ptr<const void> first_lifetime(first_recipe);
+  geom_epsilon *copied = new geom_epsilon(*geps);
+  CHECK(first_signature && geps->has_owned_recipe() && copied->has_owned_recipe() &&
+            geps->recipe_matches(f) && copied->recipe_matches(f),
+        "material compatibility handle did not own/copy the installed IR generation");
+
+  set_material_ir_capture_failure_for_testing(0, 1);
+  bool rejected = false;
+  try { set_materials_from_geom_epsilon(&s, geps, true, 1e-5, 256); }
+  catch (const std::runtime_error &) { rejected = true; }
+  set_material_ir_capture_failure_for_testing(-1, 0);
+  CHECK(and_to_all(rejected) && s.material_ir.get() == first_recipe.get() &&
+            geps->owned_recipe_signature() == first_signature && geps->recipe_matches(f) &&
+            copied->recipe_matches(f),
+        "failed set_materials changed the structure or compatibility-handle generation");
+
+  set_materials_from_geom_epsilon(&s, geps, true, 1e-5, 256);
+  std::shared_ptr<const void> second_recipe = s.material_ir;
+  std::weak_ptr<const void> second_lifetime(second_recipe);
+  CHECK(second_recipe && second_recipe.get() != first_recipe.get() &&
+            geps->recipe_matches(second_recipe) && !geps->recipe_matches(f) &&
+            copied->recipe_matches(f) && !copied->recipe_matches(second_recipe),
+        "replacement material generation did not make copied handles stale independently");
+
+  /* This is the C++ equivalent of the private Python binding transaction: the
+     candidate is validated against its owned generation before publication. */
+  f.material_ir = second_recipe;
+  CHECK(geps->recipe_matches(f) && !copied->recipe_matches(f),
+        "material compatibility handle accepted a stale generation after publication");
+  first_recipe.reset();
+  CHECK(!first_lifetime.expired(),
+        "copied material compatibility handle did not retain its owned generation");
+  delete copied;
+  CHECK(first_lifetime.expired(),
+        "destroying the last copied compatibility handle did not release its generation");
+  delete geps;
+  CHECK(!second_lifetime.expired(),
+        "destroying the compatibility handle invalidated the installed material generation");
+  f.material_ir.reset();
+  s.material_ir.reset();
+  second_recipe.reset();
+  CHECK(second_lifetime.expired(),
+        "installed material generation was not released after every owner reset");
+
+  geometric_object_destroy(object);
+  material_free(dielectric);
+  geom_initialize();
+}
+
 static void test_geometry_backed_material_ir_removal() {
   using namespace meep_geom;
   const grid_volume gv = vol2d(1.5, 1.25, 8.0);
@@ -10434,10 +10513,40 @@ static void test_resident_material_recipe_lifecycle() {
    use it is deferred -- so it is built and unit-tested here rather than wired
    in. */
 static void test_initialization_plan() {
+  {
+    const InitRegion a(3, ivec(0, 0), ivec(6, 8));
+    const InitRegion b(3, ivec(4, -2), ivec(10, 3));
+    CHECK(a.overlaps(b), "partially overlapping initialization regions were missed");
+    const InitRegion clipped = a.intersection(b);
+    CHECK(!clipped.whole && clipped.chunk == 3 && clipped.begin == ivec(4, 0) &&
+              clipped.end == ivec(6, 3),
+          "initialization-region intersection was not clipped exactly");
+    CHECK(!a.overlaps(InitRegion(3, ivec(6, 0), ivec(8, 2))),
+          "touching half-open initialization regions overlap");
+    CHECK(!a.overlaps(InitRegion(4, ivec(1, 1), ivec(2, 2))),
+          "different initialization chunks overlap");
+    CHECK(InitRegion(-1, ivec(1, 1), ivec(2, 2)).overlaps(
+              InitRegion(9, ivec(1, 1), ivec(2, 2))),
+          "wildcard initialization chunk did not overlap a concrete chunk");
+    CHECK(InitRegion(3, ivec(2, 2), ivec(2, 4)).empty(),
+          "zero-width initialization region is not empty");
+    bool rejected = false;
+    try { InitRegion(3, ivec(4, 2), ivec(2, 4)).validate(); }
+    catch (const std::invalid_argument &) { rejected = true; }
+    CHECK(rejected, "reversed initialization region was accepted");
+  }
+
   structure *s;
   fields *f;
   build(&s, &f);
   f->advance(3);
+
+  const uint64_t empty_generation = generation(*f, MutationKind::material_region);
+  invalidate_material_region(*f, InitRegion(0, ivec(2, 2), ivec(2, 4)),
+                             "empty regional update");
+  CHECK(generation(*f, MutationKind::material_region) == empty_generation &&
+            !pending_material_region(*f, NULL),
+        "empty regional update advanced or retained a generation");
 
   const InitializationPlan plan = build_initialization_plan(*f);
   CHECK(or_to_all(!plan.operations.empty()), "the initialization plan is empty");
@@ -10468,6 +10577,62 @@ static void test_initialization_plan() {
   CHECK(sub.material_values_generation == plan.material_values_generation &&
             sub.material_region_generation == plan.material_region_generation,
         "restrict_to changed material recipe generations");
+  CHECK(sub.regional && !sub.requested_region.whole,
+        "restrict_to did not mark its regional authority");
+  for (const InitOperation &op : sub.operations) {
+    CHECK(op.kind == InitKind::material_geometry || op.kind == InitKind::pml_profile,
+          "regional initialization retained a non-material producer");
+    CHECK(narrow.contains(op.region), "regional initialization operation was not clipped");
+    if (op.kind == InitKind::material_geometry && sub.regional_supported)
+      CHECK(!op.point_spans.empty(), "regional material operation has no selected points");
+  }
+  if (count_processors() != 1)
+    CHECK(!sub.regional_supported &&
+              sub.regional_reason == RegionalSupportReason::remote_dependency &&
+              !sub.regional_unsupported_reason.empty(),
+          "distributed regional initialization did not reject deferred PR7 transport");
+  else if (plan.materials[0].ir())
+    CHECK(sub.regional_supported,
+          "owned material IR unexpectedly rejected regional initialization");
+  else
+    CHECK(!sub.regional_supported &&
+              sub.regional_reason == RegionalSupportReason::opaque_coordinates &&
+              !sub.regional_unsupported_reason.empty(),
+          "opaque host material recipe did not reject regional initialization");
+  if (!sub.material_destinations.empty()) {
+    CHECK(std::is_sorted(sub.material_destinations.begin(), sub.material_destinations.end()),
+          "regional material destinations are not canonical");
+    CHECK(std::adjacent_find(sub.material_destinations.begin(),
+                             sub.material_destinations.end()) ==
+              sub.material_destinations.end(),
+          "regional material destinations contain duplicates");
+  }
+
+  InitializationPlan synthetic;
+  synthetic.material_values_generation = 7;
+  synthetic.material_region_generation = 11;
+  InitOperation material = {};
+  material.kind = InitKind::pml_profile;
+  material.destination = ArrayRef{ArrayId{0}, 0, 16};
+  material.region = InitRegion(2, ivec(0, 0), ivec(8, 8));
+  synthetic.operations.push_back(material);
+  InitOperation field = material;
+  field.kind = InitKind::zero;
+  field.destination.id = ArrayId{1};
+  synthetic.operations.push_back(field);
+  const InitializationPlan clipped =
+      synthetic.restrict_to(InitRegion(2, ivec(6, 4), ivec(10, 10)));
+  CHECK(clipped.operations.size() == 1 &&
+            clipped.operations[0].kind == InitKind::pml_profile,
+        "regional restriction did not preserve only supported producer groups");
+  CHECK(clipped.operations[0].region.begin == ivec(6, 4) &&
+            clipped.operations[0].region.end == ivec(8, 8),
+        "regional restriction did not retain the exact overlap");
+  CHECK(synthetic.restrict_to(InitRegion(2, ivec(8, 0), ivec(10, 2))).operations.empty(),
+        "disjoint regional restriction retained an operation");
+  CHECK(synthetic.restrict_to(InitRegion(2, ivec(8, 0), ivec(10, 2))).regional_reason ==
+            RegionalSupportReason::empty,
+        "empty regional restriction lacks its distinct reason code");
 
   master_printf("init plan: %zu ops (%zu zero, %zu material, %zu pml), restricted to %zu\n",
                 plan.operations.size(), zero_ops, material_ops, pml_ops, sub.operations.size());
@@ -11046,6 +11211,10 @@ static void test_backend_safe_host_access() {
   const CheckpointFailurePoint load_failures[] = {
       CheckpointFailurePoint::read, CheckpointFailurePoint::allocation,
       CheckpointFailurePoint::validation, CheckpointFailurePoint::precommit};
+  invalidate_material_region(*f, InitRegion(0, ivec(0, 0), ivec(2, 2)),
+                             "checkpoint pending-region rollback fixture");
+  CHECK(pending_material_region(*f, NULL),
+        "checkpoint rollback fixture has no pending regional authority");
   for (CheckpointFailurePoint point : load_failures) {
     BackendState *const state_before = f->backend_state;
     Executable *const executable_before = f->executable;
@@ -11057,7 +11226,8 @@ static void test_backend_safe_host_access() {
     catch (const std::runtime_error &) { rejected = true; }
     checkpoint_clear_failure_for_testing();
     CHECK(rejected && f->backend_state == state_before && f->executable == executable_before &&
-              f->t == t_before && f->dirty_mask == dirty_before,
+              f->t == t_before && f->dirty_mask == dirty_before &&
+              pending_material_region(*f, NULL),
           "failed staged checkpoint load changed the live resident epoch (point=%d rejected=%d "
           "state=%d executable=%d time=%d dirty=%u/%u)",
           int(point), int(rejected), int(f->backend_state == state_before),
@@ -11084,6 +11254,8 @@ static void test_backend_safe_host_access() {
   CHECK(f->backend_state == NULL && f->executable == NULL,
         "checkpoint load retained artifacts referring to the old catalog");
   CHECK(is_dirty(*f, dirty_storage), "checkpoint load did not invalidate storage layout");
+  CHECK(!pending_material_region(*f, NULL),
+        "successful checkpoint load retained stale regional authority");
   CHECK(f->mutation_generation[static_cast<int>(MutationKind::source_values)] ==
             checkpoint_generation,
         "checkpoint generation split/merge did not preserve a value above 2^53");
@@ -12378,6 +12550,14 @@ int main(int argc, char **argv) {
     master_printf("backend_api: CW checks passed\n");
     return 0;
   }
+  if (getenv("MEEP_BACKEND_API_REGIONAL_ONLY")) {
+    test_initialization_plan();
+    test_material_recipe_compatibility_handle();
+    failures = sum_to_all(failures);
+    if (failures) return 1;
+    master_printf("backend_api: regional initialization checks passed\n");
+    return 0;
+  }
 
   test_selection();
   test_susceptibility_clone_coefficients();
@@ -12419,6 +12599,7 @@ int main(int argc, char **argv) {
   test_classification_change_recompiles();
   test_geometry_backed_material_ir();
   test_material_ir_capture_atomicity();
+  test_material_recipe_compatibility_handle();
   test_geometry_backed_material_ir_removal();
   test_material_recipe_and_provisional_storage();
   test_owned_tiled_material_route();

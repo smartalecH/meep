@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <memory>
 #include <vector>
 
 #include "material_data.hpp"
@@ -234,11 +235,18 @@ public:
   const material_type_list &owned_extra_materials() const { return extra_materials; }
   const material_data &owned_default_material() const { return *captured_default_material; }
   std::vector<susceptibility> owned_unique_susceptibilities(meep::field_type ft) const;
+  uint64_t owned_recipe_signature() const { return owned_material_signature; }
+  bool has_owned_recipe() const { return bool(owned_material_ir); }
+  bool recipe_matches(const meep::fields &f) const;
+  bool recipe_matches(const std::shared_ptr<const void> &recipe) const;
+  void bind_owned_recipe(const std::shared_ptr<const void> &recipe, uint64_t signature);
 
 private:
   material_type_list extra_materials;
   material_data *captured_default_material;
   pol *current_pol;
+  std::shared_ptr<const void> owned_material_ir;
+  uint64_t owned_material_signature = 0;
 };
 
 void set_dimensions(int dims);

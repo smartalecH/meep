@@ -939,7 +939,10 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
   if (f.material_ir)
     input.ir = std::shared_ptr<const MaterialIR>(f.material_ir, material_ir_for(f));
   std::set<StorageKey, StorageKeyLess> present;
-  for (size_t i = 0; i < f.storage_plan->arrays.size(); ++i) {
+  const size_t host_rows = f.array_catalog->host_backed_size();
+  if (host_rows > f.storage_plan->arrays.size())
+    throw std::logic_error("material recipe host catalog exceeds storage plan");
+  for (size_t i = 0; i < host_rows; ++i) {
     const ArraySpec &spec = f.storage_plan->arrays[i];
     if (spec.role != array_role::material) continue;
     if (is_valid(spec.alias_of))

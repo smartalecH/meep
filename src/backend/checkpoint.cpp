@@ -5,6 +5,7 @@
 #include "backend/backend.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/lifecycle.hpp"
+#include "backend/initialization_plan.hpp"
 #include "backend/material_ir.hpp"
 #include "meep_internals.hpp"
 
@@ -1775,6 +1776,7 @@ void CheckpointTransaction::commit(fields &owner, const CheckpointImage &image) 
      increments was admitted by the final collective gate above. */
   note_connections_invalidated(owner);
   mark_local_invalidation(owner);
+  clear_pending_material_region(owner);
   owner.chunk_connections_valid = false;
   owner.changed_materials = true;
   owner.t = image.timestep;

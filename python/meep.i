@@ -1511,6 +1511,12 @@ void _get_gradient(PyObject *grad, double scalegrad,
 %ignore std::vector<meep_geom::dft_data>::resize;
 
 %ignore meep_geom::set_materials_from_geom_epsilon;
+/* The material-recipe ownership token is a backend compatibility detail.  The
+   Python frontend uses only the underscored transaction helpers below. */
+%ignore meep_geom::geom_epsilon::owned_recipe_signature;
+%ignore meep_geom::geom_epsilon::has_owned_recipe;
+%ignore meep_geom::geom_epsilon::recipe_matches;
+%ignore meep_geom::geom_epsilon::bind_owned_recipe;
 
 // template instantiations
 %template(get_dft_flux_array) _get_dft_array<meep::dft_flux>;
@@ -2013,6 +2019,15 @@ meep_geom::geom_epsilon* _set_materials(meep::structure * s,
     meep_geom::fragment_stats::split_chunks_evenly = false;
 
     return geps;
+}
+
+void _bind_material_recipe(meep::fields *f, meep::structure *s,
+                           meep_geom::geom_epsilon *geps) {
+    if (!f || !s || !geps || !s->material_ir || !geps->has_owned_recipe())
+        throw std::invalid_argument("material recipe compatibility handle is incomplete");
+    if (!geps->recipe_matches(s->material_ir))
+        throw std::invalid_argument("material recipe compatibility handle is stale");
+    f->material_ir = s->material_ir;
 }
 
 void _get_epsilon_grid(geometric_object_list gobj_list,

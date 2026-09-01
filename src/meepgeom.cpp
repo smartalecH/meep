@@ -762,6 +762,25 @@ geom_epsilon::geom_epsilon(geometric_object_list g, material_type_list mlist,
   restricted_tree = geometry_tree;
 }
 
+void geom_epsilon::bind_owned_recipe(const std::shared_ptr<const void> &recipe,
+                                     uint64_t signature) {
+  if (!recipe || !signature)
+    throw std::invalid_argument("material compatibility handle has no owned recipe identity");
+  owned_material_ir = recipe;
+  owned_material_signature = signature;
+}
+
+bool geom_epsilon::recipe_matches(const meep::fields &f) const {
+  return recipe_matches(f.material_ir);
+}
+
+bool geom_epsilon::recipe_matches(const std::shared_ptr<const void> &recipe) const {
+  const meep::MaterialIR *current =
+      static_cast<const meep::MaterialIR *>(recipe.get());
+  return owned_material_ir && current && owned_material_ir.get() == recipe.get() &&
+         owned_material_signature == current->signature;
+}
+
 // copy constructor
 geom_epsilon::geom_epsilon(const geom_epsilon &geps1) : captured_volume(geps1.captured_volume) {
   u_p = geps1.u_p;
@@ -790,6 +809,8 @@ geom_epsilon::geom_epsilon(const geom_epsilon &geps1) : captured_volume(geps1.ca
     extra_materials.items[i]->copy_from(*geps1.extra_materials.items[i]);
   }
   current_pol = NULL;
+  owned_material_ir = geps1.owned_material_ir;
+  owned_material_signature = geps1.owned_material_signature;
 
   FOR_DIRECTIONS(d) FOR_SIDES(b) {
     cond[d][b].L = geps1.cond[d][b].L;
@@ -2194,6 +2215,7 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
   s->remove_susceptibilities();
   geps->add_susceptibilities(s);
   s->material_ir = staged_material_ir;
+  geps->bind_owned_recipe(staged_material_ir, captured_ir->signature);
 
   if (meep::verbosity > 0) master_printf("-----------\n");
 }

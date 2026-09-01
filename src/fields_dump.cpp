@@ -32,6 +32,7 @@
 #include "meep_internals.hpp"
 #include "backend/backend.hpp"
 #include "backend/checkpoint.hpp"
+#include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 
 namespace meep {
@@ -456,6 +457,7 @@ void fields::load(const char *filename, bool single_parallel_file) {
   }
   if (!single_parallel_file)
     backend_reconcile_host_access(dft_load_error, "fields::load DFT storage");
+  clear_pending_material_region(*this);
 }
 
 } // namespace meep

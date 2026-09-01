@@ -295,6 +295,20 @@ public:
      stream submission, or device allocation.  Callers reconcile it
      collectively before initialize() may copy or launch. */
   virtual void prepare_initialization(const InitializationPlan &, BackendState &) {}
+  /* Optional host-only classification of a prepared initialization image.
+     Returning true supplies the exact classification that initialize() will
+     produce, without enqueueing work. Regional updates use this to select
+     stable-address commit versus full epoch replacement before dispatch. */
+  virtual bool preview_prepared_material_classification(const StoragePlan &,
+                                                        BackendState &,
+                                                        MaterialClassification &) {
+    return false;
+  }
+  virtual bool prepared_material_classification_preserves_storage(
+      const InitializationPlan &, const InitializationPlan &, const StoragePlan &,
+      const StoragePlan &, const MaterialClassification &, BackendState &) {
+    return false;
+  }
   virtual bool enforces_material_fallback_policy() const { return false; }
   /* True only when the backend can refresh a classification-equivalent
      material recipe into allocation-stable resident storage without retiring

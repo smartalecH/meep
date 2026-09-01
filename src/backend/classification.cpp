@@ -679,7 +679,8 @@ void require_live_array(const StoragePlan &plan, ArrayId id, const char *what,
   if (id.value >= plan.arrays.size())
     throw std::invalid_argument(std::string(what) + " has an out-of-range ArrayId");
   if (plan.arrays[id.value].classification_elided)
-    throw std::invalid_argument(std::string(what) + " references a material tombstone");
+    throw std::invalid_argument(std::string(what) + " references material tombstone ArrayId " +
+                                std::to_string(id.value));
 }
 
 void require_pml(const StoragePlan &plan, const PmlProfile &pml, const char *what) {

@@ -37,7 +37,16 @@ struct InitRegion {
   InitRegion() : chunk(-1), begin(D1), end(D1), whole(true) {}
   InitRegion(int c, const ivec &b, const ivec &e) : chunk(c), begin(b), end(e), whole(false) {}
 
+  void validate() const;
+  bool empty() const;
   bool contains(const InitRegion &other) const;
+  bool overlaps(const InitRegion &other) const;
+  InitRegion intersection(const InitRegion &other) const;
+};
+
+struct InitPointSpan {
+  uint64_t first;
+  uint64_t count;
 };
 
 struct InitOperation {
@@ -45,6 +54,9 @@ struct InitOperation {
   ArrayRef destination;
   uint32_t descriptor_index;
   InitRegion region;
+  /* Exact canonical point ordinals selected by a regional restriction. Empty
+     means the complete destination. IDs are never renumbered. */
+  std::vector<InitPointSpan> point_spans;
 };
 
 struct PmlRecipe {
@@ -60,6 +72,17 @@ struct HostCallbackRecipe {
   std::string description;
 };
 
+enum class RegionalSupportReason {
+  supported,
+  empty,
+  opaque_coordinates,
+  incomplete_group,
+  whole_row_kernel,
+  remote_dependency
+};
+
+const char *regional_support_reason_name(RegionalSupportReason reason);
+
 struct InitializationPlan {
   uint64_t material_values_generation = 0;
   uint64_t material_region_generation = 0;
@@ -67,10 +90,24 @@ struct InitializationPlan {
   std::vector<MaterialRecipe> materials;
   std::vector<PmlRecipe> pml;
   std::vector<HostCallbackRecipe> host_callbacks;
+  /* Compact selectors into the immutable MaterialIR. They preserve original
+     destination/job identities while excluding work outside a restricted
+     refresh. Empty selectors on a non-regional plan mean the complete IR. */
+  std::vector<uint32_t> material_destinations;
+  std::vector<MaterialIRBulkSpan> material_bulk_spans;
+  std::vector<uint32_t> material_analytic_interfaces;
+  std::vector<uint32_t> material_hybrid_patches;
+  std::vector<MaterialCallbackTile> material_callback_tiles;
+  /* A same-simulation multi-rank plan may classify local regional work, but
+     publishing it would require PR7 transport/reconciliation. */
+  bool requires_remote_transport = false;
+  bool regional = false;
+  bool regional_supported = true;
+  RegionalSupportReason regional_reason = RegionalSupportReason::supported;
+  std::string regional_unsupported_reason;
+  InitRegion requested_region;
 
-  /* Emit the subset of operations needed to refresh `region` only.
-     No Phase-1 consumer: the in-place design update that would use it is
-     deferred (§14). Built and unit-tested, deliberately unwired. */
+  /* Emit the subset of operations needed to refresh `region` only. */
   InitializationPlan restrict_to(const InitRegion &region) const;
 
   void clear() {
@@ -80,10 +117,32 @@ struct InitializationPlan {
     materials.clear();
     pml.clear();
     host_callbacks.clear();
+    material_destinations.clear();
+    material_bulk_spans.clear();
+    material_analytic_interfaces.clear();
+    material_hybrid_patches.clear();
+    material_callback_tiles.clear();
+    requires_remote_transport = false;
+    regional = false;
+    regional_supported = true;
+    regional_reason = RegionalSupportReason::supported;
+    regional_unsupported_reason.clear();
+    requested_region = InitRegion();
   }
 };
 
 InitializationPlan build_initialization_plan(fields &f);
+
+/* Backend-private regional mutation authority. The region is owned by the
+   fields lifetime and consumed only after a successful material transaction. */
+void invalidate_material_region(fields &f, const InitRegion &region,
+                                const char *reason = NULL);
+bool pending_material_region(const fields &f, InitRegion *region);
+void clear_pending_material_region(const fields &f);
+bool regional_replacement_preserves_unselected(const InitializationPlan &installed,
+                                               const InitializationPlan &candidate,
+                                               const InitializationPlan &restricted,
+                                               std::string *reason);
 
 } // namespace meep
 
