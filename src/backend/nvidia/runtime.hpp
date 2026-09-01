@@ -289,7 +289,16 @@ enum class failure_point {
   material_initialization_sync,
   material_finalize,
   material_compile,
-  state_rebuild_sync
+  state_rebuild_sync,
+  graph_create,
+  graph_begin_capture,
+  graph_end_capture,
+  graph_instantiate,
+  graph_update,
+  graph_scalar_write,
+  graph_launch,
+  graph_destroy,
+  graph_exec_destroy
 };
 void fail_next(failure_point point);
 void clear_failure();

@@ -3,11 +3,11 @@ convergence_cyl_waveguide.cpp cylindrical.cpp dump_load.cpp flux.cpp    \
 harmonics.cpp integrate.cpp known_results.cpp near2far.cpp              \
 one_dimensional.cpp physical.cpp stress_tensor.cpp symmetry.cpp 	\
 three_d.cpp two_dimensional.cpp 2D_convergence.cpp h5test.cpp pml.cpp \
-lifecycle.cpp random-state.cpp halo_plan.cpp storage_plan.cpp classification.cpp step_plan.cpp region_plan.cpp descriptors.cpp backend_api.cpp
+lifecycle.cpp random-state.cpp halo_plan.cpp storage_plan.cpp classification.cpp step_plan.cpp graph_plan.cpp region_plan.cpp descriptors.cpp backend_api.cpp
 
 # The bitwise-neutrality harness (plan section 4) is Python, and is driven by
 # CI rather than by `make check`: it needs two builds to compare.
-EXTRA_DIST = $(SRC) bitwise nvidia_runtime_smoke.cu nvidia_arena_smoke.cu \
+EXTRA_DIST = $(SRC) bitwise nvidia_runtime_smoke.cu nvidia_graph_smoke.cu nvidia_arena_smoke.cu \
 nvidia_dft_smoke.cu nvidia_dft_reduction_smoke.cu nvidia_flux_smoke.cu nvidia_cw_smoke.cu nvidia_mpi_runtime_smoke.cu nvidia_step_smoke.cu nvidia_polarization_smoke.cu nvidia_backend_state.cpp \
 nvidia_multilevel_smoke.cu nvidia_timestep.cpp nvidia_dft.cpp nvidia_cw.cpp
 
@@ -21,7 +21,7 @@ AM_CPPFLAGS = -I$(top_srcdir)/src -I$(top_builddir)/src -DDATADIR=\"$(srcdir)/\"
 
 .SUFFIXES = .dac .done
 
-check_PROGRAMS = lifecycle random-state-lazy-default random-state-initial-restore random-state-initial-set random-state-transitions halo_plan storage_plan classification step_plan prepared_plan region_plan descriptors backend_api aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml pw-source-ll ring-ll cyl-ellipsoid-ll absorber-1d-ll array-slice-ll user-defined-material dft-fields bend-flux-ll array-metadata
+check_PROGRAMS = lifecycle random-state-lazy-default random-state-initial-restore random-state-initial-set random-state-transitions halo_plan storage_plan classification step_plan graph_plan prepared_plan region_plan descriptors backend_api aniso_disp bench bragg_transmission convergence_cyl_waveguide cylindrical dump_load flux harmonics integrate known_results near2far one_dimensional physical stress_tensor symmetry three_d two_dimensional 2D_convergence h5test pml pw-source-ll ring-ll cyl-ellipsoid-ll absorber-1d-ll array-slice-ll user-defined-material dft-fields bend-flux-ll array-metadata
 
 array_metadata_SOURCES = array-metadata.cpp
 array_metadata_LDADD   = $(MEEPLIBS)
@@ -56,6 +56,8 @@ classification_LDADD = $(MEEPLIBS)
 
 step_plan_SOURCES = step_plan.cpp
 step_plan_LDADD = $(MEEPLIBS)
+graph_plan_SOURCES = graph_plan.cpp
+graph_plan_LDADD = $(MEEPLIBS)
 prepared_plan_SOURCES = prepared_plan.cpp
 prepared_plan_LDADD = $(MEEPLIBS)
 
@@ -167,7 +169,7 @@ endif
 if HAVE_NVIDIA_BACKEND
 NVIDIA_CUDA_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
 NVIDIA_CUDA_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
-NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke
+NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_graph_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke
 if WITH_MPI
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
 endif
@@ -190,6 +192,7 @@ check-local: check-TESTS
 .PHONY: nvidia-runtime-check
 nvidia-runtime-check: $(NVIDIA_RUNTIME_TESTS)
 	./nvidia_runtime_smoke
+	./nvidia_graph_smoke
 	./nvidia_arena_smoke
 	./nvidia_step_smoke
 	./nvidia_polarization_smoke
@@ -211,6 +214,11 @@ $(NVIDIA_CUDA_ARCHIVE): $(NVIDIA_CUDA_LIBRARY)
 	$(AM_V_at)test -f $@
 
 nvidia_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
+	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
+	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+
+nvidia_graph_smoke: $(srcdir)/nvidia_graph_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
 	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
 	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
 	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
