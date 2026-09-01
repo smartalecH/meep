@@ -804,12 +804,66 @@
       (if (eq? to-do 'step) (func))
       (func to-do)))
 
+; Private event metadata for library-created wrappers. Unknown procedures are
+; deliberately treated as per-step callbacks. The registry preserves ordinary
+; procedure callability on old Guile versions lacking writable properties.
+(define meep-step-schedule-registry '())
+(define (set-step-schedule! proc next-event requires-each)
+  (set! meep-step-schedule-registry
+        (cons (list proc next-event requires-each) meep-step-schedule-registry))
+  proc)
+(define (step-schedule proc) (assq proc meep-step-schedule-registry))
+(define (step-func-requires-each? proc)
+  (let ((schedule (step-schedule proc)))
+    (if schedule ((caddr schedule)) true)))
+(define (step-func-next-event proc)
+  (let ((schedule (step-schedule proc)))
+    (if schedule ((cadr schedule)) false)))
+(define frontend-max-batch-steps 1024)
+(define (first-step-before-or-at-time target)
+  ; Scheme has no portable binary32 conversion matching fields::round_time.
+  ; Stop conservatively before the possible rounded boundary, then single-step
+  ; the short remainder. The relative margin exceeds a binary32 half-ulp over
+  ; the complete signed-int timestep range.
+  (let* ((current (meep-fields-t-get fields))
+         (dt (meep-fields-dt-get fields)))
+    (if (or (not (> dt 0)) (>= (meep-round-time) target))
+        current
+        (let* ((estimate (inexact->exact (floor (/ target dt))))
+               (margin (+ 4 (inexact->exact
+                             (ceiling (* (abs estimate) 0.0000002384185791015625)))))
+               (candidate (- estimate margin)))
+          (max (+ current 1) candidate)))))
+(define (step-funcs-require-each? funcs)
+  (if (null? funcs) false
+      (or (step-func-requires-each? (car funcs))
+          (step-funcs-require-each? (cdr funcs)))))
+(define (step-funcs-next-event funcs)
+  (if (null? funcs) false
+      (let ((first (step-func-next-event (car funcs)))
+            (rest (step-funcs-next-event (cdr funcs))))
+        (cond ((not first) rest)
+              ((not rest) first)
+              (else (min first rest))))))
+(define (has-custom-source?)
+  (let loop ((remaining sources))
+    (if (null? remaining) false
+        (let ((src (object-property-value (car remaining) 'src)))
+          (or (object-member? 'custom-src src)
+              (not (or (object-member? 'continuous-src src)
+                       (object-member? 'gaussian-src src)))
+              (loop (cdr remaining)))))))
+
 ; Some convenient wrappers for step functions passed to run.  e.g., these
 ; can be used to only output at certain times, instead of ata every time step.
 
 (define (combine-step-funcs . step-funcs)
-  (lambda (to-do)
-    (map (lambda (f) (eval-step-func f to-do)) step-funcs)))
+  (let ((combined (lambda (to-do)
+                    (map (lambda (f) (eval-step-func f to-do)) step-funcs))))
+    (set-step-schedule!
+     combined
+     (lambda () (step-funcs-next-event step-funcs))
+     (lambda () (step-funcs-require-each? step-funcs)))))
 
 ; generic wrapper
 (define (when-true-funcs cond? step-funcs)
@@ -826,30 +880,51 @@
 (define (at-every dT . step-funcs)
   (if (null? fields) (init-fields))
   (let ((Tlast (meep-round-time)))
-    (lambda (to-do)
-      (let ((T (meep-round-time)))
-	(if (or (eq? to-do 'finish)
-		(>= T (+ Tlast dT (* -0.5 (meep-fields-dt-get fields)))))
-	    (begin
-	      (map (lambda (f) (eval-step-func f to-do)) step-funcs)
-	      (set! Tlast T)))))))
+    (let ((wrapper
+           (lambda (to-do)
+             (let ((T (meep-round-time)))
+	       (if (or (eq? to-do 'finish)
+		       (>= T (+ Tlast dT (* -0.5 (meep-fields-dt-get fields)))))
+	           (begin
+	             (map (lambda (f) (eval-step-func f to-do)) step-funcs)
+	             (set! Tlast T)))))))
+      (set-step-schedule!
+       wrapper
+       (lambda ()
+     (first-step-before-or-at-time
+          (+ Tlast dT (* -0.5 (meep-fields-dt-get fields)))))
+       (lambda () false)))))
 
 (define (after-time T . step-funcs)
   (if (null? fields) (init-fields))
-  (let ((T0 (meep-round-time)))
-    (when-true-funcs (lambda () (>= (meep-round-time) (+ T0 T))) step-funcs)))
+  (let* ((target (+ (meep-round-time) T))
+         (wrapper (when-true-funcs (lambda () (>= (meep-round-time) target)) step-funcs)))
+    (set-step-schedule!
+     wrapper
+     (lambda () (if (>= (meep-round-time) target)
+                    false
+                    (first-step-before-or-at-time target)))
+     (lambda () (>= (meep-round-time) target)))))
 
 (define (before-time T . step-funcs)
   (if (null? fields) (init-fields))
-  (let ((T0 (meep-round-time)))
-    (when-true-funcs (lambda () (< (meep-round-time) (+ T0 T))) step-funcs)))
+  (let* ((target (+ (meep-round-time) T))
+         (wrapper (when-true-funcs (lambda () (< (meep-round-time) target)) step-funcs)))
+    (set-step-schedule! wrapper (lambda () false)
+                        (lambda () (< (meep-round-time) target)))))
 
 (define (at-time T . step-funcs)
   (let ((done? false))
-    (after-time T (lambda (to-do)
-		    (if (or (not done?) (eq? to-do 'finish))
-			(map (lambda (f) (eval-step-func f to-do)) step-funcs))
-		    (set! done? (or done? (eq? to-do 'step)))))))
+    (let* ((target (+ (meep-round-time) T))
+           (wrapper
+            (after-time T (lambda (to-do)
+		            (if (or (not done?) (eq? to-do 'finish))
+			        (map (lambda (f) (eval-step-func f to-do)) step-funcs))
+		            (set! done? (or done? (eq? to-do 'step)))))))
+      (set-step-schedule!
+       wrapper
+       (lambda () (if done? false (first-step-before-or-at-time target)))
+       (lambda () false)))))
 
 (define (after-sources . step-funcs)
   (if (null? fields) (init-fields))
@@ -874,27 +949,35 @@
 ; from having to manually call init-fields
 (define (at-beginning . step-funcs)
   (let ((done? false))
-    (lambda (to-do)
-      (if (not done?)
-	  (begin
-	    (map (lambda (f) (eval-step-func f to-do)) step-funcs)
-	    (set! done? true))))))
+    (let ((wrapper
+           (lambda (to-do)
+             (if (not done?)
+	         (begin
+	           (map (lambda (f) (eval-step-func f to-do)) step-funcs)
+	           (set! done? true))))))
+      (set-step-schedule! wrapper
+                          (lambda () (if done? false (meep-fields-t-get fields)))
+                          (lambda () false)))))
 
 ; for completeness (although the user could just do this after running):
 (define (at-end . step-funcs)
-  (lambda (to-do)
-    (if (eq? to-do 'finish)
-	(begin
-	  (map (lambda (f) (eval-step-func f 'step)) step-funcs)
-	  (map (lambda (f) (eval-step-func f 'finish)) step-funcs)))))
+  (let ((wrapper
+         (lambda (to-do)
+           (if (eq? to-do 'finish)
+	       (begin
+	         (map (lambda (f) (eval-step-func f 'step)) step-funcs)
+	         (map (lambda (f) (eval-step-func f 'finish)) step-funcs))))))
+    (set-step-schedule! wrapper (lambda () false) (lambda () false))))
 
 ; run the step-funcs with the magnetic fields synchronized in time
 ; with the electric fields
 (define (synchronized-magnetic . step-funcs)
-  (lambda (to-do)
-    (meep-fields-synchronize-magnetic-fields fields)
-    (map (lambda (f) (eval-step-func f to-do)) step-funcs)
-    (meep-fields-restore-magnetic-fields fields)))
+  (let ((wrapper
+         (lambda (to-do)
+           (meep-fields-synchronize-magnetic-fields fields)
+           (map (lambda (f) (eval-step-func f to-do)) step-funcs)
+           (meep-fields-restore-magnetic-fields fields))))
+    (set-step-schedule! wrapper (lambda () false) (lambda () true))))
 
 ; ****************************************************************
 ; File output functions (can only be called after init-fields).
@@ -1252,17 +1335,45 @@
 ; display progress from T0 until T, every dt seconds (wall time)
 (define (display-progress T0 T dt)
   (let ((t0 (meep-wall-time)) (tlast (meep-wall-time)))
-    (lambda ()
-      (let ((t (meep-wall-time)))
-	(if (>= (- t tlast) dt)
-	    (begin
-	      (print "Meep progress: "
-		     (- (meep-time) T0) "/" T " = "
-		     (round-dig 1 (/ (- (meep-time) T0) (* 0.01 T))) "% done"
-		     " in " (round-dig 1 (- t t0)) "s, "
-		     (round-dig 1 ( - (* (- t t0) (/ T (- (meep-time) T0)))
-				      (- t t0))) "s to go\n")
-	      (set! tlast t)))))))
+    (let ((wrapper
+           (lambda ()
+             (let ((t (meep-wall-time)))
+	       (if (>= (- t tlast) dt)
+	           (begin
+	             (print "Meep progress: "
+		            (- (meep-time) T0) "/" T " = "
+		            (round-dig 1 (/ (- (meep-time) T0) (* 0.01 T))) "% done"
+		            " in " (round-dig 1 (- t t0)) "s, "
+		            (round-dig 1 ( - (* (- t t0) (/ T (- (meep-time) T0)))
+				             (- t t0))) "s to go\n")
+	             (set! tlast t)))))))
+      (set-step-schedule! wrapper (lambda () false) (lambda () true)))))
+
+(define (frontend-batch-size stop-time step-funcs)
+  (let ((stop-step (if stop-time (first-step-before-or-at-time stop-time) false)))
+    (if (or (> (meep-count-processors) 1) (not stop-step) (has-custom-source?)
+            (step-funcs-require-each? step-funcs))
+        1
+        (let* ((current (meep-fields-t-get fields))
+               (event (step-funcs-next-event step-funcs))
+               (boundary (if event (min stop-step event) stop-step)))
+          (if (> boundary current)
+              (min (- boundary current) frontend-max-batch-steps)
+              1)))))
+
+(define (run-until-loop cond? step-funcs stop-time)
+  (map (lambda (f) (eval-step-func f 'step)) step-funcs)
+  (if (cond?)
+      (begin
+        (map (lambda (f) (eval-step-func f 'finish)) step-funcs)
+        (print "run " run-index " finished at t = " (meep-time)
+               " (" (meep-fields-t-get fields) " timesteps)\n")
+        (set! run-index (+ run-index 1)))
+      (let ((batch (frontend-batch-size stop-time step-funcs)))
+        (if (= batch 1)
+            (meep-fields-step fields)
+            (meep-fields-advance fields batch))
+        (run-until-loop cond? step-funcs stop-time))))
 
 ; run until (cond?) is true or, if cond? is a number, until time cond?
 ; (in Meep units) has elapsed, calling step-funcs at every time step.
@@ -1270,23 +1381,15 @@
   (set! interactive? false)
   (if (null? fields) (init-fields))
   (if (number? cond?) ; cond? is a time to run for
-      (let ((T0 (meep-round-time))) ; current Meep time
-	(apply run-until (cons (lambda () (>= (meep-round-time)
-					      (+ T0 cond?)))
-			       (cons (display-progress T0 (+ T0 cond?)
-						       progress-interval)
-				     step-funcs))))
-      (begin ; otherwise, cond? is a boolean thunk
-	(map (lambda (f) (eval-step-func f 'step)) step-funcs)
-	(if (cond?)
-	    (begin
-	      (map (lambda (f) (eval-step-func f 'finish)) step-funcs)
-	      (print "run " run-index " finished at t = " (meep-time)
-		     " (" (meep-fields-t-get fields) " timesteps)\n")
-	      (set! run-index (+ run-index 1)))
-	    (begin
-	      (meep-fields-step fields)
-	      (apply run-until (cons cond? step-funcs)))))))
+      (let* ((T0 (meep-round-time))
+             (target (+ T0 cond?))
+             (numeric-cond (lambda () (>= (meep-round-time) target)))
+             (scheduled-funcs
+              (if (and (defined? 'quiet?) quiet?)
+                  step-funcs
+                  (cons (display-progress T0 target progress-interval) step-funcs))))
+        (run-until-loop numeric-cond scheduled-funcs target))
+      (run-until-loop cond? step-funcs false)))
 
 ; run until all sources are finished and cond? is true.  If cond? is a number
 ; T, run until all sources are finished + a time T.

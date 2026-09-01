@@ -9067,6 +9067,76 @@ static bool same_noisy_snapshot(const noisy_snapshot &a, const noisy_snapshot &b
   return true;
 }
 
+static void test_frontend_batch_equivalence(precision_policy_kind policy) {
+  const grid_volume gv = vol2d(2.0, 2.0, 7.0);
+  const int count = 11;
+  const double tolerance = sizeof(realnum) == sizeof(float) ||
+                                   policy != precision_policy_kind::native
+                               ? 1e-4
+                               : 2e-12;
+  struct fixture_result {
+    CheckpointImage image;
+    double flux;
+    unsigned nonfinite;
+  };
+  const auto run = [&](bool batch, bool noisy) {
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    noisy_lorentzian_susceptibility noisy_susceptibility(0.015625, 0.71, 0.04);
+    if (noisy) s.add_susceptibility(unit_value, E_stuff, noisy_susceptibility);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    options.precision = policy;
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ez);
+    gaussian_src_time source(0.37, 0.12);
+    f.add_point_source(Ez, source, vec(0.13, -0.09), 0.25);
+    component monitor_component = Ez;
+    dft_fields monitor =
+        f.add_dft_fields(&monitor_component, 1, f.v, 0.37, 0.37, 1, true, 3);
+    (void)monitor;
+    flux_vol *flux = f.add_flux_vol(X, volume(vec(0.0, -0.7), vec(0.0, 0.7)));
+    set_random_seed(0x6a6b6c6dUL);
+    if (batch)
+      f.advance(count);
+    else
+      for (int i = 0; i < count; ++i) f.step();
+    require_selected_graph_mode(f);
+    require(f.t == count, "NVIDIA frontend batch reached the wrong timestep");
+    return fixture_result{CheckpointTransaction::snapshot(f), flux->flux(), f.nonfinite_flag};
+  };
+  const auto compare = [&](const fixture_result &stepped, const fixture_result &batched,
+                           const char *label) {
+    require(stepped.image.rows.size() == batched.image.rows.size(),
+            "NVIDIA frontend batch changed persistent row count");
+    for (size_t row = 0; row < stepped.image.rows.size(); ++row) {
+      const CheckpointRow &expected = stepped.image.rows[row];
+      const CheckpointRow &observed = batched.image.rows[row];
+      require(expected.key == observed.key && expected.has_alias == observed.has_alias &&
+                  expected.values.size() == observed.values.size(),
+              "NVIDIA frontend batch changed persistent row identity");
+      for (size_t value = 0; value < expected.values.size(); ++value)
+        require(std::fabs(expected.values[value] - observed.values[value]) <=
+                    tolerance * (1.0 + std::fabs(expected.values[value])),
+                "NVIDIA frontend batch changed a persistent row value");
+    }
+    require(std::fabs(stepped.flux - batched.flux) <=
+                tolerance * (1.0 + std::fabs(stepped.flux)),
+            "NVIDIA frontend batch changed legacy flux cadence");
+    require(!stepped.nonfinite && !batched.nonfinite,
+            "NVIDIA frontend batch changed finite-diagnostic cadence");
+    master_printf("nvidia_timestep: frontend batch %s/%s PASS\n", label,
+                  precision_policy_name(policy));
+  };
+
+  set_finite_check_mode(FiniteCheckMode::step);
+  compare(run(false, false), run(true, false), "source-dft-flux-finite");
+  compare(run(false, true), run(true, true), "noisy");
+  set_finite_check_mode(FiniteCheckMode::off);
+}
+
 static noisy_snapshot capture_noisy_group(fields &f, field_type ft, int state_index,
                                           component selected_component = Dielectric) {
   require(f.step_plans[0] && f.array_catalog,
@@ -10007,6 +10077,12 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_NVIDIA_CHECKPOINT_ONLY")) {
     test_graph_checkpoint_roundtrip();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_FRONTEND_BATCH_ONLY")) {
+    test_frontend_batch_equivalence(precision_policy_kind::native);
+    test_frontend_batch_equivalence(precision_policy_kind::f32);
+    master_printf("nvidia_timestep: frontend batch PASS\n");
     return 0;
   }
   if (getenv("MEEP_NVIDIA_VALUE_REUSE_ONLY")) {

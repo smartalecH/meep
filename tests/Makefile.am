@@ -7,7 +7,7 @@ lifecycle.cpp random-state.cpp halo_plan.cpp storage_plan.cpp classification.cpp
 
 # The bitwise-neutrality harness (plan section 4) is Python, and is driven by
 # CI rather than by `make check`: it needs two builds to compare.
-EXTRA_DIST = $(SRC) bitwise nvidia_runtime_smoke.cu nvidia_graph_smoke.cu nvidia_arena_smoke.cu \
+EXTRA_DIST = $(SRC) bitwise frontend-batching.ctl nvidia_runtime_smoke.cu nvidia_graph_smoke.cu nvidia_arena_smoke.cu \
 nvidia_dft_smoke.cu nvidia_dft_reduction_smoke.cu nvidia_flux_smoke.cu nvidia_cw_smoke.cu nvidia_mpi_runtime_smoke.cu nvidia_step_smoke.cu nvidia_polarization_smoke.cu nvidia_backend_state.cpp \
 nvidia_multilevel_smoke.cu nvidia_timestep.cpp nvidia_dft.cpp nvidia_cw.cpp
 

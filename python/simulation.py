@@ -24,7 +24,10 @@ except ImportError:
 import numpy as np
 from meep.geom import GeometricObject, Medium, Vector3, init_do_averaging
 from meep.source import (
+    ContinuousSource,
+    CustomSource,
     EigenModeSource,
+    GaussianSource,
     GaussianBeamSource,
     IndexedSource,
     Source,
@@ -50,6 +53,12 @@ except ImportError:
 from matplotlib.axes import Axes
 
 verbosity = Verbosity(mp.cvar, "meep", 1)
+
+# Return to the interpreter after at most this many native timesteps. Besides
+# bounding latency for ordinary SIGINT/KeyboardInterrupt delivery, this keeps
+# one frontend call from monopolizing a process for an unbounded interval.
+_FRONTEND_MAX_BATCH_STEPS = 1024
+_FRONTEND_MAX_TIMESTEP = 0x7FFFFFFF
 
 mp.setup()
 
@@ -2082,10 +2091,14 @@ class Simulation:
         opts = mp.execution_options()
         opts.backend = self._BACKEND_KINDS[self.backend]
         opts.precision = self._PRECISION_KINDS[self.precision]
-        opts.device_id = mp.automatic_device if self.device_id is None else int(self.device_id)
+        opts.device_id = (
+            mp.automatic_device if self.device_id is None else int(self.device_id)
+        )
         opts.strict = bool(self.accelerator_strict)
         opts.fallback = (
-            mp.fallback_policy_error if self.accelerator_strict else mp.fallback_policy_warn
+            mp.fallback_policy_error
+            if self.accelerator_strict
+            else mp.fallback_policy_warn
         )
         return opts
 
@@ -2915,27 +2928,40 @@ class Simulation:
             cond = [cond]
 
         self.progress = False
+        static_stop_times = []
+        dynamic_stop = False
+        progress_stop_time = None
+        progress_start_time = None
         for i in range(len(cond)):
             if isinstance(cond[i], numbers.Number):
                 stop_time = cond[i]
                 t0 = self.round_time()
+                target_time = t0 + stop_time
+                static_stop_times.append(target_time)
+                progress_stop_time = stop_time
+                progress_start_time = t0
 
-                def stop_cond(sim):
-                    return sim.round_time() >= t0 + stop_time
+                def stop_cond(sim, target_time=target_time):
+                    return sim.round_time() >= target_time
 
                 cond[i] = stop_cond
 
-                step_funcs = list(step_funcs)
-                step_funcs.append(
-                    display_progress(t0, t0 + stop_time, self.progress_interval)
-                )
+                # Wall-clock progress is observable and therefore requires a
+                # callback opportunity at every step. When progress is wholly
+                # disabled there is no observable callback to schedule.
+                if do_progress or verbosity.meep > 0:
+                    step_funcs = list(step_funcs)
+                    step_funcs.append(
+                        display_progress(t0, target_time, self.progress_interval)
+                    )
 
                 if do_progress:
                     self.progress = FloatProgress(
-                        value=t0, min=t0, max=t0 + stop_time, description="0% done "
+                        value=t0, min=t0, max=target_time, description="0% done "
                     )
                     display(self.progress)
             else:
+                dynamic_stop = True
                 assert callable(
                     cond[i]
                 ), "Stopping condition {} is not an integer or a function".format(
@@ -2945,7 +2971,42 @@ class Simulation:
         while not any([x(self) for x in cond]):
             for func in step_funcs:
                 _eval_step_func(self, func, "step")
-            self.fields.step()
+
+            batch = 1
+            if (
+                mp.count_processors() == 1
+                and not dynamic_stop
+                and not _has_python_custom_source(self)
+            ):
+                current_step = int(self.fields.t)
+                if not any(_step_func_requires_each_step(self, f) for f in step_funcs):
+                    boundaries = [
+                        step
+                        for step in (
+                            _first_step_at_or_after_time(self, target)
+                            for target in static_stop_times
+                        )
+                        if step is not None
+                    ]
+                    boundaries.extend(
+                        event
+                        for event in (
+                            _step_func_next_event_step(self, f) for f in step_funcs
+                        )
+                        if event is not None
+                    )
+                    if boundaries:
+                        next_boundary = min(boundaries)
+                        if next_boundary > current_step:
+                            batch = min(
+                                next_boundary - current_step,
+                                _FRONTEND_MAX_BATCH_STEPS,
+                            )
+
+            if batch == 1:
+                self.fields.step()
+            else:
+                self.fields.advance(batch)
 
         # Translating the recursive scheme version of run-until into an iterative version
         # (because python isn't tail-call-optimized) means we need one extra iteration to
@@ -2957,7 +3018,7 @@ class Simulation:
             _eval_step_func(self, func, "finish")
 
         if do_progress and self.progress:
-            self.progress.value = t0 + stop_time
+            self.progress.value = progress_start_time + progress_stop_time
             self.progress.description = "100% done "
 
         if verbosity.meep > 0:
@@ -5271,7 +5332,18 @@ def _combine_step_funcs(*step_funcs):
         for func in step_funcs:
             _eval_step_func(sim, func, todo)
 
-    return _combine
+    def _requires_each(sim):
+        return any(_step_func_requires_each_step(sim, func) for func in step_funcs)
+
+    def _next_event(sim):
+        events = [
+            event
+            for event in (_step_func_next_event_step(sim, func) for func in step_funcs)
+            if event is not None
+        ]
+        return min(events) if events else None
+
+    return _set_step_func_schedule(_combine, _next_event, _requires_each)
 
 
 def _eval_step_func(sim, func, todo):
@@ -5284,6 +5356,64 @@ def _eval_step_func(sim, func, todo):
             func(sim)
     elif num_args == 2:
         func(sim, todo)
+
+
+def _set_step_func_schedule(func, next_event_step=None, requires_each_step=False):
+    """Attach private scheduling facts without changing wrapper callability."""
+    func._meep_next_event_step = next_event_step
+    func._meep_requires_each_step = requires_each_step
+    return func
+
+
+def _step_func_requires_each_step(sim, func):
+    requirement = getattr(func, "_meep_requires_each_step", True)
+    return bool(requirement(sim) if callable(requirement) else requirement)
+
+
+def _step_func_next_event_step(sim, func):
+    event = getattr(func, "_meep_next_event_step", None)
+    if event is None:
+        return None
+    step = event(sim) if callable(event) else event
+    if step is None:
+        return None
+    return int(step)
+
+
+def _rounded_time_at_step(sim, step):
+    # fields::round_time is exactly float(t * dt). Keep the multiply in
+    # double precision and perform the same final binary32 rounding.
+    return float(np.float32(int(step) * float(sim.fields.dt)))
+
+
+def _first_step_at_or_after_time(sim, target):
+    """Return the first integer step whose fields::round_time reaches target."""
+    if not math.isfinite(target) or sim.fields.dt <= 0:
+        return None
+    current = int(sim.fields.t)
+    if _rounded_time_at_step(sim, current) >= target:
+        return current
+    if _rounded_time_at_step(sim, _FRONTEND_MAX_TIMESTEP) < target:
+        return None
+    candidate = max(current + 1, int(math.floor(target / sim.fields.dt)) - 2)
+    candidate = min(candidate, _FRONTEND_MAX_TIMESTEP)
+    while _rounded_time_at_step(sim, candidate) < target:
+        candidate += 1
+    while candidate > current and _rounded_time_at_step(sim, candidate - 1) >= target:
+        candidate -= 1
+    return candidate
+
+
+def _has_python_custom_source(sim):
+    # A CustomSource invokes Python from the native per-step source boundary.
+    # Unknown source wrappers are conservatively treated as callback-bearing.
+    for source in getattr(sim, "sources", ()):
+        source_time = getattr(source, "src", None)
+        if isinstance(source_time, CustomSource) or not isinstance(
+            source_time, (ContinuousSource, GaussianSource)
+        ):
+            return True
+    return False
 
 
 def _when_true_funcs(cond, *step_funcs):
@@ -5310,7 +5440,15 @@ def after_sources(*step_funcs):
             for func in step_funcs:
                 _eval_step_func(sim, func, todo)
 
-    return _after_sources
+    def _requires_each(sim):
+        return sim.round_time() >= sim.fields.last_source_time()
+
+    def _next_event(sim):
+        if _requires_each(sim):
+            return None
+        return _first_step_at_or_after_time(sim, sim.fields.last_source_time())
+
+    return _set_step_func_schedule(_after_sources, _next_event, _requires_each)
 
 
 def after_sources_and_time(t, *step_funcs):
@@ -5337,7 +5475,15 @@ def after_time(t, *step_funcs):
     def _after_t(sim):
         return sim.round_time() >= t
 
-    return _when_true_funcs(_after_t, *step_funcs)
+    wrapped = _when_true_funcs(_after_t, *step_funcs)
+
+    def _requires_each(sim):
+        return sim.round_time() >= t
+
+    def _next_event(sim):
+        return None if _requires_each(sim) else _first_step_at_or_after_time(sim, t)
+
+    return _set_step_func_schedule(wrapped, _next_event, _requires_each)
 
 
 def at_beginning(*step_funcs):
@@ -5353,7 +5499,10 @@ def at_beginning(*step_funcs):
                 _eval_step_func(sim, f, todo)
             closure["done"] = True
 
-    return _beg
+    def _next_event(sim):
+        return None if closure["done"] else int(sim.fields.t)
+
+    return _set_step_func_schedule(_beg, _next_event, False)
 
 
 def at_end(*step_funcs):
@@ -5368,7 +5517,7 @@ def at_end(*step_funcs):
             for func in step_funcs:
                 _eval_step_func(sim, func, "finish")
 
-    return _end
+    return _set_step_func_schedule(_end, None, False)
 
 
 def at_every(dt, *step_funcs):
@@ -5385,7 +5534,11 @@ def at_every(dt, *step_funcs):
                 _eval_step_func(sim, func, todo)
             closure["tlast"] = t
 
-    return _every
+    def _next_event(sim):
+        threshold = closure["tlast"] + dt + (-0.5 * sim.fields.dt)
+        return _first_step_at_or_after_time(sim, threshold)
+
+    return _set_step_func_schedule(_every, _next_event, False)
 
 
 def at_time(t, *step_funcs):
@@ -5401,7 +5554,12 @@ def at_time(t, *step_funcs):
                 _eval_step_func(sim, f, todo)
         closure["done"] = closure["done"] or todo == "step"
 
-    return after_time(t, _at_time)
+    wrapped = after_time(t, _at_time)
+
+    def _next_event(sim):
+        return None if closure["done"] else _first_step_at_or_after_time(sim, t)
+
+    return _set_step_func_schedule(wrapped, _next_event, False)
 
 
 def before_time(t, *step_funcs):
@@ -5413,7 +5571,12 @@ def before_time(t, *step_funcs):
     def _before_t(sim):
         return sim.round_time() < t
 
-    return _when_true_funcs(_before_t, *step_funcs)
+    wrapped = _when_true_funcs(_before_t, *step_funcs)
+
+    def _requires_each(sim):
+        return sim.round_time() < t
+
+    return _set_step_func_schedule(wrapped, None, _requires_each)
 
 
 def during_sources(*step_funcs):
@@ -5433,7 +5596,10 @@ def during_sources(*step_funcs):
                 _eval_step_func(sim, func, "finish")
             closure["finished"] = True
 
-    return _during_sources
+    def _requires_each(sim):
+        return sim.round_time() < sim.fields.last_source_time()
+
+    return _set_step_func_schedule(_during_sources, None, _requires_each)
 
 
 def in_volume(v, *step_funcs):
@@ -5791,7 +5957,7 @@ def synchronized_magnetic(*step_funcs):
             _eval_step_func(sim, f, todo)
         sim.fields.restore_magnetic_fields()
 
-    return _sync
+    return _set_step_func_schedule(_sync, None, True)
 
 
 def when_true(cond, *step_funcs):
@@ -5853,7 +6019,7 @@ def display_progress(t0, t, dt):
                 print(msg_fmt.format(val1, t, val2, val3, val4))
             closure["tlast"] = t1
 
-    return _disp
+    return _set_step_func_schedule(_disp, None, True)
 
 
 def data_to_str(d):

@@ -73,6 +73,7 @@ TESTS =                                        \
     $(TEST_DIR)/test_faraday_rotation.py       \
     $(TEST_DIR)/test_field_functions.py        \
     $(TEST_DIR)/test_force.py                  \
+    $(TEST_DIR)/test_frontend_batching.py      \
     $(TEST_DIR)/test_fragment_stats.py         \
     $(TEST_DIR)/test_gaussianbeam.py           \
     $(TEST_DIR)/test_geom.py                   \
