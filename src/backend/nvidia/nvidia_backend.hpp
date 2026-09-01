@@ -16,6 +16,7 @@
 #ifndef MEEP_BACKEND_NVIDIA_NVIDIA_BACKEND_HPP
 #define MEEP_BACKEND_NVIDIA_NVIDIA_BACKEND_HPP
 
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -26,6 +27,7 @@ namespace meep {
 
 class NvidiaBackendState;
 class NvidiaExecutable;
+class DeviceUuidReservation;
 struct NvidiaCompiledOperation;
 
 struct NvidiaMaterialInitializationStatistics {
@@ -385,6 +387,9 @@ public:
     next_executable_generation_ = generation;
   }
   int device_ordinal_for_testing() const { return device_; }
+  bool device_reservation_valid_for_testing() const;
+  std::string normalized_device_uuid_for_testing() const;
+  const void *device_reservation_identity_for_testing() const;
   void clear_cw_graphs_for_testing();
 
 private:
@@ -409,6 +414,8 @@ private:
   fields &f_;
   execution_options options_;
   int device_;
+  std::string normalized_device_uuid_;
+  std::shared_ptr<DeviceUuidReservation> device_reservation_;
   GraphExecutionMode graph_mode_;
   bool graph_mode_parse_valid_;
   size_t device_memory_bytes_;

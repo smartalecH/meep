@@ -38,6 +38,7 @@
 #include "backend/material_recipe.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
+#include "backend/device_uuid_reservation.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/nvidia/arena.hpp"
 #include "backend/nvidia/nvidia_dft.hpp"
@@ -3952,10 +3953,47 @@ NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int se
   graph_mode_ =
       parse_graph_mode_locally(std::getenv("MEEP_NVIDIA_GRAPH_MODE"), graph_mode_parse_valid_);
   if (device_ < 0) throw std::invalid_argument("NVIDIA backend requires a resolved device ID");
-  device_memory_bytes_ = nvidia::properties_for_device(device_).total_memory;
+  const nvidia::device_properties properties = nvidia::properties_for_device(device_);
+  device_memory_bytes_ = properties.total_memory;
+
+  std::string reservation_uuid = device_uuid_testing::uuid_override();
+  if (reservation_uuid.empty()) reservation_uuid = properties.uuid;
+  std::string why;
+  if (!DeviceUuidReservation::normalize_uuid(reservation_uuid, normalized_device_uuid_, why))
+    throw std::runtime_error(std::string("invalid CUDA device UUID: ") + why);
+
+  /* Backend replacement is staged while the old backend/state is still live.
+     A same-UUID candidate borrows the existing admission owner, so state,
+     executable, graph, route, and communicator rebuilds never close/reacquire
+     the host lock. A distinct fields object cannot borrow it and is rejected
+     by DeviceUuidReservation's process registry. */
+  NvidiaBackend *prior = dynamic_cast<NvidiaBackend *>(f_.backend);
+  if (prior && prior->normalized_device_uuid_ == normalized_device_uuid_ &&
+      prior->device_reservation_ && prior->device_reservation_->valid())
+    device_reservation_ = prior->device_reservation_;
+  else {
+    std::shared_ptr<DeviceUuidReservation> candidate(new DeviceUuidReservation);
+    if (!candidate->acquire(reservation_uuid, why,
+                            device_uuid_testing::lock_root_override()))
+      throw std::runtime_error(std::string("cannot reserve CUDA device UUID ") +
+                               normalized_device_uuid_ + ": " + why);
+    device_reservation_ = candidate;
+  }
 }
 
 NvidiaBackend::~NvidiaBackend() {}
+
+bool NvidiaBackend::device_reservation_valid_for_testing() const {
+  return device_reservation_ && device_reservation_->valid();
+}
+
+std::string NvidiaBackend::normalized_device_uuid_for_testing() const {
+  return normalized_device_uuid_;
+}
+
+const void *NvidiaBackend::device_reservation_identity_for_testing() const {
+  return device_reservation_.get();
+}
 
 uint64_t NvidiaBackend::claim_executable_generation() {
   if (next_executable_generation_ == std::numeric_limits<uint64_t>::max())

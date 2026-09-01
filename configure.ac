@@ -74,6 +74,21 @@ AC_ARG_WITH(mpi, [AS_HELP_STRING([--with-mpi],[enable MPI parallelization])],
 if test "x$with_mpi" = "xyes"; then
   AX_MPI([],[AC_MSG_ERROR([could not find mpi library for --with-mpi])])
   CXX=$MPICXX
+  AC_CHECK_HEADERS([mpi-ext.h], [
+    AC_LINK_IFELSE(
+      [AC_LANG_PROGRAM([[#include <mpi.h>
+#include <mpi-ext.h>]], [[return MPIX_Query_cuda_support() < 0;]])],
+      [AC_DEFINE([HAVE_MPIX_QUERY_CUDA_SUPPORT], [1],
+                 [Define when MPIX_Query_cuda_support is available])])
+    AC_COMPILE_IFELSE(
+      [AC_LANG_PROGRAM([[#include <mpi.h>
+#include <mpi-ext.h>
+#if !defined(MPIX_CUDA_AWARE_SUPPORT) && !defined(OMPI_HAVE_MPI_EXT_CUDA)
+#error no Open MPI CUDA-awareness compile-time indicator
+#endif]], [[]])],
+      [AC_DEFINE([HAVE_OPEN_MPI_CUDA_AWARE_SUPPORT_MACRO], [1],
+                 [Define when Open MPI publishes a CUDA-awareness support macro])])
+  ], [], [[#include <mpi.h>]])
 fi
 
 # Require C++11 support
@@ -287,6 +302,9 @@ fi
 # More checks
 
 LT_INIT
+
+AC_CHECK_HEADERS([dirent.h fcntl.h sys/file.h sys/stat.h sys/types.h sys/wait.h unistd.h])
+AC_CHECK_FUNCS([close flock fork fstat ftruncate geteuid lseek lstat mkdir mkdtemp openat pipe waitpid write])
 
 AC_CHECK_LIB(m, sin)
 
