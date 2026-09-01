@@ -55,6 +55,9 @@ RandomSeedSnapshot random_seed_snapshot();
 /* Performs the same lazy default initialization as the legacy random draw
    entry points, then returns the resulting snapshot. */
 RandomSeedSnapshot ensure_random_seed_snapshot();
+/* Checkpoint commit hook. The caller must validate the algorithm/version and
+   invoke this only after its final no-fail publication gate. */
+void restore_random_seed_snapshot(const RandomSeedSnapshot &snapshot);
 
 } // namespace meep
 

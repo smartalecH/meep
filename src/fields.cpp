@@ -604,6 +604,29 @@ void fields_chunk::swap_prepared_state(fields_chunk &other) noexcept {
   }
 }
 
+void fields_chunk::swap_checkpoint_state(fields_chunk &other) noexcept {
+  std::swap(s, other.s);
+  DOCMP2 FOR_COMPONENTS(c) {
+    std::swap(f[c][cmp], other.f[c][cmp]);
+    std::swap(f_u[c][cmp], other.f_u[c][cmp]);
+    std::swap(f_w[c][cmp], other.f_w[c][cmp]);
+    std::swap(f_cond[c][cmp], other.f_cond[c][cmp]);
+    std::swap(f_bfast[c][cmp], other.f_bfast[c][cmp]);
+    std::swap(f_minus_p[c][cmp], other.f_minus_p[c][cmp]);
+    std::swap(f_w_prev[c][cmp], other.f_w_prev[c][cmp]);
+    std::swap(f_backup[c][cmp], other.f_backup[c][cmp]);
+    std::swap(f_u_backup[c][cmp], other.f_u_backup[c][cmp]);
+    std::swap(f_w_backup[c][cmp], other.f_w_backup[c][cmp]);
+    std::swap(f_cond_backup[c][cmp], other.f_cond_backup[c][cmp]);
+    std::swap(f_bfast_backup[c][cmp], other.f_bfast_backup[c][cmp]);
+  }
+  std::swap(f_rderiv_int, other.f_rderiv_int);
+  FOR_FIELD_TYPES(ft) {
+    std::swap(npol[ft], other.npol[ft]);
+    std::swap(pol[ft], other.pol[ft]);
+  }
+}
+
 static inline bool cross_negative(direction a, direction b) {
   if (a >= R) a = direction(a - 3);
   if (b >= R) b = direction(b - 3);

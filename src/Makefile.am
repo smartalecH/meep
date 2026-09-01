@@ -44,7 +44,7 @@ multilevel-atom.cpp near2far.cpp output_directory.cpp random.cpp 	\
 sources.cpp step.cpp step_db.cpp stress.cpp structure.cpp structure_dump.cpp		\
 susceptibility.cpp time.cpp update_eh.cpp mpb.cpp update_pols.cpp 	\
 vec.cpp step_generic.cpp meepgeom.cpp GDSIIgeom.cpp 	\
-backend/lifecycle.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
+backend/lifecycle.cpp backend/checkpoint.cpp backend/diagnostics.cpp backend/halo_plan.cpp 	\
 backend/prepare.cpp backend/storage_plan.cpp backend/classification.cpp 	\
 backend/material_ir.cpp backend/material_recipe.cpp 	\
 backend/step_plan.cpp backend/graph_plan.cpp backend/cpu/cpu_executor.cpp 	\

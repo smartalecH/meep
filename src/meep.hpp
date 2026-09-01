@@ -1029,6 +1029,8 @@ void begin_dft_monitor_removal(const std::shared_ptr<dft_monitor_lifetime> &life
                                bool locally_attached, const char *site);
 class fields_chunk;
 class PreparedBackendEpoch;
+class CheckpointTransaction;
+class PreparedCheckpointCommit;
 struct BackendEpochSnapshot;
 class flux_vol;
 class source_descriptor_builder;
@@ -1676,9 +1678,12 @@ public:
 
 private:
   friend class PreparedBackendEpoch;
+  friend class CheckpointTransaction;
+  friend class PreparedCheckpointCommit;
   friend struct BackendEpochSnapshot;
   friend struct StepPlanTestAccess;
   void swap_prepared_state(fields_chunk &other) noexcept;
+  void swap_checkpoint_state(fields_chunk &other) noexcept;
   void release_owned_data() noexcept;
 
   // we set a flag during cw_solve to replace some
@@ -2535,6 +2540,7 @@ private:
   friend void backend_preflight_host_custom_fallback(fields &, HostCustomFallbackUse,
                                                       const char *);
   friend class PreparedBackendEpoch;
+  friend class CheckpointTransaction;
   friend struct BackendEpochSnapshot;
   friend struct LiveIdentitySnapshot;
   int synchronized_magnetic_fields; // count number of nested synchs
@@ -2664,6 +2670,8 @@ public:
   flux_vol *next;
 
 private:
+  friend class CheckpointTransaction;
+  friend class fields;
   friend class legacy_flux_descriptor_builder;
   friend void backend_publish_legacy_flux(fields &, const double *, size_t, const char *);
   double flux_wrongE() { return f->flux_in_box_wrongH(d, where); }

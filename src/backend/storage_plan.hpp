@@ -84,10 +84,10 @@ struct StorageKey {
 
 struct StorageKeyHash {
   size_t operator()(const StorageKey &k) const {
-    size_t h = size_t(k.chunk + 1) * 1000003u;
+    size_t h = (size_t(uint32_t(k.chunk)) + 1u) * 1000003u;
     h = h * 31 + size_t(k.kind);
-    h = h * 31 + size_t(k.component_ + 2);
-    h = h * 31 + size_t(k.cmp + 2);
+    h = h * 31 + size_t(uint32_t(k.component_)) + 2u;
+    h = h * 31 + size_t(uint32_t(k.cmp)) + 2u;
     h = h * 31 + size_t(k.aux ^ (k.aux >> 32));
     return h;
   }

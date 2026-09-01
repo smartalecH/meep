@@ -185,6 +185,17 @@ const char *susceptibility_kind_name(SusceptibilityKind k);
    pre-allocation resident capability gate. Derived built-ins remain custom. */
 SusceptibilityKind classify_susceptibility(const susceptibility *s);
 
+/* Canonical, precision-independent identity of an ordered built-in
+   susceptibility chain.  The representation deliberately rounds real-valued
+   parameters to IEEE binary32 so checkpoints written by the f32 and f64 host
+   builds compare the same material definition.  Unknown/derived chains are
+   rejected instead of being assigned an incomplete identity. */
+uint64_t susceptibility_chain_signature(const susceptibility *s);
+/* Native-precision companion used for same-precision checkpoint validation.
+   Unlike the portable signature above, this preserves every supported
+   realnum bit (with signed zero and NaN payloads canonicalized). */
+uint64_t susceptibility_chain_native_signature(const susceptibility *s);
+
 struct LorentzianParameters {
   double omega_0;
   double gamma;

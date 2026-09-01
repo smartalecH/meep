@@ -786,6 +786,124 @@ SusceptibilityKind classify_susceptibility(const susceptibility *s) {
 
 namespace {
 
+uint64_t susceptibility_chain_signature_impl(const susceptibility *head, bool portable) {
+  const uint64_t fnv_offset = UINT64_C(0xcbf29ce484222325);
+  const uint64_t fnv_prime = UINT64_C(0x00000100000001b3);
+  uint64_t hash = fnv_offset;
+  const auto mix_word = [&](uint64_t value) {
+    for (int byte = 0; byte < 8; ++byte) {
+      hash ^= uint8_t(value >> (8 * byte));
+      hash *= fnv_prime;
+    }
+  };
+  const auto mix_real = [&](double value) {
+    if (portable || sizeof(realnum) == sizeof(float)) {
+      if (std::isnan(value)) {
+        mix_word(UINT32_C(0x7fc00000));
+        return;
+      }
+      float normalized = float(value);
+      if (std::isfinite(value) && !std::isfinite(double(normalized)))
+        throw std::invalid_argument(
+            "checkpoint susceptibility parameter is outside binary32 range");
+      if (normalized == 0.0f) normalized = 0.0f;
+      uint32_t bits = 0;
+      static_assert(sizeof(bits) == sizeof(normalized), "binary32 must be 32 bits");
+      memcpy(&bits, &normalized, sizeof(bits));
+      mix_word(bits);
+      return;
+    }
+    if (std::isnan(value)) {
+      mix_word(UINT64_C(0x7ff8000000000000));
+      return;
+    }
+    if (value == 0.0) value = 0.0;
+    uint64_t bits = 0;
+    static_assert(sizeof(bits) == sizeof(value), "binary64 must be 64 bits");
+    memcpy(&bits, &value, sizeof(bits));
+    mix_word(bits);
+  };
+  size_t count = 0;
+  for (const susceptibility *current = head; current; current = current->next) {
+    if (count == std::numeric_limits<uint32_t>::max())
+      throw std::overflow_error("checkpoint susceptibility chain is too long");
+    const SusceptibilityKind kind = classify_susceptibility(current);
+    if (kind == SusceptibilityKind::host_custom)
+      throw std::invalid_argument(
+          "checkpoint requires a canonical identity for custom susceptibility chains");
+    mix_word(uint64_t(kind));
+    switch (kind) {
+      case SusceptibilityKind::lorentzian:
+      case SusceptibilityKind::noisy_lorentzian: {
+        const lorentzian_susceptibility &live =
+            static_cast<const lorentzian_susceptibility &>(*current);
+        const LorentzianParameters p =
+            susceptibility_descriptor_builder::lorentzian_parameters(live);
+        mix_real(p.omega_0);
+        mix_real(p.gamma);
+        mix_word(p.drude ? 1 : 0);
+        if (kind == SusceptibilityKind::noisy_lorentzian) {
+          const noisy_lorentzian_susceptibility &noisy =
+              static_cast<const noisy_lorentzian_susceptibility &>(*current);
+          mix_real(susceptibility_descriptor_builder::noise_amplitude(noisy));
+          /* The counter algorithm and rank-keyed seed policy are part of the
+             evolution contract.  The concrete seed state is serialized in
+             the checkpoint seed table. */
+          mix_word(counter_random_algorithm_version);
+          mix_word(1); // rank-keyed counter stream policy
+        }
+        break;
+      }
+      case SusceptibilityKind::gyrotropic: {
+        const gyrotropic_susceptibility &live =
+            static_cast<const gyrotropic_susceptibility &>(*current);
+        const GyrotropicParameters p =
+            susceptibility_descriptor_builder::gyrotropic_parameters(live);
+        mix_real(p.omega_0);
+        mix_real(p.gamma);
+        mix_real(p.alpha);
+        mix_word(uint64_t(p.model));
+        for (int i = 0; i < 3; ++i)
+          for (int j = 0; j < 3; ++j) mix_real(p.gyro_tensor[i][j]);
+        break;
+      }
+      case SusceptibilityKind::multilevel: {
+        const multilevel_susceptibility &live =
+            static_cast<const multilevel_susceptibility &>(*current);
+        const MultilevelParameters p =
+            susceptibility_descriptor_builder::multilevel_parameters(live);
+        mix_word(p.levels);
+        mix_word(p.transitions);
+        const std::vector<double> *vectors[] = {
+            &p.gamma_matrix,       &p.initial_populations, &p.alpha,
+            &p.omega,              &p.transition_gamma,   &p.sigmat};
+        for (const std::vector<double> *values : vectors) {
+          mix_word(values->size());
+          for (double value : *values) mix_real(value);
+        }
+        break;
+      }
+      case SusceptibilityKind::host_custom:
+        throw std::logic_error("unreachable custom susceptibility identity");
+    }
+    ++count;
+  }
+  mix_word(count);
+  return hash;
+}
+
+} // namespace
+
+uint64_t susceptibility_chain_signature(const susceptibility *head) {
+  return susceptibility_chain_signature_impl(head, true);
+}
+
+uint64_t susceptibility_chain_native_signature(const susceptibility *head) {
+  return susceptibility_chain_signature_impl(head, false);
+}
+
+namespace {
+
 uint64_t polarization_component_bit(component c, int cmp) {
   static_assert(2 * NUM_FIELD_COMPONENTS <= 64,
                 "polarization component/cmp mask does not fit in uint64_t");

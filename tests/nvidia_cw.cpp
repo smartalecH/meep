@@ -13,6 +13,7 @@
 #include <meep.hpp>
 
 #include "backend/backend.hpp"
+#include "backend/checkpoint.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
@@ -573,6 +574,65 @@ static void test_cw_graph_operator_fixture(precision_policy_kind precision_polic
                 graph.statistics.graph_count, graph.statistics.graph_launch_count, error);
 }
 
+static void test_cw_graph_checkpoint_roundtrip(precision_policy_kind precision_policy) {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  nvidia::testing::reset_graph_accounting();
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, one, no_pml());
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  continuous_src_time source(0.30, 0.19);
+  gpu.add_point_source(Ez, source, vec(1.0, 1.0), std::complex<double>(1.0, 0.2));
+  component monitor_component = Ez;
+  dft_fields monitor = gpu.add_dft_fields(&monitor_component, 1,
+                                          volume(vec(0.5, 0.5), vec(1.5, 1.5)),
+                                          0.30, 0.30, 1, true, 2);
+  gpu.t = 2;
+  require(gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2),
+          "CW checkpoint fixture did not converge");
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && gpu.backend_state && gpu.executable && gpu.backend_state->cw_executable,
+          "CW checkpoint fixture did not publish both executable owners");
+  require(backend->cw_statistics_for_testing().graph_enabled,
+          "CW checkpoint fixture did not retain required graph mode");
+  const std::complex<double> saved_field = gpu.get_field(Ez, vec(1.0, 1.0));
+  const std::vector<std::complex<realnum> > saved_dft =
+      dft_values(gpu, monitor, monitor_component);
+  const nvidia::graph_accounting before = nvidia::testing::current_graph_accounting();
+  const size_t definitions = before.end_captures - before.graph_destroys;
+  const size_t executables = before.instantiates - before.executable_destroys;
+  const char *filename = "/tmp/meep-pr6-5-cw-checkpoint.h5";
+  std::remove(filename);
+  gpu.dump(filename, false);
+  require(gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2),
+          "CW checkpoint mutation solve did not converge");
+  gpu.load(filename, false);
+  const nvidia::graph_accounting after_load = nvidia::testing::current_graph_accounting();
+  require(!gpu.backend_state && !gpu.executable &&
+              after_load.graph_destroys - before.graph_destroys == definitions &&
+              after_load.executable_destroys - before.executable_destroys == executables,
+          "CW checkpoint load did not retire ordinary/CW graph owners exactly once");
+  const double tolerance = precision_policy == precision_policy_kind::native &&
+                                   sizeof(realnum) == sizeof(double)
+                               ? 2e-6
+                               : 2e-3;
+  require(std::abs(gpu.get_field(Ez, vec(1.0, 1.0)) - saved_field) <=
+              tolerance * (1.0 + std::abs(saved_field)),
+          "CW checkpoint did not restore the converged field");
+  compare_dft_values(saved_dft, dft_values(gpu, monitor, monitor_component), tolerance);
+  require(gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2),
+          "CW checkpoint continuation did not converge");
+  const nvidia::graph_accounting rebuilt = nvidia::testing::current_graph_accounting();
+  require(backend->cw_statistics_for_testing().graph_enabled &&
+              rebuilt.instantiates - after_load.instantiates == executables,
+          "CW checkpoint continuation did not rebuild fresh ordinary/CW graphs");
+  std::remove(filename);
+}
+
 static src_vol *first_nonempty_source(fields &owner) {
   for (int chunk = 0; chunk < owner.num_chunks; ++chunk) {
     FOR_FIELD_TYPES(ft) {
@@ -1050,6 +1110,11 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
     require(sizeof(realnum) == sizeof(float) && precision_policy == precision_policy_kind::native,
             "native-single validation requires a single-precision native build");
+  if (getenv("MEEP_NVIDIA_CW_CHECKPOINT_ONLY")) {
+    require(count_processors() == 1, "CW checkpoint fixture requires one MPI rank");
+    test_cw_graph_checkpoint_roundtrip(precision_policy);
+    return 0;
+  }
   if (getenv("MEEP_NVIDIA_CW_GRAPH_ONLY")) {
     require(count_processors() == 1, "CW graph fixture requires one MPI rank");
     test_cw_graph_compile_rollback();
@@ -1070,6 +1135,7 @@ int main(int argc, char **argv) {
                                   "device-restore", true);
     test_cw_graph_workspace_replacement();
     test_cw_graph_operator_fixture(precision_policy);
+    test_cw_graph_checkpoint_roundtrip(precision_policy);
     test_cw_source_value_graph_reuse();
     test_cw_graph_launch_failure();
     return 0;

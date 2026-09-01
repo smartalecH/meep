@@ -414,7 +414,22 @@ void mix_u64(uint64_t &h, uint64_t value) {
 }
 void mix_i64(uint64_t &h, int64_t value) { mix_u64(h, uint64_t(value)); }
 void mix_bool(uint64_t &h, bool value) { mix_byte(h, value ? 1 : 0); }
+thread_local bool portable_signature_reals = false;
 void mix_double(uint64_t &h, double value) {
+  if (portable_signature_reals) {
+    if (std::isnan(value)) {
+      mix_u64(h, UINT32_C(0x7fc00000));
+      return;
+    }
+    float normalized = float(value);
+    if (std::isfinite(value) && !std::isfinite(double(normalized)))
+      throw std::invalid_argument("material IR value is outside binary32 range");
+    if (normalized == 0.0f) normalized = 0.0f;
+    uint32_t bits = 0;
+    memcpy(&bits, &normalized, sizeof(bits));
+    mix_u64(h, bits);
+    return;
+  }
   if (std::isnan(value)) {
     mix_u64(h, UINT64_C(0x7ff8000000000000));
     return;
@@ -434,7 +449,14 @@ void mix_values(uint64_t &h, const std::vector<double> &values) {
   for (double value : values) mix_double(h, value);
 }
 
-uint64_t signature(const MaterialIR &ir, bool include_rank_layout) {
+uint64_t signature(const MaterialIR &ir, bool include_rank_layout, bool portable = false) {
+  struct PrecisionScope {
+    bool previous;
+    explicit PrecisionScope(bool value) : previous(portable_signature_reals) {
+      portable_signature_reals = value;
+    }
+    ~PrecisionScope() { portable_signature_reals = previous; }
+  } precision_scope(portable);
   uint64_t h = UINT64_C(1469598103934665603);
   mix_tag(h, "meep.material-ir.v1"); mix_u64(h, ir.version);
   mix_bool(h, ir.eps_averaging); mix_double(h, ir.subpixel_tol);
@@ -1894,6 +1916,10 @@ material_ir_callback_owners(const MaterialIR &ir) {
 
 const MaterialIR *material_ir_for(const fields &f) {
   return static_cast<const MaterialIR *>(f.material_ir.get());
+}
+
+uint64_t material_ir_portable_signature(const MaterialIR &ir) {
+  return signature(ir, false, true);
 }
 
 void refresh_material_ir_signatures_for_testing(MaterialIR &ir) {

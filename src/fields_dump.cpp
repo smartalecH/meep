@@ -24,10 +24,14 @@
 #include <string.h>
 
 #include <cassert>
+#include <cerrno>
+#include <string>
+#include <unistd.h>
 
 #include "meep.hpp"
 #include "meep_internals.hpp"
 #include "backend/backend.hpp"
+#include "backend/checkpoint.hpp"
 #include "backend/lifecycle.hpp"
 
 namespace meep {
@@ -53,10 +57,6 @@ void fields::dump_fields_chunk_field(h5file *h5f, bool single_parallel_file,
   std::string local_error;
   for (int i = 0, chunk_i = 0; i < num_chunks; i++) {
     if (chunks[i]->is_mine()) {
-      FOR_FIELD_TYPES(ft) {
-        if (chunks[i]->pol[ft] != NULL)
-          meep::abort("non-null polarization_state in fields::dump (unsupported)");
-      }
       size_t ntot = chunks[i]->gv.ntot();
       for (int c = 0; c < NUM_FIELD_COMPONENTS; ++c) {
         for (int d = 0; d < 2; ++d) {
@@ -118,7 +118,37 @@ void fields::dump(const char *filename, bool single_parallel_file) {
     printf("creating fields output file \"%s\" (%d)...\n", filename, single_parallel_file);
   }
 
-  h5file file(filename, h5file::WRITE, single_parallel_file, !single_parallel_file);
+  CheckpointImage image;
+  std::string local_error;
+  try { image = CheckpointTransaction::snapshot(*this); }
+  catch (const std::exception &e) { local_error = e.what(); }
+  catch (...) { local_error = "unknown checkpoint snapshot failure"; }
+  backend_reconcile_host_access(local_error, "fields::dump checkpoint staging");
+  /* Recipe identities are global, but their canonical descriptors are
+     rank-local. Combine them only after every rank has completed fallible
+     staging, at this fixed collective boundary. */
+  const uint64_t disk_mask = (UINT64_C(1) << 52) - 1;
+  image.source_definition_signature =
+      uint64_t(sum_to_all(size_t(image.source_definition_signature))) & disk_mask;
+  image.dft_recipe_signature =
+      uint64_t(sum_to_all(size_t(image.dft_recipe_signature))) & disk_mask;
+  image.dft_native_signature =
+      uint64_t(sum_to_all(size_t(image.dft_native_signature))) & disk_mask;
+  image.material_recipe_signature =
+      uint64_t(sum_to_all(size_t(image.material_recipe_signature))) & disk_mask;
+  image.material_native_signature =
+      uint64_t(sum_to_all(size_t(image.material_native_signature))) & disk_mask;
+
+  const std::string temporary = std::string(filename) + ".tmp";
+  local_error.clear();
+  try { checkpoint_fail_if_requested(CheckpointFailurePoint::write); }
+  catch (const std::exception &e) { local_error = e.what(); }
+  catch (...) { local_error = "unknown checkpoint write preflight failure"; }
+  backend_reconcile_host_access(local_error, "fields::dump checkpoint write preflight");
+
+  try {
+    {
+      h5file file(temporary.c_str(), h5file::WRITE, single_parallel_file, !single_parallel_file);
 
   // Write out the current time 't'
   size_t dims[1] = {1};
@@ -161,6 +191,109 @@ void fields::dump(const char *filename, bool single_parallel_file) {
                     !single_parallel_file);
     }
   }
+      CheckpointTransaction::write_manifest(file, image, single_parallel_file);
+    }
+  }
+  catch (const std::exception &e) { local_error = e.what(); }
+  catch (...) { local_error = "unknown checkpoint write failure"; }
+  if (!local_error.empty() && ((single_parallel_file && am_master()) || !single_parallel_file))
+    std::remove(temporary.c_str());
+  backend_reconcile_host_access(local_error, "fields::dump checkpoint write");
+
+  all_wait();
+  const bool publish_owner = !single_parallel_file || am_master();
+  const std::string backup = std::string(filename) + ".bak";
+  bool had_previous = false;
+  bool published = false;
+
+  /* A sharded checkpoint is one collective transaction even though each rank
+     owns a different pathname. Preserve every old shard before publishing any
+     replacement; an asymmetric rename failure rolls back all successful
+     peers before the collective error escapes. */
+  local_error.clear();
+  try {
+    checkpoint_fail_if_requested(CheckpointFailurePoint::rename_backup);
+    if (publish_owner) {
+      /* A failed prior rollback deliberately leaves the old checkpoint under
+         .bak and no target, never a newly-published partial target. Recover
+         that authoritative image before beginning another transaction. */
+      errno = 0;
+      const bool target_exists = access(filename, F_OK) == 0;
+      const int target_errno = errno;
+      errno = 0;
+      const bool backup_exists = access(backup.c_str(), F_OK) == 0;
+      if (!target_exists && target_errno != ENOENT)
+        throw std::runtime_error(std::string("checkpoint target probe failed: ") +
+                                 strerror(target_errno));
+      if (!target_exists && backup_exists && std::rename(backup.c_str(), filename) != 0)
+        throw std::runtime_error(std::string("checkpoint prior-backup recovery failed: ") +
+                                 strerror(errno));
+      if (target_exists && backup_exists && std::remove(backup.c_str()) != 0)
+        throw std::runtime_error(std::string("checkpoint stale-backup removal failed: ") +
+                                 strerror(errno));
+      errno = 0;
+      if (std::rename(filename, backup.c_str()) == 0)
+        had_previous = true;
+      else if (errno != ENOENT)
+        throw std::runtime_error(std::string("checkpoint backup rename failed: ") +
+                                 strerror(errno));
+    }
+  }
+  catch (const std::exception &e) { local_error = e.what(); }
+  catch (...) { local_error = "unknown checkpoint backup failure"; }
+  const bool backup_failed = or_to_all(!local_error.empty());
+  if (backup_failed) {
+    std::string restore_error;
+    if (publish_owner && had_previous) try {
+        checkpoint_fail_if_requested(CheckpointFailurePoint::rename_restore);
+        if (std::rename(backup.c_str(), filename) != 0)
+          throw std::runtime_error(std::string("checkpoint backup restore failed: ") +
+                                   strerror(errno));
+      }
+      catch (const std::exception &e) { restore_error = e.what(); }
+      catch (...) { restore_error = "unknown checkpoint backup restore failure"; }
+    if (publish_owner) std::remove(temporary.c_str());
+    const bool restore_failed = or_to_all(!restore_error.empty());
+    if (restore_failed)
+      backend_reconcile_host_access(restore_error, "fields::dump checkpoint backup restore");
+    backend_reconcile_host_access(local_error, "fields::dump checkpoint backup");
+  }
+
+  local_error.clear();
+  try {
+    checkpoint_fail_if_requested(CheckpointFailurePoint::rename_publish);
+    if (publish_owner) {
+      if (std::rename(temporary.c_str(), filename) != 0)
+        throw std::runtime_error(std::string("checkpoint rename failed: ") + strerror(errno));
+      published = true;
+    }
+  }
+  catch (const std::exception &e) { local_error = e.what(); }
+  catch (...) { local_error = "unknown checkpoint rename failure"; }
+  const bool publish_failed = or_to_all(!local_error.empty());
+  if (publish_failed) {
+    std::string rollback_error;
+    if (publish_owner) {
+      if (published && std::remove(filename) != 0 && errno != ENOENT)
+        rollback_error = std::string("checkpoint rollback remove failed: ") + strerror(errno);
+      if (had_previous) try {
+          checkpoint_fail_if_requested(CheckpointFailurePoint::rename_restore);
+          if (std::rename(backup.c_str(), filename) != 0)
+            throw std::runtime_error(std::string("checkpoint rollback restore failed: ") +
+                                     strerror(errno));
+          rollback_error.clear();
+        }
+        catch (const std::exception &e) { rollback_error = e.what(); }
+        catch (...) { rollback_error = "unknown checkpoint rollback restore failure"; }
+      std::remove(temporary.c_str());
+    }
+    const bool rollback_failed = or_to_all(!rollback_error.empty());
+    if (rollback_failed)
+      backend_reconcile_host_access(rollback_error, "fields::dump checkpoint rollback");
+    backend_reconcile_host_access(local_error, "fields::dump checkpoint publish");
+  }
+  if (publish_owner && had_previous) std::remove(backup.c_str());
+  all_wait();
 }
 
 void fields::load_fields_chunk_field(h5file *h5f, bool single_parallel_file,
@@ -252,12 +385,29 @@ void fields::load(const char *filename, bool single_parallel_file) {
   if (verbosity > 0)
     printf("reading fields from file \"%s\" (%d)...\n", filename, single_parallel_file);
 
-  /* The reader below may create/delete field allocations and writes directly
-     through their host pointers. Retire resident state before either happens;
-     the next advance rebuilds from the checkpoint's host values. */
-  backend_prepare_checkpoint_load(*this);
+  std::string read_preflight_error;
+  try { checkpoint_fail_if_requested(CheckpointFailurePoint::read); }
+  catch (const std::exception &e) { read_preflight_error = e.what(); }
+  catch (...) { read_preflight_error = "unknown checkpoint read preflight failure"; }
+  backend_reconcile_host_access(read_preflight_error, "fields::load checkpoint read preflight");
 
   h5file file(filename, h5file::READONLY, single_parallel_file, !single_parallel_file);
+
+  if (CheckpointTransaction::has_manifest(file)) {
+    CheckpointImage image;
+    std::string local_error;
+    try { image = CheckpointTransaction::read_manifest(file, single_parallel_file); }
+    catch (const std::exception &e) { local_error = e.what(); }
+    catch (...) { local_error = "unknown checkpoint read failure"; }
+    backend_reconcile_host_access(local_error, "fields::load checkpoint staging");
+    CheckpointTransaction::validate_target(*this, image);
+    CheckpointTransaction::commit(*this, image);
+    return;
+  }
+
+  /* Legacy files retain their historical same-layout behavior. They are
+     detected explicitly and never interpreted as a versioned checkpoint. */
+  backend_prepare_checkpoint_load(*this);
 
   // Read in the current time 't'
   int rank;

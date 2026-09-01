@@ -121,6 +121,16 @@ RandomSeedSnapshot ensure_random_seed_snapshot() {
   return seed_snapshot;
 }
 
+void restore_random_seed_snapshot(const RandomSeedSnapshot &snapshot) {
+  std::lock_guard<std::mutex> lock(random_state_mutex);
+  if (snapshot.algorithm_version != counter_random_algorithm_version)
+    meep::abort("checkpoint random algorithm version mismatch");
+  if (snapshot.initialized && snapshot.semantic_seed_valid)
+    meep_mt_init_genrand(snapshot.semantic_seed);
+  seed_snapshot = snapshot;
+  rand_inited.store(snapshot.initialized, std::memory_order_release);
+}
+
 int random_int(int a, int b) {
   init_rand();
   return a + meep_mt_genrand_int32() % (b - a + 1);

@@ -26,6 +26,7 @@
 #include <meep.hpp>
 
 #include "backend/backend.hpp"
+#include "backend/checkpoint.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
@@ -2223,6 +2224,120 @@ static void test_source_value_graph_reuse_with_magnetic_snapshot() {
           "field_values refresh replaced a structurally compatible executable");
   compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 1e-6);
   master_printf("nvidia_timestep: source-value graph reuse PASS\n");
+}
+
+static void test_graph_checkpoint_roundtrip() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  nvidia::testing::reset_graph_accounting();
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  gaussian_src_time source_time(0.29, 0.11);
+  const volume source_volume(vec(-0.25, -0.25), vec(0.25, 0.25));
+  cpu.add_volume_source(Ez, source_time, source_volume, 0.23);
+  gpu.add_volume_source(Ez, source_time, source_volume, 0.23);
+  cpu.advance(2);
+  gpu.advance(2);
+  require_selected_graph_mode(gpu);
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+
+  const char *filename = "/tmp/meep-pr6-5-gpu-checkpoint.h5";
+  std::remove(filename);
+  bool rejected = false;
+  try { gpu.dump(filename, false); }
+  catch (const std::exception &) { rejected = true; }
+  require(rejected && gpu.backend_state && gpu.executable,
+          "active magnetic checkpoint rejection changed the live graph epoch");
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+
+  gpu.dump(filename, false);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && gpu.backend_state && gpu.executable,
+          "checkpoint dump retired the live NVIDIA graph epoch");
+  const NvidiaExecutableCacheStatistics cache_before =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting graphs_before = nvidia::testing::current_graph_accounting();
+  const size_t owned_definitions = graphs_before.end_captures - graphs_before.graph_destroys;
+  const size_t owned_executables = graphs_before.instantiates - graphs_before.executable_destroys;
+
+  cpu.advance(1);
+  cpu.load(filename, false);
+  require(cpu.t == 2, "NVIDIA-to-CPU checkpoint reselection did not restore the saved timestep");
+  gpu.advance(1);
+  BackendState *const state_before_failed_load = gpu.backend_state;
+  Executable *const executable_before_failed_load = gpu.executable;
+  const int time_before_failed_load = gpu.t;
+  const uint32_t dirty_before_failed_load = gpu.dirty_mask;
+  const uint64_t connections_before_failed_load = gpu.connections_generation;
+  gpu.connections_generation = std::numeric_limits<uint64_t>::max();
+  bool overflow_rejected = false;
+  try { gpu.load(filename, false); }
+  catch (const std::exception &) { overflow_rejected = true; }
+  const nvidia::graph_accounting after_failed_load =
+      nvidia::testing::current_graph_accounting();
+  require(overflow_rejected && gpu.backend_state == state_before_failed_load &&
+              gpu.executable == executable_before_failed_load && gpu.t == time_before_failed_load &&
+              gpu.dirty_mask == dirty_before_failed_load &&
+              after_failed_load.instantiates == graphs_before.instantiates &&
+              after_failed_load.graph_destroys == graphs_before.graph_destroys &&
+              after_failed_load.executable_destroys == graphs_before.executable_destroys,
+          "checkpoint precommit overflow retired or changed the live graph epoch");
+  gpu.connections_generation = connections_before_failed_load;
+  gpu.load(filename, false);
+  const nvidia::graph_accounting after_load = nvidia::testing::current_graph_accounting();
+  require(!gpu.backend_state && !gpu.executable && is_dirty(gpu, dirty_storage) &&
+              after_load.graph_destroys - graphs_before.graph_destroys == owned_definitions &&
+              after_load.executable_destroys - graphs_before.executable_destroys ==
+                  owned_executables,
+          "checkpoint load did not retire each stale graph owner exactly once");
+
+  cpu.advance(2);
+  gpu.advance(2);
+  require_selected_graph_mode(gpu);
+  const NvidiaExecutableCacheStatistics cache_after =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting graphs_after = nvidia::testing::current_graph_accounting();
+  require(cache_before.executable_build_count == 1 &&
+              cache_after.ordinary_resource_generation > cache_before.ordinary_resource_generation &&
+              cache_after.executable_build_count == 1 &&
+              graphs_after.instantiates - after_load.instantiates == owned_executables,
+          "checkpoint continuation did not rebuild a fresh canonical graph executable");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+
+  cpu.dump(filename, false);
+  const nvidia::graph_accounting before_cpu_to_gpu =
+      nvidia::testing::current_graph_accounting();
+  const size_t current_definitions =
+      before_cpu_to_gpu.end_captures - before_cpu_to_gpu.graph_destroys;
+  const size_t current_executables =
+      before_cpu_to_gpu.instantiates - before_cpu_to_gpu.executable_destroys;
+  gpu.advance(1);
+  gpu.load(filename, false);
+  const nvidia::graph_accounting after_cpu_to_gpu_load =
+      nvidia::testing::current_graph_accounting();
+  require(after_cpu_to_gpu_load.graph_destroys - before_cpu_to_gpu.graph_destroys ==
+                  current_definitions &&
+              after_cpu_to_gpu_load.executable_destroys -
+                      before_cpu_to_gpu.executable_destroys ==
+                  current_executables,
+          "CPU-to-NVIDIA checkpoint load did not retire the live graph owners exactly once");
+  cpu.advance(1);
+  gpu.advance(1);
+  require_selected_graph_mode(gpu);
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  std::remove(filename);
+  master_printf("nvidia_timestep: graph checkpoint round-trip PASS\n");
 }
 
 static void test_source_value_refresh_failures_and_resource_overflow() {
@@ -9888,6 +10003,10 @@ int main(int argc, char **argv) {
     test_source_value_graph_reuse_with_magnetic_snapshot();
     test_source_value_refresh_failures_and_resource_overflow();
     master_printf("nvidia_timestep: source-value reuse PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_CHECKPOINT_ONLY")) {
+    test_graph_checkpoint_roundtrip();
     return 0;
   }
   if (getenv("MEEP_NVIDIA_VALUE_REUSE_ONLY")) {

@@ -34,7 +34,9 @@
 
 #include "config.h"
 #include "backend/backend.hpp"
+#include "backend/checkpoint.hpp"
 #include "backend/cpu/cpu_backend.hpp"
+#include "backend/descriptors.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
@@ -65,6 +67,10 @@ static int failures = 0;
 static double eps_slab(const vec &p) { return (fabs(p.y()) < 0.4) ? 12.0 : 1.0; }
 static double unit_epsilon(const vec &) { return 1.0; }
 static double two_epsilon(const vec &) { return 2.0; }
+static realnum checkpoint_identity_epsilon_value = realnum(1.0);
+static double checkpoint_identity_epsilon(const vec &) {
+  return double(checkpoint_identity_epsilon_value);
+}
 static double phase_conductivity(const vec &);
 static std::complex<double> initial_ez(const vec &) { return std::complex<double>(0.25, -0.5); }
 static int material_ir_user_calls = 0;
@@ -776,6 +782,8 @@ private:
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL);
+static bool checkpoint_payload_equal(const CheckpointImage &expected,
+                                     const CheckpointImage &actual);
 
 static CwSolveRequest cw_request() {
   CwSolveRequest request;
@@ -10882,20 +10890,1121 @@ static void test_backend_safe_host_access() {
   snprintf(filename, sizeof(filename), "/tmp/meep-backend-access-%ld-%d.h5", long(getpid()),
            my_rank());
   accesses.reads = accesses.field_reads = accesses.dft_reads = accesses.max_elements = 0;
+  const uint64_t checkpoint_generation = std::numeric_limits<uint64_t>::max();
+  f->mutation_generation[static_cast<int>(MutationKind::source_values)] =
+      checkpoint_generation;
   f->dump(filename, false);
   CHECK(sum_to_all(int(accesses.field_reads)) > 0 && sum_to_all(int(accesses.dft_reads)) > 0,
         "checkpoint dump did not explicitly read field and DFT storage");
   CHECK(f->backend_state != NULL && f->executable != NULL,
         "checkpoint dump retired resident execution state");
+  CHECK(accesses.prepare_rebuilds == 1,
+        "checkpoint dump did not batch a storage-safe resident snapshot");
+  CheckpointImage expected_checkpoint;
+  {
+    h5file stored(filename, h5file::READONLY, false, true);
+    expected_checkpoint = CheckpointTransaction::read_manifest(stored, false);
+  }
+  f->mutation_generation[static_cast<int>(MutationKind::source_values)] = 1;
+
+  const CheckpointFailurePoint dump_failures[] = {
+      CheckpointFailurePoint::snapshot, CheckpointFailurePoint::write,
+      CheckpointFailurePoint::rename_publish};
+  for (CheckpointFailurePoint point : dump_failures) {
+    BackendState *const state_before = f->backend_state;
+    Executable *const executable_before = f->executable;
+    checkpoint_set_failure_for_testing(point, 0);
+    bool rejected = false;
+    try { f->dump(filename, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    checkpoint_clear_failure_for_testing();
+    bool target_complete = false;
+    try {
+      h5file existing(filename, h5file::READONLY, false, true);
+      target_complete = CheckpointTransaction::has_manifest(existing);
+    }
+    catch (...) { target_complete = false; }
+    CHECK(rejected && target_complete && access((std::string(filename) + ".tmp").c_str(), F_OK) != 0 &&
+              access((std::string(filename) + ".bak").c_str(), F_OK) != 0 &&
+              f->backend_state == state_before && f->executable == executable_before,
+          "failed checkpoint dump changed the live epoch, target, or left a temporary file "
+          "(point=%d rejected=%d complete=%d tmp=%d bak=%d)",
+          int(point), int(rejected), int(target_complete),
+          int(access((std::string(filename) + ".tmp").c_str(), F_OK) == 0),
+          int(access((std::string(filename) + ".bak").c_str(), F_OK) == 0));
+  }
+  if (count_processors() > 1) {
+    checkpoint_set_failure_for_testing(CheckpointFailurePoint::rename_backup, 0);
+    checkpoint_set_secondary_failure_for_testing(CheckpointFailurePoint::rename_restore, 1);
+    bool rejected = false;
+    try { f->dump(filename, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    checkpoint_clear_failure_for_testing();
+    const std::string backup = std::string(filename) + ".bak";
+    const bool target_exists = access(filename, F_OK) == 0;
+    const bool backup_exists = access(backup.c_str(), F_OK) == 0;
+    bool authoritative_complete = false;
+    try {
+      const char *authoritative = target_exists ? filename : backup.c_str();
+      h5file existing(authoritative, h5file::READONLY, false, true);
+      authoritative_complete = CheckpointTransaction::has_manifest(existing);
+    }
+    catch (...) { authoritative_complete = false; }
+    CHECK(sum_to_all(int(rejected)) == count_processors() && authoritative_complete &&
+              access((std::string(filename) + ".tmp").c_str(), F_OK) != 0 &&
+              (my_rank() != 1 || (!target_exists && backup_exists)),
+          "asymmetric backup-restore failure lost prior authority or exposed a partial target");
+    if (!target_exists && backup_exists) CHECK(std::rename(backup.c_str(), filename) == 0,
+                                                "checkpoint test could not recover prior backup");
+    all_wait();
+  }
+  const int prepares_before_load = accesses.prepare_rebuilds;
+
+  if (count_processors() == 1) {
+    int rank = 0;
+    size_t count = 0, start = 0;
+    std::vector<double> values;
+    double original = 0.0;
+    {
+      h5file corrupt(filename, h5file::READWRITE, false, true);
+      corrupt.read_size("backend_checkpoint_values", &rank, &count, 1);
+      values.resize(count);
+      corrupt.read_chunk(1, &start, &count, values.data());
+      original = values[0];
+      values[0] = original + 1.0;
+      corrupt.write("backend_checkpoint_values", 1, &count, values.data(), false);
+    }
+    bool rejected = false;
+    try { f->load(filename, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected && f->backend_state && f->executable,
+          "checkpoint hash corruption changed the live epoch");
+    {
+      values[0] = original;
+      h5file restore(filename, h5file::READWRITE, false, true);
+      restore.write("backend_checkpoint_values", 1, &count, values.data(), false);
+    }
+  }
+
+  if (count_processors() == 1) {
+    int rank = 0;
+    size_t dims[2] = {0, 0}, start[2] = {0, 0};
+    std::vector<double> rows;
+    double original = 0.0;
+    {
+      h5file corrupt(filename, h5file::READWRITE, false, true);
+      corrupt.read_size("backend_checkpoint_rows", &rank, dims, 2);
+      rows.resize(dims[0] * dims[1]);
+      corrupt.read_chunk(2, start, dims, rows.data());
+      original = rows[7];
+      rows[7] = 99.0;
+      corrupt.write("backend_checkpoint_rows", 2, dims, rows.data(), false);
+    }
+    bool rejected = false;
+    try { f->load(filename, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected && f->backend_state && f->executable,
+          "unsupported checkpoint precision changed the live epoch");
+    {
+      rows[7] = original;
+      h5file restore(filename, h5file::READWRITE, false, true);
+      restore.write("backend_checkpoint_rows", 2, dims, rows.data(), false);
+    }
+  }
+
+  if (count_processors() == 1 &&
+      std::numeric_limits<size_t>::max() > size_t(std::numeric_limits<int>::max())) {
+    int rank = 0;
+    size_t count = 0, start = 0;
+    std::vector<size_t> header;
+    {
+      h5file corrupt(filename, h5file::READWRITE, false, true);
+      corrupt.read_size("backend_checkpoint_header", &rank, &count, 1);
+      header.resize(count);
+      corrupt.read_chunk(1, &start, &count, header.data());
+      header[9] = size_t(std::numeric_limits<int>::max()) + 1;
+      corrupt.remove_data("backend_checkpoint_header");
+      corrupt.create_data("backend_checkpoint_header", 1, &count, false, false);
+      corrupt.write_chunk(1, &start, &count, header.data());
+      corrupt.done_writing_chunks();
+    }
+    bool rejected = false;
+    try { f->load(filename, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected && f->backend_state && f->executable,
+          "out-of-range disk timestep changed the live epoch");
+    {
+      header[9] = size_t(expected_checkpoint.timestep);
+      h5file restore(filename, h5file::READWRITE, false, true);
+      restore.remove_data("backend_checkpoint_header");
+      restore.create_data("backend_checkpoint_header", 1, &count, false, false);
+      restore.write_chunk(1, &start, &count, header.data());
+      restore.done_writing_chunks();
+    }
+  }
+
+  const CheckpointFailurePoint load_failures[] = {
+      CheckpointFailurePoint::read, CheckpointFailurePoint::allocation,
+      CheckpointFailurePoint::validation, CheckpointFailurePoint::precommit};
+  for (CheckpointFailurePoint point : load_failures) {
+    BackendState *const state_before = f->backend_state;
+    Executable *const executable_before = f->executable;
+    const int t_before = f->t;
+    const uint32_t dirty_before = f->dirty_mask;
+    checkpoint_set_failure_for_testing(point, 0);
+    bool rejected = false;
+    try { f->load(filename, false); }
+    catch (const std::runtime_error &) { rejected = true; }
+    checkpoint_clear_failure_for_testing();
+    CHECK(rejected && f->backend_state == state_before && f->executable == executable_before &&
+              f->t == t_before && f->dirty_mask == dirty_before,
+          "failed staged checkpoint load changed the live resident epoch (point=%d rejected=%d "
+          "state=%d executable=%d time=%d dirty=%u/%u)",
+          int(point), int(rejected), int(f->backend_state == state_before),
+          int(f->executable == executable_before), f->t - t_before, f->dirty_mask,
+          dirty_before);
+  }
+
+  if (count_processors() == 1) {
+    const uint64_t layout_generation =
+        f->mutation_generation[static_cast<int>(MutationKind::field_layout)];
+    f->mutation_generation[static_cast<int>(MutationKind::field_layout)] =
+        std::numeric_limits<uint64_t>::max();
+    bool generation_rejected = false;
+    try { f->load(filename, false); }
+    catch (const std::runtime_error &) { generation_rejected = true; }
+    CHECK(generation_rejected && f->backend_state && f->executable,
+          "checkpoint field-layout overflow changed the live epoch");
+    f->mutation_generation[static_cast<int>(MutationKind::field_layout)] = layout_generation;
+  }
 
   f->load(filename, false);
-  CHECK(accesses.prepare_rebuilds == 1,
+  CHECK(accesses.prepare_rebuilds == prepares_before_load + 1,
         "checkpoint load did not prepare resident authority for replacement");
   CHECK(f->backend_state == NULL && f->executable == NULL,
         "checkpoint load retained artifacts referring to the old catalog");
   CHECK(is_dirty(*f, dirty_storage), "checkpoint load did not invalidate storage layout");
+  CHECK(f->mutation_generation[static_cast<int>(MutationKind::source_values)] ==
+            checkpoint_generation,
+        "checkpoint generation split/merge did not preserve a value above 2^53");
+  const CheckpointImage restored_checkpoint = CheckpointTransaction::snapshot(*f);
+  CHECK(checkpoint_payload_equal(expected_checkpoint, restored_checkpoint),
+        "checkpoint did not exactly restore field, material, DFT, alias, or legacy flux rows");
   std::remove(filename);
 
+  delete f;
+  delete s;
+}
+
+static void test_checkpoint_metadata_boundaries() {
+  CHECK(checkpoint_decode_signed_for_testing(checkpoint_encode_signed_for_testing(
+            std::numeric_limits<int>::min())) == std::numeric_limits<int>::min() &&
+            checkpoint_decode_signed_for_testing(checkpoint_encode_signed_for_testing(-1)) == -1 &&
+            checkpoint_decode_signed_for_testing(checkpoint_encode_signed_for_testing(0)) == 0 &&
+            checkpoint_decode_signed_for_testing(checkpoint_encode_signed_for_testing(
+                std::numeric_limits<int>::max())) == std::numeric_limits<int>::max(),
+        "checkpoint signed-key encoding did not preserve int bounds");
+  bool wide_rejected = false;
+  try { (void)checkpoint_decode_signed_for_testing(std::numeric_limits<uint64_t>::max()); }
+  catch (const std::invalid_argument &) { wide_rejected = true; }
+  CHECK(wide_rejected, "checkpoint signed-key decoder accepted an out-of-domain disk integer");
+}
+
+static void test_checkpoint_susceptibility_identity() {
+  lorentzian_susceptibility lorentz_a(realnum(1.125), realnum(0.0625), false);
+  lorentzian_susceptibility lorentz_b(realnum(1.25), realnum(0.0625), false);
+  lorentzian_susceptibility lorentz_gamma(realnum(1.125), realnum(0.125), false);
+  lorentzian_susceptibility drude(realnum(1.125), realnum(0.0625), true);
+  CHECK(susceptibility_chain_signature(&lorentz_a) !=
+            susceptibility_chain_signature(&lorentz_b) &&
+            susceptibility_chain_signature(&lorentz_a) !=
+                susceptibility_chain_signature(&lorentz_gamma) &&
+            susceptibility_chain_signature(&lorentz_a) !=
+                susceptibility_chain_signature(&drude),
+        "checkpoint susceptibility identity omitted Lorentzian dynamics");
+
+  noisy_lorentzian_susceptibility noisy_a(realnum(0.03125), realnum(1.125),
+                                           realnum(0.0625));
+  noisy_lorentzian_susceptibility noisy_b(realnum(0.046875), realnum(1.125),
+                                           realnum(0.0625));
+  CHECK(susceptibility_chain_signature(&noisy_a) !=
+            susceptibility_chain_signature(&noisy_b),
+        "checkpoint susceptibility identity omitted noisy amplitude");
+
+  gyrotropic_susceptibility gyro_a(vec(0.125, -0.25, 0.375), realnum(1.125),
+                                    realnum(0.0625), realnum(0.015625),
+                                    GYROTROPIC_LORENTZIAN);
+  gyrotropic_susceptibility gyro_b(vec(0.125, -0.25, 0.5), realnum(1.125),
+                                    realnum(0.0625), realnum(0.015625),
+                                    GYROTROPIC_LORENTZIAN);
+  gyrotropic_susceptibility gyro_c(vec(0.125, -0.25, 0.375), realnum(1.125),
+                                    realnum(0.0625), realnum(0.03125), GYROTROPIC_DRUDE);
+  CHECK(susceptibility_chain_signature(&gyro_a) != susceptibility_chain_signature(&gyro_b) &&
+            susceptibility_chain_signature(&gyro_a) != susceptibility_chain_signature(&gyro_c),
+        "checkpoint susceptibility identity omitted gyrotropic bias/model/alpha dynamics");
+
+  const realnum gamma_matrix[] = {realnum(0.0), realnum(0.125), realnum(0.25), realnum(0.0)};
+  const realnum populations[] = {realnum(1.0), realnum(0.0)};
+  const realnum alpha[] = {realnum(-0.5), realnum(0.5)};
+  const realnum omega[] = {realnum(0.75)};
+  const realnum transition_gamma[] = {realnum(0.03125)};
+  const realnum sigmat[] = {realnum(1.0), realnum(0.5), realnum(0.25), realnum(0.125),
+                            realnum(0.0625)};
+  multilevel_susceptibility multilevel_a(2, 1, gamma_matrix, populations, alpha, omega,
+                                          transition_gamma, sigmat);
+  multilevel_susceptibility multilevel_same(2, 1, gamma_matrix, populations, alpha, omega,
+                                             transition_gamma, sigmat);
+  CHECK(susceptibility_chain_signature(&multilevel_a) ==
+            susceptibility_chain_signature(&multilevel_same),
+        "checkpoint multilevel identity is not exact for equal definitions");
+  realnum changed_gamma_matrix[4];
+  memcpy(changed_gamma_matrix, gamma_matrix, sizeof(gamma_matrix));
+  changed_gamma_matrix[1] += realnum(0.03125);
+  multilevel_susceptibility multilevel_changed(2, 1, changed_gamma_matrix, populations, alpha,
+                                                omega, transition_gamma, sigmat);
+  CHECK(susceptibility_chain_signature(&multilevel_a) !=
+            susceptibility_chain_signature(&multilevel_changed),
+        "checkpoint multilevel identity omitted relaxation rates");
+  realnum changed_populations[2];
+  memcpy(changed_populations, populations, sizeof(populations));
+  changed_populations[0] -= realnum(0.125);
+  multilevel_susceptibility multilevel_population(2, 1, gamma_matrix, changed_populations, alpha,
+                                                   omega, transition_gamma, sigmat);
+  realnum changed_alpha[2];
+  memcpy(changed_alpha, alpha, sizeof(alpha));
+  changed_alpha[0] -= realnum(0.125);
+  multilevel_susceptibility multilevel_alpha(2, 1, gamma_matrix, populations, changed_alpha,
+                                              omega, transition_gamma, sigmat);
+  realnum changed_omega[1] = {omega[0] + realnum(0.125)};
+  multilevel_susceptibility multilevel_omega(2, 1, gamma_matrix, populations, alpha,
+                                              changed_omega, transition_gamma, sigmat);
+  realnum changed_transition_gamma[1] = {transition_gamma[0] + realnum(0.015625)};
+  multilevel_susceptibility multilevel_loss(2, 1, gamma_matrix, populations, alpha, omega,
+                                             changed_transition_gamma, sigmat);
+  realnum changed_sigmat[5];
+  memcpy(changed_sigmat, sigmat, sizeof(sigmat));
+  changed_sigmat[4] += realnum(0.03125);
+  multilevel_susceptibility multilevel_sigma(2, 1, gamma_matrix, populations, alpha, omega,
+                                              transition_gamma, changed_sigmat);
+  const uint64_t multilevel_signature = susceptibility_chain_signature(&multilevel_a);
+  CHECK(multilevel_signature != susceptibility_chain_signature(&multilevel_population) &&
+            multilevel_signature != susceptibility_chain_signature(&multilevel_alpha) &&
+            multilevel_signature != susceptibility_chain_signature(&multilevel_omega) &&
+            multilevel_signature != susceptibility_chain_signature(&multilevel_loss) &&
+            multilevel_signature != susceptibility_chain_signature(&multilevel_sigma),
+        "checkpoint multilevel identity omitted an evolution-affecting parameter family");
+
+  susceptibility *ordered = new lorentzian_susceptibility(realnum(0.75), realnum(0.0625));
+  ordered->next = new noisy_lorentzian_susceptibility(realnum(0.03125), realnum(1.0),
+                                                       realnum(0.125));
+  susceptibility *reversed = new noisy_lorentzian_susceptibility(
+      realnum(0.03125), realnum(1.0), realnum(0.125));
+  reversed->next = new lorentzian_susceptibility(realnum(0.75), realnum(0.0625));
+  CHECK(susceptibility_chain_signature(ordered) != susceptibility_chain_signature(reversed),
+        "checkpoint susceptibility identity omitted chain order");
+  delete ordered;
+  delete reversed;
+
+  susceptibility unsupported;
+  bool custom_rejected = false;
+  try { (void)susceptibility_chain_signature(&unsupported); }
+  catch (const std::invalid_argument &) { custom_rejected = true; }
+  CHECK(custom_rejected, "checkpoint susceptibility identity accepted a custom chain");
+
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure structure_a(gv, unit_epsilon, no_pml(), identity(), 1);
+  structure structure_b(gv, unit_epsilon, no_pml(), identity(), 1);
+  structure_a.add_susceptibility(unit_epsilon, E_stuff, lorentz_a);
+  structure_b.add_susceptibility(unit_epsilon, E_stuff, lorentz_b);
+  fields fields_a(&structure_a), fields_b(&structure_b);
+  const size_t signature_a =
+      size_t(CheckpointTransaction::snapshot(fields_a).material_recipe_signature);
+  const size_t signature_b =
+      size_t(CheckpointTransaction::snapshot(fields_b).material_recipe_signature);
+  CHECK(sum_to_all(signature_a) != sum_to_all(signature_b),
+        "checkpoint material signature omitted same-shape susceptibility parameter changes");
+
+  if (sizeof(realnum) == sizeof(double)) {
+    const auto adjacent = [](realnum value) {
+      return realnum(std::nextafter(double(value), std::numeric_limits<double>::infinity()));
+    };
+    const auto exact_only = [](const susceptibility &baseline, const susceptibility &changed,
+                               const char *what) {
+      CHECK(susceptibility_chain_native_signature(&baseline) !=
+                    susceptibility_chain_native_signature(&changed) &&
+                susceptibility_chain_signature(&baseline) ==
+                    susceptibility_chain_signature(&changed),
+            "checkpoint susceptibility identity did not preserve exact %s bits", what);
+    };
+
+    lorentzian_susceptibility lorentz_adjacent_omega(adjacent(realnum(1.125)),
+                                                      realnum(0.0625), false);
+    lorentzian_susceptibility lorentz_adjacent_gamma(realnum(1.125),
+                                                      adjacent(realnum(0.0625)), false);
+    exact_only(lorentz_a, lorentz_adjacent_omega, "Lorentzian omega");
+    exact_only(lorentz_a, lorentz_adjacent_gamma, "Lorentzian gamma");
+    noisy_lorentzian_susceptibility noisy_adjacent(adjacent(realnum(0.03125)),
+                                                    realnum(1.125), realnum(0.0625));
+    exact_only(noisy_a, noisy_adjacent, "noisy amplitude");
+
+    const realnum gyro_base[6] = {realnum(0.125), realnum(-0.25), realnum(0.375),
+                                  realnum(1.125), realnum(0.0625), realnum(0.015625)};
+    for (int parameter = 0; parameter < 6; ++parameter) {
+      realnum changed[6];
+      memcpy(changed, gyro_base, sizeof(changed));
+      changed[parameter] = adjacent(changed[parameter]);
+      gyrotropic_susceptibility baseline(
+          vec(gyro_base[0], gyro_base[1], gyro_base[2]), gyro_base[3], gyro_base[4],
+          gyro_base[5], GYROTROPIC_LORENTZIAN);
+      gyrotropic_susceptibility modified(
+          vec(changed[0], changed[1], changed[2]), changed[3], changed[4], changed[5],
+          GYROTROPIC_LORENTZIAN);
+      exact_only(baseline, modified, "gyrotropic numeric parameter");
+    }
+
+    for (int family = 0; family < 6; ++family) {
+      realnum gamma_changed[4], populations_changed[2], alpha_changed[2], omega_changed[1],
+          transition_gamma_changed[1], sigmat_changed[5];
+      memcpy(gamma_changed, gamma_matrix, sizeof(gamma_changed));
+      memcpy(populations_changed, populations, sizeof(populations_changed));
+      memcpy(alpha_changed, alpha, sizeof(alpha_changed));
+      memcpy(omega_changed, omega, sizeof(omega_changed));
+      memcpy(transition_gamma_changed, transition_gamma, sizeof(transition_gamma_changed));
+      memcpy(sigmat_changed, sigmat, sizeof(sigmat_changed));
+      realnum *families[] = {gamma_changed, populations_changed, alpha_changed, omega_changed,
+                             transition_gamma_changed, sigmat_changed};
+      families[family][0] = adjacent(families[family][0]);
+      multilevel_susceptibility modified(
+          2, 1, gamma_changed, populations_changed, alpha_changed, omega_changed,
+          transition_gamma_changed, sigmat_changed);
+      exact_only(multilevel_a, modified, "multilevel numeric parameter family");
+    }
+
+    checkpoint_identity_epsilon_value = realnum(2.0);
+    structure material(gv, checkpoint_identity_epsilon, no_pml(), identity(), 1);
+    material.set_chi3(checkpoint_identity_epsilon);
+    fields material_fields(&material);
+    material_fields.require_component(Ez);
+    gaussian_src_time material_source(0.25, 0.0625);
+    material_fields.add_point_source(Ez, material_source, vec(0.0, 0.0));
+    const CheckpointImage material_image_a = CheckpointTransaction::snapshot(material_fields);
+    bool changed_material_sample = false;
+    for (int chunk = 0; chunk < material_fields.num_chunks && !changed_material_sample; ++chunk) {
+      structure_chunk *sc = material_fields.chunks[chunk]->s;
+      if (!material_fields.chunks[chunk]->is_mine()) continue;
+      realnum *row = sc->chi3[int(Ez)];
+      if (!row) continue;
+      for (int i = 0; i < sc->gv.ntot(); ++i) {
+        if (!sc->gv.owns(sc->gv.iloc(Ez, i))) continue;
+        row[i] = adjacent(row[i]);
+        changed_material_sample = true;
+        break;
+      }
+    }
+    const CheckpointImage material_image_b = CheckpointTransaction::snapshot(material_fields);
+    CHECK(or_to_all(changed_material_sample),
+          "checkpoint material identity fixture found no owned material sample");
+    const size_t native_a = sum_to_all(size_t(material_image_a.material_native_signature));
+    const size_t native_b = sum_to_all(size_t(material_image_b.material_native_signature));
+    const size_t portable_a = sum_to_all(size_t(material_image_a.material_recipe_signature));
+    const size_t portable_b = sum_to_all(size_t(material_image_b.material_recipe_signature));
+    CHECK(native_a != native_b && portable_a == portable_b,
+          "checkpoint material identity collapsed adjacent binary64 samples");
+    checkpoint_identity_epsilon_value = realnum(1.0);
+  }
+}
+
+static void test_checkpoint_dft_identity_precision_and_order() {
+  if (sizeof(realnum) != sizeof(double)) return;
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, unit_epsilon, no_pml(), identity(), 1);
+  fields f(&s);
+  f.use_real_fields();
+  component monitored = Ez;
+  f.require_component(monitored);
+  const double frequency = 0.25;
+  dft_fields monitor = f.add_dft_fields(&monitored, 1, f.v, &frequency, 1);
+  (void)monitor;
+  const CheckpointImage baseline = CheckpointTransaction::snapshot(f);
+  const auto reduced = [](uint64_t signature) {
+    return uint64_t(sum_to_all(size_t(signature))) & ((UINT64_C(1) << 52) - 1);
+  };
+  const auto verify_exact_only = [&](const CheckpointImage &changed, const char *what) {
+    CHECK(reduced(baseline.dft_native_signature) != reduced(changed.dft_native_signature) &&
+              reduced(baseline.dft_recipe_signature) == reduced(changed.dft_recipe_signature),
+          "checkpoint DFT identity did not preserve exact %s bits", what);
+  };
+  dft_chunk *local = NULL;
+  for (int chunk = 0; chunk < f.num_chunks && !local; ++chunk)
+    if (f.chunks[chunk]->is_mine()) local = f.chunks[chunk]->dft_chunks;
+
+  const double original_omega = local ? local->omega[0] : 0.0;
+  if (local) local->omega[0] = std::nextafter(local->omega[0], INFINITY);
+  verify_exact_only(CheckpointTransaction::snapshot(f), "frequency");
+  if (local) local->omega[0] = original_omega;
+
+  const std::complex<double> original_scale = local ? local->scale : std::complex<double>();
+  if (local)
+    local->scale = std::complex<double>(std::nextafter(local->scale.real(), INFINITY),
+                                        local->scale.imag());
+  verify_exact_only(CheckpointTransaction::snapshot(f), "scale");
+  if (local) local->scale = original_scale;
+
+  double original_weight = 0.0;
+  if (local) {
+    original_weight = local->s0.in_direction(X);
+    local->s0.set_direction(X, std::nextafter(original_weight, INFINITY));
+  }
+  verify_exact_only(CheckpointTransaction::snapshot(f), "boundary weight");
+  if (local) local->s0.set_direction(X, original_weight);
+
+  const double frequency_a = 0.1875, frequency_b = 0.3125;
+  structure ordered_structure(gv, unit_epsilon, no_pml(), identity(), 1);
+  fields ordered(&ordered_structure);
+  ordered.use_real_fields();
+  ordered.require_component(monitored);
+  dft_fields ordered_a = ordered.add_dft_fields(&monitored, 1, ordered.v, &frequency_a, 1);
+  dft_fields ordered_b = ordered.add_dft_fields(&monitored, 1, ordered.v, &frequency_b, 1);
+  (void)ordered_a;
+  (void)ordered_b;
+  structure swapped_structure(gv, unit_epsilon, no_pml(), identity(), 1);
+  fields swapped(&swapped_structure);
+  swapped.use_real_fields();
+  swapped.require_component(monitored);
+  dft_fields swapped_b = swapped.add_dft_fields(&monitored, 1, swapped.v, &frequency_b, 1);
+  dft_fields swapped_a = swapped.add_dft_fields(&monitored, 1, swapped.v, &frequency_a, 1);
+  (void)swapped_a;
+  (void)swapped_b;
+  const CheckpointImage ordered_image = CheckpointTransaction::snapshot(ordered);
+  const CheckpointImage swapped_image = CheckpointTransaction::snapshot(swapped);
+  CHECK(reduced(ordered_image.dft_native_signature) !=
+                reduced(swapped_image.dft_native_signature) &&
+            reduced(ordered_image.dft_recipe_signature) !=
+                reduced(swapped_image.dft_recipe_signature),
+        "checkpoint DFT identity omitted equal-shape monitor ordering");
+}
+
+static bool checkpoint_payload_equal(const CheckpointImage &expected,
+                                     const CheckpointImage &actual) {
+  if (expected.rows.size() != actual.rows.size() ||
+      expected.legacy_flux_signatures != actual.legacy_flux_signatures ||
+      expected.legacy_flux_values != actual.legacy_flux_values ||
+      !same_seed_snapshot(expected.random_seed, actual.random_seed))
+    return false;
+  for (const CheckpointRow &row : expected.rows) {
+    const CheckpointRow *match = NULL;
+    for (const CheckpointRow &candidate : actual.rows)
+      if (candidate.key == row.key) {
+        if (match) return false;
+        match = &candidate;
+      }
+    if (!match || match->spec.element_type != row.spec.element_type ||
+        match->spec.elements != row.spec.elements || match->has_alias != row.has_alias ||
+        (row.has_alias && !(match->alias_key == row.alias_key)) || match->values != row.values)
+      return false;
+  }
+  return true;
+}
+
+static void test_checkpoint_polarization_dft_roundtrip() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure s(gv, unit_epsilon, pml(0.25), identity(), 2);
+  add_multilevel_lifecycle_states(s);
+  fields f(&s);
+  f.use_real_fields();
+  f.require_component(Ez);
+  f.require_component(Hz);
+  gaussian_src_time source(0.31, 0.09);
+  f.add_point_source(Ez, source, vec(0.13, -0.17));
+  component monitored = Ez;
+  const double frequencies[2] = {0.21, 0.37};
+  dft_fields monitor = f.add_dft_fields(&monitored, 1, f.v, frequencies, 2);
+  (void)monitor;
+  f.add_flux_vol(X, volume(vec(0.1, -0.7), vec(0.1, 0.7)));
+  set_random_seed(41000 + my_global_rank());
+  f.advance(3);
+
+  const CheckpointImage expected = CheckpointTransaction::snapshot(f);
+  const RandomSeedSnapshot expected_seed = random_seed_snapshot();
+  size_t polarization_rows = 0, dft_rows = 0, aliases = 0;
+  bool saw_gamma_inv = false;
+  for (const CheckpointRow &row : expected.rows) {
+    if (row.key.kind == int(array_kind::polarization_internal)) {
+      ++polarization_rows;
+      saw_gamma_inv |= row.key.component_ == int(Centered) && row.key.cmp == -1 &&
+                       row.spec.elements == 9;
+    }
+    if (row.key.kind == int(array_kind::dft) || row.key.kind == int(array_kind::dft_phase))
+      ++dft_rows;
+    aliases += row.has_alias;
+  }
+  CHECK(or_to_all(polarization_rows > 0) && or_to_all(dft_rows > 0) &&
+            or_to_all(saw_gamma_inv),
+        "checkpoint fixture omitted state rows (polarization=%zu DFT=%zu aliases=%zu GammaInv=%d)",
+        polarization_rows, dft_rows, aliases, int(saw_gamma_inv));
+
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-checkpoint-state-%ld-%d.h5", long(getpid()),
+           my_rank());
+  f.dump(filename, false);
+  f.advance(2);
+  const vec continuation_probes[] = {vec(-0.45, -0.35), vec(0.15, 0.25), vec(0.55, -0.15)};
+  std::complex<double> expected_continuation[3];
+  for (size_t i = 0; i < 3; ++i)
+    expected_continuation[i] = f.get_field(Ez, continuation_probes[i]);
+  CHECK(f.phase_in_material(&s, f.dt) == 1,
+        "checkpoint continuation fixture did not enter material mutation");
+  f.advance(1);
+  set_random_seed(42000 + my_global_rank());
+  f.load(filename, false);
+  const CheckpointImage restored = CheckpointTransaction::snapshot(f);
+  bool rebound = true;
+  for (int chunk = 0; chunk < f.num_chunks; ++chunk)
+    FOR_FIELD_TYPES(ft) {
+      const polarization_state *state = f.chunks[chunk]->pol[ft];
+      const susceptibility *sus = f.chunks[chunk]->s->chiP[ft];
+      while (state && sus) {
+        rebound &= state->s == sus;
+        state = state->next;
+        sus = sus->next;
+      }
+      rebound &= !state && !sus;
+    }
+  CHECK(f.t == expected.timestep && checkpoint_payload_equal(expected, restored) &&
+            same_seed_snapshot(random_seed_snapshot(), expected_seed) && rebound,
+        "checkpoint did not exactly restore multilevel/GammaInv/DFT/alias state");
+  f.advance(2);
+  bool continued = true;
+  for (size_t i = 0; i < 3; ++i)
+    continued &= std::abs(f.get_field(Ez, continuation_probes[i]) -
+                          expected_continuation[i]) < 1e-10;
+  CHECK(continued, "checkpoint did not continue after a cloned material structure");
+  std::remove(filename);
+
+  structure alias_structure(gv, unit_epsilon, no_pml(), identity(), 1);
+  fields alias_fields(&alias_structure);
+  alias_fields.use_real_fields();
+  alias_fields.require_component(Hx);
+  const CheckpointImage expected_alias = CheckpointTransaction::snapshot(alias_fields);
+  size_t alias_rows = 0;
+  for (const CheckpointRow &row : expected_alias.rows) alias_rows += row.has_alias;
+  snprintf(filename, sizeof(filename), "/tmp/meep-checkpoint-alias-%ld-%d.h5", long(getpid()),
+           my_rank());
+  alias_fields.dump(filename, false);
+  alias_fields.load(filename, false);
+  const CheckpointImage restored_alias = CheckpointTransaction::snapshot(alias_fields);
+  CHECK(or_to_all(alias_rows > 0) && checkpoint_payload_equal(expected_alias, restored_alias),
+        "checkpoint did not preserve canonical H/B alias ownership");
+  CheckpointImage cyclic_alias = expected_alias;
+  for (CheckpointRow &row : cyclic_alias.rows)
+    if (row.has_alias) {
+      row.alias_key = row.key;
+      row.checksum = checkpoint_row_checksum(row);
+      break;
+    }
+  bool cycle_rejected = false;
+  try { CheckpointTransaction::validate_target(alias_fields, cyclic_alias); }
+  catch (const std::runtime_error &) { cycle_rejected = true; }
+  CHECK(cycle_rejected, "checkpoint accepted a cyclic alias graph");
+  CheckpointImage dangling_alias = expected_alias;
+  for (CheckpointRow &row : dangling_alias.rows)
+    if (row.has_alias) {
+      row.alias_key.chunk = std::numeric_limits<int>::max();
+      row.checksum = checkpoint_row_checksum(row);
+      break;
+    }
+  bool dangling_rejected = false;
+  try { CheckpointTransaction::validate_target(alias_fields, dangling_alias); }
+  catch (const std::runtime_error &) { dangling_rejected = true; }
+  CHECK(dangling_rejected, "checkpoint accepted a dangling alias target");
+
+  const auto rejected_metadata = [&](CheckpointImage malformed, const char *what) {
+    bool rejected = false;
+    try { CheckpointTransaction::validate_target(alias_fields, malformed); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected, "checkpoint accepted checksum-consistent malformed %s", what);
+  };
+  for (int kind = 0; kind <= int(array_kind::num_kinds); ++kind) {
+    CheckpointImage malformed = expected_alias;
+    if (!malformed.rows.empty()) {
+      CheckpointRow &row = malformed.rows.front();
+      row.key.kind = kind;
+      row.key.component_ = -1;
+      row.key.cmp = -1;
+      row.key.aux = std::numeric_limits<uint64_t>::max();
+      row.checksum = checkpoint_row_checksum(row);
+    }
+    rejected_metadata(malformed, "array-kind key domain");
+  }
+  CheckpointImage malformed_component = expected_alias;
+  if (!malformed_component.rows.empty()) {
+    malformed_component.rows.front().key.component_ = NUM_FIELD_COMPONENTS;
+    malformed_component.rows.front().checksum =
+        checkpoint_row_checksum(malformed_component.rows.front());
+  }
+  rejected_metadata(malformed_component, "component");
+  CheckpointImage malformed_cmp = expected_alias;
+  if (!malformed_cmp.rows.empty()) {
+    malformed_cmp.rows.front().key.cmp = 2;
+    malformed_cmp.rows.front().checksum = checkpoint_row_checksum(malformed_cmp.rows.front());
+  }
+  rejected_metadata(malformed_cmp, "complex lane");
+  CheckpointImage malformed_aux = expected_alias;
+  if (!malformed_aux.rows.empty()) {
+    malformed_aux.rows.front().key.aux = 1;
+    malformed_aux.rows.front().checksum = checkpoint_row_checksum(malformed_aux.rows.front());
+  }
+  rejected_metadata(malformed_aux, "auxiliary key");
+  CheckpointImage malformed_timestep = expected_alias;
+  malformed_timestep.timestep = -1;
+  rejected_metadata(malformed_timestep, "timestep");
+  CheckpointImage wrong_configuration = expected_alias;
+  wrong_configuration.configuration_signature ^= 1;
+  bool configuration_rejected = false;
+  try { CheckpointTransaction::validate_target(alias_fields, wrong_configuration); }
+  catch (const std::runtime_error &) { configuration_rejected = true; }
+  CHECK(configuration_rejected,
+        "checkpoint accepted mismatched global grid/boundary/symmetry metadata");
+  CheckpointImage unsupported_host_precision = expected_alias;
+  unsupported_host_precision.host_realnum_bytes = 16;
+  bool host_precision_rejected = false;
+  try { CheckpointTransaction::validate_target(alias_fields, unsupported_host_precision); }
+  catch (const std::runtime_error &) { host_precision_rejected = true; }
+  CHECK(host_precision_rejected, "checkpoint accepted an unsupported host precision");
+  if (count_processors() == 1) {
+    CheckpointImage opposite_precision = expected_alias;
+    const bool native_f32 = sizeof(realnum) == sizeof(float);
+    opposite_precision.host_realnum_bytes = native_f32 ? 8 : 4;
+    for (CheckpointRow &row : opposite_precision.rows) {
+      row.spec.storage = native_f32 ? Precision::f64 : Precision::f32;
+      row.spec.alignment = native_f32 ? alignof(double) : alignof(float);
+      if (!native_f32)
+        for (double &value : row.values)
+          if (std::isfinite(value)) value = double(float(value));
+      row.checksum = checkpoint_row_checksum(row);
+    }
+    bool opposite_precision_accepted = true;
+    try { CheckpointTransaction::validate_target(alias_fields, opposite_precision); }
+    catch (const std::runtime_error &) { opposite_precision_accepted = false; }
+    CHECK(opposite_precision_accepted,
+          "checkpoint rejected a format-correct opposite-precision row layout");
+    CheckpointImage wrong_saved_alignment = opposite_precision;
+    if (!wrong_saved_alignment.rows.empty()) {
+      ++wrong_saved_alignment.rows.front().spec.alignment;
+      wrong_saved_alignment.rows.front().checksum =
+          checkpoint_row_checksum(wrong_saved_alignment.rows.front());
+      bool saved_alignment_rejected = false;
+      try { CheckpointTransaction::validate_target(alias_fields, wrong_saved_alignment); }
+      catch (const std::runtime_error &) { saved_alignment_rejected = true; }
+      CHECK(saved_alignment_rejected,
+            "checkpoint accepted alignment inconsistent with the saved precision format");
+    }
+    CheckpointImage malformed_f32 = expected_alias;
+    malformed_f32.host_realnum_bytes = 4;
+    bool injected_noncanonical_f32 = false;
+    for (CheckpointRow &row : malformed_f32.rows) {
+      row.spec.storage = Precision::f32;
+      row.spec.alignment = alignof(float);
+      if (!row.has_alias && !row.values.empty() && !injected_noncanonical_f32) {
+        row.values.front() = 0.1;
+        injected_noncanonical_f32 = true;
+      }
+      else
+        for (double &value : row.values)
+          if (std::isfinite(value)) value = double(float(value));
+      row.checksum = checkpoint_row_checksum(row);
+    }
+    bool malformed_f32_rejected = false;
+    try { CheckpointTransaction::validate_target(alias_fields, malformed_f32); }
+    catch (const std::runtime_error &) { malformed_f32_rejected = true; }
+    CHECK(injected_noncanonical_f32 && malformed_f32_rejected,
+          "checkpoint accepted a noncanonical binary32 payload");
+    if (native_f32) {
+      CheckpointImage overflowing_f64 = opposite_precision;
+      bool injected_overflow = false;
+      for (CheckpointRow &row : overflowing_f64.rows) {
+        if (!row.has_alias && !row.values.empty() && !injected_overflow) {
+          row.values.front() = std::numeric_limits<double>::max();
+          injected_overflow = true;
+        }
+        row.checksum = checkpoint_row_checksum(row);
+      }
+      bool overflow_rejected = false;
+      try { CheckpointTransaction::validate_target(alias_fields, overflowing_f64); }
+      catch (const std::runtime_error &) { overflow_rejected = true; }
+      CHECK(injected_overflow && overflow_rejected,
+            "checkpoint accepted an f64 payload outside binary32 range");
+    }
+  }
+  if (count_processors() == 1) {
+    CheckpointImage wrong_source_recipe = expected_alias;
+    wrong_source_recipe.source_definition_signature ^= 1;
+    bool source_recipe_rejected = false;
+    try { CheckpointTransaction::validate_target(alias_fields, wrong_source_recipe); }
+    catch (const std::runtime_error &) { source_recipe_rejected = true; }
+    CHECK(source_recipe_rejected, "checkpoint accepted a changed source recipe fingerprint");
+
+    CheckpointImage wrong_dft_recipe = expected_alias;
+    wrong_dft_recipe.dft_native_signature ^= 1;
+    bool dft_recipe_rejected = false;
+    try { CheckpointTransaction::validate_target(alias_fields, wrong_dft_recipe); }
+    catch (const std::runtime_error &) { dft_recipe_rejected = true; }
+    CHECK(dft_recipe_rejected,
+          "checkpoint accepted a changed same-precision DFT recipe fingerprint");
+
+    CheckpointImage ambiguous_seed = expected_alias;
+    ambiguous_seed.saved_rank_count = 2;
+    ambiguous_seed.random_seed_ranks = {0, 1};
+    ambiguous_seed.random_seeds = {expected_alias.random_seed, expected_alias.random_seed};
+    ++ambiguous_seed.random_seeds[1].semantic_seed;
+    bool seed_remap_rejected = false;
+    try { CheckpointTransaction::validate_target(alias_fields, ambiguous_seed); }
+    catch (const std::runtime_error &) { seed_remap_rejected = true; }
+    CHECK(seed_remap_rejected, "checkpoint accepted an ambiguous noisy rank-count remap");
+  }
+  std::remove(filename);
+}
+
+static void test_checkpoint_noisy_rank_seed_continuation() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure reference_structure(gv, unit_epsilon, no_pml(), identity(), 2);
+  structure resumed_structure(gv, unit_epsilon, no_pml(), identity(), 2);
+  noisy_lorentzian_susceptibility noisy(0.03125, 1.1, 0.05);
+  reference_structure.add_susceptibility(unit_epsilon, E_stuff, noisy);
+  resumed_structure.add_susceptibility(unit_epsilon, E_stuff, noisy);
+  fields reference(&reference_structure);
+  fields resumed(&resumed_structure);
+  gaussian_src_time source(0.31, 0.09);
+  reference.add_point_source(Ez, source, vec(0.13, -0.17));
+  resumed.add_point_source(Ez, source, vec(0.13, -0.17));
+  lifetime_counts reference_counts, resumed_counts;
+  reference.backend = new tracking_backend(reference, reference_counts);
+  resumed.backend = new tracking_backend(resumed, resumed_counts);
+
+  const unsigned long seed = 51000 + unsigned(my_global_rank());
+  set_random_seed(seed);
+  reference.advance(5);
+  const vec probes[] = {vec(-0.6, -0.4), vec(0.1, 0.2), vec(0.7, -0.3)};
+  std::complex<double> expected[3];
+  for (size_t i = 0; i < 3; ++i) expected[i] = reference.get_field(Ez, probes[i]);
+
+  set_random_seed(seed);
+  resumed.advance(3);
+  const RandomSeedSnapshot saved_seed = random_seed_snapshot();
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-checkpoint-noisy-%ld-%d.h5", long(getpid()),
+           my_rank());
+  resumed.dump(filename, false);
+  set_random_seed(52000 + unsigned(my_global_rank()));
+  resumed.load(filename, false);
+  CHECK(same_seed_snapshot(random_seed_snapshot(), saved_seed),
+        "checkpoint did not restore the rank-local noisy seed snapshot");
+  resumed.advance(2);
+  bool continued = true;
+  for (size_t i = 0; i < 3; ++i)
+    continued &= std::abs(resumed.get_field(Ez, probes[i]) - expected[i]) < 1e-10;
+  CHECK(continued, "checkpoint did not preserve noisy rank-local continuation");
+  std::remove(filename);
+}
+
+static void test_checkpoint_single_rank_repartition() {
+  if (count_processors() != 1) return;
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  structure source_structure(gv, eps_slab, no_pml(), identity(), 3);
+  structure target_structure(gv, eps_slab, no_pml(), identity(), 1);
+  fields source(&source_structure);
+  fields target(&target_structure);
+  source.use_real_fields();
+  target.use_real_fields();
+  source.require_component(Hx);
+  target.require_component(Hx);
+  gaussian_src_time source_time(0.27, 0.08);
+  const vec source_point(0.17, -0.21);
+  source.add_point_source(Ez, source_time, source_point);
+  target.add_point_source(Ez, source_time, source_point);
+  source.advance(3);
+  target.advance(1);
+  CHECK(source.num_chunks != target.num_chunks,
+        "checkpoint repartition fixture did not select distinct chunk layouts");
+  const CheckpointImage source_image = CheckpointTransaction::snapshot(source);
+  const CheckpointImage target_image = CheckpointTransaction::snapshot(target);
+  CHECK(source_image.storage_signature != target_image.storage_signature,
+        "checkpoint repartition fixture unexpectedly had an identical storage signature");
+
+  CheckpointImage missing_persistent = source_image;
+  for (std::vector<CheckpointRow>::iterator row = missing_persistent.rows.begin();
+       row != missing_persistent.rows.end(); ++row)
+    if (!row->has_alias && row->key.kind == int(array_kind::f)) {
+      missing_persistent.rows.erase(row);
+      break;
+    }
+  BackendState *const state_before_reject = target.backend_state;
+  Executable *const executable_before_reject = target.executable;
+  const int time_before_reject = target.t;
+  bool missing_rejected = false;
+  try {
+    CheckpointTransaction::validate_target(target, missing_persistent);
+    CheckpointTransaction::commit(target, missing_persistent);
+  }
+  catch (const std::runtime_error &) { missing_rejected = true; }
+  CHECK(missing_rejected && target.backend_state == state_before_reject &&
+            target.executable == executable_before_reject && target.t == time_before_reject,
+        "checkpoint repartition accepted a missing persistent physical row");
+
+  CheckpointImage extra_persistent = source_image;
+  for (const CheckpointRow &row : source_image.rows)
+    if (!row.has_alias && row.key.kind == int(array_kind::f)) {
+      CheckpointRow extra = row;
+      extra.key.aux ^= UINT64_C(1) << 63;
+      extra.checksum = checkpoint_row_checksum(extra);
+      extra_persistent.rows.push_back(extra);
+      break;
+    }
+  bool extra_rejected = false;
+  try {
+    CheckpointTransaction::validate_target(target, extra_persistent);
+    CheckpointTransaction::commit(target, extra_persistent);
+  }
+  catch (const std::runtime_error &) { extra_rejected = true; }
+  CHECK(extra_rejected && target.t == time_before_reject,
+        "checkpoint silently discarded an unmatched saved persistent row");
+
+  CheckpointImage trailing_persistent = source_image;
+  for (CheckpointRow &row : trailing_persistent.rows)
+    if (!row.has_alias && row.key.kind == int(array_kind::f)) {
+      ++row.spec.elements;
+      row.values.push_back(0.0);
+      row.checksum = checkpoint_row_checksum(row);
+      break;
+    }
+  bool trailing_rejected = false;
+  try {
+    CheckpointTransaction::validate_target(target, trailing_persistent);
+    CheckpointTransaction::commit(target, trailing_persistent);
+  }
+  catch (const std::runtime_error &) { trailing_rejected = true; }
+  CHECK(trailing_rejected && target.t == time_before_reject,
+        "checkpoint repartition accepted a trailing spatial scalar");
+
+  CheckpointImage nonintersecting = source_image;
+  for (const CheckpointRow &row : source_image.rows)
+    if (!row.has_alias && row.key.kind == int(array_kind::f)) {
+      CheckpointRow extra = row;
+      extra.key.chunk += source.num_chunks + 100;
+      for (int axis = 0; axis < 3; ++axis) {
+        extra.little_corner[axis] += 100000;
+        extra.big_corner[axis] += 100000;
+      }
+      extra.checksum = checkpoint_row_checksum(extra);
+      nonintersecting.rows.push_back(extra);
+      break;
+    }
+  bool nonintersecting_rejected = false;
+  try {
+    CheckpointTransaction::validate_target(target, nonintersecting);
+    CheckpointTransaction::commit(target, nonintersecting);
+  }
+  catch (const std::runtime_error &) { nonintersecting_rejected = true; }
+  CHECK(nonintersecting_rejected && target.t == time_before_reject,
+        "checkpoint repartition accepted an unconsumed nonintersecting saved row");
+
+  structure changed_structure(gv, two_epsilon, no_pml(), identity(), 1);
+  fields changed_target(&changed_structure);
+  changed_target.use_real_fields();
+  changed_target.require_component(Hx);
+  changed_target.add_point_source(Ez, source_time, source_point);
+  changed_target.advance(1);
+  bool changed_material_rejected = false;
+  try { CheckpointTransaction::validate_target(changed_target, source_image); }
+  catch (const std::runtime_error &) { changed_material_rejected = true; }
+  CHECK(changed_material_rejected,
+        "checkpoint repartition accepted a changed global material definition");
+
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-checkpoint-repartition-%ld.h5", long(getpid()));
+  source.dump(filename, false);
+  target.load(filename, false);
+  CHECK(target.t == source.t, "checkpoint repartition did not restore the saved timestep");
+  const vec probes[] = {vec(-1.1, -0.6), vec(-0.35, 0.2), vec(0.25, -0.3), vec(1.0, 0.55)};
+  bool restored = true;
+  for (const vec &probe : probes)
+    restored &= std::abs(source.get_field(Ez, probe) - target.get_field(Ez, probe)) < 1e-12;
+  CHECK(restored, "checkpoint repartition changed restored global Yee field values");
+  source.advance(2);
+  target.advance(2);
+  bool continued = true;
+  for (const vec &probe : probes)
+    continued &= std::abs(source.get_field(Ez, probe) - target.get_field(Ez, probe)) < 1e-10;
+  CHECK(continued, "checkpoint repartition did not preserve continuation semantics");
+  std::remove(filename);
+}
+
+static void checkpoint_mpi_repartition_file(const char *filename, bool write_only) {
+  const grid_volume gv = vol2d(3.0, 2.0, 8.0);
+  gaussian_src_time source_time(0.27, 0.08);
+  const vec source_point(0.17, -0.21);
+  if (write_only) {
+    structure source_structure(gv, eps_slab, no_pml(), identity(), 1);
+    fields source(&source_structure);
+    source.use_real_fields();
+    source.add_point_source(Ez, source_time, source_point);
+    source.advance(3);
+    if (am_master()) std::remove(filename);
+    all_wait();
+    source.dump(filename, true);
+    master_printf("backend_api: MPI checkpoint writer PASS at np=%d\n", count_processors());
+    return;
+  }
+
+  structure reference_structure(gv, eps_slab, no_pml(), identity(), 1);
+  structure target_structure(gv, eps_slab, no_pml(), identity(), 3);
+  fields reference(&reference_structure);
+  fields target(&target_structure);
+  reference.use_real_fields();
+  target.use_real_fields();
+  reference.add_point_source(Ez, source_time, source_point);
+  target.add_point_source(Ez, source_time, source_point);
+  reference.advance(3);
+  target.advance(1);
+  if (count_processors() > 1) {
+    const int t_before_failure = target.t;
+    checkpoint_set_failure_for_testing(CheckpointFailurePoint::read, 0);
+    bool read_rejected = false;
+    try { target.load(filename, true); }
+    catch (const std::runtime_error &) { read_rejected = true; }
+    checkpoint_clear_failure_for_testing();
+    CHECK(sum_to_all(int(read_rejected)) == count_processors() && target.t == t_before_failure,
+          "shared checkpoint asymmetric read preflight did not reject collectively");
+  }
+  target.load(filename, true);
+  CHECK(target.t == reference.t,
+        "MPI checkpoint repartition did not restore the saved timestep");
+  const vec probes[] = {vec(-1.1, -0.6), vec(-0.35, 0.2), vec(0.25, -0.3), vec(1.0, 0.55)};
+  bool restored = true;
+  for (const vec &probe : probes)
+    restored &= std::abs(reference.get_field(Ez, probe) - target.get_field(Ez, probe)) < 1e-12;
+  CHECK(restored, "MPI checkpoint repartition changed restored global Yee field values");
+  reference.advance(2);
+  target.advance(2);
+  bool continued = true;
+  for (const vec &probe : probes)
+    continued &= std::abs(reference.get_field(Ez, probe) - target.get_field(Ez, probe)) < 1e-10;
+  CHECK(continued, "MPI checkpoint repartition did not preserve continuation semantics");
+  if (failures) return;
+  master_printf("backend_api: MPI checkpoint reader PASS at np=%d\n", count_processors());
+}
+
+static void checkpoint_cross_precision_file(const char *filename, bool write_only) {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  gaussian_src_time source_time(0.25, 0.0625);
+  const vec source_point(0.125, -0.1875);
+  const double frequencies[2] = {0.1875, 0.3125};
+  component monitored = Ez;
+  lorentzian_susceptibility susceptibility(realnum(1.125), realnum(0.0625));
+
+  if (write_only) {
+    structure source_structure(gv, unit_epsilon, no_pml(), identity(), 1);
+    source_structure.add_susceptibility(unit_epsilon, E_stuff, susceptibility);
+    fields source(&source_structure);
+    source.use_real_fields();
+    source.add_point_source(Ez, source_time, source_point);
+    dft_fields monitor = source.add_dft_fields(&monitored, 1, source.v, frequencies, 2);
+    (void)monitor;
+    source.advance(4);
+    if (am_master()) std::remove(filename);
+    all_wait();
+    source.dump(filename, false);
+    master_printf("backend_api: %zu-bit checkpoint writer PASS\n", 8 * sizeof(realnum));
+    return;
+  }
+
+  CheckpointImage saved;
+  {
+    h5file stored(filename, h5file::READONLY, false, true);
+    saved = CheckpointTransaction::read_manifest(stored, false);
+  }
+  CHECK(saved.host_realnum_bytes != sizeof(realnum),
+        "cross-precision checkpoint reader received a native-precision file");
+
+  structure target_structure(gv, unit_epsilon, no_pml(), identity(), 1);
+  target_structure.add_susceptibility(unit_epsilon, E_stuff, susceptibility);
+  fields target(&target_structure);
+  target.use_real_fields();
+  target.add_point_source(Ez, source_time, source_point);
+  dft_fields monitor = target.add_dft_fields(&monitored, 1, target.v, frequencies, 2);
+  (void)monitor;
+  target.advance(1);
+  const CheckpointImage before_load = CheckpointTransaction::snapshot(target);
+  CHECK(saved.dft_recipe_signature == before_load.dft_recipe_signature,
+        "cross-precision DFT recipe identity depends on catalog numbering");
+  target.load(filename, false);
+  const CheckpointImage restored = CheckpointTransaction::snapshot(target);
+  bool converted = restored.rows.size() == saved.rows.size();
+  for (const CheckpointRow &source_row : saved.rows) {
+    const CheckpointRow *target_row = NULL;
+    for (const CheckpointRow &candidate : restored.rows)
+      if (candidate.key == source_row.key) {
+        target_row = &candidate;
+        break;
+      }
+    if (!target_row || target_row->has_alias != source_row.has_alias ||
+        target_row->values.size() != source_row.values.size()) {
+      converted = false;
+      continue;
+    }
+    for (size_t i = 0; i < source_row.values.size(); ++i) {
+      const double expected = double(realnum(source_row.values[i]));
+      converted &= (std::isnan(target_row->values[i]) && std::isnan(expected)) ||
+                   target_row->values[i] == expected;
+    }
+  }
+  CHECK(converted && target.t == saved.timestep,
+        "cross-precision checkpoint did not explicitly convert every real/complex row");
+  target.advance(2);
+  const std::complex<double> probe = target.get_field(Ez, vec(0.25, -0.125));
+  CHECK(target.t == saved.timestep + 2 && std::isfinite(probe.real()) &&
+            std::isfinite(probe.imag()),
+        "cross-precision checkpoint did not continue with finite state");
+  master_printf("backend_api: %zu-bit checkpoint reader PASS\n", 8 * sizeof(realnum));
+}
+
+static void test_checkpoint_transient_rejections() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  f->advance(1);
+  char filename[160];
+  snprintf(filename, sizeof(filename), "/tmp/meep-checkpoint-transient-%ld-%d.h5",
+           long(getpid()), my_rank());
+
+  f->synchronize_magnetic_fields();
+  bool magnetic_rejected = false;
+  try { f->dump(filename, false); }
+  catch (const std::runtime_error &) { magnetic_rejected = true; }
+  CHECK(magnetic_rejected, "checkpoint accepted an active magnetic synchronization");
+  f->restore_magnetic_fields();
+
+  f->phasein_time = 1;
+  bool phase_rejected = false;
+  try { f->dump(filename, false); }
+  catch (const std::runtime_error &) { phase_rejected = true; }
+  CHECK(phase_rejected, "checkpoint accepted an active material phase");
+  f->phasein_time = 0;
+
+  int active_chunk = -1;
+  for (int chunk = 0; chunk < f->num_chunks; ++chunk)
+    if (f->chunks[chunk]->is_mine()) {
+      active_chunk = chunk;
+      f->chunks[chunk]->set_solve_cw_omega(0.3);
+      break;
+    }
+  bool cw_rejected = false;
+  try { f->dump(filename, false); }
+  catch (const std::runtime_error &) { cw_rejected = true; }
+  CHECK(cw_rejected, "checkpoint accepted an active CW solve");
+  if (active_chunk >= 0) f->chunks[active_chunk]->unset_solve_cw_omega();
+  std::remove(filename);
+  std::remove((std::string(filename) + ".tmp").c_str());
   delete f;
   delete s;
 }
@@ -11079,6 +12188,38 @@ static void test_compact_dft_reduction_boundary() {
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
+
+  if (const char *filename = getenv("MEEP_BACKEND_API_CHECKPOINT_WRITE")) {
+    checkpoint_mpi_repartition_file(filename, true);
+    return failures ? 1 : 0;
+  }
+  if (const char *filename = getenv("MEEP_BACKEND_API_CHECKPOINT_READ")) {
+    checkpoint_mpi_repartition_file(filename, false);
+    return failures ? 1 : 0;
+  }
+  if (const char *filename = getenv("MEEP_BACKEND_API_PRECISION_WRITE")) {
+    checkpoint_cross_precision_file(filename, true);
+    return failures ? 1 : 0;
+  }
+  if (const char *filename = getenv("MEEP_BACKEND_API_PRECISION_READ")) {
+    checkpoint_cross_precision_file(filename, false);
+    return failures ? 1 : 0;
+  }
+  if (getenv("MEEP_BACKEND_API_CHECKPOINT_ONLY")) {
+#ifdef HAVE_HDF5
+    test_backend_safe_host_access();
+    test_checkpoint_metadata_boundaries();
+    test_checkpoint_susceptibility_identity();
+    test_checkpoint_dft_identity_precision_and_order();
+    test_checkpoint_transient_rejections();
+    test_checkpoint_polarization_dft_roundtrip();
+    test_checkpoint_noisy_rank_seed_continuation();
+    test_checkpoint_single_rank_repartition();
+#endif
+    if (sum_to_all(failures)) return 1;
+    master_printf("backend_api: checkpoint checks passed\n");
+    return 0;
+  }
 
   if (getenv("MEEP_BACKEND_API_BETA_ONLY")) {
     test_resident_beta_fingerprint();
@@ -11295,6 +12436,13 @@ int main(int argc, char **argv) {
   test_cpu_state_rebuild_is_safe_noop();
   test_backend_safe_host_access();
 #ifdef HAVE_HDF5
+  test_checkpoint_metadata_boundaries();
+  test_checkpoint_susceptibility_identity();
+  test_checkpoint_dft_identity_precision_and_order();
+  test_checkpoint_transient_rejections();
+  test_checkpoint_polarization_dft_roundtrip();
+  test_checkpoint_noisy_rank_seed_continuation();
+  test_checkpoint_single_rank_repartition();
   test_sharded_dft_checkpoint_ordering();
 #endif
   test_compact_dft_reduction_boundary();

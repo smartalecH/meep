@@ -306,6 +306,9 @@ struct OwnedMaterialCallback;
 std::vector<std::shared_ptr<const OwnedMaterialCallback> >
 material_ir_callback_owners(const MaterialIR &ir);
 const MaterialIR *material_ir_for(const fields &f);
+/* Definition-only identity normalized to binary32 for checkpoint validation
+   between f32 and f64 host builds. */
+uint64_t material_ir_portable_signature(const MaterialIR &ir);
 void validate_material_ir(const MaterialIR &ir);
 uint32_t material_ir_material_at_point(const MaterialIR &ir, const double point[3],
                                        uint32_t *image = NULL);
