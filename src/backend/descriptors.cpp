@@ -396,7 +396,9 @@ void source_hash_double(uint64_t &hash, double value) {
 
 } // namespace
 
-uint64_t source_plan_signature(const SourcePlan &plan) {
+namespace {
+
+uint64_t source_plan_signature_impl(const SourcePlan &plan, bool include_amplitudes) {
   uint64_t hash = 0xcbf29ce484222325ull;
   source_hash_mix(hash, plan.source_times.size());
   for (const SourceTimeDescriptor &d : plan.source_times) {
@@ -426,12 +428,23 @@ uint64_t source_plan_signature(const SourcePlan &plan) {
     for (ptrdiff_t index : d.indices)
       source_hash_mix(hash, uint64_t(index));
     source_hash_mix(hash, d.complex_amplitudes.size());
-    for (std::complex<double> amplitude : d.complex_amplitudes) {
-      source_hash_double(hash, amplitude.real());
-      source_hash_double(hash, amplitude.imag());
-    }
+    if (include_amplitudes)
+      for (std::complex<double> amplitude : d.complex_amplitudes) {
+        source_hash_double(hash, amplitude.real());
+        source_hash_double(hash, amplitude.imag());
+      }
   }
   return hash;
+}
+
+} // namespace
+
+uint64_t source_plan_signature(const SourcePlan &plan) {
+  return source_plan_signature_impl(plan, true);
+}
+
+uint64_t source_plan_topology_signature(const SourcePlan &plan) {
+  return source_plan_signature_impl(plan, false);
 }
 
 /* --- DFT monitors --------------------------------------------------------- */

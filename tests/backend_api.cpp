@@ -635,9 +635,9 @@ public:
     why = "tracking backend CW support is disabled";
     return false;
   }
-  Executable *preflight_cw(const CwSolveRequest &, const StepPlan &step_plan,
-                           const CwPlan &cw_plan, Executable *cached,
-                           BackendState &state) override {
+  Executable *preflight_cw(const CwSolveRequest &, const StepPlan &,
+                           const StepPlan &step_plan, const CwPlan &cw_plan,
+                           Executable &, Executable *cached, BackendState &state) override {
     ++counts.cw_preflights;
     if (counts.fail_cw_preflight)
       throw std::runtime_error("injected solve_cw preflight failure");

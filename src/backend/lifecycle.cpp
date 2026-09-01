@@ -18,7 +18,25 @@
 #include "meep.hpp"
 #include "backend/lifecycle.hpp"
 
+#include <limits>
+#include <stdexcept>
+#include <string>
+
 namespace meep {
+
+namespace {
+
+void check_generation_increment(uint64_t value, const char *what) {
+  if (value == std::numeric_limits<uint64_t>::max())
+    throw std::overflow_error(std::string(what) + " generation overflow");
+}
+
+void increment_generation(uint64_t &value, const char *what) {
+  check_generation_increment(value, what);
+  ++value;
+}
+
+} // namespace
 
 static_assert(fields::num_mutation_kinds == mutation_kind_count,
               "fields::num_mutation_kinds is out of sync with meep::mutation_kind_count");
@@ -107,6 +125,26 @@ const char *mutation_kind_name(MutationKind cause) {
   return "?";
 }
 
+bool mutation_may_preserve_executable_structure(MutationKind cause) {
+  switch (cause) {
+    case MutationKind::field_values:
+    case MutationKind::source_values:
+    case MutationKind::material_values:
+    case MutationKind::material_region: return true;
+    case MutationKind::source_definition:
+    case MutationKind::monitor_definition:
+    case MutationKind::legacy_flux_definition:
+    case MutationKind::material_phase:
+    case MutationKind::material_definition:
+    case MutationKind::field_layout:
+    case MutationKind::boundary_topology:
+    case MutationKind::chunk_topology:
+    case MutationKind::coordinate_definition:
+    case MutationKind::precision_policy: return false;
+  }
+  return false;
+}
+
 const char *dirty_bit_name(DirtyBit bit) {
   switch (bit) {
     case dirty_none: return "none";
@@ -142,13 +180,22 @@ void lifecycle_init(fields &f) {
 bool invalidate_collectively(fields &f, MutationKind cause, bool locally_observed,
                              const char *site) {
   const bool anywhere = or_to_all(locally_observed);
-  if (anywhere) invalidate(f, cause, site);
+  if (anywhere) {
+    const uint64_t value = generation(f, cause);
+    const bool local_overflow = value == std::numeric_limits<uint64_t>::max();
+    if (or_to_all(local_overflow))
+      throw std::overflow_error(std::string("collective ") + mutation_kind_name(cause) +
+                                " generation overflow");
+    invalidate(f, cause, site);
+  }
   return anywhere;
 }
 
 void invalidate(fields &f, MutationKind cause, const char *site) {
+  uint64_t &value = f.mutation_generation[static_cast<int>(cause)];
+  check_generation_increment(value, mutation_kind_name(cause));
   f.dirty_mask |= invalidation_closure(cause);
-  ++f.mutation_generation[static_cast<int>(cause)];
+  ++value;
   (void)site;
 }
 
@@ -160,7 +207,9 @@ bool is_dirty(const fields &f, DirtyBit bit) { return (f.dirty_mask & bit) != 0;
 
 void clear_dirty(fields &f, DirtyMask bits) { f.dirty_mask &= ~bits; }
 
-void note_connections_invalidated(fields &f) { ++f.connections_generation; }
+void note_connections_invalidated(fields &f) {
+  increment_generation(f.connections_generation, "connection topology");
+}
 
 void note_connections_built(fields &f) {
   f.connections_built_generation = f.connections_generation;
@@ -171,7 +220,9 @@ bool connections_are_current(const fields &f) {
   return f.connections_generation == f.connections_built_generation;
 }
 
-void mark_local_invalidation(fields &f) { ++f.local_invalidation_generation; }
+void mark_local_invalidation(fields &f) {
+  increment_generation(f.local_invalidation_generation, "local invalidation");
+}
 
 bool needs_connection_sync(const fields &f) {
   return f.local_invalidation_generation != f.local_invalidation_synced;

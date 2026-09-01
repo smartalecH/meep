@@ -3032,6 +3032,103 @@ void fields::init_backend() {
       MaterialRecipeDisposition::host_reference, 0, 0};
   if (material_candidate) material_preflight = preflight_material_fallback(*this);
 
+  /* Value-only material changes first classify the refreshed immutable recipe
+     on the host without touching the live device epoch.  When the exact
+     classification hash, route, and storage layout remain unchanged, upload
+     into the allocation-stable state and retain every compiled graph owner.
+     Any ambiguity falls through to the staged replacement transaction below. */
+  const DirtyMask material_value_mask =
+      DirtyMask(dirty_initialization | dirty_classification);
+  const bool material_value_candidate =
+      backend_state && backend->supports_stable_material_refresh() && material_candidate &&
+      (dirty_mask & ~material_value_mask) == dirty_none &&
+      (generation(*this, MutationKind::material_values) != 0 ||
+       generation(*this, MutationKind::material_region) != 0);
+  if (material_value_candidate) {
+    std::unique_ptr<InitializationPlan> refreshed;
+    MaterialClassification preview;
+    std::string refresh_error;
+    try {
+      backend->prepare_state_rebuild(*backend_state, DirtyMask(dirty_mask));
+      refreshed.reset(new InitializationPlan(build_initialization_plan(*this)));
+      if (refreshed->materials.size() != 1)
+        throw std::logic_error("resident material-value refresh requires one recipe");
+      const MaterialRecipeDisposition local_route =
+          material_preflight.global_route == MaterialRecipeDisposition::host_reference
+              ? MaterialRecipeDisposition::host_reference
+              : refreshed->materials[0].disposition();
+      if (material_preflight.global_route != backend_state->material_route ||
+          local_route != backend_state->material_local_route)
+        throw std::logic_error("resident material-value refresh changed material route");
+      refreshed->materials[0] =
+          select_material_recipe_route(refreshed->materials[0], local_route);
+      InitializationPlan *const old_initialization = initialization_plan;
+      initialization_plan = refreshed.get();
+      try { preview = classify(*this, *storage_plan); }
+      catch (...) {
+        initialization_plan = old_initialization;
+        throw;
+      }
+      initialization_plan = old_initialization;
+    }
+    catch (const std::exception &e) {
+      refresh_error = e.what();
+    }
+    catch (...) {
+      refresh_error = "unknown resident material-value preclassification failure";
+    }
+    backend_reconcile_host_access(refresh_error,
+                                  "fields::init_backend material-value preclassification");
+
+    if (preview.hash == prepared_classification_hash) {
+      refresh_error.clear();
+      try {
+        backend->preflight_initialization(*refreshed);
+        backend->prepare_initialization(*refreshed, *backend_state);
+      }
+      catch (const std::exception &e) {
+        refresh_error = e.what();
+      }
+      catch (...) {
+        refresh_error = "unknown resident material-value refresh preparation failure";
+      }
+      backend_reconcile_host_access(refresh_error,
+                                    "fields::init_backend material-value refresh preparation");
+
+      bool initialized_refresh = false;
+      refresh_error.clear();
+      try {
+        backend->initialize(*refreshed, *backend_state);
+        initialized_refresh = true;
+        MaterialClassification observed = backend->classify_state(*storage_plan, *backend_state);
+        validate_material_classification(*this, *storage_plan, refreshed->materials[0], observed);
+        if (observed.hash != preview.hash)
+          throw std::logic_error(
+              "resident material-value device classification differs from preflight");
+        backend->finalize_storage(*storage_plan, observed, *backend_state);
+        delete initialization_plan;
+        initialization_plan = refreshed.release();
+        prepared_classification_hash = observed.hash;
+        backend_state->material_classification_hash = observed.hash;
+        clear_dirty(*this, material_value_mask);
+        return;
+      }
+      catch (const std::exception &e) {
+        refresh_error = e.what();
+      }
+      catch (...) {
+        refresh_error = "unknown resident material-value refresh failure";
+      }
+      size_t local_poison = size_t(backend->is_poisoned() ||
+                                   (!refresh_error.empty() && initialized_refresh));
+      size_t global_poison = 0;
+      bw_or_to_all(&local_poison, &global_poison, 1);
+      if (global_poison) backend->poison();
+      backend_reconcile_host_access(refresh_error,
+                                    "fields::init_backend material-value refresh");
+    }
+  }
+
   /* A phase may have been configured while the CPU backend was still lazy and
      only then moved to a resident backend.  Before that backend freezes its
      catalog, detach shared current structure chunks and realize the retained
@@ -3525,6 +3622,7 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
 
   Executable *ordinary_executable = NULL;
   BackendState *state = NULL;
+  const StepPlan *ordinary_step_plan = NULL;
   const StepPlan *cw_step_plan = NULL;
   CwPlan cw_plan;
   uint64_t storage_fingerprint = 0;
@@ -3539,6 +3637,7 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
   std::unique_ptr<DescriptorSet> source_value_descriptors;
   std::unique_ptr<StepPlan> source_value_step_plans[2];
   Executable *source_value_ordinary = NULL;
+  bool source_value_ordinary_reused = false;
   DescriptorSet *live_descriptors = NULL;
   try {
     if (source_value_refresh) {
@@ -3548,11 +3647,26 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
       f.descriptors = source_value_descriptors.get();
       source_value_step_plans[0].reset(new StepPlan(build_step_plan(f, StepProgram::ordinary)));
       source_value_step_plans[1].reset(new StepPlan(build_step_plan(f, StepProgram::solve_cw)));
-      source_value_ordinary = f.backend->compile(*source_value_step_plans[0], *f.backend_state);
+      if (f.backend->supports_atomic_cw_source_refresh()) {
+        /* CW owns a three-buffer source refresh (ordinary, nested timestep,
+           and RHS points). Defer every upload to preflight_cw so the complete
+           set can be validated before any live device buffer is touched. */
+        source_value_ordinary_reused = true;
+        source_value_ordinary = f.executable;
+      }
+      else {
+        source_value_ordinary_reused = f.backend->refresh_source_values(
+            *source_value_step_plans[0], *f.executable, *f.backend_state);
+        source_value_ordinary = source_value_ordinary_reused
+                                    ? f.executable
+                                    : f.backend->compile(*source_value_step_plans[0],
+                                                         *f.backend_state);
+      }
       if (!source_value_ordinary)
         throw std::runtime_error("backend returned no source-refresh executable");
       ordinary_executable = source_value_ordinary;
       state = f.backend_state;
+      ordinary_step_plan = source_value_step_plans[0].get();
       cw_step_plan = source_value_step_plans[1].get();
     }
     else {
@@ -3565,6 +3679,7 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
       }
       ordinary_executable = f.executable;
       state = f.backend_state;
+      ordinary_step_plan = f.step_plans[0];
       cw_step_plan = &f.step_plan_for(StepProgram::solve_cw);
     }
     if (!ordinary_executable || !state)
@@ -3587,12 +3702,15 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
     old_cw_step_plan_signature = state->cw_step_plan_signature;
     old_cw_plan_signature = state->cw_plan_signature;
     captured_cw_cache = true;
-    replacement = f.backend->preflight_cw(request, *cw_step_plan, cw_plan,
-                                            cache_matches ? old_cw_executable : NULL, *state);
+    if (!ordinary_step_plan)
+      throw std::logic_error("resident solve_cw has no ordinary StepPlan");
+    replacement = f.backend->preflight_cw(
+        request, *ordinary_step_plan, *cw_step_plan, cw_plan, *ordinary_executable,
+        (cache_matches || source_value_ordinary_reused) ? old_cw_executable : NULL, *state);
     if (!replacement) throw std::runtime_error("backend returned no solve_cw executable");
     if (replacement == ordinary_executable)
       throw std::runtime_error("backend aliased the ordinary and solve_cw executables");
-    if (!cache_matches && replacement == old_cw_executable)
+    if (!cache_matches && !source_value_refresh && replacement == old_cw_executable)
       throw std::runtime_error("backend reused a solve_cw executable with a stale cache key");
   }
   catch (const std::exception &e) {
@@ -3624,7 +3742,7 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
       delete rogue_cache_executable;
     if (replacement && replacement != old_cw_executable && replacement != ordinary_executable)
       delete replacement;
-    delete source_value_ordinary;
+    if (!source_value_ordinary_reused) delete source_value_ordinary;
     prepared_epoch.reset();
     if (local_error.empty())
       throw std::runtime_error("fields::solve_cw compiled preflight failed on another MPI rank");
@@ -3641,7 +3759,7 @@ bool backend_try_solve_cw(fields &f, const CwSolveRequest &request, CwSolveResul
     f.executable = source_value_ordinary;
     source_value_ordinary = NULL;
     clear_dirty(f, dirty_source_plan | dirty_executable);
-    delete old_ordinary;
+    if (!source_value_ordinary_reused) delete old_ordinary;
     delete old_step_plans[0];
     delete old_step_plans[1];
     delete old_descriptors;

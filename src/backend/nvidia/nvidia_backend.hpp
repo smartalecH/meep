@@ -134,6 +134,17 @@ struct NvidiaGraphStatistics {
         magnetic_boundary_count(0) {}
 };
 
+struct NvidiaExecutableCacheStatistics {
+  uint64_t ordinary_resource_generation;
+  uint64_t cw_resource_generation;
+  size_t executable_build_count;
+  size_t source_value_reuse_count;
+
+  NvidiaExecutableCacheStatistics()
+      : ordinary_resource_generation(0), cw_resource_generation(0),
+        executable_build_count(0), source_value_reuse_count(0) {}
+};
+
 struct NvidiaCwStatistics {
   CwSolveResult result;
   size_t reduction_count;
@@ -307,11 +318,15 @@ public:
   void prepare_initialization(const InitializationPlan &plan, BackendState &state) override;
   void initialize(const InitializationPlan &plan, BackendState &state) override;
   bool enforces_material_fallback_policy() const override { return true; }
+  bool supports_stable_material_refresh() const override { return true; }
   MaterialClassification classify_state(const StoragePlan &plan, BackendState &state) override;
   void finalize_storage(const StoragePlan &plan, const MaterialClassification &classification,
                         BackendState &state) override;
 
   Executable *compile(const StepPlan &plan, BackendState &state) override;
+  bool refresh_source_values(const StepPlan &plan, Executable &executable,
+                             BackendState &state) override;
+  bool supports_atomic_cw_source_refresh() const override { return true; }
   void preflight_advance(Executable &executable, BackendState &state,
                          int num_steps) override;
   void advance(Executable &executable, BackendState &state, int num_steps) override;
@@ -330,8 +345,10 @@ public:
   void validate_host_custom_plan(const StepPlan &plan, BackendState &state) override;
 
   bool supports_cw(const CwSolveRequest &request, std::string &why) const override;
-  Executable *preflight_cw(const CwSolveRequest &request, const StepPlan &step_plan,
-                           const CwPlan &cw_plan, Executable *cached,
+  Executable *preflight_cw(const CwSolveRequest &request,
+                           const StepPlan &ordinary_plan,
+                           const StepPlan &step_plan, const CwPlan &cw_plan,
+                           Executable &ordinary, Executable *cached,
                            BackendState &state) override;
   CwSolveResult solve_cw(const CwSolveRequest &request, const StepPlan &step_plan,
                          const CwPlan &cw_plan, Executable &ordinary, Executable &cw,
@@ -351,6 +368,10 @@ public:
   NvidiaHostFallbackStatistics host_fallback_statistics_for_testing() const;
   NvidiaMaterialInitializationStatistics material_initialization_statistics_for_testing() const;
   NvidiaGraphStatistics graph_statistics_for_testing() const;
+  NvidiaExecutableCacheStatistics executable_cache_statistics_for_testing() const;
+  void set_next_executable_generation_for_testing(uint64_t generation) {
+    next_executable_generation_ = generation;
+  }
   int device_ordinal_for_testing() const { return device_; }
   void clear_cw_graphs_for_testing();
 
@@ -372,6 +393,7 @@ private:
   void configure_cw_graph_execution(const StepPlan &plan, const CwPlan &cw_plan,
                                     NvidiaExecutable &executable, NvidiaBackendState &state);
   void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
+  uint64_t claim_executable_generation();
   fields &f_;
   execution_options options_;
   int device_;
@@ -379,6 +401,7 @@ private:
   bool graph_mode_parse_valid_;
   size_t device_memory_bytes_;
   uint64_t next_state_token_;
+  uint64_t next_executable_generation_;
   mutable size_t pending_initialization_reserve_bytes_;
   mutable size_t pending_initialization_compact_bytes_;
   mutable size_t pending_initialization_scratch_bytes_;

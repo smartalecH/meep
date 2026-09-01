@@ -268,6 +268,48 @@ void fields::ensure_backend_executable() {
   }
   if (!recompile) return;
 
+  /* A resident backend may retain an executable for a pure source-amplitude
+     mutation after proving that its complete structural identity and every
+     captured pointer target are unchanged.  The hook owns the value upload;
+     rank agreement is established before the refreshed artifact becomes the
+     caller-visible current plan. */
+  if (executable && backend->requires_full_storage_preparation()) {
+    bool local_reused = false;
+    std::string refresh_error;
+    try {
+      local_reused = backend->refresh_source_values(plan, *executable, *backend_state);
+    }
+    catch (const std::exception &e) {
+      refresh_error = e.what();
+    }
+    catch (...) {
+      refresh_error = "unknown backend source-value refresh failure";
+    }
+    size_t local_refresh_status = size_t(!refresh_error.empty()) |
+                                  (size_t(local_reused) << 1) |
+                                  (size_t(backend->is_poisoned()) << 2);
+    size_t global_refresh_status = 0;
+    bw_or_to_all(&local_refresh_status, &global_refresh_status, 1);
+    if (global_refresh_status & 1) {
+      if (global_refresh_status & 4) backend->poison();
+      dirty_mask = entry_dirty_mask;
+      if (refresh_error.empty())
+        throw std::runtime_error("backend source-value refresh failed on another MPI rank");
+      throw std::runtime_error(refresh_error);
+    }
+    const bool reused_everywhere =
+        sum_to_all(int(local_reused)) == count_processors();
+    if (reused_everywhere) {
+      if (backend_state->noisy_plan_validated)
+        backend_state->noisy_validated_plan_signature = plan.signature;
+      if (backend_state->multilevel_plan_validated)
+        backend_state->multilevel_validated_plan_signature = plan.signature;
+      if (backend_state->host_custom_plan_validated)
+        backend_state->host_custom_validated_plan_signature = plan.signature;
+      return;
+    }
+  }
+
   Executable *previous = executable;
   Executable *replacement = NULL;
   std::string local_error;

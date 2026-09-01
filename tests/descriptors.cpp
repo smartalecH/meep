@@ -292,15 +292,23 @@ static void test_sources() {
   CHECK(saw_gaussian && saw_continuous, "built-in source kinds were not both classified");
 
   const uint64_t source_signature = source_plan_signature(plan);
+  const uint64_t topology_signature = source_plan_topology_signature(plan);
   SourcePlan changed = plan;
   changed.source_times[0].parameters[0] += 1e-6;
   CHECK(source_plan_signature(changed) != source_signature,
         "source signature ignored a built-in parameter change");
+  CHECK(source_plan_topology_signature(changed) != topology_signature,
+        "source topology ignored a source-time recipe change");
   changed = plan;
   if (!changed.sources.empty() && !changed.sources[0].complex_amplitudes.empty()) {
     changed.sources[0].complex_amplitudes[0] += complex<double>(0.0, 1e-6);
     CHECK(source_plan_signature(changed) != source_signature,
           "source signature ignored a spatial amplitude change");
+    CHECK(source_plan_topology_signature(changed) == topology_signature,
+          "source topology included a mutable spatial amplitude");
+    ++changed.sources[0].indices[0];
+    CHECK(source_plan_topology_signature(changed) != topology_signature,
+          "source topology ignored a spatial index change");
   }
 
   /* Closed descriptors reproduce the live built-ins, including cutoff and

@@ -22,6 +22,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits>
+#include <stdexcept>
 #include <vector>
 
 #include <meep.hpp>
@@ -161,6 +163,96 @@ static void test_generations() {
 
   clear_dirty(f, dirty_initialization);
   CHECK(!is_dirty(f, dirty_initialization), "clear_dirty did not clear");
+}
+
+static void test_generation_overflow() {
+  const double a = 8.0;
+  grid_volume gv = vol2d(3.0, 3.0, a);
+  structure s(gv, one, no_pml());
+  fields f(&s);
+  const uint64_t maximum = std::numeric_limits<uint64_t>::max();
+
+  clear_dirty(f, ~DirtyMask(0));
+  f.mutation_generation[int(MutationKind::source_values)] = maximum;
+  bool rejected = false;
+  try {
+    invalidate(f, MutationKind::source_values);
+  } catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  CHECK(rejected, "mutation generation overflow was not rejected");
+  CHECK(f.mutation_generation[int(MutationKind::source_values)] == maximum,
+        "rejected mutation generation overflow changed the generation");
+  CHECK(f.dirty_mask == dirty_none,
+        "rejected mutation generation overflow changed dirty state to 0x%03x",
+        unsigned(f.dirty_mask));
+
+  f.connections_generation = maximum;
+  const uint64_t built_before = f.connections_built_generation;
+  rejected = false;
+  try {
+    note_connections_invalidated(f);
+  } catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  CHECK(rejected, "connection generation overflow was not rejected");
+  CHECK(f.connections_generation == maximum &&
+            f.connections_built_generation == built_before,
+        "rejected connection generation overflow changed lifecycle state");
+
+  f.local_invalidation_generation = maximum;
+  const uint64_t synced_before = f.local_invalidation_synced;
+  rejected = false;
+  try {
+    mark_local_invalidation(f);
+  } catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  CHECK(rejected, "local invalidation generation overflow was not rejected");
+  CHECK(f.local_invalidation_generation == maximum &&
+            f.local_invalidation_synced == synced_before,
+        "rejected local invalidation generation overflow changed lifecycle state");
+
+  clear_dirty(f, ~DirtyMask(0));
+  f.mutation_generation[int(MutationKind::monitor_definition)] =
+      my_rank() == count_processors() - 1 ? maximum : 17;
+  const uint64_t collective_before =
+      f.mutation_generation[int(MutationKind::monitor_definition)];
+  rejected = false;
+  try {
+    invalidate_collectively(f, MutationKind::monitor_definition,
+                            /*locally_observed=*/true, "overflow test");
+  } catch (const std::overflow_error &) {
+    rejected = true;
+  }
+  CHECK(rejected, "collective mutation overflow was not rejected on every rank");
+  CHECK(f.mutation_generation[int(MutationKind::monitor_definition)] == collective_before,
+        "collective overflow rejection changed the local generation");
+  CHECK(f.dirty_mask == dirty_none,
+        "collective overflow rejection changed dirty state to 0x%03x", unsigned(f.dirty_mask));
+}
+
+static void test_executable_freshness_taxonomy() {
+  const bool expected[mutation_kind_count] = {
+      true,  /* field_values */
+      true,  /* source_values */
+      false, /* source_definition */
+      false, /* monitor_definition */
+      false, /* legacy_flux_definition */
+      true,  /* material_values */
+      true,  /* material_region */
+      false, /* material_phase */
+      false, /* material_definition */
+      false, /* field_layout */
+      false, /* boundary_topology */
+      false, /* chunk_topology */
+      false, /* coordinate_definition */
+      false, /* precision_policy */
+  };
+  for (int i = 0; i < mutation_kind_count; ++i)
+    CHECK(mutation_may_preserve_executable_structure(MutationKind(i)) == expected[i],
+          "executable freshness taxonomy is wrong for %s",
+          mutation_kind_name(MutationKind(i)));
 }
 
 static void test_legacy_flux_invalidation() {
@@ -491,6 +583,8 @@ int main(int argc, char **argv) {
   test_closure_table();
   test_cw_source_time_rounding();
   test_generations();
+  test_generation_overflow();
+  test_executable_freshness_taxonomy();
   test_legacy_flux_invalidation();
   test_advance_equivalence();
   test_finite_check_modes();

@@ -593,7 +593,7 @@ public:
                          &classification_rows)
       : owner_(owner), plan_(plan), layout_(allocation_requests_for(plan_)), device_(device),
         state_token_(state_token), fingerprint_(storage_fingerprint(plan_)), initialized_(false),
-        transfer_failed_(false),
+        transfer_failed_(false), material_refresh_pending_(false),
         device_authoritative_(false), magnetic_snapshot_bytes_(0),
         magnetic_snapshot_layout_fingerprint_(0), magnetic_snapshot_valid_(false),
         cw_skip_source_evaluation_(false), cw_workspace_allocations_(0),
@@ -606,8 +606,8 @@ public:
         prepared_authoritative_arrays_(0),
         prepared_compact_staging_offset_(0), prepared_status_staging_offset_(0),
         prepared_result_staging_offset_(0), prepared_callback_scratch_offset_(0),
-        noisy_seed_active_slot_(-1),
-        noisy_seed_staged_slot_(-1) {
+        noisy_seed_active_slot_(-1), noisy_seed_staged_slot_(-1),
+        executable_build_count_(0), source_value_reuse_count_(0) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_, initialization_reserve_bytes));
@@ -677,6 +677,7 @@ public:
   uint64_t fingerprint_;
   bool initialized_;
   bool transfer_failed_;
+  bool material_refresh_pending_;
   bool device_authoritative_;
   std::unique_ptr<nvidia::device_arenas> arenas_;
   std::unique_ptr<nvidia::stream> transfer_;
@@ -724,6 +725,8 @@ public:
   nvidia::device_buffer noisy_seed_slots_;
   int noisy_seed_active_slot_;
   int noisy_seed_staged_slot_;
+  size_t executable_build_count_;
+  size_t source_value_reuse_count_;
 };
 
 struct NvidiaCompiledOperation {
@@ -870,7 +873,10 @@ bool cleanup_cw_graphs(std::vector<NvidiaCapturedGraph> &graphs, std::string &er
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, StepProgram program, uint64_t signature,
-                   uint64_t storage_fingerprint, uint64_t state_token,
+                   uint64_t structural_signature, uint64_t source_topology_signature,
+                   const uint64_t *freshness, uint64_t resource_generation,
+                   uint64_t storage_fingerprint,
+                   uint64_t state_token,
                    const std::vector<NvidiaCompiledOperation> &operations,
                    const std::vector<nvidia::curl_launch> &curl_updates,
                    const std::vector<nvidia::cylindrical_radial_prefix_launch>
@@ -919,7 +925,9 @@ public:
                    size_t host_staging_bytes,
                    NvidiaBackendState &state)
       : Executable(state.material_phase_active), owner_(owner), state_token_(state_token),
-        program_(program), signature_(signature),
+        program_(program), signature_(signature), structural_signature_(structural_signature),
+        source_topology_signature_(source_topology_signature),
+        resource_generation_(resource_generation),
         storage_fingerprint_(storage_fingerprint),
         operations_(operations), curl_updates_(curl_updates),
         cylindrical_radial_prefixes_(cylindrical_radial_prefixes),
@@ -942,6 +950,7 @@ public:
         material_target_signature_(material_target_signature),
         source_scalar_count_(source_scalar_count), host_segments_(host_segments),
         graph_enabled_(false), cw_workspace_(NULL) {
+    for (int i = 0; i < mutation_kind_count; ++i) freshness_[i] = freshness[i];
     for (const nvidia::compiled_polarization_update &update : polarization_updates_)
       has_noisy_updates_ = has_noisy_updates_ ||
                            update.kind ==
@@ -1109,6 +1118,10 @@ public:
   uint64_t state_token_;
   StepProgram program_;
   uint64_t signature_;
+  uint64_t structural_signature_;
+  uint64_t source_topology_signature_;
+  uint64_t freshness_[mutation_kind_count];
+  uint64_t resource_generation_;
   uint64_t storage_fingerprint_;
   std::vector<NvidiaCompiledOperation> operations_;
   std::vector<nvidia::curl_launch> curl_updates_;
@@ -1188,6 +1201,9 @@ public:
   NvidiaCwExecutable(const NvidiaBackend *owner, uint64_t layout_storage_fingerprint,
                      uint64_t device_storage_fingerprint,
                      uint64_t step_plan_signature, uint64_t cw_plan_signature,
+                     uint64_t structural_step_signature,
+                     uint64_t structural_cw_signature, uint64_t source_topology_signature,
+                     const uint64_t *freshness, uint64_t resource_generation,
                      nvidia::scalar_precision precision, size_t real_count,
                      const std::vector<nvidia::cw_state_row_launch> &rows,
                      const std::vector<nvidia::cw_zero_launch> &zeroes,
@@ -1203,11 +1219,15 @@ public:
       : owner_(owner), layout_storage_fingerprint_(layout_storage_fingerprint),
         device_storage_fingerprint_(device_storage_fingerprint),
         state_token_(state.state_token_), step_plan_signature_(step_plan_signature),
-        cw_plan_signature_(cw_plan_signature),
+        cw_plan_signature_(cw_plan_signature), structural_step_signature_(structural_step_signature),
+        structural_cw_signature_(structural_cw_signature),
+        source_topology_signature_(source_topology_signature),
+        resource_generation_(resource_generation),
         precision_(precision), real_count_(real_count), rows_(rows), zeroes_(zeroes),
         rhs_stages_(rhs_stages), rhs_sources_(rhs_sources), final_dfts_(final_dfts),
         unpack_skip_w_components_(unpack.skip_w_components), workspace_(std::move(workspace)),
         timestep_(std::move(timestep)) {
+    for (int i = 0; i < mutation_kind_count; ++i) freshness_[i] = freshness[i];
     unpack_operations_[0] = unpack.first_boundary.operation_index;
     unpack_operations_[1] = unpack.constitutive.operation_index;
     unpack_operations_[2] = unpack.second_boundary.operation_index;
@@ -1280,6 +1300,11 @@ public:
   uint64_t state_token_;
   uint64_t step_plan_signature_;
   uint64_t cw_plan_signature_;
+  uint64_t structural_step_signature_;
+  uint64_t structural_cw_signature_;
+  uint64_t source_topology_signature_;
+  uint64_t freshness_[mutation_kind_count];
+  uint64_t resource_generation_;
   nvidia::scalar_precision precision_;
   size_t real_count_;
   std::vector<nvidia::cw_state_row_launch> rows_;
@@ -3912,7 +3937,8 @@ NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int se
     : f_(f), options_(options), device_(selected_device),
       graph_mode_(GraphExecutionMode::automatic), graph_mode_parse_valid_(true),
       device_memory_bytes_(0),
-      next_state_token_(1), pending_initialization_reserve_bytes_(0),
+      next_state_token_(1), next_executable_generation_(0),
+      pending_initialization_reserve_bytes_(0),
       pending_initialization_compact_bytes_(0), pending_initialization_scratch_bytes_(0),
       pending_initialization_route_(MaterialRecipeDisposition::device_native),
       pending_initialization_reserve_valid_(false) {
@@ -3923,6 +3949,12 @@ NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int se
 }
 
 NvidiaBackend::~NvidiaBackend() {}
+
+uint64_t NvidiaBackend::claim_executable_generation() {
+  if (next_executable_generation_ == std::numeric_limits<uint64_t>::max())
+    throw std::overflow_error("NVIDIA executable resource generation overflow");
+  return ++next_executable_generation_;
+}
 
 namespace nvidia {
 namespace testing {
@@ -6826,8 +6858,9 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
     std::string why;
     if (!validate_alias_precisions(device_plan, why))
       throw std::invalid_argument(std::string("invalid NVIDIA storage aliases: ") + why);
-    if (next_state_token_ == 0)
+    if (next_state_token_ == std::numeric_limits<uint64_t>::max())
       throw std::overflow_error("NVIDIA backend state token overflow");
+    const uint64_t state_token = next_state_token_++;
     const nvidia::arena_plan layout(allocation_requests_for(device_plan));
     size_t classification_status_bytes = 0;
     for (const std::pair<StorageKey, size_t> &row :
@@ -6885,7 +6918,7 @@ BackendState *NvidiaBackend::create_state(const StoragePlan &plan) {
               << test_budget << " bytes";
       throw std::runtime_error(message.str());
     }
-    state.reset(new NvidiaBackendState(this, device_plan, device_, next_state_token_++,
+    state.reset(new NvidiaBackendState(this, device_plan, device_, state_token,
                                        device_reserve_bytes, compact_input_bytes,
                                        staging_bytes,
                                        pending_initialization_classification_rows_));
@@ -7232,7 +7265,7 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
 
 void NvidiaBackend::initialize(const InitializationPlan &initialization, BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
-  state.initialized_ = false;
+  const bool live_refresh = state.initialized_;
   std::string local_error;
   try {
     nvidia::device_scope device_scope(state.device_);
@@ -7251,6 +7284,43 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
     if (native_material) bind_material_compact_inputs(state, compact_input_bytes);
     else state.material_ir_inputs_.reset();
     bind_material_classification(state);
+    bool has_tiled_upload = false;
+    for (const NvidiaInitializationUpload &upload : state.initialization_uploads_)
+      has_tiled_upload = has_tiled_upload ||
+                         (upload.material &&
+                          state.prepared_material_route_ !=
+                              MaterialRecipeDisposition::host_reference);
+    if (has_tiled_upload && nvidia::testing::consume_failure_for_testing(
+                                nvidia::testing::failure_point::material_tiled_upload))
+      throw std::runtime_error("injected NVIDIA tiled material upload failure");
+    if (native_material && compact_input_bytes &&
+        nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_ir_upload))
+      throw std::runtime_error("injected NVIDIA material IR upload failure");
+    if (live_refresh && nvidia::testing::consume_failure_for_testing(
+                            nvidia::testing::failure_point::material_refresh_before_upload))
+      throw std::runtime_error("injected NVIDIA material refresh pre-upload failure");
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown NVIDIA initialization preflight failure"; }
+  if (or_to_all(!local_error.empty())) {
+    if (local_error.empty())
+      local_error = "another rank failed NVIDIA initialization preflight";
+    throw std::runtime_error(local_error);
+  }
+
+  state.initialized_ = false;
+  bool enqueued = false;
+  try {
+    nvidia::device_scope device_scope(state.device_);
+    const bool native_material =
+        state.prepared_material_route_ == MaterialRecipeDisposition::device_native ||
+        state.prepared_material_route_ == MaterialRecipeDisposition::hybrid_interface;
+    const size_t compact_input_bytes = state.initialization_compact_input_bytes_;
+    /* The classification header below guarantees at least one launch. Mark
+       the live transaction irreversible before the first CUDA API call so an
+       API error cannot be misreported as a retryable pre-enqueue failure. */
+    enqueued = true;
     if (native_material && state.material_classification_status_.size())
       nvidia::fill_byte_async(state.material_classification_status_, 0, 0,
                               state.material_classification_status_.size(),
@@ -7270,10 +7340,6 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
               : state.prepared_material_route_ == MaterialRecipeDisposition::host_reference
                     ? nvidia::host_to_device_copy_kind::material_dense_output
                     : nvidia::host_to_device_copy_kind::material_tiled_output;
-      if (copy_kind == nvidia::host_to_device_copy_kind::material_tiled_output &&
-          nvidia::testing::consume_failure_for_testing(
-              nvidia::testing::failure_point::material_tiled_upload))
-        throw std::runtime_error("injected NVIDIA tiled material upload failure");
       state.arenas_->copy_from_host_async(
           upload.allocation, 0,
           static_cast<const unsigned char *>(state.staging_.data()) + upload.staging_offset,
@@ -7295,10 +7361,10 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
         }
       }
     }
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_refresh_after_upload))
+      throw std::runtime_error("injected NVIDIA material refresh post-upload failure");
     if (native_material && compact_input_bytes) {
-      if (nvidia::testing::consume_failure_for_testing(
-              nvidia::testing::failure_point::material_ir_upload))
-        throw std::runtime_error("injected NVIDIA material IR upload failure");
       nvidia::copy_host_to_device_async(
           state.material_ir_inputs_, 0,
           static_cast<const unsigned char *>(state.staging_.data()) +
@@ -7482,21 +7548,22 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
   }
   catch (const std::exception &error) {
     local_error = error.what();
-    state.transfer_failed_ = true;
     try { state.transfer_->synchronize(); }
     catch (...) {}
   }
   catch (...) {
     local_error = "unknown NVIDIA initialization failure";
-    state.transfer_failed_ = true;
     try { state.transfer_->synchronize(); }
     catch (...) {}
   }
   if (or_to_all(!local_error.empty())) {
+    state.transfer_failed_ = true;
+    if (live_refresh && enqueued) poison();
     if (local_error.empty()) local_error = "another rank failed to initialize NVIDIA storage";
     throw std::runtime_error(local_error);
   }
   state.initialized_ = true;
+  state.material_refresh_pending_ = live_refresh;
   state.device_authoritative_ = false;
 }
 
@@ -7644,6 +7711,10 @@ MaterialClassification NvidiaBackend::classify_state(const StoragePlan &plan,
   catch (...) {
     local_error = "unknown NVIDIA classification precondition failure";
   }
+  if (!local_error.empty() && state && state->material_refresh_pending_) {
+    state->transfer_failed_ = true;
+    poison();
+  }
   backend_reconcile_host_access(local_error, "NVIDIA classification preflight");
   return assemble_material_classification(
       f_, plan, f_.initialization_plan->materials[0], facts);
@@ -7653,20 +7724,31 @@ void NvidiaBackend::finalize_storage(const StoragePlan &plan,
                                      const MaterialClassification &classification,
                                      BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
-  if (!state.initialized_) throw std::logic_error("cannot finalize uninitialized NVIDIA storage");
-  if (!f_.initialization_plan || f_.initialization_plan->materials.size() != 1)
-    throw std::logic_error("NVIDIA material finalization requires one frozen recipe");
-  if (nvidia::testing::consume_failure_for_testing(
-          nvidia::testing::failure_point::material_finalize))
-    throw std::runtime_error("injected NVIDIA material finalization failure");
-  resolve_material_storage(f_.initialization_plan->materials[0], classification, plan,
-                           state.plan_, policy_for(options_.precision));
-  if (has_provisional_material_storage(state.plan_))
-    throw std::logic_error("NVIDIA material finalization left provisional storage");
-  /* phase_in_material is a collective public operation, so this bit is
-     identical on active and idle ranks.  It is copied into the executable at
-     compile and cleared only after all ranks finish the last phase step. */
-  state.material_phase_active = f_.phasein_time > 0;
+  try {
+    if (!state.initialized_)
+      throw std::logic_error("cannot finalize uninitialized NVIDIA storage");
+    if (!f_.initialization_plan || f_.initialization_plan->materials.size() != 1)
+      throw std::logic_error("NVIDIA material finalization requires one frozen recipe");
+    if (nvidia::testing::consume_failure_for_testing(
+            nvidia::testing::failure_point::material_finalize))
+      throw std::runtime_error("injected NVIDIA material finalization failure");
+    resolve_material_storage(f_.initialization_plan->materials[0], classification, plan,
+                             state.plan_, policy_for(options_.precision));
+    if (has_provisional_material_storage(state.plan_))
+      throw std::logic_error("NVIDIA material finalization left provisional storage");
+    /* phase_in_material is a collective public operation, so this bit is
+       identical on active and idle ranks.  It is copied into the executable at
+       compile and cleared only after all ranks finish the last phase step. */
+    state.material_phase_active = f_.phasein_time > 0;
+    state.material_refresh_pending_ = false;
+  }
+  catch (...) {
+    if (state.material_refresh_pending_) {
+      state.transfer_failed_ = true;
+      poison();
+    }
+    throw;
+  }
 }
 
 void NvidiaBackend::refresh_noisy_seed(const RandomSeedSnapshot &candidate,
@@ -7719,6 +7801,126 @@ void NvidiaBackend::discard_noisy_seed(BackendState &raw_state) noexcept {
   NvidiaBackendState *state = dynamic_cast<NvidiaBackendState *>(&raw_state);
   if (state) state->noisy_seed_staged_slot_ = -1;
 }
+
+namespace {
+
+uint64_t source_structural_step_signature(const StepPlan &plan,
+                                          const SourcePlan *source_plan) {
+  StepPlan structural = plan;
+  structural.source_signature =
+      source_plan ? source_plan_topology_signature(*source_plan)
+                  : source_plan_topology_signature(SourcePlan());
+  return compute_step_plan_signature(structural);
+}
+
+bool same_source_launch_topology(const nvidia::source_batch_launch &a,
+                                 const nvidia::source_batch_launch &b) {
+  return a.target_real == b.target_real && a.target_imag == b.target_imag &&
+         a.conductivity_inverse == b.conductivity_inverse &&
+         a.point_offset == b.point_offset && a.point_count == b.point_count &&
+         a.scalar_slot == b.scalar_slot && a.dt == b.dt && a.integrated == b.integrated &&
+         a.sequential == b.sequential && a.precision == b.precision;
+}
+
+bool same_cw_source_launch_topology(const nvidia::cw_source_batch_launch &a,
+                                    const nvidia::cw_source_batch_launch &b) {
+  return a.target_real == b.target_real && a.target_imag == b.target_imag &&
+         a.conductivity_inverse == b.conductivity_inverse &&
+         a.point_offset == b.point_offset && a.point_count == b.point_count &&
+         a.scalar_slot == b.scalar_slot && a.dt == b.dt &&
+         a.sequential == b.sequential && a.precision == b.precision;
+}
+
+uint64_t source_structural_cw_signature(const CwPlan &plan,
+                                        uint64_t structural_step_signature,
+                                        uint64_t source_topology_signature) {
+  CwPlan structural = plan;
+  structural.step_plan_signature = structural_step_signature;
+  structural.source_fingerprint = source_topology_signature;
+  return compute_cw_plan_signature(structural);
+}
+
+struct NvidiaStagedSourceRefresh {
+  std::vector<nvidia::source_point> points;
+  uint64_t topology;
+  bool advanced;
+
+  NvidiaStagedSourceRefresh() : topology(0), advanced(false) {}
+};
+
+bool stage_source_value_refresh(fields &f, const StepPlan &plan,
+                                NvidiaExecutable &executable,
+                                NvidiaBackendState &state,
+                                NvidiaStagedSourceRefresh &staged) {
+  if (!f.descriptors || plan.program != executable.program_ ||
+      plan.signature != compute_step_plan_signature(plan) ||
+      plan.source_signature != source_plan_signature(f.descriptors->sources) ||
+      executable.storage_fingerprint_ != state.fingerprint_)
+    return false;
+
+  const SourcePlan &source_plan = f.descriptors->sources;
+  staged.topology = source_plan_topology_signature(source_plan);
+  if (staged.topology != executable.source_topology_signature_ ||
+      source_structural_step_signature(plan, &source_plan) !=
+          executable.structural_signature_)
+    return false;
+
+  for (int i = 0; i < mutation_kind_count; ++i) {
+    const uint64_t current = f.mutation_generation[i];
+    const uint64_t installed = executable.freshness_[i];
+    const MutationKind kind = MutationKind(i);
+    if (kind == MutationKind::source_values) {
+      if (current < installed) return false;
+      staged.advanced = current != installed;
+    }
+    else if (mutation_may_preserve_executable_structure(kind)) {
+      if (current < installed) return false;
+    }
+    else if (current != installed)
+      return false;
+  }
+
+  std::vector<nvidia::source_batch_launch> batches;
+  std::vector<unsigned int> references(source_plan.sources.size(), 0);
+  batches.reserve(executable.source_batches_.size());
+  for (const Operation &operation : plan.operations) {
+    if (operation.kind != OpKind::apply_sources && operation.kind != OpKind::update_eh)
+      continue;
+    if (!operation.source_descriptor_count) continue;
+    if (size_t(operation.source_descriptor_index) + operation.source_descriptor_count >
+        source_plan.sources.size())
+      throw std::invalid_argument("NVIDIA source refresh descriptor span is out of range");
+    for (size_t i = operation.source_descriptor_index;
+         i < size_t(operation.source_descriptor_index) + operation.source_descriptor_count; ++i) {
+      ++references[i];
+      batches.push_back(compile_source_batch(source_plan.sources[i], source_plan, f, state,
+                                             staged.points));
+    }
+  }
+  size_t referenced_sources = 0;
+  for (unsigned int count : references) {
+    if (count > 1) return false;
+    referenced_sources += count;
+  }
+  if (referenced_sources != batches.size() ||
+      batches.size() != executable.source_batches_.size() ||
+      staged.points.size() * sizeof(nvidia::source_point) != executable.source_points_.size())
+    return false;
+  for (size_t i = 0; i < batches.size(); ++i)
+    if (!same_source_launch_topology(batches[i], executable.source_batches_[i])) return false;
+  return true;
+}
+
+void commit_source_value_refresh(fields &f, const StepPlan &plan,
+                                 NvidiaExecutable &executable,
+                                 const NvidiaStagedSourceRefresh &staged) {
+  executable.signature_ = plan.signature;
+  executable.source_topology_signature_ = staged.topology;
+  for (int i = 0; i < mutation_kind_count; ++i)
+    executable.freshness_[i] = f.mutation_generation[i];
+}
+
+} // namespace
 
 Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
@@ -8946,9 +9148,15 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       if (nvidia::testing::consume_failure_for_testing(
               nvidia::testing::failure_point::material_compile))
         throw std::runtime_error("injected NVIDIA material executable compilation failure");
-    if (local_error.empty())
+    if (local_error.empty()) {
+      const uint64_t source_topology =
+          source_plan ? source_plan_topology_signature(*source_plan)
+                      : source_plan_topology_signature(SourcePlan());
       executable.reset(new NvidiaExecutable(
-          this, plan.program, plan.signature, state.fingerprint_, state.state_token_, operations,
+          this, plan.program, plan.signature,
+          source_structural_step_signature(plan, source_plan), source_topology,
+          f_.mutation_generation, claim_executable_generation(), state.fingerprint_,
+          state.state_token_, operations,
           curl_updates,
           cylindrical_radial_prefixes, bfast_updates, beta_updates, cylindrical_m_updates,
           cylindrical_axis_updates, cylindrical_origin_actions, constitutive_updates, zero_updates,
@@ -8964,6 +9172,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           plan.material_phase_target_signature,
           source_plan ? source_plan->scalars.size() : 0,
           source_staging_elements, host_segments, host_staging_bytes, state));
+    }
   }
   catch (const std::exception &error) {
     local_error = error.what();
@@ -8995,7 +9204,51 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   }
   if (plan.program == StepProgram::ordinary)
     state.graph_statistics_ = executable->graph_statistics_;
+  ++state.executable_build_count_;
   return executable.release();
+}
+
+bool NvidiaBackend::refresh_source_values(const StepPlan &plan,
+                                          Executable &raw_executable,
+                                          BackendState &raw_state) {
+  NvidiaBackendState &state = checked_state(raw_state);
+  NvidiaExecutable &executable = checked_executable(raw_executable, state);
+  if (!state.initialized_ || state.transfer_failed_ || is_poisoned())
+    throw std::logic_error("NVIDIA source refresh requires an initialized usable state");
+  NvidiaStagedSourceRefresh staged;
+  if (!stage_source_value_refresh(f_, plan, executable, state, staged) || !staged.advanced)
+    return false;
+
+  if (!staged.points.empty()) {
+    bool enqueued = false;
+    try {
+      nvidia::device_scope scope(state.device_);
+      if (nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::source_value_copy))
+        throw std::runtime_error("injected NVIDIA source-value copy failure");
+      enqueued = true;
+      nvidia::copy_host_to_device_async(executable.source_points_, 0, staged.points.data(),
+                                        staged.points.size() * sizeof(staged.points[0]),
+                                        *state.transfer_);
+      state.transfer_->synchronize();
+      if (nvidia::testing::consume_failure_for_testing(
+              nvidia::testing::failure_point::source_value_sync))
+        throw std::runtime_error("injected NVIDIA source-value synchronization failure");
+    }
+    catch (...) {
+      if (enqueued) {
+        state.transfer_failed_ = true;
+        poison();
+      }
+      throw;
+    }
+  }
+
+  commit_source_value_refresh(f_, plan, executable, staged);
+  ++state.source_value_reuse_count_;
+  if (plan.program == StepProgram::ordinary)
+    state.graph_statistics_ = executable.graph_statistics_;
+  return true;
 }
 
 namespace {
@@ -9395,9 +9648,12 @@ bool NvidiaBackend::supports_cw(const CwSolveRequest &, std::string &why) const 
 }
 
 Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
+                                        const StepPlan &ordinary_plan,
                                         const StepPlan &step_plan, const CwPlan &cw_plan,
-                                        Executable *cached, BackendState &raw_state) {
+                                        Executable &raw_ordinary, Executable *cached,
+                                        BackendState &raw_state) {
   NvidiaBackendState &state = checked_state(raw_state);
+  NvidiaExecutable &ordinary = checked_executable(raw_ordinary, state);
   if (!state.initialized_ || state.transfer_failed_)
     throw std::logic_error("NVIDIA solve_cw requires an initialized usable state");
   if (!std::isfinite(request.tolerance) || request.tolerance <= 0.0 || request.maxiters < 1 ||
@@ -9586,17 +9842,129 @@ Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
 
   const nvidia::cw_workspace_shape shape =
       cw_workspace_shape(layout.real_count, request.L, precision);
+  const uint64_t source_topology = source_plan_topology_signature(source_plan);
+  const uint64_t structural_step =
+      source_structural_step_signature(step_plan, &source_plan);
+  const uint64_t structural_cw =
+      source_structural_cw_signature(cw_plan, structural_step, source_topology);
+  NvidiaStagedSourceRefresh ordinary_refresh;
+  if (!stage_source_value_refresh(f_, ordinary_plan, ordinary, state, ordinary_refresh))
+    throw std::invalid_argument("NVIDIA solve_cw ordinary source targets are not reusable");
   if (cached) {
     NvidiaCwExecutable *existing = dynamic_cast<NvidiaCwExecutable *>(cached);
     if (!existing || existing->owner_ != this ||
         existing->state_token_ != state.state_token_ ||
         existing->layout_storage_fingerprint_ != layout.storage_fingerprint ||
         existing->device_storage_fingerprint_ != state.fingerprint_ ||
-        existing->step_plan_signature_ != step_plan.signature ||
-        existing->cw_plan_signature_ != cw_plan.signature ||
         existing->precision_ != precision || existing->real_count_ != layout.real_count)
       throw std::invalid_argument("NVIDIA solve_cw cache entry has the wrong identity");
-    if (existing->workspace_->accommodates(shape, precision, request.L)) return existing;
+    const bool exact_identity = existing->step_plan_signature_ == step_plan.signature &&
+                                existing->cw_plan_signature_ == cw_plan.signature;
+    if (exact_identity) {
+      if (existing->workspace_->accommodates(shape, precision, request.L)) return existing;
+    }
+    else {
+      bool source_values_advanced = false;
+      for (int i = 0; i < mutation_kind_count; ++i) {
+        const uint64_t current = f_.mutation_generation[i];
+        const uint64_t installed = existing->freshness_[i];
+        const MutationKind kind = MutationKind(i);
+        if (kind == MutationKind::source_values) {
+          if (current < installed)
+            throw std::invalid_argument("NVIDIA solve_cw cache freshness regressed");
+          source_values_advanced = current != installed;
+        }
+        else if (mutation_may_preserve_executable_structure(kind)) {
+          if (current < installed)
+            throw std::invalid_argument("NVIDIA solve_cw cache freshness regressed");
+        }
+        else if (current != installed)
+          throw std::invalid_argument("NVIDIA solve_cw cache has stale structural freshness");
+      }
+      const bool structurally_compatible =
+          source_values_advanced && existing->structural_step_signature_ == structural_step &&
+          existing->structural_cw_signature_ == structural_cw &&
+          existing->source_topology_signature_ == source_topology &&
+          existing->workspace_->accommodates(shape, precision, request.L) &&
+          existing->rhs_sources_.size() == rhs_sources.size() &&
+          existing->source_points_.size() ==
+              source_points.size() * sizeof(nvidia::source_point);
+      if (structurally_compatible) {
+        for (size_t i = 0; i < rhs_sources.size(); ++i)
+          if (!same_cw_source_launch_topology(existing->rhs_sources_[i], rhs_sources[i]))
+            throw std::invalid_argument("NVIDIA solve_cw source targets are not reusable");
+        NvidiaStagedSourceRefresh timestep_refresh;
+        if (!ordinary_refresh.advanced ||
+            !stage_source_value_refresh(f_, step_plan, *existing->timestep_, state,
+                                        timestep_refresh) ||
+            !timestep_refresh.advanced)
+          throw std::invalid_argument("NVIDIA solve_cw timestep source targets are not reusable");
+
+        /* All identities above are validated before the first transfer.  The
+           three live buffers then share one stream transaction, and none of
+           their freshness metadata is published until its final sync. */
+        const bool have_ordinary_points = !ordinary_refresh.points.empty();
+        const bool have_timestep_points = !timestep_refresh.points.empty();
+        const bool have_rhs_points = !source_points.empty();
+        if ((have_ordinary_points || have_timestep_points) &&
+            nvidia::testing::consume_failure_for_testing(
+                nvidia::testing::failure_point::source_value_copy))
+          throw std::runtime_error("injected NVIDIA source-value copy failure");
+        if (have_rhs_points && nvidia::testing::consume_failure_for_testing(
+                                   nvidia::testing::failure_point::cw_source_value_copy))
+          throw std::runtime_error("injected NVIDIA CW source-value copy failure");
+        bool enqueued = false;
+        try {
+          nvidia::device_scope scope(state.device_);
+          if (have_ordinary_points) {
+            enqueued = true;
+            nvidia::copy_host_to_device_async(
+                ordinary.source_points_, 0, ordinary_refresh.points.data(),
+                ordinary_refresh.points.size() * sizeof(ordinary_refresh.points[0]),
+                *state.transfer_);
+          }
+          if (have_timestep_points) {
+            enqueued = true;
+            nvidia::copy_host_to_device_async(
+                existing->timestep_->source_points_, 0, timestep_refresh.points.data(),
+                timestep_refresh.points.size() * sizeof(timestep_refresh.points[0]),
+                *state.transfer_);
+          }
+          if (have_rhs_points) {
+            enqueued = true;
+            nvidia::copy_host_to_device_async(
+                existing->source_points_, 0, source_points.data(),
+                source_points.size() * sizeof(source_points[0]), *state.transfer_);
+          }
+          if (enqueued) state.transfer_->synchronize();
+          if (enqueued && nvidia::testing::consume_failure_for_testing(
+                              nvidia::testing::failure_point::source_value_sync))
+            throw std::runtime_error("injected NVIDIA source-value synchronization failure");
+          if (enqueued && nvidia::testing::consume_failure_for_testing(
+                              nvidia::testing::failure_point::cw_source_value_sync))
+            throw std::runtime_error(
+                "injected NVIDIA CW source-value synchronization failure");
+        }
+        catch (...) {
+          if (enqueued) {
+            state.transfer_failed_ = true;
+            poison();
+          }
+          throw;
+        }
+        commit_source_value_refresh(f_, ordinary_plan, ordinary, ordinary_refresh);
+        commit_source_value_refresh(f_, step_plan, *existing->timestep_, timestep_refresh);
+        existing->step_plan_signature_ = step_plan.signature;
+        existing->cw_plan_signature_ = cw_plan.signature;
+        for (int i = 0; i < mutation_kind_count; ++i)
+          existing->freshness_[i] = f_.mutation_generation[i];
+        state.source_value_reuse_count_ += 3;
+        state.graph_statistics_ = ordinary.graph_statistics_;
+        return existing;
+      }
+      if (!source_values_advanced)
+        throw std::invalid_argument("NVIDIA solve_cw cache entry has the wrong identity");
+    }
   }
 
   std::unique_ptr<NvidiaCwWorkspace> workspace(
@@ -9608,7 +9976,9 @@ Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
   compiled_step.release();
   std::unique_ptr<NvidiaCwExecutable> compiled_cw(new NvidiaCwExecutable(
       this, layout.storage_fingerprint, state.fingerprint_, step_plan.signature,
-      cw_plan.signature, precision, layout.real_count, rows, zeroes, rhs_stages, rhs_sources,
+      cw_plan.signature, structural_step, structural_cw, source_topology,
+      f_.mutation_generation, claim_executable_generation(), precision, layout.real_count,
+      rows, zeroes, rhs_stages, rhs_sources,
       source_points, final_dfts, dft_omega, cw_plan.final_dfts, cw_plan.unpack,
       std::move(workspace), std::move(timestep_owner), state));
   const GraphExecutionMode requested =
@@ -9617,7 +9987,11 @@ Executable *NvidiaBackend::preflight_cw(const CwSolveRequest &request,
     configure_cw_graph_execution(step_plan, cw_plan, *compiled_cw->timestep_, state);
     if (!compiled_cw->timestep_->graph_enabled_) clear_cw_device_graphs(*compiled_cw);
   }
+  if (ordinary_refresh.advanced &&
+      !refresh_source_values(ordinary_plan, ordinary, state))
+    throw std::invalid_argument("NVIDIA solve_cw ordinary source targets are not reusable");
   ++state.cw_workspace_allocations_;
+  ++state.executable_build_count_;
   return compiled_cw.release();
 }
 
@@ -12271,6 +12645,21 @@ NvidiaBackend::material_initialization_statistics_for_testing() const {
 NvidiaGraphStatistics NvidiaBackend::graph_statistics_for_testing() const {
   NvidiaBackendState *state = current_state();
   return state ? state->graph_statistics_ : NvidiaGraphStatistics();
+}
+
+NvidiaExecutableCacheStatistics NvidiaBackend::executable_cache_statistics_for_testing() const {
+  NvidiaExecutableCacheStatistics result;
+  NvidiaBackendState *state = current_state();
+  if (!state) return result;
+  result.executable_build_count = state->executable_build_count_;
+  result.source_value_reuse_count = state->source_value_reuse_count_;
+  NvidiaExecutable *ordinary = dynamic_cast<NvidiaExecutable *>(f_.executable);
+  if (ordinary && ordinary->owner_ == this && ordinary->state_token_ == state->state_token_)
+    result.ordinary_resource_generation = ordinary->resource_generation_;
+  NvidiaCwExecutable *cw = dynamic_cast<NvidiaCwExecutable *>(state->cw_executable);
+  if (cw && cw->owner_ == this && cw->state_token_ == state->state_token_)
+    result.cw_resource_generation = cw->resource_generation_;
+  return result;
 }
 
 ExecutionBackend *make_nvidia_backend(fields &f, const execution_options &options,

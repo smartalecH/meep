@@ -296,6 +296,10 @@ public:
      collectively before initialize() may copy or launch. */
   virtual void prepare_initialization(const InitializationPlan &, BackendState &) {}
   virtual bool enforces_material_fallback_policy() const { return false; }
+  /* True only when the backend can refresh a classification-equivalent
+     material recipe into allocation-stable resident storage without retiring
+     compiled executable owners. */
+  virtual bool supports_stable_material_refresh() const { return false; }
 
   // Pass 2: report what initialization actually produced.
   virtual MaterialClassification classify_state(const StoragePlan &, BackendState &) = 0;
@@ -303,6 +307,16 @@ public:
                                 BackendState &) = 0;
 
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
+  /* A value-only source mutation may retain a compiled artifact only when the
+     backend proves that every captured target and descriptor pointer is
+     allocation-stable. Returning false is a pre-enqueue unsupported result
+     and asks the caller to compile transactionally. Once an implementation
+     enqueues the refresh, any transfer/synchronization failure must poison the
+     resident backend before throwing. */
+  virtual bool refresh_source_values(const StepPlan &, Executable &, BackendState &) {
+    return false;
+  }
+  virtual bool supports_atomic_cw_source_refresh() const { return false; }
   /* Allocation-free, pre-dispatch validation. Throwing here is retryable and
      must not enqueue work or poison the installed epoch. */
   virtual void preflight_advance(Executable &, BackendState &, int) {}
@@ -348,15 +362,18 @@ public:
 
   /* A resident CW solve is one coarse operation. CPU declines this hook and
      keeps the legacy solver unchanged. preflight_cw must not invoke source
-     callbacks or mutate fields; it may return `cached` after validating and
-     reserving workspace, or a replacement compiled artifact. solve_cw owns
+     callbacks or mutate fields; a backend advertising atomic CW source refresh
+     may update the supplied ordinary and cached CW device buffers only after
+     validating the complete transaction. It otherwise returns `cached` after
+     validation/reservation, or a replacement compiled artifact. solve_cw owns
      the complete post-preflight operation, including final synchronization
      and the single due-filtered DFT action. */
   virtual bool supports_cw(const CwSolveRequest &, std::string &why) const {
     why = "backend does not implement resident solve_cw";
     return false;
   }
-  virtual Executable *preflight_cw(const CwSolveRequest &, const StepPlan &, const CwPlan &,
+  virtual Executable *preflight_cw(const CwSolveRequest &, const StepPlan &,
+                                   const StepPlan &, const CwPlan &, Executable &,
                                    Executable *, BackendState &) {
     throw std::logic_error("backend does not implement resident solve_cw preflight");
   }

@@ -342,6 +342,11 @@ void populate_source_scalars(fields &f, SourcePlan &out);
 /* Structural identity of source recipes/spatial tables. Runtime scalar values
    are deliberately excluded so ordinary timesteps do not invalidate code. */
 uint64_t source_plan_signature(const SourcePlan &plan);
+/* Structural source identity for resident executable reuse.  Spatial
+   amplitudes are mutable values stored behind a stable device pointer; all
+   source-time recipes, destinations, index order, and scalar mappings remain
+   structural. */
+uint64_t source_plan_topology_signature(const SourcePlan &plan);
 void build_dft_descriptors(fields &f, std::vector<DftDescriptor> &out);
 /* Structural identity of the complete final-monitor recipes. Runtime due
    values are deliberately excluded; decimation_factor and due_scalar_slot

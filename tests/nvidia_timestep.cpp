@@ -2121,6 +2121,202 @@ static void test_magnetic_pre_step_and_recompile() {
   master_printf("nvidia_timestep: magnetic pre-step/recompile PASS\n");
 }
 
+static src_vol *first_nonempty_source(fields &owner) {
+  for (int chunk = 0; chunk < owner.num_chunks; ++chunk) {
+    FOR_FIELD_TYPES(ft) {
+      for (src_vol &source : owner.chunks[chunk]->sources[ft])
+        if (source.num_points()) return &source;
+    }
+  }
+  return NULL;
+}
+
+static void test_source_value_graph_reuse_with_magnetic_snapshot() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  gaussian_src_time source_time(0.29, 0.11);
+  const volume source_volume(vec(-0.25, -0.25), vec(0.25, 0.25));
+  cpu.add_volume_source(Ez, source_time, source_volume, 0.23);
+  gpu.add_volume_source(Ez, source_time, source_volume, 0.23);
+  cpu.advance(1);
+  gpu.advance(1);
+  require_selected_graph_mode(gpu);
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+
+  src_vol *cpu_source = first_nonempty_source(cpu);
+  src_vol *gpu_source = first_nonempty_source(gpu);
+  require(cpu_source && gpu_source &&
+              cpu_source->num_points() == gpu_source->num_points(),
+          "NVIDIA source-value reuse fixture has no corresponding source");
+  const std::complex<double> changed_amplitude =
+      cpu_source->amplitude_at(0) + std::complex<double>(0.0625, -0.03125);
+  cpu_source->set_amplitude(0, changed_amplitude);
+  gpu_source->set_amplitude(0, changed_amplitude);
+  invalidate(cpu, MutationKind::source_values, "CPU magnetic source-value reuse test");
+  invalidate(gpu, MutationKind::source_values, "NVIDIA magnetic source-value reuse test");
+
+  Executable *const value_executable = gpu.executable;
+  NvidiaBackend *const value_backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(value_backend, "NVIDIA source-value reuse fixture lost its backend");
+  const NvidiaExecutableCacheStatistics cache_before =
+      value_backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting graphs_before = nvidia::testing::current_graph_accounting();
+  cpu.advance(1);
+  gpu.advance(1);
+  const nvidia::graph_accounting graphs_after = nvidia::testing::current_graph_accounting();
+  const NvidiaExecutableCacheStatistics cache_after =
+      value_backend->executable_cache_statistics_for_testing();
+  require(gpu.executable == value_executable && !is_dirty(gpu, dirty_executable),
+          "NVIDIA source-value mutation replaced the structurally compatible executable");
+  require(graphs_after.creates == graphs_before.creates &&
+              graphs_after.begin_captures == graphs_before.begin_captures &&
+              graphs_after.instantiates == graphs_before.instantiates &&
+              graphs_after.graph_destroys == graphs_before.graph_destroys &&
+              graphs_after.executable_destroys == graphs_before.executable_destroys,
+          "NVIDIA source-value mutation recaptured or retired a magnetic graph");
+  require(cache_before.ordinary_resource_generation != 0 &&
+              cache_after.ordinary_resource_generation ==
+                  cache_before.ordinary_resource_generation &&
+              cache_after.executable_build_count == cache_before.executable_build_count &&
+              cache_after.source_value_reuse_count ==
+                  cache_before.source_value_reuse_count + 1,
+          "NVIDIA source-value mutation changed resource generation/build accounting");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 8e-13);
+
+  Executable *const field_value_executable = gpu.executable;
+  const NvidiaExecutableCacheStatistics field_cache_before =
+      value_backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting field_graphs_before =
+      nvidia::testing::current_graph_accounting();
+  cpu.zero_fields();
+  gpu.zero_fields();
+  cpu.advance(1);
+  gpu.advance(1);
+  const NvidiaExecutableCacheStatistics field_cache_after =
+      value_backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting field_graphs_after =
+      nvidia::testing::current_graph_accounting();
+  require(gpu.executable == field_value_executable &&
+              field_cache_after.ordinary_resource_generation ==
+                  field_cache_before.ordinary_resource_generation &&
+              field_cache_after.executable_build_count ==
+                  field_cache_before.executable_build_count &&
+              field_graphs_after.creates == field_graphs_before.creates &&
+              field_graphs_after.instantiates == field_graphs_before.instantiates &&
+              field_graphs_after.graph_destroys == field_graphs_before.graph_destroys &&
+              field_graphs_after.executable_destroys ==
+                  field_graphs_before.executable_destroys,
+          "field_values refresh replaced a structurally compatible executable");
+  compare_live_fields_by_key(cpu, gpu, sizeof(realnum) == sizeof(float) ? 8e-5 : 1e-6);
+  master_printf("nvidia_timestep: source-value graph reuse PASS\n");
+}
+
+static void test_source_value_refresh_failures_and_resource_overflow() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+
+  {
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gaussian_src_time source_time(0.29, 0.11);
+    const volume source_volume(vec(-0.25, -0.25), vec(0.25, 0.25));
+    gpu.add_volume_source(Ez, source_time, source_volume, 0.23);
+    gpu.advance(1);
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    src_vol *source = first_nonempty_source(gpu);
+    require(backend && source, "source refresh failure fixture was not prepared");
+    Executable *const original = gpu.executable;
+    source->set_amplitude(0, source->amplitude_at(0) + 0.125);
+    invalidate(gpu, MutationKind::source_values, "source refresh retry test");
+    nvidia::testing::fail_next(nvidia::testing::failure_point::source_value_copy);
+    bool rejected = false;
+    try { gpu.advance(1); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(rejected && !gpu.backend->is_poisoned() && gpu.executable == original &&
+                is_dirty(gpu, dirty_executable),
+            "pre-enqueue source refresh failure did not retain a retryable owner");
+    gpu.advance(1);
+    require(gpu.executable == original && !is_dirty(gpu, dirty_executable),
+            "source refresh retry did not reuse the original owner");
+
+    continuous_src_time added(0.31);
+    gpu.add_volume_source(Ez, added, source_volume, 0.05);
+    Executable *const overflow_original = gpu.executable;
+    const NvidiaExecutableCacheStatistics before =
+        backend->executable_cache_statistics_for_testing();
+    backend->set_next_executable_generation_for_testing(
+        std::numeric_limits<uint64_t>::max());
+    rejected = false;
+    try { gpu.advance(1); }
+    catch (const std::exception &error) {
+      rejected = std::string(error.what()).find("generation overflow") != std::string::npos;
+    }
+    require(rejected && !gpu.backend->is_poisoned() && gpu.executable == overflow_original &&
+                is_dirty(gpu, dirty_executable),
+            "executable generation overflow did not preserve the live owner");
+    backend->set_next_executable_generation_for_testing(
+        before.ordinary_resource_generation);
+    gpu.advance(1);
+    const NvidiaExecutableCacheStatistics after =
+        backend->executable_cache_statistics_for_testing();
+    require(gpu.executable != overflow_original &&
+                after.ordinary_resource_generation > before.ordinary_resource_generation,
+            "structural retry did not publish a newer executable generation");
+  }
+
+  nvidia::testing::reset_graph_accounting();
+  size_t poisoned_graphs = 0;
+  {
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gaussian_src_time source_time(0.29, 0.11);
+    const volume source_volume(vec(-0.25, -0.25), vec(0.25, 0.25));
+    gpu.add_volume_source(Ez, source_time, source_volume, 0.23);
+    gpu.advance(1);
+    const NvidiaGraphStatistics graph_stats =
+        dynamic_cast<NvidiaBackend *>(gpu.backend)->graph_statistics_for_testing();
+    poisoned_graphs = graph_stats.instantiate_count + graph_stats.magnetic_instantiate_count;
+    src_vol *source = first_nonempty_source(gpu);
+    require(source, "source refresh poison fixture has no source");
+    Executable *const original = gpu.executable;
+    source->set_amplitude(0, source->amplitude_at(0) + 0.125);
+    invalidate(gpu, MutationKind::source_values, "source refresh poison test");
+    nvidia::testing::fail_next(nvidia::testing::failure_point::source_value_sync);
+    bool rejected = false;
+    try { gpu.advance(1); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(rejected && gpu.backend->is_poisoned() && gpu.executable == original,
+            "post-enqueue source refresh failure did not poison and retain its owner");
+  }
+  const nvidia::graph_accounting poison_cleanup = nvidia::testing::current_graph_accounting();
+  require(poisoned_graphs > 0 && poison_cleanup.graph_destroys == poisoned_graphs &&
+              poison_cleanup.executable_destroys == poisoned_graphs,
+          "poisoned source refresh did not release every graph owner exactly once");
+  master_printf("nvidia_timestep: source-value failure/overflow PASS\n");
+}
+
 static void test_magnetic_historical_host_backups() {
   const grid_volume gv = vol2d(2.0, 2.0, 8.0);
   structure reference_structure(gv, isotropic_eps, no_pml(), identity(), 1);
@@ -5465,7 +5661,7 @@ static void install_pr54_tiled_material(structure &s, size_t &callback_calls) {
 }
 
 static void test_pr54_post_callback_failure_matrix() {
-  const nvidia::testing::failure_point failures[] = {
+  const nvidia::testing::failure_point cold_failures[] = {
       nvidia::testing::failure_point::material_callback_dispatch,
       nvidia::testing::failure_point::material_tiled_upload,
       nvidia::testing::failure_point::material_initialization_sync,
@@ -5481,8 +5677,8 @@ static void test_pr54_post_callback_failure_matrix() {
   options.fallback = fallback_policy::warn;
 
   for (size_t failure_index = 0;
-       failure_index < sizeof(failures) / sizeof(failures[0]); ++failure_index) {
-    const nvidia::testing::failure_point failure = failures[failure_index];
+       failure_index < sizeof(cold_failures) / sizeof(cold_failures[0]); ++failure_index) {
+    const nvidia::testing::failure_point failure = cold_failures[failure_index];
     size_t callback_calls = 0;
     structure s(gv, isotropic_eps, no_pml(), identity(), 1);
     install_pr54_tiled_material(s, callback_calls);
@@ -5518,32 +5714,93 @@ static void test_pr54_post_callback_failure_matrix() {
             "cold post-callback material failure was not retryable");
   }
 
-  for (nvidia::testing::failure_point failure : failures) {
-    size_t callback_calls = 0;
-    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
-    install_pr54_tiled_material(s, callback_calls);
+  nvidia::testing::reset_graph_accounting();
+  struct WarmFailure {
+    nvidia::testing::failure_point point;
+    bool poisons;
+  };
+  const WarmFailure warm_failures[] = {
+      {nvidia::testing::failure_point::material_refresh_before_upload, false},
+      {nvidia::testing::failure_point::material_refresh_after_upload, true},
+      {nvidia::testing::failure_point::material_initialization_sync, true},
+      {nvidia::testing::failure_point::material_classification_d2h, true},
+      {nvidia::testing::failure_point::material_classification_result_mutation, true},
+      {nvidia::testing::failure_point::material_finalize, true}};
+  for (const WarmFailure &failure : warm_failures) {
+    structure s(gv, isotropic_eps, pml(0.25, X), identity(), 2);
     fields f(&s, options);
     f.use_real_fields();
     f.require_component(Ez);
+    setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
     f.init_backend();
+    f.advance(1);
     invalidate(f, MutationKind::material_values, "PR5.4 warm post-callback failure");
-    const Pr54MaterialEpochSummary entry(f);
-    const size_t callbacks_before = callback_calls;
-    nvidia::testing::fail_next(failure);
+    BackendState *const entry_state = f.backend_state;
+    Executable *const entry_executable = f.executable;
+    const NvidiaExecutableCacheStatistics cache_before =
+        dynamic_cast<NvidiaBackend *>(f.backend)->executable_cache_statistics_for_testing();
+    const nvidia::graph_accounting graphs_before =
+        nvidia::testing::current_graph_accounting();
+    nvidia::testing::fail_next(failure.point);
     bool rejected = false;
     try { f.init_backend(); }
     catch (const std::exception &) { rejected = true; }
     nvidia::testing::clear_failure();
-    require(rejected && callback_calls > callbacks_before && entry.matches(f) &&
-                !f.backend->is_poisoned(),
-            "warm post-callback material failure changed the committed epoch");
-    BackendState *const previous_state = f.backend_state;
-    f.init_backend();
-    require(f.backend_state && f.backend_state != previous_state && f.executable &&
-                f.backend_state->material_route == MaterialRecipeDisposition::tiled_callback &&
-                f.backend->material_fallback_warning_count() == 1,
-            "warm post-callback material failure was not retryable");
+    const NvidiaExecutableCacheStatistics cache_failed =
+        dynamic_cast<NvidiaBackend *>(f.backend)->executable_cache_statistics_for_testing();
+    const nvidia::graph_accounting graphs_failed =
+        nvidia::testing::current_graph_accounting();
+    const bool warm_clean =
+        rejected &&
+        f.backend_state == entry_state && f.executable == entry_executable &&
+        cache_failed.ordinary_resource_generation == cache_before.ordinary_resource_generation &&
+        cache_failed.executable_build_count == cache_before.executable_build_count &&
+        graphs_failed.creates == graphs_before.creates &&
+        graphs_failed.begin_captures == graphs_before.begin_captures &&
+        graphs_failed.instantiates == graphs_before.instantiates &&
+        graphs_failed.graph_destroys == graphs_before.graph_destroys &&
+        graphs_failed.executable_destroys == graphs_before.executable_destroys &&
+        f.backend->is_poisoned() == failure.poisons;
+    if (!warm_clean)
+      fprintf(stderr,
+              "warm material point=%d poison_expected=%d rejected=%d state=%d exec=%d "
+              "resource=%llu/%llu builds=%zu/%zu "
+              "graphs=%zu/%zu captures=%zu/%zu instances=%zu/%zu destroys=%zu/%zu "
+              "exec_destroys=%zu/%zu poisoned=%d\n",
+              int(failure.point), int(failure.poisons), int(rejected),
+              int(f.backend_state == entry_state), int(f.executable == entry_executable),
+              (unsigned long long)cache_failed.ordinary_resource_generation,
+              (unsigned long long)cache_before.ordinary_resource_generation,
+              cache_failed.executable_build_count, cache_before.executable_build_count,
+              graphs_failed.creates, graphs_before.creates, graphs_failed.begin_captures,
+              graphs_before.begin_captures, graphs_failed.instantiates,
+              graphs_before.instantiates, graphs_failed.graph_destroys,
+              graphs_before.graph_destroys, graphs_failed.executable_destroys,
+              graphs_before.executable_destroys, int(f.backend->is_poisoned()));
+    require(warm_clean,
+            failure.poisons
+                ? "post-enqueue material refresh did not poison and retain graph owners"
+                : "pre-enqueue material refresh failure changed live graph owners");
+    if (failure.poisons) {
+      bool health_rejected = false;
+      try { f.init_backend(); }
+      catch (const std::exception &error) {
+        health_rejected = std::string(error.what()).find("poison") != std::string::npos;
+      }
+      require(health_rejected,
+              "poisoned material refresh accepted a subsequent backend operation");
+    }
+    else {
+      f.init_backend();
+      require(f.backend_state == entry_state && f.executable == entry_executable &&
+                  !f.backend->is_poisoned(),
+              "pre-enqueue material refresh failure was not retryable in place");
+    }
   }
+  const nvidia::graph_accounting teardown = nvidia::testing::current_graph_accounting();
+  require(teardown.end_captures == teardown.graph_destroys &&
+              teardown.instantiates == teardown.executable_destroys,
+          "material refresh failure matrix did not release every graph owner exactly once");
   master_printf("nvidia_timestep: PR5.4 post-callback rollback/retry PASS\n");
 }
 
@@ -6340,11 +6597,20 @@ static void test_material_value_refresh_preserves_host_edit(precision_policy_kin
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ez);
   f.init_backend();
   f.advance(1);
+  NvidiaBackend *const backend = dynamic_cast<NvidiaBackend *>(f.backend);
+  require(backend, "NVIDIA material refresh fixture lost its backend");
+  BackendState *const stable_state = f.backend_state;
+  Executable *const stable_executable = f.executable;
+  const NvidiaExecutableCacheStatistics stable_cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting stable_graphs = nvidia::testing::current_graph_accounting();
 
   ArrayId target = invalid_array();
   realnum *host = NULL;
@@ -6377,6 +6643,34 @@ static void test_material_value_refresh_preserves_host_edit(precision_policy_kin
       precision == precision_policy_kind::native ? sentinel : realnum(float(sentinel));
   require(recipe_saw_sentinel && observed[0] == device_sentinel,
           "NVIDIA authority migration overwrote a new host material coefficient");
+  const NvidiaExecutableCacheStatistics value_cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting value_graphs = nvidia::testing::current_graph_accounting();
+  require(f.backend_state == stable_state && f.executable == stable_executable &&
+              value_cache.ordinary_resource_generation ==
+                  stable_cache.ordinary_resource_generation &&
+              value_cache.executable_build_count == stable_cache.executable_build_count &&
+              value_graphs.creates == stable_graphs.creates &&
+              value_graphs.instantiates == stable_graphs.instantiates &&
+              value_graphs.graph_destroys == stable_graphs.graph_destroys &&
+              value_graphs.executable_destroys == stable_graphs.executable_destroys,
+          "stable-classification material_values replaced the resident executable");
+
+  host[0] = sentinel + realnum(0.03125);
+  invalidate(f, MutationKind::material_region, "NVIDIA material-region value refresh");
+  f.init_backend();
+  const NvidiaExecutableCacheStatistics region_cache =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting region_graphs = nvidia::testing::current_graph_accounting();
+  require(f.backend_state == stable_state && f.executable == stable_executable &&
+              region_cache.ordinary_resource_generation ==
+                  stable_cache.ordinary_resource_generation &&
+              region_cache.executable_build_count == stable_cache.executable_build_count &&
+              region_graphs.creates == stable_graphs.creates &&
+              region_graphs.instantiates == stable_graphs.instantiates &&
+              region_graphs.graph_destroys == stable_graphs.graph_destroys &&
+              region_graphs.executable_destroys == stable_graphs.executable_destroys,
+          "stable-classification material_region replaced the resident executable");
   master_printf("nvidia_timestep: material host-value refresh PASS\n");
 }
 
@@ -9582,11 +9876,27 @@ int main(int argc, char **argv) {
       run_magnetic_sync_case("complex-pml-conductive", policy, false, false);
     }
     test_magnetic_pre_step_and_recompile();
+    test_source_value_graph_reuse_with_magnetic_snapshot();
     test_magnetic_historical_host_backups();
     test_magnetic_compile_rejections();
     test_magnetic_graph_compile_modes();
     test_magnetic_graph_launch_failures();
     master_printf("nvidia_timestep: magnetic graph PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_SOURCE_REUSE_ONLY")) {
+    test_source_value_graph_reuse_with_magnetic_snapshot();
+    test_source_value_refresh_failures_and_resource_overflow();
+    master_printf("nvidia_timestep: source-value reuse PASS\n");
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_VALUE_REUSE_ONLY")) {
+    const precision_policy_kind policies[] = {precision_policy_kind::native,
+                                              precision_policy_kind::mixed,
+                                              precision_policy_kind::f32};
+    for (precision_policy_kind policy : policies)
+      test_material_value_refresh_preserves_host_edit(policy);
+    master_printf("nvidia_timestep: value-only reuse PASS\n");
     return 0;
   }
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))

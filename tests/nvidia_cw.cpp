@@ -573,6 +573,187 @@ static void test_cw_graph_operator_fixture(precision_policy_kind precision_polic
                 graph.statistics.graph_count, graph.statistics.graph_launch_count, error);
 }
 
+static src_vol *first_nonempty_source(fields &owner) {
+  for (int chunk = 0; chunk < owner.num_chunks; ++chunk) {
+    FOR_FIELD_TYPES(ft) {
+      for (src_vol &source : owner.chunks[chunk]->sources[ft])
+        if (source.num_points()) return &source;
+    }
+  }
+  return NULL;
+}
+
+static void test_cw_source_value_graph_reuse() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure cpu_structure(gv, one, no_pml());
+  structure gpu_structure(gv, one, no_pml());
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&gpu_structure, options);
+  continuous_src_time cpu_time(0.30), gpu_time(0.30);
+  cpu_time.is_integrated = gpu_time.is_integrated = false;
+  cpu.add_point_source(Ez, cpu_time, vec(1.0, 1.0), std::complex<double>(1.0, 0.2));
+  gpu.add_point_source(Ez, gpu_time, vec(1.0, 1.0), std::complex<double>(1.0, 0.2));
+  cpu.t = gpu.t = 2;
+  (void)cpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+  (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && backend->cw_statistics_for_testing().graph_enabled,
+          "CW source-value reuse fixture did not retain required graph mode");
+  src_vol *cpu_source = first_nonempty_source(cpu);
+  src_vol *gpu_source = first_nonempty_source(gpu);
+  require(cpu_source && gpu_source &&
+              cpu_source->num_points() == gpu_source->num_points(),
+          "CW source-value reuse fixture has no corresponding source");
+  const std::complex<double> amplitude =
+      cpu_source->amplitude_at(0) + std::complex<double>(0.125, -0.0625);
+  cpu_source->set_amplitude(0, amplitude);
+  gpu_source->set_amplitude(0, amplitude);
+  invalidate(cpu, MutationKind::source_values, "CPU CW graph source-value reuse test");
+  invalidate(gpu, MutationKind::source_values, "NVIDIA CW graph source-value reuse test");
+  BackendState *const state = gpu.backend_state;
+  Executable *const ordinary = gpu.executable;
+  Executable *const cw = state->cw_executable;
+  const NvidiaExecutableCacheStatistics cache_before =
+      backend->executable_cache_statistics_for_testing();
+  const nvidia::graph_accounting before = nvidia::testing::current_graph_accounting();
+  (void)cpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+  (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+  const nvidia::graph_accounting after = nvidia::testing::current_graph_accounting();
+  const NvidiaExecutableCacheStatistics cache_after =
+      backend->executable_cache_statistics_for_testing();
+  require(gpu.backend_state == state && gpu.executable == ordinary &&
+              state->cw_executable == cw,
+          "CW source-value mutation replaced a structurally compatible owner");
+  require(after.creates == before.creates && after.begin_captures == before.begin_captures &&
+              after.instantiates == before.instantiates &&
+              after.graph_destroys == before.graph_destroys &&
+              after.executable_destroys == before.executable_destroys,
+          "CW source-value mutation recaptured or retired a graph");
+  require(cache_before.ordinary_resource_generation != 0 &&
+              cache_before.cw_resource_generation != 0 &&
+              cache_after.ordinary_resource_generation ==
+                  cache_before.ordinary_resource_generation &&
+              cache_after.cw_resource_generation == cache_before.cw_resource_generation &&
+              cache_after.executable_build_count == cache_before.executable_build_count &&
+              cache_after.source_value_reuse_count ==
+                  cache_before.source_value_reuse_count + 3,
+          "CW source-value refresh changed resource generation/build accounting");
+  const std::complex<double> expected = cpu.get_field(Ez, vec(1.0, 1.0));
+  const std::complex<double> actual = gpu.get_field(Ez, vec(1.0, 1.0));
+  require(std::abs(actual - expected) <= 2e-3 * (1.0 + std::abs(expected)),
+          "CW source-value graph reuse changed CPU/NVIDIA parity");
+}
+
+static void test_cw_source_value_refresh_poison_cleanup() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  nvidia::testing::reset_graph_accounting();
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  for (int failure = 0; failure < 2; ++failure) {
+    structure s(gv, one, no_pml());
+    fields gpu(&s, options);
+    continuous_src_time source_time(0.30);
+    source_time.is_integrated = false;
+    gpu.add_point_source(Ez, source_time, vec(1.0, 1.0), 1.0);
+    gpu.t = 2;
+    (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    src_vol *source = first_nonempty_source(gpu);
+    require(backend && source && gpu.backend_state->cw_executable,
+            "CW source refresh retry fixture was not prepared");
+    BackendState *const state = gpu.backend_state;
+    Executable *const ordinary = gpu.executable;
+    Executable *const cw = state->cw_executable;
+    const NvidiaExecutableCacheStatistics cache_before =
+        backend->executable_cache_statistics_for_testing();
+    const nvidia::graph_accounting graphs_before =
+        nvidia::testing::current_graph_accounting();
+    source->set_amplitude(0, source->amplitude_at(0) + 0.125);
+    invalidate(gpu, MutationKind::source_values, "CW source refresh retry test");
+    if (failure == 0)
+      nvidia::testing::fail_next(nvidia::testing::failure_point::cw_source_value_copy);
+    else
+      backend_set_cw_plan_corruption_for_testing(true);
+    bool rejected = false;
+    try { (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    backend_set_cw_plan_corruption_for_testing(false);
+    const NvidiaExecutableCacheStatistics cache_failed =
+        backend->executable_cache_statistics_for_testing();
+    const nvidia::graph_accounting graphs_failed =
+        nvidia::testing::current_graph_accounting();
+    require(rejected && !gpu.backend->is_poisoned() && gpu.backend_state == state &&
+                gpu.executable == ordinary && state->cw_executable == cw &&
+                cache_failed.ordinary_resource_generation ==
+                    cache_before.ordinary_resource_generation &&
+                cache_failed.cw_resource_generation == cache_before.cw_resource_generation &&
+                cache_failed.executable_build_count == cache_before.executable_build_count &&
+                cache_failed.source_value_reuse_count == cache_before.source_value_reuse_count &&
+                graphs_failed.creates == graphs_before.creates &&
+                graphs_failed.begin_captures == graphs_before.begin_captures &&
+                graphs_failed.instantiates == graphs_before.instantiates &&
+                graphs_failed.graph_destroys == graphs_before.graph_destroys &&
+                graphs_failed.executable_destroys == graphs_before.executable_destroys,
+            failure == 0
+                ? "pre-enqueue CW source copy failure changed live owners or accounting"
+                : "later CW plan validation failure partially published source refresh");
+    (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+    const NvidiaExecutableCacheStatistics cache_after =
+        backend->executable_cache_statistics_for_testing();
+    require(gpu.backend_state == state && gpu.executable == ordinary &&
+                state->cw_executable == cw &&
+                cache_after.source_value_reuse_count ==
+                    cache_before.source_value_reuse_count + 3,
+            "retryable CW source refresh did not reuse all three owners");
+  }
+
+  nvidia::testing::reset_graph_accounting();
+  size_t owned_definitions = 0;
+  size_t owned_executables = 0;
+  {
+    structure s(gv, one, no_pml());
+    fields gpu(&s, options);
+    continuous_src_time source_time(0.30);
+    source_time.is_integrated = false;
+    gpu.add_point_source(Ez, source_time, vec(1.0, 1.0), 1.0);
+    gpu.t = 2;
+    (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2);
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    src_vol *source = first_nonempty_source(gpu);
+    require(backend && source && gpu.backend_state->cw_executable,
+            "CW source refresh poison fixture was not prepared");
+    const nvidia::graph_accounting prepared = nvidia::testing::current_graph_accounting();
+    owned_definitions = prepared.end_captures - prepared.graph_destroys;
+    owned_executables = prepared.instantiates - prepared.executable_destroys;
+    Executable *const ordinary = gpu.executable;
+    Executable *const cw = gpu.backend_state->cw_executable;
+    source->set_amplitude(0, source->amplitude_at(0) + 0.125);
+    invalidate(gpu, MutationKind::source_values, "CW source refresh poison test");
+    nvidia::testing::fail_next(nvidia::testing::failure_point::cw_source_value_sync);
+    bool rejected = false;
+    try { (void)gpu.solve_cw(1e-4, 1000, std::complex<double>(0.30, 0.0), 2); }
+    catch (const std::exception &) { rejected = true; }
+    nvidia::testing::clear_failure();
+    require(rejected && gpu.backend->is_poisoned() && gpu.executable == ordinary &&
+                gpu.backend_state->cw_executable == cw,
+            "post-enqueue CW source refresh failure did not poison and retain owners");
+  }
+  const nvidia::graph_accounting cleanup = nvidia::testing::current_graph_accounting();
+  require(owned_definitions > 0 && owned_executables > 0 &&
+              cleanup.graph_destroys == owned_definitions &&
+              cleanup.executable_destroys == owned_executables,
+          "poisoned CW source refresh did not release every graph owner exactly once");
+}
+
 static void test_cw_graph_compile_rollback() {
   setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
   const grid_volume gv = vol2d(2.0, 2.0, 8.0);
@@ -850,6 +1031,12 @@ int main(int argc, char **argv) {
     master_printf("nvidia_cw: profile-only PASS\n");
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_CW_SOURCE_REUSE_ONLY")) {
+    test_cw_source_value_graph_reuse();
+    test_cw_source_value_refresh_poison_cleanup();
+    master_printf("nvidia_cw: source-value reuse PASS\n");
+    return 0;
+  }
   bool use_conductivity = true, use_integrated = true, use_magnetic = true;
   precision_policy_kind precision_policy = precision_policy_kind::native;
   for (int i = 1; i < argc; ++i) {
@@ -883,6 +1070,7 @@ int main(int argc, char **argv) {
                                   "device-restore", true);
     test_cw_graph_workspace_replacement();
     test_cw_graph_operator_fixture(precision_policy);
+    test_cw_source_value_graph_reuse();
     test_cw_graph_launch_failure();
     return 0;
   }
@@ -1074,7 +1262,8 @@ int main(int argc, char **argv) {
     bool rejected = false;
     Executable *unexpected = NULL;
     try {
-      unexpected = nvidia_backend->preflight_cw(request, step_plan, cw_plan, NULL,
+      unexpected = nvidia_backend->preflight_cw(request, *gpu.step_plans[0], step_plan,
+                                                 cw_plan, *gpu.executable, NULL,
                                                  *gpu.backend_state);
     }
     catch (const std::exception &) {
@@ -1349,6 +1538,8 @@ int main(int argc, char **argv) {
   BackendState *const source_value_state = gpu.backend_state;
   Executable *const source_value_ordinary = gpu.executable;
   Executable *const source_value_cw = gpu.backend_state->cw_executable;
+  const nvidia::graph_accounting source_value_graphs_before =
+      nvidia::testing::current_graph_accounting();
   src_vol *const cpu_mutated_source = first_live_source(cpu);
   src_vol *const gpu_mutated_source = first_live_source(gpu);
   require(cpu_mutated_source && gpu_mutated_source &&
@@ -1366,9 +1557,21 @@ int main(int argc, char **argv) {
   require(gpu.solve_cw(tolerance, 1000, std::complex<double>(0.30, 0.0), 2),
           "NVIDIA source-value refresh solve did not converge");
   const NvidiaCwStatistics repeat_stats = nvidia_backend->cw_statistics_for_testing();
-  require(gpu.backend_state == source_value_state && gpu.executable != source_value_ordinary &&
-              gpu.backend_state->cw_executable != source_value_cw,
-          "source-value refresh did not retain state and replace both executables");
+  const nvidia::graph_accounting source_value_graphs_after =
+      nvidia::testing::current_graph_accounting();
+  require(gpu.backend_state == source_value_state && gpu.executable == source_value_ordinary &&
+              gpu.backend_state->cw_executable == source_value_cw,
+          "source-value refresh did not retain state and both compatible executables");
+  require(source_value_graphs_after.creates == source_value_graphs_before.creates &&
+              source_value_graphs_after.begin_captures ==
+                  source_value_graphs_before.begin_captures &&
+              source_value_graphs_after.instantiates ==
+                  source_value_graphs_before.instantiates &&
+              source_value_graphs_after.graph_destroys ==
+                  source_value_graphs_before.graph_destroys &&
+              source_value_graphs_after.executable_destroys ==
+                  source_value_graphs_before.executable_destroys,
+          "source-value refresh recaptured or retired a CW graph");
   require(repeat_stats.valid && repeat_stats.workspace_allocations == 1 &&
               repeat_stats.workspace_capacity_bytes == first_stats.workspace_capacity_bytes &&
               repeat_stats.vector_host_to_device_bytes == 0 &&

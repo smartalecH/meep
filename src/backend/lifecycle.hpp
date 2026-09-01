@@ -78,6 +78,10 @@ enum DirtyBit : DirtyMask {
 DirtyMask invalidation_closure(MutationKind cause);
 
 const char *mutation_kind_name(MutationKind cause);
+/* Value freshness may advance without changing executable structure, provided
+   the backend independently proves layout/classification and pointer targets
+   unchanged. */
+bool mutation_may_preserve_executable_structure(MutationKind cause);
 const char *dirty_bit_name(DirtyBit bit);
 
 /* Record a mutation: union its closure into f.dirty_mask and bump the
