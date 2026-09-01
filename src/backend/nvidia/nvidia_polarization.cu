@@ -206,9 +206,14 @@ __global__ void polarization_subtract_kernel(polarization_subtract_launch update
 
 template <typename T>
 __global__ void noisy_add_kernel(noisy_add_launch update, const noisy_seed_block *seed,
-                                 uint64_t timestep, size_t points) {
+                                 uint64_t timestep, const StepScalars *scalars, size_t points) {
   const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (linear >= points) return;
+  if (scalars) {
+    if (scalars->active_noisy_seed_slot < 0) return;
+    seed += scalars->active_noisy_seed_slot;
+    timestep = scalars->noisy_counter_time;
+  }
   const ptrdiff_t i = region_index(update.region, linear);
   const build_realnum sigma = build_realnum(static_cast<const T *>(update.diagonal_sigma)[i]);
   const build_realnum standard_deviation = build_realnum(update.amplitude) * sqrt(sigma);
@@ -265,7 +270,8 @@ void launch_gyrotropic_t(const gyrotropic_update_launch &update,
 
 template <typename T>
 void launch_noisy_t(const noisy_add_launch &update, const noisy_seed_block *seed,
-                    uint64_t timestep, const stream &execution_stream) {
+                    uint64_t timestep, const StepScalars *scalars,
+                    const stream &execution_stream) {
   const size_t points = checked_points(update.region);
   if (points - 1 > UINT64_MAX - update.point_ordinal_base)
     throw std::overflow_error("NVIDIA noisy polarization point ordinal overflow");
@@ -273,7 +279,7 @@ void launch_noisy_t(const noisy_add_launch &update, const noisy_seed_block *seed
   launch_geometry(points, blocks, threads);
   noisy_add_kernel<T>
       <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
-          update, seed, timestep, points);
+          update, seed, timestep, scalars, points);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA noisy polarization addition");
 }
 
@@ -383,14 +389,35 @@ void launch_polarization_update(const compiled_polarization_update &update,
       if (!update.noisy.p || !update.noisy.diagonal_sigma)
         throw std::invalid_argument("NVIDIA noisy polarization update has incomplete operands");
       if (update.noisy.precision == scalar_precision::f32)
-        launch_noisy_t<float>(update.noisy, seed, timestep, execution_stream);
+        launch_noisy_t<float>(update.noisy, seed, timestep, NULL, execution_stream);
       else if (update.noisy.precision == scalar_precision::f64)
-        launch_noisy_t<double>(update.noisy, seed, timestep, execution_stream);
+        launch_noisy_t<double>(update.noisy, seed, timestep, NULL, execution_stream);
       else
         throw std::invalid_argument("NVIDIA noisy polarization update has invalid precision");
       break;
     default: throw std::invalid_argument("NVIDIA polarization update has invalid kind");
   }
+}
+
+void launch_polarization_update_graph(const compiled_polarization_update &update,
+                                      const noisy_seed_block *seed_slots,
+                                      const StepScalars *scalars,
+                                      const stream &execution_stream) {
+  if (!scalars) throw std::invalid_argument("NVIDIA graph polarization has no StepScalars");
+  if (update.kind != compiled_polarization_update::kind_type::noisy_add) {
+    launch_polarization_update(update, NULL, 0, execution_stream);
+    return;
+  }
+  if (!seed_slots)
+    throw std::invalid_argument("NVIDIA graph noisy polarization has no seed slots");
+  if (!update.noisy.p || !update.noisy.diagonal_sigma)
+    throw std::invalid_argument("NVIDIA noisy polarization update has incomplete operands");
+  if (update.noisy.precision == scalar_precision::f32)
+    launch_noisy_t<float>(update.noisy, seed_slots, 0, scalars, execution_stream);
+  else if (update.noisy.precision == scalar_precision::f64)
+    launch_noisy_t<double>(update.noisy, seed_slots, 0, scalars, execution_stream);
+  else
+    throw std::invalid_argument("NVIDIA noisy polarization update has invalid precision");
 }
 
 void launch_polarization_subtract(const polarization_subtract_launch &update,

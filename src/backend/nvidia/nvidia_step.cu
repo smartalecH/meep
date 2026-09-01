@@ -250,9 +250,10 @@ template <typename T> __global__ void zero_kernel(zero_launch update, size_t poi
 
 template <typename T>
 __global__ void finite_check_kernel(finite_check_launch launch,
-                                    unsigned long long *first_bad) {
+                                    unsigned long long *first_bad,
+                                    const StepScalars *scalars) {
   const size_t index = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (index >= launch.elements) return;
+  if (index >= launch.elements || (scalars && !scalars->finite_check_due)) return;
   if (!isfinite(static_cast<const T *>(launch.values)[index]))
     atomicMin(first_bad, static_cast<unsigned long long>(launch.ordinal_base + index));
 }
@@ -373,12 +374,12 @@ void launch_halo_scatter_t(const halo_launch &launch, const void *device_entries
 
 template <typename T>
 void launch_finite_check_t(const finite_check_launch &launch, void *device_first_bad,
-                           const stream &execution_stream) {
+                           const StepScalars *scalars, const stream &execution_stream) {
   unsigned int blocks = 0, threads = 0;
   linear_launch_geometry(launch.elements, blocks, threads);
   finite_check_kernel<T>
       <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
-          launch, static_cast<unsigned long long *>(device_first_bad));
+          launch, static_cast<unsigned long long *>(device_first_bad), scalars);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA finite-value check");
 }
 
@@ -580,9 +581,25 @@ void launch_finite_check(const finite_check_launch &launch, void *device_first_b
   static_assert(sizeof(uint64_t) == sizeof(unsigned long long),
                 "CUDA diagnostic ordinal must be 64-bit");
   if (launch.precision == scalar_precision::f32)
-    launch_finite_check_t<float>(launch, device_first_bad, execution_stream);
+    launch_finite_check_t<float>(launch, device_first_bad, NULL, execution_stream);
   else
-    launch_finite_check_t<double>(launch, device_first_bad, execution_stream);
+    launch_finite_check_t<double>(launch, device_first_bad, NULL, execution_stream);
+}
+
+void launch_finite_check_graph(const finite_check_launch &launch, void *device_first_bad,
+                               const StepScalars *scalars,
+                               const stream &execution_stream) {
+  if (!scalars)
+    throw std::invalid_argument("NVIDIA graph finite-value check has no StepScalars");
+  if (!launch.values || !device_first_bad)
+    throw std::invalid_argument("NVIDIA finite-value check has incomplete storage");
+  if (!launch.elements) throw std::invalid_argument("NVIDIA finite-value check is empty");
+  if (launch.ordinal_base > std::numeric_limits<uint64_t>::max() - (launch.elements - 1))
+    throw std::overflow_error("NVIDIA finite-value check ordinal overflow");
+  if (launch.precision == scalar_precision::f32)
+    launch_finite_check_t<float>(launch, device_first_bad, scalars, execution_stream);
+  else
+    launch_finite_check_t<double>(launch, device_first_bad, scalars, execution_stream);
 }
 
 } // namespace nvidia

@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "backend/initialization_plan.hpp"
+#include "backend/graph_plan.hpp"
 #include "backend/material_recipe.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
@@ -39,6 +40,7 @@
 #include "backend/nvidia/arena.hpp"
 #include "backend/nvidia/nvidia_dft.hpp"
 #include "backend/nvidia/nvidia_flux.hpp"
+#include "backend/nvidia/nvidia_graph.hpp"
 #include "backend/nvidia/nvidia_magnetic.hpp"
 #include "backend/nvidia/nvidia_initialization.hpp"
 #include "backend/nvidia/nvidia_materials.hpp"
@@ -690,6 +692,7 @@ public:
   NvidiaCwStatistics cw_statistics_;
   NvidiaHostFallbackStatistics host_fallback_statistics_;
   NvidiaMaterialInitializationStatistics material_initialization_statistics_;
+  NvidiaGraphStatistics graph_statistics_;
   nvidia::device_buffer material_ir_inputs_;
   std::vector<nvidia::material_fill_launch> material_fill_launches_;
   std::vector<nvidia::material_table_launch> material_table_launches_;
@@ -816,6 +819,18 @@ struct NvidiaCompiledLegacyFluxUpdate {
   uint64_t recipe_signature;
 };
 
+struct NvidiaCompiledGraphSegment {
+  GraphSegment plan;
+  nvidia::graph definition;
+  nvidia::graph_exec executable;
+
+  explicit NvidiaCompiledGraphSegment(const GraphSegment &source) : plan(source) {}
+  NvidiaCompiledGraphSegment(NvidiaCompiledGraphSegment &&) noexcept = default;
+  NvidiaCompiledGraphSegment &operator=(NvidiaCompiledGraphSegment &&) noexcept = default;
+  NvidiaCompiledGraphSegment(const NvidiaCompiledGraphSegment &) = delete;
+  NvidiaCompiledGraphSegment &operator=(const NvidiaCompiledGraphSegment &) = delete;
+};
+
 class NvidiaExecutable : public Executable {
 public:
   NvidiaExecutable(const NvidiaBackend *owner, StepProgram program, uint64_t signature,
@@ -889,7 +904,8 @@ public:
         magnetic_layout_fingerprint_(magnetic_layout_fingerprint),
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
         material_target_signature_(material_target_signature),
-        source_scalar_count_(source_scalar_count), host_segments_(host_segments) {
+        source_scalar_count_(source_scalar_count), host_segments_(host_segments),
+        graph_enabled_(false) {
     for (const nvidia::compiled_polarization_update &update : polarization_updates_)
       has_noisy_updates_ = has_noisy_updates_ ||
                            update.kind ==
@@ -1042,6 +1058,14 @@ public:
     }
   }
 
+  ~NvidiaExecutable() override {
+    /* Captured graph nodes retain raw addresses owned by the buffers below.
+       Destroy executable graphs and their definitions while every captured
+       allocation is still alive; member reverse-order destruction would do
+       the opposite because graph_segments_ precedes those buffers. */
+    graph_segments_.clear();
+  }
+
   const NvidiaBackend *owner_;
   uint64_t state_token_;
   StepProgram program_;
@@ -1079,6 +1103,11 @@ public:
   uint64_t material_target_signature_;
   size_t source_scalar_count_;
   std::vector<NvidiaCompiledHostSegment> host_segments_;
+  GraphProgram graph_program_;
+  std::vector<NvidiaCompiledGraphSegment> graph_segments_;
+  nvidia::device_buffer step_scalars_;
+  bool graph_enabled_;
+  NvidiaGraphStatistics graph_statistics_;
   nvidia::device_buffer halo_gathers_;
   nvidia::device_buffer halo_scatters_;
   nvidia::device_buffer halo_scratch_;
@@ -3714,19 +3743,120 @@ void set_reason(std::string &why, size_t operation, const char *detail) {
   why = message.str();
 }
 
+GraphExecutionMode parse_graph_mode_locally(const char *value, bool &valid) noexcept {
+  valid = true;
+  if (!value || !*value || strcmp(value, "auto") == 0)
+    return GraphExecutionMode::automatic;
+  if (strcmp(value, "eager") == 0) return GraphExecutionMode::eager;
+  if (strcmp(value, "required") == 0) return GraphExecutionMode::required;
+  valid = false;
+  return GraphExecutionMode::automatic;
+}
+
+void reconcile_graph_stage(const std::string &local_error, const char *remote_error) {
+  const bool any_error = or_to_all(!local_error.empty());
+  if (!any_error) return;
+  throw std::runtime_error(local_error.empty() ? remote_error : local_error);
+}
+
+GraphExecutionMode reconcile_graph_mode(GraphExecutionMode local_mode,
+                                        bool local_parse_valid) {
+  const bool any_parse_error = or_to_all(!local_parse_valid);
+  if (any_parse_error)
+    throw std::invalid_argument(
+        local_parse_valid ? "NVIDIA graph mode was invalid on another rank"
+                          : "invalid NVIDIA graph mode (expected auto, eager, or required)");
+  const int requested = int(local_mode);
+  const int minimum = min_to_all(requested);
+  const int maximum = max_to_all(requested);
+  if (minimum != maximum)
+    throw std::invalid_argument("NVIDIA graph execution mode differs across ranks");
+  return local_mode;
+}
+
+bool reconcile_graph_support(GraphExecutionMode requested, bool local_supported) {
+  const bool all_supported = and_to_all(local_supported);
+  const std::vector<GraphRankModeSupport> collective_support(
+      1, GraphRankModeSupport{requested, all_supported, all_supported});
+  return resolve_collective_graph_execution_mode(collective_support).use_graph;
+}
+
+bool reconcile_graph_attempt(GraphExecutionMode requested, const std::string &local_error,
+                             const char *remote_error) {
+  const bool any_error = or_to_all(!local_error.empty());
+  if (!any_error) return true;
+  if (requested == GraphExecutionMode::required)
+    throw std::runtime_error(local_error.empty() ? remote_error : local_error);
+  return false;
+}
+
 } // namespace
 
 NvidiaBackend::NvidiaBackend(fields &f, const execution_options &options, int selected_device)
-    : f_(f), options_(options), device_(selected_device), device_memory_bytes_(0),
+    : f_(f), options_(options), device_(selected_device),
+      graph_mode_(GraphExecutionMode::automatic), graph_mode_parse_valid_(true),
+      device_memory_bytes_(0),
       next_state_token_(1), pending_initialization_reserve_bytes_(0),
       pending_initialization_compact_bytes_(0), pending_initialization_scratch_bytes_(0),
       pending_initialization_route_(MaterialRecipeDisposition::device_native),
       pending_initialization_reserve_valid_(false) {
+  graph_mode_ =
+      parse_graph_mode_locally(std::getenv("MEEP_NVIDIA_GRAPH_MODE"), graph_mode_parse_valid_);
   if (device_ < 0) throw std::invalid_argument("NVIDIA backend requires a resolved device ID");
   device_memory_bytes_ = nvidia::properties_for_device(device_).total_memory;
 }
 
 NvidiaBackend::~NvidiaBackend() {}
+
+namespace nvidia {
+namespace testing {
+
+GraphModeResolution reconcile_graph_execution_for_testing(
+    const graph_collective_probe &probe) {
+  bool parse_valid = true;
+  const GraphExecutionMode local_mode = parse_graph_mode_locally(probe.mode, parse_valid);
+  const GraphExecutionMode requested = reconcile_graph_mode(local_mode, parse_valid);
+  reconcile_graph_stage(probe.lowering_valid ? std::string()
+                                             : "injected graph lowering failure",
+                        "graph lowering failed on another rank");
+  reconcile_graph_stage(probe.validation_valid ? std::string()
+                                               : "injected graph validation failure",
+                        "graph validation failed on another rank");
+  if (!reconcile_graph_support(
+          requested, probe.runtime_capture_supported && probe.program_graphable))
+    return GraphModeResolution{requested, false};
+  const auto reconcile_attempt = [&](bool local_valid, const char *local_failure,
+                                     const char *remote_failure) {
+    const bool any_failure = or_to_all(!local_valid);
+    if (!any_failure) return true;
+    std::string cleanup_error;
+    if (!probe.graph_exec_destroy_valid)
+      cleanup_error = "injected CUDA graph executable cleanup failure";
+    if (!probe.graph_destroy_valid && cleanup_error.empty())
+      cleanup_error = "injected CUDA graph definition cleanup failure";
+    if (!probe.graph_device_restore_valid && cleanup_error.empty())
+      cleanup_error = "injected CUDA graph cleanup device-restoration failure";
+    reconcile_graph_stage(cleanup_error, "CUDA graph cleanup failed on another rank");
+    return reconcile_graph_attempt(requested,
+                                   local_valid ? std::string() : local_failure,
+                                   remote_failure);
+  };
+  if (!reconcile_attempt(probe.allocation_valid,
+                         "injected graph scalar allocation failure",
+                         "graph scalar allocation failed on another rank"))
+    return GraphModeResolution{requested, false};
+  if (!reconcile_attempt(probe.capture_valid, "injected graph capture failure",
+                         "graph capture failed on another rank"))
+    return GraphModeResolution{requested, false};
+  if (!reconcile_attempt(probe.instantiate_valid,
+                         "injected graph instantiate failure",
+                         "graph instantiate failed on another rank"))
+    return GraphModeResolution{requested, false};
+  return GraphModeResolution{requested, true};
+}
+
+} // namespace testing
+} // namespace nvidia
 
 namespace {
 void preflight_native_table_ir(const MaterialIR &ir);
@@ -8731,6 +8861,24 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     if (local_error.empty()) local_error = "NVIDIA PR2 compilation was rejected on another rank";
     throw std::runtime_error(local_error);
   }
+  local_error.clear();
+  try {
+    configure_graph_execution(plan, *executable, state);
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown NVIDIA graph configuration failure";
+  }
+  if (or_to_all(!local_error.empty())) {
+    executable.reset();
+    if (local_error.empty())
+      local_error = "NVIDIA graph configuration was rejected on another rank";
+    throw std::runtime_error(local_error);
+  }
+  if (plan.program == StepProgram::ordinary)
+    state.graph_statistics_ = executable->graph_statistics_;
   return executable.release();
 }
 
@@ -9912,6 +10060,428 @@ void NvidiaBackend::preflight_advance(Executable &raw_executable,
   nvidia::validate_material_phase_state(f_, executable.material_target_signature_);
 }
 
+bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
+                                            NvidiaBackendState &state,
+                                            const NvidiaCompiledOperation &op,
+                                            const StepScalars *graph_scalars,
+                                            bool account_cw) {
+  const auto count_cw_kernel = [&]() {
+    if (account_cw) ++state.cw_workspace_->timestep_kernel_launches_;
+  };
+  const auto accumulate_legacy_flux = [&]() {
+    for (size_t i = op.legacy_flux_first;
+         i < op.legacy_flux_first + op.legacy_flux_count; ++i) {
+      const NvidiaCompiledLegacyFluxUpdate &update = executable.legacy_flux_updates_[i];
+      double *result = static_cast<double *>(executable.legacy_flux_current_.opaque_handle()) +
+                       update.flux_ordinal;
+      for (size_t j = update.term_first; j < update.term_first + update.term_count; ++j) {
+        const nvidia::legacy_flux_term_launch &term = executable.legacy_flux_terms_[j];
+        if (!term.e_real || !term.h_real) continue;
+        nvidia::launch_legacy_flux_term(term, executable.legacy_flux_partials_.opaque_handle(),
+                                        result, *state.transfer_);
+      }
+    }
+  };
+  switch (op.kind) {
+    case OpKind::update_db:
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        const uint32_t prefix = executable.curl_updates_[i].radial_prefix_index;
+        if (prefix != UINT32_MAX)
+          nvidia::launch_cylindrical_radial_prefix(
+              executable.cylindrical_radial_prefixes_[prefix], *state.transfer_);
+        if (prefix != UINT32_MAX) count_cw_kernel();
+        nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
+        count_cw_kernel();
+        const uint32_t bfast = executable.curl_updates_[i].bfast_update_index;
+        if (bfast != UINT32_MAX)
+          nvidia::launch_bfast(executable.bfast_updates_[bfast], *state.transfer_);
+        if (bfast != UINT32_MAX) count_cw_kernel();
+      }
+      for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i) {
+        nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.cylindrical_m_first;
+           i < op.cylindrical_m_first + op.cylindrical_m_count; ++i) {
+        nvidia::launch_cylindrical_m(executable.cylindrical_m_updates_[i], *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.cylindrical_origin_first;
+           i < op.cylindrical_origin_first + op.cylindrical_origin_count; ++i) {
+        const NvidiaCompiledCylindricalOriginAction &action =
+            executable.cylindrical_origin_actions_[i];
+        if (action.kind == CylindricalOriginActionKind::axis_update)
+          nvidia::launch_cylindrical_axis(executable.cylindrical_axis_updates_[action.index],
+                                          *state.transfer_);
+        else
+          nvidia::launch_zero(executable.zero_updates_[action.index], *state.transfer_);
+        count_cw_kernel();
+      }
+      return true;
+    case OpKind::update_eh:
+      for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i) {
+        nvidia::launch_array_copy(executable.source_copies_[i], *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.subtraction_first; i < op.subtraction_first + op.subtraction_count; ++i) {
+        nvidia::launch_polarization_subtract(executable.polarization_subtractions_[i],
+                                             *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.source_first; i < op.source_first + op.source_count; ++i) {
+        nvidia::launch_source_batch(executable.source_batches_[i],
+                                    executable.source_scalars_.opaque_handle(), *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
+        count_cw_kernel();
+      }
+      return true;
+    case OpKind::update_polarization: {
+      const nvidia::noisy_seed_block *seed = NULL;
+      if (graph_scalars)
+        seed = static_cast<const nvidia::noisy_seed_block *>(
+            state.noisy_seed_slots_.opaque_handle());
+      else if (state.noisy_seed_active_slot_ >= 0)
+        seed = static_cast<const nvidia::noisy_seed_block *>(
+                   state.noisy_seed_slots_.opaque_handle()) +
+               state.noisy_seed_active_slot_;
+      for (size_t i = op.polarization_first;
+           i < op.polarization_first + op.polarization_count; ++i) {
+        const NvidiaCompiledPolarizationAction &action = executable.polarization_actions_[i];
+        if (action.kind == NvidiaCompiledPolarizationAction::Kind::ordinary) {
+          const nvidia::compiled_polarization_update &update =
+              executable.polarization_updates_[action.index];
+          if (graph_scalars)
+            nvidia::launch_polarization_update_graph(update, seed, graph_scalars,
+                                                      *state.transfer_);
+          else
+            nvidia::launch_polarization_update(update, seed, uint64_t(f_.t), *state.transfer_);
+          if (!graph_scalars &&
+              update.kind == nvidia::compiled_polarization_update::kind_type::noisy_add &&
+              nvidia::testing::consume_failure_for_testing(
+                  nvidia::testing::failure_point::noisy_add))
+            throw std::runtime_error("injected NVIDIA noisy-add postlaunch failure");
+        }
+        else if (action.kind == NvidiaCompiledPolarizationAction::Kind::multilevel_population) {
+          nvidia::launch_multilevel_population(
+              executable.multilevel_population_updates_[action.index], *state.transfer_);
+          if (!graph_scalars && nvidia::testing::consume_failure_for_testing(
+                                    nvidia::testing::failure_point::multilevel_population))
+            throw std::runtime_error("injected NVIDIA multilevel population postlaunch failure");
+        }
+        else if (action.kind == NvidiaCompiledPolarizationAction::Kind::multilevel_transition) {
+          nvidia::launch_multilevel_transition(
+              executable.multilevel_transition_updates_[action.index], *state.transfer_);
+          if (!graph_scalars && nvidia::testing::consume_failure_for_testing(
+                                    nvidia::testing::failure_point::multilevel_transition))
+            throw std::runtime_error("injected NVIDIA multilevel transition postlaunch failure");
+        }
+        else
+          throw std::logic_error("NVIDIA polarization schedule has an invalid action");
+        count_cw_kernel();
+      }
+      return true;
+    }
+    case OpKind::transfer_halo:
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+        nvidia::launch_halo_gather(executable.halo_plans_[i].gather,
+                                   executable.halo_gathers_.opaque_handle(),
+                                   executable.halo_scratch_.opaque_handle(), *state.transfer_);
+        count_cw_kernel();
+      }
+      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+        nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
+                                    executable.halo_scatters_.opaque_handle(),
+                                    executable.halo_scratch_.opaque_handle(), *state.transfer_);
+        count_cw_kernel();
+      }
+      return true;
+    case OpKind::apply_sources:
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        nvidia::launch_source_batch(executable.source_batches_[i],
+                                    executable.source_scalars_.opaque_handle(), *state.transfer_);
+        count_cw_kernel();
+      }
+      return true;
+    case OpKind::update_dft:
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        const nvidia::dft_launch &dft = executable.dft_updates_[i];
+        if (graph_scalars) {
+          const StepScalarSlot *predicate = NULL;
+          for (const StepScalarSlot &slot : executable.graph_program_.scalar_layout.slots)
+            if (slot.semantic == StepScalarSemantic::dft_due_predicate &&
+                slot.semantic_index == uint32_t(dft.decimation_factor)) {
+              predicate = &slot;
+              break;
+            }
+          if (!predicate) throw std::logic_error("NVIDIA graph DFT predicate is missing");
+          const size_t word = (predicate->byte_offset - offsetof(StepScalars, predicate_words)) /
+                              sizeof(uint64_t);
+          nvidia::launch_dft_graph(dft, graph_scalars, uint32_t(word), predicate->bit_offset,
+                                   *state.transfer_);
+        }
+        else {
+          if ((f_.t % dft.decimation_factor) != 0) continue;
+          const double sample_time = dft.magnetic ? f_.time() - 0.5 * f_.dt : f_.time();
+          nvidia::launch_dft(dft, sample_time, *state.transfer_);
+        }
+        count_cw_kernel();
+      }
+      return true;
+    case OpKind::update_flux_half: {
+      const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
+                                           "clearing NVIDIA legacy flux half sample");
+      nvidia::fill_byte_async(executable.legacy_flux_current_, 0, 0, bytes, *state.transfer_);
+      accumulate_legacy_flux();
+      nvidia::copy_device_to_device_async(executable.legacy_flux_half_, 0,
+                                          executable.legacy_flux_current_, 0, bytes,
+                                          *state.transfer_);
+      return true;
+    }
+    case OpKind::update_flux: {
+      const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
+                                           "copying NVIDIA legacy flux result");
+      nvidia::fill_byte_async(executable.legacy_flux_current_, 0, 0, bytes, *state.transfer_);
+      accumulate_legacy_flux();
+      nvidia::launch_legacy_flux_average(executable.legacy_flux_current_.opaque_handle(),
+                                         executable.legacy_flux_half_.opaque_handle(),
+                                         op.legacy_flux_count, *state.transfer_);
+      return true;
+    }
+    case OpKind::finite_value_check:
+      nvidia::fill_byte_async(executable.finite_result_, 0, 0xff, sizeof(uint64_t),
+                              *state.transfer_);
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        if (graph_scalars)
+          nvidia::launch_finite_check_graph(executable.finite_checks_[i].launch,
+                                            executable.finite_result_.opaque_handle(),
+                                            graph_scalars, *state.transfer_);
+        else
+          nvidia::launch_finite_check(executable.finite_checks_[i].launch,
+                                      executable.finite_result_.opaque_handle(),
+                                      *state.transfer_);
+      }
+      if (account_cw) state.cw_workspace_->timestep_kernel_launches_ += op.count;
+      if (account_cw) state.cw_workspace_->finite_check_kernel_launches_ += op.count;
+      return true;
+    default: return false;
+  }
+}
+
+void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
+                                              NvidiaExecutable &executable,
+                                              NvidiaBackendState &state) {
+  executable.graph_statistics_ = NvidiaGraphStatistics();
+  executable.graph_statistics_.requested = graph_mode_;
+  executable.graph_statistics_.valid = true;
+
+  const GraphExecutionMode requested =
+      reconcile_graph_mode(graph_mode_, graph_mode_parse_valid_);
+  executable.graph_statistics_.requested = requested;
+  const int local_program = int(plan.program);
+  const int minimum_program = min_to_all(local_program);
+  const int maximum_program = max_to_all(local_program);
+  if (minimum_program != maximum_program)
+    throw std::invalid_argument("NVIDIA timestep program differs across ranks");
+
+  if (plan.program != StepProgram::ordinary) {
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error("required CUDA graph mode does not yet support solve_cw");
+    return;
+  }
+
+  GraphLoweringAuthorities authority;
+  GraphProgram graph_program;
+  std::string local_error;
+  try {
+    authority = build_graph_lowering_authorities(plan, f_.halos, f_.array_catalog,
+                                                  f_.is_real ? 1 : 2);
+    graph_program = build_graph_program(plan, authority, GraphVariantKind::ordinary);
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown NVIDIA graph lowering failure";
+  }
+  reconcile_graph_stage(local_error, "NVIDIA graph lowering failed on another rank");
+
+  local_error.clear();
+  bool program_graphable = false;
+  try {
+    std::string graph_error;
+    if (!validate_graph_program(plan, authority, graph_program, &graph_error))
+      throw std::invalid_argument(graph_error.empty() ? "invalid NVIDIA graph program"
+                                                       : graph_error);
+    program_graphable = graph_required_compatible(graph_program);
+    for (const GraphBoundary &boundary : graph_program.boundaries)
+      if (boundary.kind == GraphBoundaryKind::remote_halo) program_graphable = false;
+    for (const GraphSegment &segment : graph_program.segments)
+      for (const GraphOperationRef &operation : segment.operations)
+        if (operation.operation.guard.kind == GuardKind::device_predicate &&
+            operation.operation.kind != OpKind::update_dft)
+          program_graphable = false;
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown NVIDIA graph validation failure";
+  }
+  reconcile_graph_stage(local_error, "NVIDIA graph validation failed on another rank");
+
+  bool runtime_supported = false;
+  local_error.clear();
+  try {
+    runtime_supported = nvidia::query_graph_capability().capture_supported;
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown CUDA graph capability-query failure";
+  }
+  reconcile_graph_stage(local_error,
+                        "CUDA graph capability query failed on another rank");
+  if (!reconcile_graph_support(requested, runtime_supported && program_graphable)) return;
+
+  const auto discard_graph_state = [&]() {
+    executable.graph_enabled_ = false;
+    executable.graph_statistics_.enabled = false;
+    executable.graph_statistics_.segment_count = 0;
+    executable.graph_statistics_.capture_count = 0;
+    executable.graph_statistics_.instantiate_count = 0;
+    std::string cleanup_error;
+    const auto remember_cleanup_error = [&](const std::exception &error) {
+      if (cleanup_error.empty()) cleanup_error = error.what();
+    };
+    for (NvidiaCompiledGraphSegment &segment : executable.graph_segments_) {
+      try { segment.executable.reset(); }
+      catch (const std::exception &error) { remember_cleanup_error(error); }
+      catch (...) {
+        if (cleanup_error.empty())
+          cleanup_error = "unknown CUDA graph executable cleanup failure";
+      }
+      try { segment.definition.reset(); }
+      catch (const std::exception &error) { remember_cleanup_error(error); }
+      catch (...) {
+        if (cleanup_error.empty())
+          cleanup_error = "unknown CUDA graph definition cleanup failure";
+      }
+    }
+    bool graphs_released = true;
+    for (const NvidiaCompiledGraphSegment &segment : executable.graph_segments_)
+      graphs_released = graphs_released && !segment.executable.opaque_handle() &&
+                        !segment.definition.opaque_handle() && !segment.definition.capturing();
+    if (graphs_released) {
+      executable.graph_segments_.clear();
+      executable.graph_program_ = GraphProgram();
+      try {
+        executable.step_scalars_.reset();
+        state.transfer_->synchronize();
+      }
+      catch (const std::exception &error) { remember_cleanup_error(error); }
+      catch (...) {
+        if (cleanup_error.empty()) cleanup_error = "unknown CUDA graph cleanup failure";
+      }
+    }
+    reconcile_graph_stage(cleanup_error, "CUDA graph cleanup failed on another rank");
+  };
+
+  local_error.clear();
+  try {
+    executable.graph_program_ = graph_program;
+    executable.step_scalars_.allocate(sizeof(StepScalars), state.device_);
+    state.transfer_->synchronize();
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown CUDA graph scalar-allocation failure";
+  }
+  const bool allocation_failed = or_to_all(!local_error.empty());
+  if (allocation_failed) {
+    discard_graph_state();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty()
+                                   ? "CUDA graph scalar allocation failed on another rank"
+                                   : local_error);
+    return;
+  }
+
+  local_error.clear();
+  try {
+    executable.graph_segments_.reserve(graph_program.segments.size());
+    const StepScalars *device_scalars =
+        static_cast<const StepScalars *>(executable.step_scalars_.opaque_handle());
+    for (size_t i = 0; i < graph_program.segments.size(); ++i) {
+      std::ostringstream label;
+      label << "ordinary-step-segment-" << i;
+      executable.graph_segments_.push_back(NvidiaCompiledGraphSegment(graph_program.segments[i]));
+      NvidiaCompiledGraphSegment &compiled = executable.graph_segments_.back();
+      compiled.definition.begin_capture(*state.transfer_, label.str());
+      for (const GraphOperationRef &operation : compiled.plan.operations) {
+        if (operation.operation_index >= executable.operations_.size())
+          throw std::logic_error("NVIDIA graph operation index is out of range");
+        if (!launch_device_operation(executable, state,
+                                     executable.operations_[operation.operation_index],
+                                     device_scalars, false))
+          throw std::logic_error("NVIDIA graph segment contains a host-only operation");
+      }
+      compiled.definition.end_capture(*state.transfer_);
+      ++executable.graph_statistics_.capture_count;
+    }
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown CUDA graph capture failure";
+  }
+  const bool capture_failed = or_to_all(!local_error.empty());
+  if (capture_failed) {
+    discard_graph_state();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty() ? "CUDA graph capture failed on another rank"
+                                                   : local_error);
+    return;
+  }
+
+  local_error.clear();
+  try {
+    for (NvidiaCompiledGraphSegment &compiled : executable.graph_segments_) {
+      compiled.executable.instantiate(compiled.definition);
+      ++executable.graph_statistics_.instantiate_count;
+    }
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  catch (...) {
+    local_error = "unknown CUDA graph instantiate failure";
+  }
+  const bool instantiate_failed = or_to_all(!local_error.empty());
+  if (instantiate_failed) {
+    discard_graph_state();
+    if (requested == GraphExecutionMode::required)
+      throw std::runtime_error(local_error.empty()
+                                   ? "CUDA graph instantiate failed on another rank"
+                                   : local_error);
+    return;
+  }
+
+  executable.graph_enabled_ = true;
+  executable.graph_statistics_.enabled = true;
+  executable.graph_statistics_.segment_count = executable.graph_segments_.size();
+}
+
 void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state, int num_steps) {
   NvidiaBackendState &state = checked_state(raw_state);
   NvidiaExecutable &executable = checked_executable(raw_executable, state);
@@ -9930,9 +10500,6 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   try {
     nvidia::device_scope scope(state.device_);
     const bool account_cw = executable.program_ == StepProgram::solve_cw && state.cw_workspace_;
-    const auto count_cw_kernel = [&]() {
-      if (account_cw) ++state.cw_workspace_->timestep_kernel_launches_;
-    };
     const auto count_cw_source_upload = [&](size_t bytes) {
       if (!account_cw) return;
       ++state.cw_workspace_->source_scalar_h2d_calls_;
@@ -9951,21 +10518,51 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
       }
       if (op.material_count) state.transfer_->synchronize();
     };
-    const auto accumulate_legacy_flux = [&](const NvidiaCompiledOperation &op) {
-      for (size_t i = op.legacy_flux_first;
-           i < op.legacy_flux_first + op.legacy_flux_count; ++i) {
-        const NvidiaCompiledLegacyFluxUpdate &update = executable.legacy_flux_updates_[i];
-        double *result = static_cast<double *>(
-                             executable.legacy_flux_current_.opaque_handle()) +
-                         update.flux_ordinal;
-        for (size_t j = update.term_first; j < update.term_first + update.term_count; ++j) {
-          const nvidia::legacy_flux_term_launch &term = executable.legacy_flux_terms_[j];
-          if (!term.e_real || !term.h_real) continue;
-          nvidia::launch_legacy_flux_term(term,
-                                          executable.legacy_flux_partials_.opaque_handle(),
-                                          result, *state.transfer_);
+    const auto publish_legacy_flux = [&](const NvidiaCompiledOperation &op) {
+      const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
+                                           "copying NVIDIA legacy flux result");
+      nvidia::copy_device_to_host_async(executable.legacy_flux_host_.data(),
+                                        executable.legacy_flux_current_, 0, bytes,
+                                        *state.transfer_);
+      state.transfer_->synchronize();
+      sum_to_all(static_cast<const double *>(executable.legacy_flux_host_.data()),
+                 executable.legacy_flux_global_.data(), int(op.legacy_flux_count));
+      backend_publish_legacy_flux(f_, executable.legacy_flux_global_.data(),
+                                  executable.legacy_flux_global_.size(),
+                                  "NVIDIA legacy flux publication");
+    };
+    const auto complete_finite_check = [&](const NvidiaCompiledOperation &op) {
+      nvidia::copy_device_to_host_async(executable.finite_result_host_.data(),
+                                        executable.finite_result_, 0, sizeof(uint64_t),
+                                        *state.transfer_);
+      if (account_cw) {
+        ++state.cw_workspace_->diagnostic_d2h_calls_;
+        state.cw_workspace_->diagnostic_d2h_bytes_ += sizeof(uint64_t);
+      }
+      state.transfer_->synchronize();
+      uint64_t first_bad = std::numeric_limits<uint64_t>::max();
+      memcpy(&first_bad, executable.finite_result_host_.data(), sizeof(first_bad));
+      if (first_bad == std::numeric_limits<uint64_t>::max()) return;
+      const NvidiaFiniteCheck *found = NULL;
+      size_t element = 0;
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        const NvidiaFiniteCheck &scan = executable.finite_checks_[i];
+        if (first_bad >= scan.launch.ordinal_base &&
+            first_bad - scan.launch.ordinal_base < scan.launch.elements) {
+          found = &scan;
+          element = size_t(first_bad - scan.launch.ordinal_base);
+          break;
         }
       }
+      if (!found)
+        throw std::logic_error("NVIDIA finite-value diagnostic returned an invalid ordinal");
+      if (!f_.nonfinite_flag) {
+        f_.nonfinite_flag = 1;
+        f_.first_bad_step = f_.t;
+        f_.first_bad_component = found->key.component_;
+      }
+      meep::abort("simulation fields are NaN or Inf (chunk %d, component %d, cmp %d, element %zu)",
+                  found->key.chunk, found->key.component_, found->key.cmp, element);
     };
     for (int step = 0; step < num_steps; ++step) {
       bool segment_guard = false;
@@ -9979,9 +10576,173 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
         f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
       }
+      const bool finite_due = finite_mode == FiniteCheckMode::step ||
+                              (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps);
+      if (executable.graph_enabled_) {
+        StepScalars scalars = {};
+        scalars.abi_version = step_scalars_abi_version;
+        scalars.byte_size = sizeof(StepScalars);
+        scalars.entry_timestep = f_.t;
+        scalars.post_increment_timestep = int64_t(f_.t) + 1;
+        scalars.noisy_counter_time = uint64_t(f_.t);
+        for (int i = 0; i < 3; ++i) scalars.source_times[i] = f_.step_source_times[i];
+        scalars.batch_ordinal = uint64_t(step);
+        scalars.batch_count = uint64_t(num_steps);
+        scalars.dft_timestep = int64_t(f_.t) + 1;
+        scalars.noisy_seed_generation = state.random_seed_snapshot_accepted
+                                            ? state.accepted_random_seed.generation
+                                            : 0;
+        scalars.active_noisy_seed_slot = state.noisy_seed_active_slot_;
+        scalars.finite_check_mode = uint32_t(finite_mode);
+        scalars.finite_check_due = finite_due ? 1u : 0u;
+        scalars.graph_variant = uint32_t(GraphVariantKind::ordinary);
+        for (const StepScalarSlot &slot : executable.graph_program_.scalar_layout.slots) {
+          bool value = false;
+          if (slot.semantic == StepScalarSemantic::dft_due_predicate)
+            value = slot.semantic_index &&
+                    scalars.dft_timestep % int64_t(slot.semantic_index) == 0;
+          else if (slot.semantic == StepScalarSemantic::guard_predicate)
+            value = true;
+          if (value && slot.type == StepScalarType::predicate_bit) {
+            const size_t word =
+                (slot.byte_offset - offsetof(StepScalars, predicate_words)) / sizeof(uint64_t);
+            scalars.predicate_words[word] |= uint64_t(1) << slot.bit_offset;
+          }
+        }
+        nvidia::launch_step_scalars_write(executable.step_scalars_, scalars, *state.transfer_);
+        ++executable.graph_statistics_.scalar_write_count;
+        ++state.graph_statistics_.scalar_write_count;
+        bool graph_segment_guard = false;
+        for (const GraphScheduleEntry &entry : executable.graph_program_.schedule) {
+          if (entry.kind == GraphScheduleKind::segment) {
+            if (entry.index >= executable.graph_segments_.size())
+              throw std::logic_error("NVIDIA graph schedule segment is out of range");
+            executable.graph_segments_[entry.index].executable.launch(*state.transfer_);
+            ++executable.graph_statistics_.launch_count;
+            ++state.graph_statistics_.launch_count;
+            /* Preserve the existing post-dispatch failure seams.  Captured
+               nodes no longer pass through their launch wrappers at replay,
+               so consume these test-only failures immediately after the
+               irreversible graph launch. */
+            for (const GraphOperationRef &operation :
+                 executable.graph_segments_[entry.index].plan.operations) {
+              const NvidiaCompiledOperation &launched =
+                  executable.operations_[operation.operation_index];
+              if (launched.kind != OpKind::update_polarization) continue;
+              for (size_t i = launched.polarization_first;
+                   i < launched.polarization_first + launched.polarization_count; ++i) {
+                const NvidiaCompiledPolarizationAction &action =
+                    executable.polarization_actions_[i];
+                if (action.kind == NvidiaCompiledPolarizationAction::Kind::ordinary &&
+                    executable.polarization_updates_[action.index].kind ==
+                        nvidia::compiled_polarization_update::kind_type::noisy_add &&
+                    nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::noisy_add))
+                  throw std::runtime_error("injected NVIDIA noisy-add postlaunch failure");
+                if (action.kind ==
+                        NvidiaCompiledPolarizationAction::Kind::multilevel_population &&
+                    nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::multilevel_population))
+                  throw std::runtime_error(
+                      "injected NVIDIA multilevel population postlaunch failure");
+                if (action.kind ==
+                        NvidiaCompiledPolarizationAction::Kind::multilevel_transition &&
+                    nvidia::testing::consume_failure_for_testing(
+                        nvidia::testing::failure_point::multilevel_transition))
+                  throw std::runtime_error(
+                      "injected NVIDIA multilevel transition postlaunch failure");
+              }
+            }
+            continue;
+          }
+          if (entry.index >= executable.graph_program_.boundaries.size())
+            throw std::logic_error("NVIDIA graph schedule boundary is out of range");
+          const GraphBoundary &boundary = executable.graph_program_.boundaries[entry.index];
+          ++executable.graph_statistics_.boundary_count;
+          ++state.graph_statistics_.boundary_count;
+          if (boundary.first_operation >= executable.operations_.size())
+            throw std::logic_error("NVIDIA graph boundary operation is out of range");
+          const NvidiaCompiledOperation &op = executable.operations_[boundary.first_operation];
+          if (boundary.completion_only) {
+            if (boundary.kind == GraphBoundaryKind::legacy_flux_publish)
+              publish_legacy_flux(op);
+            else if (boundary.kind == GraphBoundaryKind::finite_diagnostic && finite_due)
+              complete_finite_check(op);
+            continue;
+          }
+          if (op.guard.kind == GuardKind::segment_boundary && !graph_segment_guard &&
+              op.kind != OpKind::phase_material)
+            continue;
+          switch (op.kind) {
+            case OpKind::host_callback:
+              execute_host_segment(executable, state, boundary.first_operation,
+                                   op.host_segment_index);
+              break;
+            case OpKind::phase_material:
+              graph_segment_guard = f_.phase_material_mix();
+              if (graph_segment_guard) upload_material(op);
+              break;
+            case OpKind::update_material_coefficients:
+              for (int i = 0; i < f_.num_chunks; ++i) f_.chunks[i]->s->update_condinv();
+              if (graph_segment_guard) upload_material(op);
+              break;
+            case OpKind::evaluate_source_scalars: {
+              evaluate_supported_source_scalars(f_, op.source_time_offset);
+              const SourcePlan &source_plan = f_.descriptors->sources;
+              if (source_plan.scalars.size() != executable.source_scalar_count_ ||
+                  op.count != executable.source_scalar_count_)
+                throw std::logic_error("NVIDIA source scalar block changed after compilation");
+              if (!op.count) break;
+              nvidia::source_scalar *staging =
+                  static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+                  op.source_staging_offset;
+              for (size_t i = 0; i < op.count; ++i) {
+                staging[i].current_real = source_plan.scalars[i].current.real();
+                staging[i].current_imag = source_plan.scalars[i].current.imag();
+                staging[i].dipole_real = source_plan.scalars[i].dipole.real();
+                staging[i].dipole_imag = source_plan.scalars[i].dipole.imag();
+              }
+              const size_t bytes = checked_product(op.count, sizeof(nvidia::source_scalar),
+                                                   "uploading NVIDIA source scalars");
+              nvidia::copy_host_to_device_async(executable.source_scalars_, 0, staging, bytes,
+                                                 *state.transfer_);
+              break;
+            }
+            case OpKind::increment_time: ++f_.t; break;
+            case OpKind::restore_magnetic_fields:
+              if (f_.synchronized_magnetic_fields) {
+                preflight_magnetic_transition(executable, state, false);
+                restore_magnetic_fields(executable, state);
+              }
+              break;
+            case OpKind::synchronize_magnetic_fields:
+              if (f_.synchronized_magnetic_fields) {
+                preflight_magnetic_transition(executable, state, true);
+                synchronize_magnetic_fields(executable, state);
+              }
+              break;
+            default:
+              if (!launch_device_operation(executable, state, op, NULL, false))
+                throw std::logic_error("NVIDIA graph boundary has an invalid host operation");
+              break;
+          }
+        }
+        /* PR6.2 deliberately retains this synchronization: one pinned source
+           staging allocation is reused by the next step. */
+        state.transfer_->synchronize();
+        continue;
+      }
       for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
         const NvidiaCompiledOperation &op = executable.operations_[oi];
         if (op.guard.kind == GuardKind::segment_boundary && !segment_guard) continue;
+        if (op.kind == OpKind::finite_value_check && account_cw && cw_profile_mode_requested())
+          continue;
+        if (op.kind == OpKind::finite_value_check && !finite_due) continue;
+        if (launch_device_operation(executable, state, op, NULL, account_cw)) {
+          if (op.kind == OpKind::update_flux) publish_legacy_flux(op);
+          else if (op.kind == OpKind::finite_value_check) complete_finite_check(op);
+          continue;
+        }
         switch (op.kind) {
           case OpKind::host_callback:
             execute_host_segment(executable, state, oi, op.host_segment_index);
@@ -10004,131 +10765,6 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               f_.chunks[i]->s->update_condinv();
             if (segment_guard) upload_material(op);
             break;
-          case OpKind::update_db:
-            for (size_t i = op.first; i < op.first + op.count; ++i) {
-              const uint32_t prefix = executable.curl_updates_[i].radial_prefix_index;
-              if (prefix != UINT32_MAX)
-                nvidia::launch_cylindrical_radial_prefix(
-                    executable.cylindrical_radial_prefixes_[prefix], *state.transfer_);
-              if (prefix != UINT32_MAX) count_cw_kernel();
-              nvidia::launch_curl(executable.curl_updates_[i], *state.transfer_);
-              count_cw_kernel();
-              const uint32_t bfast = executable.curl_updates_[i].bfast_update_index;
-              if (bfast != UINT32_MAX)
-                nvidia::launch_bfast(executable.bfast_updates_[bfast], *state.transfer_);
-              if (bfast != UINT32_MAX) count_cw_kernel();
-            }
-            for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i) {
-              nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
-              count_cw_kernel();
-            }
-            for (size_t i = op.cylindrical_m_first;
-                 i < op.cylindrical_m_first + op.cylindrical_m_count; ++i) {
-              nvidia::launch_cylindrical_m(executable.cylindrical_m_updates_[i],
-                                           *state.transfer_);
-              count_cw_kernel();
-            }
-            for (size_t i = op.cylindrical_origin_first;
-                 i < op.cylindrical_origin_first + op.cylindrical_origin_count; ++i) {
-              const NvidiaCompiledCylindricalOriginAction &action =
-                  executable.cylindrical_origin_actions_[i];
-              if (action.kind == CylindricalOriginActionKind::axis_update)
-                nvidia::launch_cylindrical_axis(
-                    executable.cylindrical_axis_updates_[action.index], *state.transfer_);
-              else
-                nvidia::launch_zero(executable.zero_updates_[action.index], *state.transfer_);
-              count_cw_kernel();
-            }
-            break;
-          case OpKind::update_eh:
-            for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i) {
-              nvidia::launch_array_copy(executable.source_copies_[i], *state.transfer_);
-              count_cw_kernel();
-            }
-            for (size_t i = op.subtraction_first; i < op.subtraction_first + op.subtraction_count;
-                 ++i) {
-              nvidia::launch_polarization_subtract(executable.polarization_subtractions_[i],
-                                                   *state.transfer_);
-              count_cw_kernel();
-            }
-            for (size_t i = op.source_first; i < op.source_first + op.source_count; ++i) {
-              nvidia::launch_source_batch(executable.source_batches_[i],
-                                          executable.source_scalars_.opaque_handle(),
-                                          *state.transfer_);
-              count_cw_kernel();
-            }
-            for (size_t i = op.first; i < op.first + op.count; ++i) {
-              nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
-              count_cw_kernel();
-            }
-            break;
-          case OpKind::update_polarization:
-            {
-              const nvidia::noisy_seed_block *noisy_seed = NULL;
-              if (state.noisy_seed_active_slot_ >= 0)
-                noisy_seed = static_cast<const nvidia::noisy_seed_block *>(
-                                 state.noisy_seed_slots_.opaque_handle()) +
-                             state.noisy_seed_active_slot_;
-            for (size_t i = op.polarization_first;
-                 i < op.polarization_first + op.polarization_count; ++i) {
-              const NvidiaCompiledPolarizationAction &action =
-                  executable.polarization_actions_[i];
-              if (action.kind == NvidiaCompiledPolarizationAction::Kind::ordinary) {
-                nvidia::launch_polarization_update(
-                    executable.polarization_updates_[action.index], noisy_seed, uint64_t(f_.t),
-                    *state.transfer_);
-                if (executable.polarization_updates_[action.index].kind ==
-                        nvidia::compiled_polarization_update::kind_type::noisy_add &&
-                    nvidia::testing::consume_failure_for_testing(
-                        nvidia::testing::failure_point::noisy_add))
-                  throw std::runtime_error("injected NVIDIA noisy-add postlaunch failure");
-              }
-              else if (action.kind ==
-                       NvidiaCompiledPolarizationAction::Kind::multilevel_population) {
-                nvidia::launch_multilevel_population(
-                    executable.multilevel_population_updates_[action.index], *state.transfer_);
-                if (nvidia::testing::consume_failure_for_testing(
-                        nvidia::testing::failure_point::multilevel_population))
-                  throw std::runtime_error(
-                      "injected NVIDIA multilevel population postlaunch failure");
-              }
-              else if (action.kind ==
-                       NvidiaCompiledPolarizationAction::Kind::multilevel_transition) {
-                nvidia::launch_multilevel_transition(
-                    executable.multilevel_transition_updates_[action.index], *state.transfer_);
-                if (nvidia::testing::consume_failure_for_testing(
-                        nvidia::testing::failure_point::multilevel_transition))
-                  throw std::runtime_error(
-                      "injected NVIDIA multilevel transition postlaunch failure");
-              }
-              else
-                throw std::logic_error("NVIDIA polarization schedule has an invalid action");
-              count_cw_kernel();
-            }
-            break;
-            }
-          case OpKind::transfer_halo:
-            for (size_t i = op.first; i < op.first + op.count; ++i) {
-              nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
-              count_cw_kernel();
-            }
-            /* All source values must be captured before any destination is
-               overwritten: local chunk boundaries can alias another plan's
-               gather side. Stream ordering supplies the gather/scatter
-               barrier without a host synchronization. */
-            for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-              nvidia::launch_halo_gather(
-                  executable.halo_plans_[i].gather, executable.halo_gathers_.opaque_handle(),
-                  executable.halo_scratch_.opaque_handle(), *state.transfer_);
-              count_cw_kernel();
-            }
-            for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-              nvidia::launch_halo_scatter(
-                  executable.halo_plans_[i].scatter, executable.halo_scatters_.opaque_handle(),
-                  executable.halo_scratch_.opaque_handle(), *state.transfer_);
-              count_cw_kernel();
-            }
-            break;
           case OpKind::evaluate_source_scalars: {
             if (state.cw_skip_source_evaluation_) break;
             evaluate_supported_source_scalars(f_, op.source_time_offset);
@@ -10136,6 +10772,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             if (source_plan.scalars.size() != executable.source_scalar_count_ ||
                 op.count != executable.source_scalar_count_)
               throw std::logic_error("NVIDIA source scalar block changed after compilation");
+            if (!op.count) break;
             nvidia::source_scalar *staging =
                 static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
                 op.source_staging_offset;
@@ -10153,14 +10790,6 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
             count_cw_source_upload(upload_bytes);
             break;
           }
-          case OpKind::apply_sources:
-            for (size_t i = op.first; i < op.first + op.count; ++i) {
-              nvidia::launch_source_batch(executable.source_batches_[i],
-                                          executable.source_scalars_.opaque_handle(),
-                                          *state.transfer_);
-              count_cw_kernel();
-            }
-            break;
           case OpKind::increment_time: ++f_.t; break;
           case OpKind::synchronize_magnetic_fields:
             if (f_.synchronized_magnetic_fields) {
@@ -10168,95 +10797,6 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               synchronize_magnetic_fields(executable, state);
             }
             break;
-          case OpKind::update_dft:
-            for (size_t i = op.first; i < op.first + op.count; ++i) {
-              const nvidia::dft_launch &dft = executable.dft_updates_[i];
-              if ((f_.t % dft.decimation_factor) != 0) continue;
-              const double sample_time =
-                  dft.magnetic ? f_.time() - 0.5 * f_.dt : f_.time();
-              nvidia::launch_dft(dft, sample_time, *state.transfer_);
-              count_cw_kernel();
-            }
-            break;
-          case OpKind::update_flux_half: {
-            const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
-                                                 "clearing NVIDIA legacy flux half sample");
-            nvidia::fill_byte_async(executable.legacy_flux_current_, 0, 0, bytes,
-                                    *state.transfer_);
-            accumulate_legacy_flux(op);
-            nvidia::copy_device_to_device_async(executable.legacy_flux_half_, 0,
-                                                executable.legacy_flux_current_, 0, bytes,
-                                                *state.transfer_);
-            break;
-          }
-          case OpKind::update_flux: {
-            const size_t bytes = checked_product(op.legacy_flux_count, sizeof(double),
-                                                 "copying NVIDIA legacy flux result");
-            nvidia::fill_byte_async(executable.legacy_flux_current_, 0, 0, bytes,
-                                    *state.transfer_);
-            accumulate_legacy_flux(op);
-            nvidia::launch_legacy_flux_average(executable.legacy_flux_current_.opaque_handle(),
-                                               executable.legacy_flux_half_.opaque_handle(),
-                                               op.legacy_flux_count, *state.transfer_);
-            nvidia::copy_device_to_host_async(executable.legacy_flux_host_.data(),
-                                              executable.legacy_flux_current_, 0, bytes,
-                                              *state.transfer_);
-            state.transfer_->synchronize();
-            sum_to_all(static_cast<const double *>(executable.legacy_flux_host_.data()),
-                       executable.legacy_flux_global_.data(), int(op.legacy_flux_count));
-            backend_publish_legacy_flux(f_, executable.legacy_flux_global_.data(),
-                                        executable.legacy_flux_global_.size(),
-                                        "NVIDIA legacy flux publication");
-            break;
-          }
-          case OpKind::finite_value_check: {
-            if (account_cw && cw_profile_mode_requested()) break;
-            const bool due = finite_mode == FiniteCheckMode::step ||
-                             (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps);
-            if (!due) break;
-            nvidia::fill_byte_async(executable.finite_result_, 0, 0xff, sizeof(uint64_t),
-                                    *state.transfer_);
-            for (size_t i = op.first; i < op.first + op.count; ++i)
-              nvidia::launch_finite_check(executable.finite_checks_[i].launch,
-                                          executable.finite_result_.opaque_handle(),
-                                          *state.transfer_);
-            if (account_cw) state.cw_workspace_->timestep_kernel_launches_ += op.count;
-            if (account_cw) state.cw_workspace_->finite_check_kernel_launches_ += op.count;
-            nvidia::copy_device_to_host_async(executable.finite_result_host_.data(),
-                                              executable.finite_result_, 0, sizeof(uint64_t),
-                                              *state.transfer_);
-            if (account_cw) {
-              ++state.cw_workspace_->diagnostic_d2h_calls_;
-              state.cw_workspace_->diagnostic_d2h_bytes_ += sizeof(uint64_t);
-            }
-            state.transfer_->synchronize();
-
-            uint64_t first_bad = std::numeric_limits<uint64_t>::max();
-            memcpy(&first_bad, executable.finite_result_host_.data(), sizeof(first_bad));
-            if (first_bad == std::numeric_limits<uint64_t>::max()) break;
-
-            const NvidiaFiniteCheck *found = NULL;
-            size_t element = 0;
-            for (size_t i = op.first; i < op.first + op.count; ++i) {
-              const NvidiaFiniteCheck &scan = executable.finite_checks_[i];
-              if (first_bad >= scan.launch.ordinal_base &&
-                  first_bad - scan.launch.ordinal_base < scan.launch.elements) {
-                found = &scan;
-                element = size_t(first_bad - scan.launch.ordinal_base);
-                break;
-              }
-            }
-            if (!found)
-              throw std::logic_error("NVIDIA finite-value diagnostic returned an invalid ordinal");
-            if (!f_.nonfinite_flag) {
-              f_.nonfinite_flag = 1;
-              f_.first_bad_step = f_.t;
-              f_.first_bad_component = found->key.component_;
-            }
-            meep::abort(
-                "simulation fields are NaN or Inf (chunk %d, component %d, cmp %d, element %zu)",
-                found->key.chunk, found->key.component_, found->key.cmp, element);
-          }
           default: break; // capability validation proved these operations are no-ops
         }
       }
@@ -10657,6 +11197,11 @@ NvidiaBackend::material_initialization_statistics_for_testing() const {
   NvidiaBackendState *state = current_state();
   return state ? state->material_initialization_statistics_
                : NvidiaMaterialInitializationStatistics();
+}
+
+NvidiaGraphStatistics NvidiaBackend::graph_statistics_for_testing() const {
+  NvidiaBackendState *state = current_state();
+  return state ? state->graph_statistics_ : NvidiaGraphStatistics();
 }
 
 ExecutionBackend *make_nvidia_backend(fields &f, const execution_options &options,

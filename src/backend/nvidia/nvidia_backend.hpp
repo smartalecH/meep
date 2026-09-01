@@ -20,11 +20,13 @@
 #include <vector>
 
 #include "backend/backend.hpp"
+#include "backend/graph_plan.hpp"
 
 namespace meep {
 
 class NvidiaBackendState;
 class NvidiaExecutable;
+struct NvidiaCompiledOperation;
 
 struct NvidiaMaterialInitializationStatistics {
   size_t compact_input_host_to_device_calls;
@@ -104,6 +106,23 @@ struct NvidiaHostFallbackStatistics {
       : segment_executions(0), callback_resolutions(0), device_to_host_calls(0),
         device_to_host_bytes(0), host_to_device_calls(0), host_to_device_bytes(0),
         synchronizations(0), steady_capacity_growths(0) {}
+};
+
+struct NvidiaGraphStatistics {
+  GraphExecutionMode requested;
+  bool enabled;
+  bool valid;
+  size_t segment_count;
+  size_t capture_count;
+  size_t instantiate_count;
+  size_t scalar_write_count;
+  size_t launch_count;
+  size_t boundary_count;
+
+  NvidiaGraphStatistics()
+      : requested(GraphExecutionMode::automatic), enabled(false), valid(false),
+        segment_count(0), capture_count(0), instantiate_count(0), scalar_write_count(0),
+        launch_count(0), boundary_count(0) {}
 };
 
 struct NvidiaCwStatistics {
@@ -228,6 +247,25 @@ namespace testing {
    first candidate allocation. SIZE_MAX restores the physical-device budget. */
 void set_initialization_memory_budget_for_testing(size_t bytes);
 size_t initialization_memory_budget_for_testing();
+
+/* Exercises the same rank-reconciliation seams used by graph configuration
+   without requiring MPI timestepping to be enabled.  Each validity flag is
+   deliberately local so MPI tests can inject one-rank failures and prove
+   that every rank makes the same publication decision. */
+struct graph_collective_probe {
+  const char *mode;
+  bool lowering_valid;
+  bool validation_valid;
+  bool runtime_capture_supported;
+  bool program_graphable;
+  bool allocation_valid;
+  bool capture_valid;
+  bool instantiate_valid;
+  bool graph_exec_destroy_valid;
+  bool graph_destroy_valid;
+  bool graph_device_restore_valid;
+};
+GraphModeResolution reconcile_graph_execution_for_testing(const graph_collective_probe &probe);
 } // namespace testing
 
 } // namespace nvidia
@@ -285,6 +323,7 @@ public:
   NvidiaCwStatistics cw_statistics_for_testing() const;
   NvidiaHostFallbackStatistics host_fallback_statistics_for_testing() const;
   NvidiaMaterialInitializationStatistics material_initialization_statistics_for_testing() const;
+  NvidiaGraphStatistics graph_statistics_for_testing() const;
   int device_ordinal_for_testing() const { return device_; }
 
 private:
@@ -296,10 +335,18 @@ private:
                                        const NvidiaBackendState &state) const;
   void execute_host_segment(NvidiaExecutable &executable, NvidiaBackendState &state,
                             size_t operation_index, size_t segment_index);
+  bool launch_device_operation(NvidiaExecutable &executable, NvidiaBackendState &state,
+                               const NvidiaCompiledOperation &operation,
+                               const StepScalars *graph_scalars,
+                               bool account_cw);
+  void configure_graph_execution(const StepPlan &plan, NvidiaExecutable &executable,
+                                 NvidiaBackendState &state);
   void execute_magnetic_half_step(NvidiaExecutable &executable, NvidiaBackendState &state);
   fields &f_;
   execution_options options_;
   int device_;
+  GraphExecutionMode graph_mode_;
+  bool graph_mode_parse_valid_;
   size_t device_memory_bytes_;
   uint64_t next_state_token_;
   mutable size_t pending_initialization_reserve_bytes_;

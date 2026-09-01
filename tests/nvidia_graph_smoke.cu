@@ -180,6 +180,143 @@ int main() {
   CHECK(destroy_destination.opaque_handle() && !destroy_source.opaque_handle(),
         "graph destroy cleanup could not be retried");
 
+  graph_exec cleanup_exec;
+  cleanup_exec.instantiate(replacement);
+  const graph_accounting exec_cleanup_before = testing::current_graph_accounting();
+  void *const cleanup_exec_handle = cleanup_exec.opaque_handle();
+  injected = false;
+  testing::fail_next(testing::failure_point::graph_exec_destroy);
+  try { cleanup_exec.reset(); }
+  catch (const std::runtime_error &) { injected = true; }
+  const graph_accounting exec_cleanup_failed = testing::current_graph_accounting();
+  CHECK(injected && cleanup_exec.opaque_handle() == cleanup_exec_handle &&
+            exec_cleanup_failed.executable_destroys ==
+                exec_cleanup_before.executable_destroys,
+        "failed executable reset lost ownership or reported a false destroy");
+  cleanup_exec.reset();
+  const graph_accounting exec_cleanup_retried = testing::current_graph_accounting();
+  CHECK(!cleanup_exec.opaque_handle() &&
+            exec_cleanup_retried.executable_destroys ==
+                exec_cleanup_before.executable_destroys + 1,
+        "executable reset retry did not release exactly one retained handle");
+
+  graph cleanup_definition;
+  cleanup_definition.create(work.device(), "cleanup-definition");
+  const graph_accounting graph_cleanup_before = testing::current_graph_accounting();
+  void *const cleanup_graph_handle = cleanup_definition.opaque_handle();
+  injected = false;
+  testing::fail_next(testing::failure_point::graph_destroy);
+  try { cleanup_definition.reset(); }
+  catch (const std::runtime_error &) { injected = true; }
+  const graph_accounting graph_cleanup_failed = testing::current_graph_accounting();
+  CHECK(injected && cleanup_definition.opaque_handle() == cleanup_graph_handle &&
+            graph_cleanup_failed.graph_destroys == graph_cleanup_before.graph_destroys,
+        "failed graph reset lost ownership or reported a false destroy");
+  cleanup_definition.reset();
+  const graph_accounting graph_cleanup_retried = testing::current_graph_accounting();
+  CHECK(!cleanup_definition.opaque_handle() &&
+            graph_cleanup_retried.graph_destroys == graph_cleanup_before.graph_destroys + 1,
+        "graph reset retry did not release exactly one retained handle");
+
+  if (device_count > 1) {
+    const int owner_device = work.device();
+    const int caller_device = owner_device == 0 ? 1 : 0;
+
+    graph restore_definition;
+    restore_definition.create(owner_device, "restore-definition");
+    CHECK(cudaSetDevice(caller_device) == cudaSuccess,
+          "could not select alternate caller device for graph cleanup");
+    const graph_accounting restore_graph_before = testing::current_graph_accounting();
+    injected = false;
+    testing::fail_next(testing::failure_point::device_restore);
+    try { restore_definition.reset(); }
+    catch (const std::runtime_error &) { injected = true; }
+    const graph_accounting restore_graph_after = testing::current_graph_accounting();
+    CHECK(injected, "graph cleanup device-restoration failure was not reported");
+    CHECK(!restore_definition.opaque_handle() && restore_definition.device() == -1,
+          "graph restore failure retained an already-destroyed definition");
+    CHECK(restore_graph_after.graph_destroys == restore_graph_before.graph_destroys + 1,
+          "graph restore failure did not account exactly one successful destroy");
+    restore_definition.reset();
+    CHECK(testing::current_graph_accounting().graph_destroys ==
+              restore_graph_after.graph_destroys,
+          "graph restore failure allowed a second destroy attempt");
+
+    graph_exec restore_executable;
+    restore_executable.instantiate(replacement);
+    CHECK(cudaSetDevice(caller_device) == cudaSuccess,
+          "could not select alternate caller device for executable cleanup");
+    const graph_accounting restore_exec_before = testing::current_graph_accounting();
+    injected = false;
+    testing::fail_next(testing::failure_point::device_restore);
+    try { restore_executable.reset(); }
+    catch (const std::runtime_error &) { injected = true; }
+    const graph_accounting restore_exec_after = testing::current_graph_accounting();
+    CHECK(injected, "executable cleanup device-restoration failure was not reported");
+    CHECK(!restore_executable.opaque_handle() && restore_executable.device() == -1,
+          "executable restore failure retained an already-destroyed handle");
+    CHECK(restore_exec_after.executable_destroys ==
+              restore_exec_before.executable_destroys + 1,
+          "executable restore failure did not account exactly one successful destroy");
+    restore_executable.reset();
+    CHECK(testing::current_graph_accounting().executable_destroys ==
+              restore_exec_after.executable_destroys,
+          "executable restore failure allowed a second destroy attempt");
+
+    graph restore_move_definition_destination, restore_move_definition_source;
+    restore_move_definition_destination.create(owner_device, "restore-move-definition-old");
+    restore_move_definition_source.create(owner_device, "restore-move-definition-new");
+    void *const replacement_definition = restore_move_definition_source.opaque_handle();
+    CHECK(cudaSetDevice(caller_device) == cudaSuccess,
+          "could not select alternate caller device for graph move cleanup");
+    const graph_accounting restore_move_graph_before = testing::current_graph_accounting();
+    testing::fail_next(testing::failure_point::device_restore);
+    restore_move_definition_destination = std::move(restore_move_definition_source);
+    const graph_accounting restore_move_graph_after = testing::current_graph_accounting();
+    CHECK(restore_move_definition_destination.opaque_handle() == replacement_definition &&
+              !restore_move_definition_source.opaque_handle() &&
+              restore_move_graph_after.graph_destroys ==
+                  restore_move_graph_before.graph_destroys + 1,
+          "graph move assignment did not transfer ownership after successful destroy");
+
+    graph_exec restore_move_exec_destination, restore_move_exec_source;
+    restore_move_exec_destination.instantiate(replacement);
+    restore_move_exec_source.instantiate(replacement);
+    void *const replacement_executable = restore_move_exec_source.opaque_handle();
+    CHECK(cudaSetDevice(caller_device) == cudaSuccess,
+          "could not select alternate caller device for executable move cleanup");
+    const graph_accounting restore_move_exec_before = testing::current_graph_accounting();
+    testing::fail_next(testing::failure_point::device_restore);
+    restore_move_exec_destination = std::move(restore_move_exec_source);
+    const graph_accounting restore_move_exec_after = testing::current_graph_accounting();
+    CHECK(restore_move_exec_destination.opaque_handle() == replacement_executable &&
+              !restore_move_exec_source.opaque_handle() &&
+              restore_move_exec_after.executable_destroys ==
+                  restore_move_exec_before.executable_destroys + 1,
+          "executable move assignment did not transfer ownership after successful destroy");
+    CHECK(cudaSetDevice(owner_device) == cudaSuccess,
+          "could not restore graph-smoke owner device after failure injection");
+  }
+
+  const graph_accounting destructor_before = testing::current_graph_accounting();
+  {
+    graph destructor_definition;
+    destructor_definition.create(work.device(), "destructor-definition");
+    testing::fail_next(testing::failure_point::graph_destroy);
+  }
+  const graph_accounting graph_destructor_after = testing::current_graph_accounting();
+  CHECK(graph_destructor_after.graph_destroys == destructor_before.graph_destroys + 1,
+        "graph destructor did not complete best-effort cleanup after a transient failure");
+  {
+    graph_exec destructor_executable;
+    destructor_executable.instantiate(replacement);
+    testing::fail_next(testing::failure_point::graph_exec_destroy);
+  }
+  const graph_accounting exec_destructor_after = testing::current_graph_accounting();
+  CHECK(exec_destructor_after.executable_destroys ==
+            graph_destructor_after.executable_destroys + 1,
+        "executable destructor did not complete best-effort cleanup after a transient failure");
+
   graph create_failure;
   injected = false;
   testing::fail_next(testing::failure_point::graph_create);
@@ -272,8 +409,8 @@ int main() {
   CHECK(capability.runtime > 0 && capability.driver > 0 && capability.capture_supported,
         "CUDA graph capability query failed");
   const graph_accounting accounting = testing::current_graph_accounting();
-  CHECK(accounting.creates >= 5 && accounting.begin_captures == 5 && accounting.end_captures == 4 &&
-            accounting.instantiates == 3 && accounting.launches >= 1 &&
+  CHECK(accounting.creates >= 6 && accounting.begin_captures == 5 && accounting.end_captures == 4 &&
+            accounting.instantiates >= 4 && accounting.launches >= 1 &&
             accounting.scalar_writes == 6 && accounting.graph_destroys >= 5,
         "CUDA graph accounting is not exact");
 

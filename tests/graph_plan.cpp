@@ -210,6 +210,33 @@ static void test_scalar_layout() {
   CHECK(rejected, "invalid DFT decimation was accepted");
 }
 
+static void test_update_eh_polarization_subtraction_contract() {
+  StepPlan plan;
+  Operation update = operation(OpKind::update_eh, E_stuff);
+  update.polarization_subtraction_index = 0;
+  update.polarization_subtraction_count = 1;
+  plan.operations.push_back(update);
+  PolarizationSubtraction subtraction = {};
+  subtraction.chunk = 0;
+  subtraction.c = Ez;
+  subtraction.target = ArrayId{0};
+  subtraction.p = ArrayId{0};
+  subtraction.elements = 1;
+  plan.polarization_subtractions.push_back(subtraction);
+  plan.signature = compute_step_plan_signature(plan);
+  HaloFixture fixture;
+  const GraphLoweringAuthorities authority = fixture.authority(plan);
+  bool accepted = true;
+  try {
+    const GraphProgram graph = build_graph_program(plan, authority, GraphVariantKind::ordinary);
+    std::string error;
+    accepted = validate_graph_program(plan, authority, graph, &error);
+  }
+  catch (...) { accepted = false; }
+  CHECK(accepted,
+        "canonical update_eh polarization-subtraction span was rejected by graph lowering");
+}
+
 static void test_halo_authority_and_boundaries() {
   std::vector<Operation> operations;
   operations.push_back(operation(OpKind::update_db, B_stuff));
@@ -662,7 +689,25 @@ static void test_source_time_descriptor_semantics() {
   rejected(malformed, "nonzero source-time descriptor index was accepted");
   malformed = compact;
   malformed.operations[0].descriptor_count = 0;
-  rejected(malformed, "empty source-time descriptor span was accepted");
+  rejected(malformed, "empty source-time extent was accepted for a nonempty source plan");
+
+  StepPlan inconsistent = compact;
+  inconsistent.operations.push_back(*source_evaluation);
+  inconsistent.operations.back().descriptor_count = 1;
+  rejected(inconsistent, "partial source-time descriptor extent was accepted");
+
+  StepPlan empty;
+  empty.source_signature = source_plan_signature(SourcePlan());
+  Operation empty_evaluation = operation(OpKind::evaluate_source_scalars);
+  empty_evaluation.descriptor_count = 0;
+  empty.operations.push_back(empty_evaluation);
+  empty.signature = compute_step_plan_signature(empty);
+  HaloFixture empty_fixture;
+  (void)empty_fixture.authority(empty);
+
+  StepPlan nonzero_empty = empty;
+  nonzero_empty.operations[0].descriptor_index = 1;
+  rejected(nonzero_empty, "nonzero empty source-time descriptor index was accepted");
 }
 
 static void test_collective_mode_resolution() {
@@ -777,6 +822,7 @@ int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   verbosity = 0;
   test_scalar_layout();
+  test_update_eh_polarization_subtraction_contract();
   test_halo_authority_and_boundaries();
   test_host_covered_interval_once();
   test_variants_and_canonical_validation();

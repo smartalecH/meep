@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "backend/graph_plan.hpp"
 #include "backend/nvidia/runtime.hpp"
 
 namespace meep {
@@ -141,6 +142,8 @@ void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
                          const void *device_buffer, const stream &stream);
 void launch_finite_check(const finite_check_launch &launch, void *device_first_bad,
                          const stream &stream);
+void launch_finite_check_graph(const finite_check_launch &launch, void *device_first_bad,
+                               const StepScalars *scalars, const stream &stream);
 
 } // namespace nvidia
 } // namespace meep

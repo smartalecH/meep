@@ -33,6 +33,7 @@
 #include "backend/lifecycle.hpp"
 #include "backend/material_recipe.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/nvidia_graph.hpp"
 #include "backend/nvidia/nvidia_initialization.hpp"
 #include "backend/nvidia/nvidia_materials.hpp"
 #include "backend/nvidia/nvidia_polarization.hpp"
@@ -73,6 +74,16 @@ static void require(bool condition, const char *message) {
     fprintf(stderr, "FAIL: %s\n", message);
     meep::abort("nvidia_timestep failed");
   }
+}
+
+static void require_selected_graph_mode(fields &f) {
+  if (!getenv("MEEP_NVIDIA_GRAPH_ASSERT")) return;
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(f.backend);
+  const NvidiaGraphStatistics stats =
+      backend ? backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
+  const bool expected = getenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED") != NULL;
+  require(backend && stats.valid && stats.enabled == expected,
+          "NVIDIA focused fixture did not retain the requested graph mode");
 }
 
 #if MEEP_SINGLE
@@ -1334,6 +1345,10 @@ static void run_custom_source_case(const char *name, precision_policy_kind polic
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -1351,6 +1366,7 @@ static void run_custom_source_case(const char *name, precision_policy_kind polic
      field/time state so callback ordering can be compared from an equal cache. */
   cpu.advance(1);
   gpu.advance(1);
+  require_selected_graph_mode(gpu);
   cpu.t = gpu.t = 0;
   cpu_trace.times.clear();
   gpu_trace.times.clear();
@@ -1859,6 +1875,10 @@ static void test_legacy_flux_postlaunch_poison() {
   structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   gpu.use_real_fields();
   gpu.require_component(Ex);
@@ -1867,6 +1887,7 @@ static void test_legacy_flux_postlaunch_poison() {
   gpu.require_component(Hy);
   flux_vol *flux = gpu.add_flux_vol(Z, volume(vec(-0.75, 0.0), vec(0.75, 0.0)));
   gpu.init_backend();
+  require_selected_graph_mode(gpu);
   gpu.advance(1);
   const double published = flux->flux();
 
@@ -2168,6 +2189,7 @@ static void run_material_phase_case(const char *name, precision_policy_kind poli
   cpu.advance(1);
   cpu.t = 0;
   gpu.init_backend();
+  require_selected_graph_mode(gpu);
   const bool narrowed = policy != precision_policy_kind::native;
   if (narrowed) round_real_arrays(*cpu.array_catalog);
   initialize_live_fields_by_key(cpu, gpu, narrowed, 0.35);
@@ -2176,6 +2198,7 @@ static void run_material_phase_case(const char *name, precision_policy_kind poli
               gpu.phase_in_material(&gpu_target, 4.0 * gpu.dt) == 4,
           "material phase setup returned the wrong countdown");
   gpu.init_backend();
+  require_selected_graph_mode(gpu);
   gpu.synchronize_magnetic_fields();
   gpu.restore_magnetic_fields();
   require_material_targets_host_only(gpu);
@@ -4390,6 +4413,9 @@ static void test_native_material_geometry(precision_policy_kind precision) {
 
 enum driven_geometry_route { driven_bulk, driven_analytic, driven_patch };
 
+static void run_noisy_replay_case(precision_policy_kind policy);
+static void test_finite_diagnostics(precision_policy_kind policy);
+
 static void install_driven_geometry(structure &s, driven_geometry_route route) {
   using namespace meep_geom;
   material_type medium = make_dielectric(4.0);
@@ -4433,7 +4459,9 @@ static void compare_geometry_dft(fields &cpu, fields &gpu, const dft_fields &cpu
             "driven geometry DFT values differ");
 }
 
-static void test_driven_material_geometry(driven_geometry_route route) {
+static void test_driven_material_geometry(
+    driven_geometry_route route,
+    precision_policy_kind precision = precision_policy_kind::native) {
   const char *name = route == driven_bulk ? "bulk" : route == driven_analytic ? "analytic"
                                                                            : "patch";
   const grid_volume gv = vol2d(1.0, 1.0, 8.0);
@@ -4444,6 +4472,7 @@ static void test_driven_material_geometry(driven_geometry_route route) {
   fields cpu(&cpu_structure);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  options.precision = precision;
   options.strict = false;
   options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
@@ -4467,6 +4496,19 @@ static void test_driven_material_geometry(driven_geometry_route route) {
       gpu.add_flux_vol(X, volume(vec(0.0, -0.45), vec(0.0, 0.45)));
   cpu.init_backend();
   gpu.init_backend();
+  NvidiaBackend *graph_backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  const bool assert_graph = getenv("MEEP_NVIDIA_GRAPH_ASSERT") != NULL;
+  const bool expect_graph = getenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED") != NULL;
+  if (assert_graph) {
+    const NvidiaGraphStatistics stats =
+        graph_backend ? graph_backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
+    require(graph_backend && stats.valid && stats.enabled == expect_graph,
+            "NVIDIA graph mode selection differs from expectation");
+    require(!expect_graph ||
+                (stats.segment_count > 0 && stats.capture_count == stats.segment_count &&
+                 stats.instantiate_count == stats.segment_count),
+            "NVIDIA graph capture/instantiate accounting is incomplete");
+  }
   const MaterialIR *ir = material_ir_for(gpu);
   require(ir && !ir->bulk_spans.empty(), "driven geometry fixture has no bulk work");
   require((route == driven_bulk && ir->analytic_interfaces.empty() &&
@@ -4488,7 +4530,9 @@ static void test_driven_material_geometry(driven_geometry_route route) {
   }
   require(polarization_arrays && polarization && dft && flux_half && flux_full,
           "driven geometry fixture omitted polarization/DFT/flux state");
-  const double tolerance = sizeof(realnum) == sizeof(float) ? 2e-4 : 2e-11;
+  const double tolerance =
+      sizeof(realnum) == sizeof(float) || precision != precision_policy_kind::native ? 2e-4
+                                                                                    : 2e-11;
   int completed = 0;
   const int checkpoints[] = {1, 2, 100};
   for (int checkpoint : checkpoints) {
@@ -4501,7 +4545,254 @@ static void test_driven_material_geometry(driven_geometry_route route) {
             "driven geometry flux differs");
     compare_geometry_dft(cpu, gpu, cpu_monitor, gpu_monitor, monitor_component, tolerance);
   }
+  if (assert_graph) {
+    const NvidiaGraphStatistics stats = graph_backend->graph_statistics_for_testing();
+    require((expect_graph && stats.scalar_write_count == size_t(completed) &&
+             stats.launch_count == size_t(completed) * stats.segment_count &&
+             stats.boundary_count > 0) ||
+                (!expect_graph && stats.scalar_write_count == 0 && stats.launch_count == 0),
+            "NVIDIA graph steady-state accounting differs from the compiled schedule");
+  }
   master_printf("nvidia_timestep: material-geometry-driven-%s PASS\n", name);
+}
+
+static void test_graph_required_compile_failure() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(1.0, 1.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::graph_instantiate);
+  bool rejected = false;
+  try { gpu.init_backend(); }
+  catch (const std::exception &error) {
+    rejected = std::string(error.what()).find("graph instantiate") != std::string::npos;
+  }
+  nvidia::testing::clear_failure();
+  require(rejected && gpu.t == 0,
+          "required NVIDIA graph capture failure was not rejected before dispatch");
+}
+
+static void test_graph_teardown_lifetime() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  nvidia::testing::reset_graph_accounting();
+  const nvidia::memory_accounting memory_before = nvidia::current_memory_accounting();
+  size_t instantiated = 0;
+  {
+    const grid_volume gv = vol2d(1.0, 1.0, 6.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+    fields gpu(&s, options);
+    gpu.use_real_fields();
+    gpu.require_component(Ez);
+    gpu.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    const NvidiaGraphStatistics stats =
+        backend ? backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
+    require(backend && stats.enabled && stats.segment_count > 0 &&
+                stats.instantiate_count == stats.segment_count,
+            "NVIDIA graph teardown fixture did not own executable graphs");
+    instantiated = stats.instantiate_count;
+  }
+  const nvidia::graph_accounting graph_after = nvidia::testing::current_graph_accounting();
+  const nvidia::memory_accounting memory_after = nvidia::current_memory_accounting();
+  require(graph_after.executable_destroys == instantiated &&
+              graph_after.graph_destroys == instantiated,
+          "NVIDIA executable teardown did not destroy every captured graph definition first");
+  require(memory_after.device_bytes_current == memory_before.device_bytes_current &&
+              memory_after.pinned_bytes_current == memory_before.pinned_bytes_current,
+          "NVIDIA graph teardown outlived or leaked a captured allocation");
+}
+
+static void test_graph_collective_reconciliation() {
+  using nvidia::testing::graph_collective_probe;
+  const int rank = my_rank();
+  const int ranks = count_processors();
+  const int asymmetric_rank = ranks - 1;
+  const graph_collective_probe supported = {
+      "auto", true, true, true, true, true, true, true, true, true, true};
+
+  const auto expect_rejected = [&](graph_collective_probe probe, const char *message) {
+    bool rejected = false;
+    try {
+      (void)nvidia::testing::reconcile_graph_execution_for_testing(probe);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
+    require(and_to_all(rejected), message);
+  };
+  const auto expect_enabled = [&](graph_collective_probe probe, bool enabled,
+                                  const char *message) {
+    bool selected = false;
+    bool completed = false;
+    try {
+      selected = nvidia::testing::reconcile_graph_execution_for_testing(probe).use_graph;
+      completed = true;
+    }
+    catch (...) {}
+    const bool all_completed = and_to_all(completed);
+    const int minimum_selected = min_to_all(selected ? 1 : 0);
+    const int maximum_selected = max_to_all(selected ? 1 : 0);
+    require(all_completed && minimum_selected == maximum_selected && selected == enabled,
+            message);
+  };
+
+  graph_collective_probe probe = supported;
+  probe.mode = rank == 0 ? "invalid" : "auto";
+  expect_rejected(probe, "rank-asymmetric graph-mode parse failure was not collective");
+
+  probe = supported;
+  probe.mode = rank == 0 ? "required" : "auto";
+  if (ranks > 1)
+    expect_rejected(probe, "rank-asymmetric graph-mode mismatch was not collective");
+  else
+    expect_enabled(probe, true, "single-rank required graph mode was not selected");
+
+  probe = supported;
+  probe.lowering_valid = rank != asymmetric_rank;
+  expect_rejected(probe, "rank-asymmetric graph lowering failure was not collective");
+
+  probe = supported;
+  probe.validation_valid = rank != asymmetric_rank;
+  expect_rejected(probe, "rank-asymmetric graph validation failure was not collective");
+
+  probe = supported;
+  probe.runtime_capture_supported = rank != asymmetric_rank;
+  expect_enabled(probe, false, "automatic graph support fallback was not collective");
+
+  probe = supported;
+  probe.allocation_valid = rank != asymmetric_rank;
+  expect_enabled(probe, false, "automatic graph allocation fallback was not collective");
+
+  probe = supported;
+  probe.capture_valid = rank != asymmetric_rank;
+  expect_enabled(probe, false, "automatic graph capture fallback was not collective");
+
+  probe = supported;
+  probe.instantiate_valid = rank != asymmetric_rank;
+  expect_enabled(probe, false, "automatic graph instantiate fallback was not collective");
+
+  probe = supported;
+  probe.capture_valid = false;
+  probe.graph_destroy_valid = rank != asymmetric_rank;
+  expect_rejected(probe,
+                  "rank-asymmetric graph-definition cleanup failure was not collective");
+
+  probe = supported;
+  probe.instantiate_valid = false;
+  probe.graph_exec_destroy_valid = rank != asymmetric_rank;
+  expect_rejected(probe,
+                  "rank-asymmetric graph-executable cleanup failure was not collective");
+
+  probe = supported;
+  probe.instantiate_valid = false;
+  probe.graph_device_restore_valid = rank != asymmetric_rank;
+  expect_rejected(probe,
+                  "rank-asymmetric graph cleanup device-restoration failure was not collective");
+
+  probe = supported;
+  probe.mode = "required";
+  probe.program_graphable = rank != asymmetric_rank;
+  expect_rejected(probe, "required graph support failure was not collective");
+
+  probe = supported;
+  probe.mode = "required";
+  probe.allocation_valid = rank != asymmetric_rank;
+  expect_rejected(probe, "required graph allocation failure was not collective");
+
+  probe = supported;
+  probe.mode = "required";
+  probe.capture_valid = rank != asymmetric_rank;
+  expect_rejected(probe, "required graph capture failure was not collective");
+
+  probe = supported;
+  probe.mode = "required";
+  probe.instantiate_valid = rank != asymmetric_rank;
+  expect_rejected(probe, "required graph instantiate failure was not collective");
+
+  expect_enabled(supported, true, "collectively supported automatic graph mode was not enabled");
+  master_printf("nvidia_timestep: graph collective reconciliation PASS (%d ranks)\n", ranks);
+}
+
+static void test_graph_auto_capture_fallback() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "auto", 1);
+  const grid_volume gv = vol2d(1.0, 1.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  nvidia::testing::fail_next(nvidia::testing::failure_point::graph_instantiate);
+  gpu.init_backend();
+  nvidia::testing::clear_failure();
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  const NvidiaGraphStatistics stats =
+      backend ? backend->graph_statistics_for_testing() : NvidiaGraphStatistics();
+  require(backend && stats.valid && !stats.enabled,
+          "automatic NVIDIA graph capture failure did not select whole-program eager");
+  gpu.advance(1);
+  require(gpu.t == 1 && !gpu.backend->is_poisoned(),
+          "automatic NVIDIA graph fallback was not dispatchable");
+}
+
+static void test_graph_launch_failure_poison() {
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  const grid_volume gv = vol2d(1.0, 1.0, 6.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 1);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ez);
+  gpu.init_backend();
+  nvidia::testing::fail_next(nvidia::testing::failure_point::graph_launch);
+  bool rejected = false;
+  try { gpu.advance(1); }
+  catch (const std::exception &error) {
+    rejected = std::string(error.what()).find("graph launch") != std::string::npos;
+  }
+  nvidia::testing::clear_failure();
+  require(rejected && gpu.t == 0 && gpu.backend->is_poisoned(),
+          "NVIDIA graph launch failure did not poison before host time publication");
+}
+
+static void test_graph_execution_integration() {
+  setenv("MEEP_NVIDIA_GRAPH_ASSERT", "1", 1);
+  unsetenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED");
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "eager", 1);
+  test_driven_material_geometry(driven_bulk);
+  setenv("MEEP_NVIDIA_GRAPH_MODE", "required", 1);
+  setenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED", "1", 1);
+  test_driven_material_geometry(driven_bulk);
+  test_driven_material_geometry(driven_bulk, precision_policy_kind::f32);
+  run_material_phase_case("graph-material-phase", precision_policy_kind::native, true, false);
+  run_custom_source_case("graph-custom-source", precision_policy_kind::native, false);
+  run_noisy_replay_case(precision_policy_kind::native);
+  test_finite_diagnostics(precision_policy_kind::native);
+  test_legacy_flux_postlaunch_poison();
+  set_finite_check_mode(FiniteCheckMode::off);
+  unsetenv("MEEP_NVIDIA_GRAPH_ASSERT");
+  unsetenv("MEEP_NVIDIA_GRAPH_EXPECT_ENABLED");
+  test_graph_auto_capture_fallback();
+  test_graph_required_compile_failure();
+  test_graph_launch_failure_poison();
+  test_graph_teardown_lifetime();
+  unsetenv("MEEP_NVIDIA_GRAPH_MODE");
+  master_printf("nvidia_timestep: graph execution integration PASS\n");
 }
 
 static void test_native_mesh_geometry() {
@@ -8153,10 +8444,15 @@ static void run_finite_diagnostic_case(const char *name, precision_policy_kind p
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ez);
   f.init_backend();
+  require_selected_graph_mode(f);
 
   const StepPlan prepared = build_step_plan(f, StepProgram::ordinary);
   const Operation *finite = NULL;
@@ -8393,6 +8689,10 @@ static noisy_snapshot run_noisy_seed_case(precision_policy_kind policy, unsigned
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   if (complex_fields)
     gpu.use_bloch(vec(0.11, 0.07, 0.05));
@@ -8401,6 +8701,7 @@ static noisy_snapshot run_noisy_seed_case(precision_policy_kind policy, unsigned
   gpu.require_component(ft == E_stuff ? Ez : Hz);
   set_random_seed(seed);
   gpu.init_backend();
+  require_selected_graph_mode(gpu);
   gpu.advance(3);
   require(gpu.backend_state && gpu.executable &&
               gpu.backend_state->random_seed_snapshot_accepted == exact_noisy,
@@ -9135,7 +9436,16 @@ int main(int argc, char **argv) {
     master_printf("nvidia_timestep: PASS\n");
     return 0;
   }
+  if (getenv("MEEP_NVIDIA_GRAPH_MPI_ONLY")) {
+    test_graph_collective_reconciliation();
+    return 0;
+  }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");
+  if (getenv("MEEP_NVIDIA_GRAPH_ONLY")) {
+    test_graph_execution_integration();
+    master_printf("nvidia_timestep: PASS\n");
+    return 0;
+  }
   if (getenv("MEEP_NVIDIA_REQUIRE_NATIVE_SINGLE"))
     require(sizeof(realnum) == sizeof(float),
             "native-single validation was built with double realnum");

@@ -744,6 +744,7 @@ void validate_operation_spans(const StepPlan &plan, const Operation &operation) 
                         operation.kind == OpKind::update_material_coefficients;
   const bool db = operation.kind == OpKind::update_db;
   const bool polarization = operation.kind == OpKind::update_polarization;
+  const bool polarization_subtraction = operation.kind == OpKind::update_eh;
   const bool magnetic = operation.kind == OpKind::restore_magnetic_fields ||
                         operation.kind == OpKind::synchronize_magnetic_fields;
   const bool flux =
@@ -757,9 +758,10 @@ void validate_operation_spans(const StepPlan &plan, const Operation &operation) 
        operation.cylindrical_m_descriptor_index || operation.cylindrical_m_descriptor_count ||
        operation.cylindrical_origin_action_index || operation.cylindrical_origin_action_count))
     throw std::invalid_argument("graph operation has unrelated curl action metadata");
-  if (!polarization &&
-      (operation.polarization_group_index || operation.polarization_group_count ||
-       operation.polarization_subtraction_index || operation.polarization_subtraction_count))
+  if ((!polarization &&
+       (operation.polarization_group_index || operation.polarization_group_count)) ||
+      (!polarization_subtraction &&
+       (operation.polarization_subtraction_index || operation.polarization_subtraction_count)))
     throw std::invalid_argument("graph operation has unrelated polarization metadata");
   if (!magnetic && (operation.magnetic_state_index || operation.magnetic_state_count))
     throw std::invalid_argument("graph operation has unrelated magnetic-state metadata");
@@ -773,8 +775,11 @@ void validate_operation_spans(const StepPlan &plan, const Operation &operation) 
     case OpKind::evaluate_source_scalars:
       /* StepPlanBuilder stores the complete SourcePlan::source_times extent
          directly in descriptor_count; those descriptors do not live in a
-         StepPlan-owned vector. */
-      if (operation.descriptor_index != 0 || operation.descriptor_count == 0)
+         StepPlan-owned vector.  A source-free canonical plan retains empty
+         evaluation markers. */
+      if (operation.descriptor_index != 0 ||
+          (operation.descriptor_count == 0 &&
+           plan.source_signature != source_plan_signature(SourcePlan())))
         throw std::invalid_argument("graph source-time descriptor span is malformed");
       return;
     case OpKind::update_db: descriptor_limit = plan.db_updates.size(); break;
@@ -858,6 +863,7 @@ void validate_graph_source_plan(const StepPlan &plan, const CpuArrayCatalog *cat
     throw std::invalid_argument("graph StepPlan program is invalid");
   validate_subordinate_spans(plan);
   std::set<uint32_t> scalar_slots;
+  size_t source_time_extent = std::numeric_limits<size_t>::max();
   for (const Operation &operation : plan.operations) {
     if (!valid_operation_kind(operation.kind))
       throw std::invalid_argument("graph operation kind is invalid");
@@ -885,6 +891,12 @@ void validate_graph_source_plan(const StepPlan &plan, const CpuArrayCatalog *cat
     else if (operation.guard.variant_index)
       throw std::invalid_argument("graph operation guard has an unrelated variant index");
     validate_operation_spans(plan, operation);
+    if (operation.kind == OpKind::evaluate_source_scalars) {
+      if (source_time_extent == std::numeric_limits<size_t>::max())
+        source_time_extent = operation.descriptor_count;
+      else if (source_time_extent != operation.descriptor_count)
+        throw std::invalid_argument("graph source-time descriptor extents are inconsistent");
+    }
     validate_operation_accesses(operation, catalog);
   }
   if (scalar_slots.size() > step_scalar_predicate_word_count * size_t(64))

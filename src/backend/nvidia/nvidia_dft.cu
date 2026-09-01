@@ -66,10 +66,19 @@ __device__ double boundary_weight(size_t i_value, size_t n_value, double start0,
   return 1.0;
 }
 
+__device__ bool graph_predicate(const StepScalars *scalars, uint32_t word, uint32_t bit) {
+  return !scalars || ((scalars->predicate_words[word] >> bit) & uint64_t(1));
+}
+
 template <typename MonitorT>
-__global__ void dft_phase_kernel(dft_launch launch, double sample_time) {
+__global__ void dft_phase_kernel(dft_launch launch, double sample_time,
+                                 const StepScalars *scalars, uint32_t predicate_word,
+                                 uint32_t predicate_bit) {
   const size_t frequency = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (frequency >= launch.frequencies) return;
+  if (frequency >= launch.frequencies ||
+      !graph_predicate(scalars, predicate_word, predicate_bit))
+    return;
+  if (scalars) sample_time = scalars->source_times[launch.magnetic ? 1 : 2];
   const double angle = launch.omega[launch.omega_offset + frequency] * sample_time;
   double sine, cosine;
   sincos(angle, &sine, &cosine);
@@ -79,9 +88,11 @@ __global__ void dft_phase_kernel(dft_launch launch, double sample_time) {
 }
 
 template <typename FieldT, typename MonitorT>
-__global__ void dft_accumulate_kernel(dft_launch launch, size_t outputs) {
+__global__ void dft_accumulate_kernel(dft_launch launch, size_t outputs,
+                                      const StepScalars *scalars, uint32_t predicate_word,
+                                      uint32_t predicate_bit) {
   const size_t output = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (output >= outputs) return;
+  if (output >= outputs || !graph_predicate(scalars, predicate_word, predicate_bit)) return;
   const size_t frequency = output % launch.frequencies;
   const size_t voxel = output / launch.frequencies;
 
@@ -225,17 +236,21 @@ __global__ void dft_reduction_final_kernel(dft_reduction_launch launch) {
 }
 
 template <typename MonitorT>
-void launch_phase(const dft_launch &launch, double sample_time, const stream &execution_stream) {
+void launch_phase(const dft_launch &launch, double sample_time, const StepScalars *scalars,
+                  uint32_t predicate_word, uint32_t predicate_bit,
+                  const stream &execution_stream) {
   unsigned int blocks = 0, threads = 0;
   launch_geometry(launch.frequencies, blocks, threads);
   dft_phase_kernel<MonitorT>
       <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
-          launch, sample_time);
+          launch, sample_time, scalars, predicate_word, predicate_bit);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA DFT phase");
 }
 
 template <typename FieldT, typename MonitorT>
-void launch_accumulation(const dft_launch &launch, const stream &execution_stream) {
+void launch_accumulation(const dft_launch &launch, const StepScalars *scalars,
+                         uint32_t predicate_word, uint32_t predicate_bit,
+                         const stream &execution_stream) {
   if (launch.points > std::numeric_limits<size_t>::max() / launch.frequencies)
     throw std::overflow_error("NVIDIA DFT output count overflow");
   const size_t outputs = launch.points * launch.frequencies;
@@ -243,7 +258,7 @@ void launch_accumulation(const dft_launch &launch, const stream &execution_strea
   launch_geometry(outputs, blocks, threads);
   dft_accumulate_kernel<FieldT, MonitorT>
       <<<blocks, threads, 0, static_cast<cudaStream_t>(execution_stream.opaque_handle())>>>(
-          launch, outputs);
+          launch, outputs, scalars, predicate_word, predicate_bit);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA DFT accumulation");
 }
 
@@ -255,18 +270,47 @@ void launch_dft(const dft_launch &launch, double sample_time, const stream &exec
   if (!launch.points || !launch.frequencies || launch.decimation_factor <= 0)
     throw std::invalid_argument("NVIDIA DFT launch has invalid dimensions or decimation");
   if (launch.monitor_precision == scalar_precision::f32) {
-    launch_phase<float>(launch, sample_time, execution_stream);
+    launch_phase<float>(launch, sample_time, NULL, 0, 0, execution_stream);
     if (launch.field_precision == scalar_precision::f32)
-      launch_accumulation<float, float>(launch, execution_stream);
+      launch_accumulation<float, float>(launch, NULL, 0, 0, execution_stream);
     else
       throw std::invalid_argument("NVIDIA DFT does not support f64 fields with f32 monitors");
   }
   else {
-    launch_phase<double>(launch, sample_time, execution_stream);
+    launch_phase<double>(launch, sample_time, NULL, 0, 0, execution_stream);
     if (launch.field_precision == scalar_precision::f32)
-      launch_accumulation<float, double>(launch, execution_stream);
+      launch_accumulation<float, double>(launch, NULL, 0, 0, execution_stream);
     else
-      launch_accumulation<double, double>(launch, execution_stream);
+      launch_accumulation<double, double>(launch, NULL, 0, 0, execution_stream);
+  }
+}
+
+void launch_dft_graph(const dft_launch &launch, const StepScalars *scalars,
+                      uint32_t predicate_word, uint32_t predicate_bit,
+                      const stream &execution_stream) {
+  if (!scalars) throw std::invalid_argument("NVIDIA graph DFT has no StepScalars");
+  if (predicate_word >= step_scalar_predicate_word_count || predicate_bit >= 64)
+    throw std::invalid_argument("NVIDIA graph DFT predicate is out of range");
+  if (!launch.source_real || !launch.accumulator || !launch.phase_scratch || !launch.omega)
+    throw std::invalid_argument("NVIDIA DFT launch has incomplete storage");
+  if (!launch.points || !launch.frequencies || launch.decimation_factor <= 0)
+    throw std::invalid_argument("NVIDIA DFT launch has invalid dimensions or decimation");
+  if (launch.monitor_precision == scalar_precision::f32) {
+    launch_phase<float>(launch, 0.0, scalars, predicate_word, predicate_bit, execution_stream);
+    if (launch.field_precision == scalar_precision::f32)
+      launch_accumulation<float, float>(launch, scalars, predicate_word, predicate_bit,
+                                        execution_stream);
+    else
+      throw std::invalid_argument("NVIDIA DFT does not support f64 fields with f32 monitors");
+  }
+  else {
+    launch_phase<double>(launch, 0.0, scalars, predicate_word, predicate_bit, execution_stream);
+    if (launch.field_precision == scalar_precision::f32)
+      launch_accumulation<float, double>(launch, scalars, predicate_word, predicate_bit,
+                                         execution_stream);
+    else
+      launch_accumulation<double, double>(launch, scalars, predicate_word, predicate_bit,
+                                          execution_stream);
   }
 }
 

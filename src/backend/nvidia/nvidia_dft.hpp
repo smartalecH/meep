@@ -13,6 +13,7 @@
 
 #include <stddef.h>
 
+#include "backend/graph_plan.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
 
 namespace meep {
@@ -69,6 +70,12 @@ struct dft_reduction_launch {
 
 /* Launches phase generation followed by accumulation on the same stream. */
 void launch_dft(const dft_launch &launch, double sample_time, const stream &stream);
+
+/* Graph-captured form.  Both kernels remain in the graph and read the exact
+   same-stream sample time and decimation predicate from StepScalars. */
+void launch_dft_graph(const dft_launch &launch, const StepScalars *scalars,
+                      uint32_t predicate_word, uint32_t predicate_bit,
+                      const stream &stream);
 
 /* Two-stage, bounded reduction. Terms are launched sequentially and this adds
    the term's contribution to the existing compact result buffer. */

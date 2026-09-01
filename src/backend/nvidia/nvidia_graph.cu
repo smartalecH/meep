@@ -34,36 +34,80 @@ void report_cleanup_failure(const char *operation, cudaError_t result) noexcept 
                cudaGetErrorName(result), static_cast<int>(result), cudaGetErrorString(result));
 }
 
-cudaError_t destroy_graph_on_device(cudaGraph_t value, int device) noexcept {
-  if (!value) return cudaSuccess;
+struct graph_resource_cleanup_result {
+  cudaError_t operation_result;
+  const char *operation;
+  cudaError_t restore_result;
+  bool released;
+};
+
+graph_resource_cleanup_result destroy_graph_on_device(cudaGraph_t value, int device) noexcept {
+  graph_resource_cleanup_result cleanup = {cudaSuccess, NULL, cudaSuccess, true};
+  if (!value) return cleanup;
   int previous = -1;
-  cudaError_t result = cudaGetDevice(&previous);
-  if (result != cudaSuccess) return result;
+  cleanup.operation_result = cudaGetDevice(&previous);
+  cleanup.operation = "cudaGetDevice(graph destroy)";
+  if (cleanup.operation_result != cudaSuccess) {
+    cleanup.released = false;
+    return cleanup;
+  }
   const bool restore = previous != device;
-  if (restore && (result = cudaSetDevice(device)) != cudaSuccess) return result;
+  if (restore) {
+    cleanup.operation_result = cudaSetDevice(device);
+    cleanup.operation = "cudaSetDevice(graph destroy)";
+    if (cleanup.operation_result != cudaSuccess) {
+      cleanup.released = false;
+      return cleanup;
+    }
+  }
   if (testing::consume_failure_for_testing(testing::failure_point::graph_destroy))
-    result = cudaErrorUnknown;
+    cleanup.operation_result = cudaErrorUnknown;
   else
-    result = cudaGraphDestroy(value);
-  if (result == cudaSuccess) graph_destroys.fetch_add(1, std::memory_order_relaxed);
-  const cudaError_t restore_result = restore ? cudaSetDevice(previous) : cudaSuccess;
-  return result != cudaSuccess ? result : restore_result;
+    cleanup.operation_result = cudaGraphDestroy(value);
+  cleanup.operation = "cudaGraphDestroy";
+  cleanup.released = cleanup.operation_result == cudaSuccess;
+  if (cleanup.released) graph_destroys.fetch_add(1, std::memory_order_relaxed);
+  if (restore)
+    cleanup.restore_result =
+        testing::consume_failure_for_testing(testing::failure_point::device_restore)
+            ? cudaErrorUnknown
+            : cudaSetDevice(previous);
+  return cleanup;
 }
 
-cudaError_t destroy_exec_on_device(cudaGraphExec_t value, int device) noexcept {
-  if (!value) return cudaSuccess;
+graph_resource_cleanup_result destroy_exec_on_device(cudaGraphExec_t value, int device) noexcept {
+  graph_resource_cleanup_result cleanup = {cudaSuccess, NULL, cudaSuccess, true};
+  if (!value) return cleanup;
   int previous = -1;
-  cudaError_t result = cudaGetDevice(&previous);
-  if (result != cudaSuccess) return result;
+  cleanup.operation_result = cudaGetDevice(&previous);
+  cleanup.operation = "cudaGetDevice(graph executable destroy)";
+  if (cleanup.operation_result != cudaSuccess) {
+    cleanup.released = false;
+    return cleanup;
+  }
   const bool restore = previous != device;
-  if (restore && (result = cudaSetDevice(device)) != cudaSuccess) return result;
+  if (restore) {
+    cleanup.operation_result = cudaSetDevice(device);
+    cleanup.operation = "cudaSetDevice(graph executable destroy)";
+    if (cleanup.operation_result != cudaSuccess) {
+      cleanup.released = false;
+      return cleanup;
+    }
+  }
   if (testing::consume_failure_for_testing(testing::failure_point::graph_exec_destroy))
-    result = cudaErrorUnknown;
+    cleanup.operation_result = cudaErrorUnknown;
   else
-    result = cudaGraphExecDestroy(value);
-  if (result == cudaSuccess) graph_executable_destroys.fetch_add(1, std::memory_order_relaxed);
-  const cudaError_t restore_result = restore ? cudaSetDevice(previous) : cudaSuccess;
-  return result != cudaSuccess ? result : restore_result;
+    cleanup.operation_result = cudaGraphExecDestroy(value);
+  cleanup.operation = "cudaGraphExecDestroy";
+  cleanup.released = cleanup.operation_result == cudaSuccess;
+  if (cleanup.released)
+    graph_executable_destroys.fetch_add(1, std::memory_order_relaxed);
+  if (restore)
+    cleanup.restore_result =
+        testing::consume_failure_for_testing(testing::failure_point::device_restore)
+            ? cudaErrorUnknown
+            : cudaSetDevice(previous);
+  return cleanup;
 }
 
 __global__ void write_step_scalars_kernel(StepScalars *destination, StepScalars values) {
@@ -90,53 +134,97 @@ namespace {
    only after CUDA has accepted the corresponding release.  This lets noexcept
    move assignment leave both operands untouched when destination teardown can
    still be retried. */
-cudaError_t cleanup_graph_definition(cudaGraph_t &value, int &device, bool &capturing,
-                                     cudaStream_t &capture_stream, size_t &nodes,
-                                     std::string &label) noexcept {
+struct graph_definition_cleanup_result {
+  cudaError_t operation_result;
+  const char *operation;
+  cudaError_t restore_result;
+  bool complete;
+};
+
+graph_definition_cleanup_result cleanup_graph_definition(cudaGraph_t &value, int &device,
+                                                         bool &capturing,
+                                                         cudaStream_t &capture_stream,
+                                                         size_t &nodes,
+                                                         std::string &label) noexcept {
+  graph_definition_cleanup_result cleanup = {cudaSuccess, NULL, cudaSuccess, false};
   if (!value && !capturing) {
     device = -1;
     capture_stream = NULL;
     nodes = 0;
     label.clear();
-    return cudaSuccess;
+    cleanup.complete = true;
+    return cleanup;
   }
   int previous = -1;
-  cudaError_t result = cudaGetDevice(&previous);
-  if (result != cudaSuccess) return result;
+  cleanup.operation_result = cudaGetDevice(&previous);
+  cleanup.operation = "cudaGetDevice(graph definition cleanup)";
+  if (cleanup.operation_result != cudaSuccess) return cleanup;
   const bool restore = device >= 0 && previous != device;
-  if (restore && (result = cudaSetDevice(device)) != cudaSuccess) return result;
+  if (restore) {
+    cleanup.operation_result = cudaSetDevice(device);
+    cleanup.operation = "cudaSetDevice(graph definition cleanup)";
+    if (cleanup.operation_result != cudaSuccess) return cleanup;
+  }
 
   if (capturing) {
+    cleanup.operation = "cudaStreamEndCapture";
     if (testing::consume_failure_for_testing(testing::failure_point::graph_end_capture))
-      result = cudaErrorUnknown;
+      cleanup.operation_result = cudaErrorUnknown;
     else {
       cudaGraph_t abandoned = NULL;
-      result = cudaStreamEndCapture(capture_stream, &abandoned);
-      if (result == cudaSuccess) {
+      cleanup.operation_result = cudaStreamEndCapture(capture_stream, &abandoned);
+      if (cleanup.operation_result == cudaSuccess) {
         graph_end_captures.fetch_add(1, std::memory_order_relaxed);
         capturing = false;
         capture_stream = NULL;
         if (abandoned) {
-          const cudaError_t destroy_result = destroy_graph_on_device(abandoned, device);
-          if (destroy_result != cudaSuccess) {
+          const graph_resource_cleanup_result destroy_result =
+              destroy_graph_on_device(abandoned, device);
+          if (destroy_result.released) abandoned = NULL;
+          if (destroy_result.operation_result != cudaSuccess) {
             value = abandoned;
-            result = destroy_result;
+            cleanup.operation_result = destroy_result.operation_result;
+            cleanup.operation = destroy_result.operation;
           }
+          if (destroy_result.restore_result != cudaSuccess &&
+              cleanup.restore_result == cudaSuccess)
+            cleanup.restore_result = destroy_result.restore_result;
         }
       }
     }
   }
-  if (result == cudaSuccess && value) {
-    result = destroy_graph_on_device(value, device);
-    if (result == cudaSuccess) value = NULL;
+  if (cleanup.operation_result == cudaSuccess && value) {
+    const graph_resource_cleanup_result destroy_result = destroy_graph_on_device(value, device);
+    if (destroy_result.released) value = NULL;
+    cleanup.operation_result = destroy_result.operation_result;
+    cleanup.operation = destroy_result.operation;
+    if (destroy_result.restore_result != cudaSuccess && cleanup.restore_result == cudaSuccess)
+      cleanup.restore_result = destroy_result.restore_result;
   }
-  if (result == cudaSuccess && !capturing && !value) {
+  cleanup.complete = !capturing && !value;
+  if (cleanup.complete) {
     device = -1;
     nodes = 0;
     label.clear();
   }
-  const cudaError_t restore_result = restore ? cudaSetDevice(previous) : cudaSuccess;
-  return result != cudaSuccess ? result : restore_result;
+  if (restore) {
+    const cudaError_t restore_result =
+        testing::consume_failure_for_testing(testing::failure_point::device_restore)
+            ? cudaErrorUnknown
+            : cudaSetDevice(previous);
+    if (cleanup.restore_result == cudaSuccess) cleanup.restore_result = restore_result;
+  }
+  return cleanup;
+}
+
+void report_graph_definition_cleanup(const graph_definition_cleanup_result &result,
+                                     const char *operation) noexcept {
+  if (result.operation_result != cudaSuccess)
+    report_cleanup_failure(result.operation ? result.operation : operation,
+                           result.operation_result);
+  if (result.restore_result != cudaSuccess)
+    report_cleanup_failure("cudaSetDevice(restore after graph definition cleanup)",
+                           result.restore_result);
 }
 
 } // namespace
@@ -145,16 +233,16 @@ graph::graph() : impl_(new impl) {}
 
 graph::~graph() {
   if (!impl_) return;
-  cudaError_t result = cleanup_graph_definition(impl_->value, impl_->device, impl_->capturing,
-                                                impl_->capture_stream, impl_->nodes, impl_->label);
-  if (result != cudaSuccess) {
-    report_cleanup_failure("CUDA graph definition cleanup", result);
+  graph_definition_cleanup_result result =
+      cleanup_graph_definition(impl_->value, impl_->device, impl_->capturing,
+                               impl_->capture_stream, impl_->nodes, impl_->label);
+  report_graph_definition_cleanup(result, "CUDA graph definition cleanup");
+  if (!result.complete) {
     /* A one-shot injected failure must not strand a live stream capture during
        destruction.  The same raw helper performs the best-effort retry. */
     result = cleanup_graph_definition(impl_->value, impl_->device, impl_->capturing,
                                       impl_->capture_stream, impl_->nodes, impl_->label);
-    if (result != cudaSuccess)
-      report_cleanup_failure("CUDA graph definition cleanup retry", result);
+    report_graph_definition_cleanup(result, "CUDA graph definition cleanup retry");
   }
   delete impl_;
 }
@@ -164,13 +252,12 @@ graph::graph(graph &&other) noexcept : impl_(other.impl_) { other.impl_ = NULL; 
 graph &graph::operator=(graph &&other) noexcept {
   if (this == &other) return *this;
   if (impl_) {
-    const cudaError_t result =
+    const graph_definition_cleanup_result result =
         cleanup_graph_definition(impl_->value, impl_->device, impl_->capturing,
                                  impl_->capture_stream, impl_->nodes, impl_->label);
-    if (result != cudaSuccess) {
-      report_cleanup_failure("CUDA graph definition cleanup(move assignment)", result);
-      return *this;
-    }
+    report_graph_definition_cleanup(result,
+                                    "CUDA graph definition cleanup(move assignment)");
+    if (!result.complete) return *this;
     delete impl_;
   }
   impl_ = other.impl_;
@@ -226,9 +313,13 @@ void graph::end_capture(const stream &on_stream) {
   if (result == cudaSuccess && injected) result = cudaErrorStreamCaptureInvalidated;
   if (result != cudaSuccess) {
     if (captured) {
-      const cudaError_t destroy_result = destroy_graph_on_device(captured, impl_->device);
-      if (destroy_result != cudaSuccess)
-        report_cleanup_failure("cudaGraphDestroy(failed capture)", destroy_result);
+      const graph_resource_cleanup_result destroy_result =
+          destroy_graph_on_device(captured, impl_->device);
+      if (destroy_result.operation_result != cudaSuccess)
+        report_cleanup_failure(destroy_result.operation, destroy_result.operation_result);
+      if (destroy_result.restore_result != cudaSuccess)
+        report_cleanup_failure("cudaSetDevice(restore after failed-capture graph destroy)",
+                               destroy_result.restore_result);
     }
     check_graph(result, "cudaStreamEndCapture");
   }
@@ -239,16 +330,15 @@ void graph::end_capture(const stream &on_stream) {
 
 void graph::reset() {
   if (!impl_) return;
-  if (impl_->capturing) throw std::logic_error("cannot reset a graph during stream capture");
-  if (impl_->value) {
-    const cudaError_t result = destroy_graph_on_device(impl_->value, impl_->device);
-    if (result != cudaSuccess) check_graph(result, "cudaGraphDestroy");
-  }
-  impl_->value = NULL;
-  impl_->device = -1;
-  impl_->capture_stream = NULL;
-  impl_->nodes = 0;
-  impl_->label.clear();
+  const graph_definition_cleanup_result result =
+      cleanup_graph_definition(impl_->value, impl_->device, impl_->capturing,
+                               impl_->capture_stream, impl_->nodes, impl_->label);
+  if (result.operation_result != cudaSuccess)
+    check_graph(result.operation_result,
+                result.operation ? result.operation : "CUDA graph definition cleanup");
+  if (result.restore_result != cudaSuccess)
+    check_graph(result.restore_result,
+                "cudaSetDevice(restore after graph definition cleanup)");
 }
 
 int graph::device() const { return impl_ ? impl_->device : -1; }
@@ -272,8 +362,21 @@ graph_exec::graph_exec() : impl_(new impl) {}
 
 graph_exec::~graph_exec() {
   if (!impl_) return;
-  const cudaError_t result = destroy_exec_on_device(impl_->value, impl_->device);
-  if (result != cudaSuccess) report_cleanup_failure("cudaGraphExecDestroy", result);
+  graph_resource_cleanup_result result =
+      destroy_exec_on_device(impl_->value, impl_->device);
+  if (result.operation_result != cudaSuccess)
+    report_cleanup_failure(result.operation, result.operation_result);
+  if (result.restore_result != cudaSuccess)
+    report_cleanup_failure("cudaSetDevice(restore after graph executable destroy)",
+                           result.restore_result);
+  if (!result.released) {
+    result = destroy_exec_on_device(impl_->value, impl_->device);
+    if (result.operation_result != cudaSuccess)
+      report_cleanup_failure(result.operation, result.operation_result);
+    if (result.restore_result != cudaSuccess)
+      report_cleanup_failure("cudaSetDevice(restore after graph executable destroy retry)",
+                             result.restore_result);
+  }
   delete impl_;
 }
 
@@ -282,11 +385,16 @@ graph_exec::graph_exec(graph_exec &&other) noexcept : impl_(other.impl_) { other
 graph_exec &graph_exec::operator=(graph_exec &&other) noexcept {
   if (this == &other) return *this;
   if (impl_) {
-    const cudaError_t result = destroy_exec_on_device(impl_->value, impl_->device);
-    if (result != cudaSuccess) {
-      report_cleanup_failure("cudaGraphExecDestroy(move assignment)", result);
+    const graph_resource_cleanup_result result =
+        destroy_exec_on_device(impl_->value, impl_->device);
+    if (result.released) impl_->value = NULL;
+    if (result.operation_result != cudaSuccess) {
+      report_cleanup_failure(result.operation, result.operation_result);
       return *this;
     }
+    if (result.restore_result != cudaSuccess)
+      report_cleanup_failure("cudaSetDevice(restore after graph executable destroy)",
+                             result.restore_result);
     delete impl_;
   }
   impl_ = other.impl_;
@@ -361,13 +469,25 @@ void graph_exec::launch(const stream &on_stream) const {
 void graph_exec::reset() {
   if (!impl_) return;
   if (impl_->value) {
-    const cudaError_t result = destroy_exec_on_device(impl_->value, impl_->device);
-    if (result != cudaSuccess) check_graph(result, "cudaGraphExecDestroy");
+    const graph_resource_cleanup_result result =
+        destroy_exec_on_device(impl_->value, impl_->device);
+    if (result.released) {
+      impl_->value = NULL;
+      impl_->device = -1;
+      impl_->nodes = 0;
+      impl_->label.clear();
+    }
+    if (result.operation_result != cudaSuccess)
+      check_graph(result.operation_result, result.operation);
+    if (result.restore_result != cudaSuccess)
+      check_graph(result.restore_result,
+                  "cudaSetDevice(restore after graph executable destroy)");
   }
-  impl_->value = NULL;
-  impl_->device = -1;
-  impl_->nodes = 0;
-  impl_->label.clear();
+  else {
+    impl_->device = -1;
+    impl_->nodes = 0;
+    impl_->label.clear();
+  }
 }
 
 int graph_exec::device() const { return impl_ ? impl_->device : -1; }

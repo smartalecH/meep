@@ -3,6 +3,7 @@
 #ifndef MEEP_BACKEND_NVIDIA_NVIDIA_POLARIZATION_HPP
 #define MEEP_BACKEND_NVIDIA_NVIDIA_POLARIZATION_HPP
 
+#include "backend/graph_plan.hpp"
 #include "backend/nvidia/nvidia_step.hpp"
 
 namespace meep {
@@ -106,6 +107,9 @@ void launch_gyrotropic_update(const gyrotropic_update_launch &update, const stre
 void launch_polarization_update(const compiled_polarization_update &update,
                                 const noisy_seed_block *seed, uint64_t timestep,
                                 const stream &stream);
+void launch_polarization_update_graph(const compiled_polarization_update &update,
+                                      const noisy_seed_block *seed_slots,
+                                      const StepScalars *scalars, const stream &stream);
 void launch_polarization_subtract(const polarization_subtract_launch &update,
                                   const stream &stream);
 
