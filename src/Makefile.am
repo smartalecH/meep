@@ -26,6 +26,7 @@ backend/nvidia/nvidia_graph.hpp backend/nvidia/nvidia_graph.cu \
 backend/nvidia/arena.hpp backend/nvidia/arena.cu \
 backend/nvidia/nvidia_step.hpp backend/nvidia/nvidia_step.cu \
 backend/nvidia/nvidia_boundaries.hpp backend/nvidia/nvidia_boundaries.cu \
+backend/nvidia/nvidia_mpi.hpp backend/nvidia/nvidia_mpi.cpp \
 backend/nvidia/nvidia_coordinates.hpp backend/nvidia/nvidia_coordinates.cu \
 backend/nvidia/nvidia_dft.hpp backend/nvidia/nvidia_dft.cu \
 backend/nvidia/nvidia_flux.hpp backend/nvidia/nvidia_flux.cu \
@@ -90,7 +91,7 @@ backend/nvidia/.libs/nvidia_sources.cuda.o backend/nvidia/.libs/nvidia_polarizat
 backend/nvidia/.libs/nvidia_cw.cuda.o
 NVIDIA_CUDA_ARCHIVE = libmeep_nvidia_runtime.la
 noinst_LTLIBRARIES += $(NVIDIA_CUDA_ARCHIVE)
-libmeep_la_SOURCES += backend/nvidia/nvidia_backend.cpp
+libmeep_la_SOURCES += backend/nvidia/nvidia_backend.cpp backend/nvidia/nvidia_mpi.cpp
 libmeep_nvidia_runtime_la_SOURCES =
 libmeep_nvidia_runtime_la_DEPENDENCIES = $(NVIDIA_CUDA_OBJECTS)
 libmeep_nvidia_runtime_la_LIBADD = $(NVIDIA_CUDA_OBJECTS)

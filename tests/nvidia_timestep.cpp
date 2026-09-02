@@ -28,6 +28,7 @@
 #include "backend/backend.hpp"
 #include "backend/checkpoint.hpp"
 #include "backend/descriptors.hpp"
+#include "backend/device_uuid_reservation.hpp"
 #include "backend/diagnostics.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
@@ -10542,48 +10543,115 @@ static void test_rejections() {
 
 }
 
-static void test_remote_boundary_compile_only_path() {
-  require(count_processors() == 2,
-          "remote boundary compile-only validation requires exactly two ranks");
+static void test_remote_boundary_staged_path() {
+  require(count_processors() == 2 || count_processors() == 4,
+          "remote boundary staged validation requires two or four ranks");
+  if (count_processors() == 4) {
+    char synthetic_uuid[40];
+    std::snprintf(synthetic_uuid, sizeof(synthetic_uuid),
+                  "000000000000000000000000000000%02x", my_rank());
+    device_uuid_testing::set_overrides(synthetic_uuid, NULL);
+    setenv("MEEP_ALLOW_GPU_SHARING", "1", 1);
+  }
   const precision_policy_kind policies[] = {precision_policy_kind::native,
                                              precision_policy_kind::f32};
   for (precision_policy_kind precision : policies) {
     const grid_volume gv = vol1d(4.0, 10.0);
-    structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+    structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+    structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+    fields cpu(&cpu_structure);
     execution_options options;
     options.backend = backend_kind::nvidia;
-    options.device_id = my_rank();
+    options.device_id = my_rank() % 2;
     options.precision = precision;
     options.strict = false;
     options.fallback = fallback_policy::warn;
-    fields f(&s, options);
-    f.use_real_fields();
-    f.require_component(Ex);
-    bool rejected = false;
-    std::string reason;
-    try { f.init_backend(); }
-    catch (const std::exception &error) {
-      rejected = true;
-      reason = error.what();
+    fields gpu(&gpu_structure, options);
+    cpu.use_real_fields();
+    gpu.use_real_fields();
+    gaussian_src_time cpu_source(0.35, 0.14), gpu_source(0.35, 0.14);
+    cpu.add_point_source(Ex, cpu_source, gv.center(), 0.37);
+    gpu.add_point_source(Ex, gpu_source, gv.center(), 0.37);
+    gpu.init_backend();
+    int completed_steps = 0;
+    const int checkpoints[] = {1, 2, 100};
+    for (int target : checkpoints) {
+      const int steps = target - completed_steps;
+      cpu.advance(steps);
+      gpu.advance(steps);
+      compare_live_fields_by_key(cpu, gpu,
+                                 precision == precision_policy_kind::f32 ? 8e-5 : 8e-13);
+      completed_steps = target;
     }
-    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(f.backend);
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
     const NvidiaRemoteBoundaryCompileStatistics statistics =
         backend ? backend->remote_boundary_compile_statistics_for_testing()
                 : NvidiaRemoteBoundaryCompileStatistics();
-    if (!rejected || reason.find("does not yet support MPI timestepping") == std::string::npos)
-      std::fprintf(stderr, "rank %d remote compile rejection: rejected=%d reason=%s\n",
-                   my_rank(), int(rejected), reason.c_str());
-    require(and_to_all(rejected) &&
-                reason.find("does not yet support MPI timestepping") != std::string::npos,
-            "PR7.1 production multi-rank dispatch did not remain rejected");
-    require(backend && statistics.attempted && statistics.valid && statistics.stages > 0 &&
-                statistics.receives + statistics.sends > 0 &&
-                statistics.gathers + statistics.scatters > 0 &&
-                statistics.storage_signature != 0 && statistics.authority_signature != 0 &&
-                !f.backend_state && !f.executable,
-            "production compile did not validate and retain real-HaloPlan descriptor evidence");
+    const NvidiaMpiTransportStatistics transport =
+        backend ? backend->mpi_transport_statistics_for_testing()
+                : NvidiaMpiTransportStatistics();
+    const bool owns_remote_descriptors = statistics.receives + statistics.sends != 0;
+    const bool exercised_remote_transport =
+        transport.messages_sent != 0 || transport.messages_received != 0;
+    const bool local_authority_valid =
+        backend && statistics.attempted && statistics.valid &&
+        statistics.program_signature != 0 && gpu.backend_state && gpu.executable &&
+        owns_remote_descriptors == exercised_remote_transport &&
+        (owns_remote_descriptors
+             ? (statistics.stages > 0 && statistics.gathers + statistics.scatters > 0 &&
+                statistics.storage_signature != 0 && statistics.authority_signature != 0)
+             : statistics.stages == 0 && statistics.receives == 0 &&
+                   statistics.sends == 0 && statistics.gathers == 0 &&
+                   statistics.scatters == 0);
+    const int descriptor_owners = sum_to_all(int(owns_remote_descriptors));
+    require(and_to_all(local_authority_valid) && descriptor_owners == 2,
+            "production staged transport did not retain the expected active/idle "
+            "real-HaloPlan descriptor authority");
+    const bool local_transport_valid =
+        transport.direct_bytes == 0 &&
+        (!exercised_remote_transport ||
+         (transport.messages_sent > 0 && transport.messages_received > 0 &&
+          transport.bytes_sent > 0 && transport.bytes_received > 0 &&
+          transport.testsome_polls > 0 && transport.waitall_calls > 0 &&
+          transport.slot_reuses > 0));
+    require(and_to_all(local_transport_valid) &&
+                sum_to_all(int(exercised_remote_transport)) == 2,
+            "production staged transport execution/accounting did not distinguish "
+            "active and idle ranks");
   }
-  master_printf("nvidia_timestep: remote boundary compile-only path PASS\n");
+  if (count_processors() == 4) {
+    unsetenv("MEEP_ALLOW_GPU_SHARING");
+    device_uuid_testing::set_overrides(NULL, NULL);
+  }
+  master_printf("nvidia_timestep: remote boundary staged path PASS\n");
+}
+
+static void test_remote_boundary_direct_rejection() {
+  require(count_processors() == 2,
+          "remote boundary direct rejection requires exactly two ranks");
+  const grid_volume gv = vol1d(4.0, 10.0);
+  structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.device_id = my_rank();
+  fields gpu(&s, options);
+  gpu.use_real_fields();
+  gpu.require_component(Ex);
+  gaussian_src_time source(0.35, 0.14);
+  gpu.add_point_source(Ex, source, gv.center(), 0.37);
+  bool rejected = false;
+  std::string reason;
+  try { gpu.init_backend(); }
+  catch (const std::exception &error) {
+    rejected = true;
+    reason = error.what();
+  }
+  if (!rejected)
+    std::fprintf(stderr, "rank %d forced-direct unexpectedly succeeded (reason=%s)\n",
+                 my_rank(), reason.c_str());
+  require(and_to_all(rejected),
+          "PR7.2 forced-direct policy was not rejected collectively");
+  master_printf("nvidia_timestep: remote direct policy rejection PASS\n");
 }
 
 static void test_compile_allocation_retry() {
@@ -10660,7 +10728,11 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (getenv("MEEP_NVIDIA_REMOTE_COMPILE_ONLY")) {
-    test_remote_boundary_compile_only_path();
+    test_remote_boundary_staged_path();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_REMOTE_DIRECT_REJECT_ONLY")) {
+    test_remote_boundary_direct_rejection();
     return 0;
   }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");

@@ -9,7 +9,7 @@ lifecycle.cpp random-state.cpp halo_plan.cpp storage_plan.cpp classification.cpp
 # CI rather than by `make check`: it needs two builds to compare.
 EXTRA_DIST = $(SRC) bitwise frontend-batching.ctl nvidia_runtime_smoke.cu nvidia_graph_smoke.cu nvidia_arena_smoke.cu \
 nvidia_dft_smoke.cu nvidia_dft_reduction_smoke.cu nvidia_flux_smoke.cu nvidia_cw_smoke.cu nvidia_mpi_runtime_smoke.cu nvidia_step_smoke.cu nvidia_polarization_smoke.cu nvidia_backend_state.cpp \
-nvidia_device_reservation.cpp nvidia_multilevel_smoke.cu nvidia_adjoint_smoke.cu nvidia_timestep.cpp nvidia_dft.cpp nvidia_cw.cpp
+nvidia_device_reservation.cpp nvidia_multilevel_smoke.cu nvidia_adjoint_smoke.cu nvidia_timestep.cpp nvidia_dft.cpp nvidia_cw.cpp nvidia_staged_transport.cpp
 
 OBJ = $(SRC:.cpp=.o)
 DAC = $(SRC:.cpp=.dac)
@@ -184,6 +184,10 @@ NVIDIA_CUDA_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
 NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_graph_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke nvidia_adjoint_smoke
 if WITH_MPI
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
+check_PROGRAMS += nvidia_staged_transport
+TESTS += nvidia_staged_transport
+nvidia_staged_transport_SOURCES = nvidia_staged_transport.cpp
+nvidia_staged_transport_LDADD = $(MEEPLIBS)
 endif
 check_SCRIPTS += $(NVIDIA_RUNTIME_TESTS)
 check_PROGRAMS += nvidia_backend_state nvidia_device_reservation nvidia_timestep nvidia_dft nvidia_cw

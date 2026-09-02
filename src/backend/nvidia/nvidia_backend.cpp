@@ -12,6 +12,7 @@
 #include "backend/nvidia/nvidia_boundaries.hpp"
 #include "backend/nvidia/nvidia_coordinates.hpp"
 #include "backend/nvidia/nvidia_cw.hpp"
+#include "backend/nvidia/nvidia_mpi.hpp"
 
 #include <stdint.h>
 #include <string.h>
@@ -620,6 +621,7 @@ public:
         executable_build_count_(0), source_value_reuse_count_(0) {
     nvidia::device_scope scope(device_);
     transfer_.reset(new nvidia::stream);
+    communication_.reset(new nvidia::stream);
     arenas_.reset(new nvidia::device_arenas(layout_, device_, initialization_reserve_bytes));
     noisy_seed_slots_.allocate(2 * sizeof(nvidia::noisy_seed_block), device_);
     if (initialization_staging_bytes_) staging_.allocate(initialization_staging_bytes_);
@@ -691,6 +693,7 @@ public:
   bool device_authoritative_;
   std::unique_ptr<nvidia::device_arenas> arenas_;
   std::unique_ptr<nvidia::stream> transfer_;
+  std::unique_ptr<nvidia::stream> communication_;
   nvidia::pinned_buffer staging_;
   nvidia::device_buffer dft_reduction_result_;
   nvidia::device_buffer dft_reduction_partials_;
@@ -741,6 +744,7 @@ public:
 
 struct NvidiaCompiledOperation {
   OpKind kind;
+  field_type ft;
   Guard guard;
   size_t first;
   size_t count;
@@ -1115,6 +1119,13 @@ public:
   }
 
   ~NvidiaExecutable() override {
+    if (transport_) {
+      std::string error;
+      if (!transport_->retire(error)) {
+        std::fprintf(stderr, "NVIDIA transport retirement failed: %s\n", error.c_str());
+        std::abort();
+      }
+    }
     /* Captured graph nodes retain raw addresses owned by the buffers below.
        Destroy executable graphs and their definitions while every captured
        allocation is still alive; member reverse-order destruction would do
@@ -1167,6 +1178,7 @@ public:
   size_t source_scalar_count_;
   std::vector<NvidiaCompiledHostSegment> host_segments_;
   nvidia::compiled_boundary_artifact remote_boundaries_;
+  std::unique_ptr<nvidia::staged_transport_epoch> transport_;
   GraphProgram graph_program_;
   std::vector<NvidiaCompiledGraphSegment> graph_segments_;
   std::vector<size_t> graph_cw_timestep_launches_;
@@ -4002,6 +4014,22 @@ const void *NvidiaBackend::device_reservation_identity_for_testing() const {
 NvidiaRemoteBoundaryCompileStatistics
 NvidiaBackend::remote_boundary_compile_statistics_for_testing() const {
   return remote_boundary_compile_statistics_;
+}
+
+NvidiaMpiTransportStatistics NvidiaBackend::mpi_transport_statistics_for_testing() const {
+  NvidiaMpiTransportStatistics result = {};
+  const NvidiaExecutable *executable = dynamic_cast<const NvidiaExecutable *>(f_.executable);
+  if (!executable || !executable->transport_) return result;
+  const nvidia::staged_transport_statistics &stats = executable->transport_->statistics();
+  result.messages_sent = stats.messages_sent;
+  result.messages_received = stats.messages_received;
+  result.bytes_sent = stats.bytes_sent;
+  result.bytes_received = stats.bytes_received;
+  result.testsome_polls = stats.testsome_polls;
+  result.waitall_calls = stats.waitall_calls;
+  result.slot_reuses = stats.slot_reuses;
+  result.direct_bytes = stats.direct_bytes;
+  return result;
 }
 
 uint64_t NvidiaBackend::claim_executable_generation() {
@@ -8459,10 +8487,32 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   NvidiaBackendState &state = checked_state(raw_state);
   if (!state.initialized_)
     throw std::logic_error("cannot compile against uninitialized NVIDIA storage");
+  const GpuMpiPolicyParse parsed_policy =
+      parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
+  bool provider_query_available = false, provider_supports_direct = false;
+  std::string provider, policy_error;
+  const bool provider_query_valid = query_gpu_aware_mpi_provider(
+      provider_query_available, provider_supports_direct, provider, policy_error);
+  GpuMpiPolicy agreed_policy = GpuMpiPolicy::automatic;
+  GpuMpiRoute resolved_route = GpuMpiRoute::staged;
+  if (!collective_resolve_gpu_mpi_policy(parsed_policy.valid && provider_query_valid,
+                                         parsed_policy.requested,
+                                         provider_query_available, provider_supports_direct,
+                                         agreed_policy, resolved_route, policy_error))
+    throw std::invalid_argument(policy_error);
+  if (agreed_policy == GpuMpiPolicy::direct)
+    throw std::invalid_argument(
+        "forced direct GPU MPI transport is not supported until PR7.3");
+  /* PR7.2 is the mandatory portable baseline. Auto never selects the direct
+     path until PR7.3 installs its provider-specific ownership contract. */
+  resolved_route = GpuMpiRoute::staged;
   std::unique_ptr<NvidiaExecutable> executable;
   nvidia::compiled_boundary_artifact remote_boundaries;
   std::string local_error;
   try {
+    bool owns_field_chunks = false;
+    for (int chunk = 0; chunk < f_.num_chunks; ++chunk)
+      owns_field_chunks = owns_field_chunks || f_.chunks[chunk]->is_mine();
     if (has_provisional_material_storage(state.plan_))
       throw std::logic_error("NVIDIA compile received unresolved material storage");
     if (plan.signature != compute_step_plan_signature(plan))
@@ -8515,20 +8565,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     FOR_FIELD_TYPES(ft)
       boundary_zeroes.insert(boundary_zeroes.end(), canonical_halos.zeros[ft].begin(),
                              canonical_halos.zeros[ft].end());
-    const GpuMpiPolicyParse parsed_policy =
-        parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
-    bool provider_query_available = false, provider_supports_direct = false;
-    std::string provider, boundary_error = parsed_policy.error;
-    if (parsed_policy.valid &&
-        !query_gpu_aware_mpi_provider(provider_query_available, provider_supports_direct,
-                                      provider, boundary_error))
-      throw std::invalid_argument(boundary_error);
-    const GpuMpiPolicy agreed_policy = parsed_policy.requested;
-    GpuMpiRoute resolved_route = GpuMpiRoute::staged;
-    if (!parsed_policy.valid ||
-        !resolve_gpu_mpi_route(agreed_policy, provider_query_available,
-                               provider_supports_direct, resolved_route, boundary_error))
-      throw std::invalid_argument(boundary_error);
+    std::string boundary_error;
     int mpi_tag_ub = INT_MAX;
 #ifdef HAVE_MPI
     int *tag_bound = NULL, tag_bound_present = 0;
@@ -8561,8 +8598,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       remote_boundary_compile_statistics_.gathers += stage.gathers.size();
       remote_boundary_compile_statistics_.scatters += stage.scatters.size();
     }
-    if (count_processors() != 1)
-      throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
+    if (count_processors() != 1 && plan.program == StepProgram::solve_cw)
+      throw std::invalid_argument("distributed NVIDIA solve_cw remains unsupported");
     if (f_.gv.dim != Dcyl && f_.m != 0.0)
       throw std::invalid_argument("NVIDIA nonzero m requires cylindrical coordinates");
     if (plan.cylindrical_m != f_.m ||
@@ -9013,6 +9050,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       const Operation &op = plan.operations[oi];
       NvidiaCompiledOperation compiled = {};
       compiled.kind = op.kind;
+      compiled.ft = op.ft;
       compiled.guard = op.guard;
       compiled.host_segment_index = std::numeric_limits<size_t>::max();
       compiled.source_time_offset = op.source_time_offset;
@@ -9184,7 +9222,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           }
           if (!local_error.empty()) break;
           compiled.count = curl_updates.size() - compiled.first;
-          if (!compiled.count) set_reason(local_error, oi, "curl descriptor span is empty");
+          if (!compiled.count && owns_field_chunks)
+            set_reason(local_error, oi, "curl descriptor span is empty");
           if (size_t(op.beta_descriptor_index) + op.beta_descriptor_count >
               plan.beta_updates.size()) {
             set_reason(local_error, oi, "beta descriptor span is out of range");
@@ -9417,6 +9456,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                host-owned, however, so only skip it after canonical remapping
                proves that some row has no device ArrayId. */
             if (canonical.storage == HaloStorageDisposition::host_owned) continue;
+            if (!canonical.same_rank) continue;
             const NvidiaCompiledHalo lowered =
                 compile_halo(canonical, f_, state, buffer_elements, halo_gathers, halo_scatters);
             if (have_halo_precision && lowered.gather.precision != halo_precision)
@@ -9448,7 +9488,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
             have_previous = true;
           }
           compiled.count = finite_checks.size() - compiled.first;
-          if (!compiled.count) set_reason(local_error, oi, "finite-value check span is empty");
+          if (!compiled.count && owns_field_chunks)
+            set_reason(local_error, oi, "finite-value check span is empty");
           break;
         }
         case OpKind::apply_sources: {
@@ -9807,8 +9848,21 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     if (local_error.empty()) local_error = "NVIDIA PR2 compilation was rejected on another rank";
     throw std::runtime_error(local_error);
   }
+  const bool needs_remote_transport =
+      count_processors() > 1 && or_to_all(!remote_boundaries.wire.stages.empty());
+  if (needs_remote_transport) {
+    std::string transport_error;
+    executable->transport_ = nvidia::create_staged_transport_epoch(
+        executable->remote_boundaries_, state.device_, state.communication_.get(),
+        transport_error);
+    if (!executable->transport_)
+      throw std::runtime_error(transport_error.empty()
+                                   ? "NVIDIA staged MPI transport creation failed"
+                                   : transport_error);
+  }
   local_error.clear();
   try {
+    nvidia::device_scope scope(state.device_);
     configure_graph_execution(plan, *executable, state);
   }
   catch (const std::exception &error) {
@@ -11498,10 +11552,16 @@ void NvidiaBackend::execute_magnetic_half_step(NvidiaExecutable &executable,
           executable.magnetic_half_graph_program_.boundaries[entry.index];
       ++executable.graph_statistics_.magnetic_boundary_count;
       ++state.graph_statistics_.magnetic_boundary_count;
-      if (boundary.kind != GraphBoundaryKind::source_evaluation ||
-          boundary.first_operation >= executable.operations_.size())
+      if (boundary.first_operation >= executable.operations_.size())
         throw std::logic_error("NVIDIA magnetic graph has an invalid host boundary");
       const NvidiaCompiledOperation &op = executable.operations_[boundary.first_operation];
+      if (boundary.kind == GraphBoundaryKind::remote_halo) {
+        if (!launch_device_operation(executable, state, op, NULL, false))
+          throw std::logic_error("NVIDIA magnetic remote-halo boundary is invalid");
+        continue;
+      }
+      if (boundary.kind != GraphBoundaryKind::source_evaluation)
+        throw std::logic_error("NVIDIA magnetic graph has an invalid host boundary");
       evaluate_supported_source_scalars(f_, op.source_time_offset);
       const SourcePlan &source_plan = f_.descriptors->sources;
       if (source_plan.scalars.size() != executable.source_scalar_count_ ||
@@ -11608,16 +11668,8 @@ void NvidiaBackend::execute_magnetic_half_step(NvidiaExecutable &executable,
           nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
         break;
       case OpKind::transfer_halo:
-        for (size_t i = op.first; i < op.first + op.count; ++i)
-          nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
-        for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i)
-          nvidia::launch_halo_gather(executable.halo_plans_[i].gather,
-                                     executable.halo_gathers_.opaque_handle(),
-                                     executable.halo_scratch_.opaque_handle(), *state.transfer_);
-        for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i)
-          nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
-                                      executable.halo_scatters_.opaque_handle(),
-                                      executable.halo_scratch_.opaque_handle(), *state.transfer_);
+        if (!launch_device_operation(executable, state, op, NULL, false))
+          throw std::logic_error("NVIDIA magnetic halo operation is not device executable");
         break;
       default: throw std::logic_error("NVIDIA magnetic half-step contains an invalid operation");
     }
@@ -11863,7 +11915,7 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       }
       return true;
     }
-    case OpKind::transfer_halo:
+    case OpKind::transfer_halo: {
       for (size_t i = op.first; i < op.first + op.count; ++i) {
         nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
         count_cw_kernel();
@@ -11874,13 +11926,38 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
                                    executable.halo_scratch_.opaque_handle(), *state.transfer_);
         count_cw_kernel();
       }
-      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-        nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
-                                    executable.halo_scatters_.opaque_handle(),
-                                    executable.halo_scratch_.opaque_handle(), *state.transfer_);
-        count_cw_kernel();
+      const bool remote_stage =
+          executable.transport_ && executable.transport_->has_stage(op.ft);
+      if (remote_stage) {
+        std::string transport_error;
+        if (!executable.transport_->begin_stage(op.ft, *state.transfer_, transport_error))
+          throw std::runtime_error(transport_error.empty()
+                                       ? "NVIDIA staged transport begin failed"
+                                       : transport_error);
+      }
+      try {
+        for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
+          nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
+                                      executable.halo_scatters_.opaque_handle(),
+                                      executable.halo_scratch_.opaque_handle(), *state.transfer_);
+          count_cw_kernel();
+        }
+      }
+      catch (...) {
+        if (remote_stage)
+          executable.transport_->abort_published_stage(
+              op.ft, "local halo scatter after remote request publication");
+        throw;
+      }
+      if (remote_stage) {
+        std::string transport_error;
+        if (!executable.transport_->finish_stage(op.ft, *state.transfer_, transport_error))
+          throw std::runtime_error(transport_error.empty()
+                                       ? "NVIDIA staged transport completion failed"
+                                       : transport_error);
       }
       return true;
+    }
     case OpKind::apply_sources:
       for (size_t i = op.first; i < op.first + op.count; ++i) {
         nvidia::launch_source_batch(executable.source_batches_[i],
@@ -11934,6 +12011,11 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       return true;
     }
     case OpKind::finite_value_check:
+      /* An MPI participant with no owned field chunks retains the canonical
+         diagnostic operation so that every rank follows the same schedule,
+         but it has no device rows (and therefore no result allocation) to
+         inspect locally. */
+      if (!op.count) return true;
       nvidia::fill_byte_async(executable.finite_result_, 0, 0xff, sizeof(uint64_t),
                               *state.transfer_);
       for (size_t i = op.first; i < op.first + op.count; ++i) {
@@ -12025,8 +12107,6 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     const GraphProgram *programs[] = {
         &graph_program, &magnetic_half_program, &magnetic_restore_program};
     for (const GraphProgram *candidate : programs) {
-      for (const GraphBoundary &boundary : candidate->boundaries)
-        if (boundary.kind == GraphBoundaryKind::remote_halo) program_graphable = false;
       for (const GraphSegment &segment : candidate->segments)
         for (const GraphOperationRef &operation : segment.operations)
           if (operation.operation.guard.kind == GuardKind::device_predicate &&
@@ -12529,8 +12609,6 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   NvidiaBackendState &state = checked_state(raw_state);
   NvidiaExecutable &executable = checked_executable(raw_executable, state);
   if (!or_to_all(num_steps > 0)) return;
-  if (count_processors() != 1)
-    throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
   if (!state.initialized_) throw std::logic_error("cannot advance uninitialized NVIDIA storage");
   if (executable.storage_fingerprint_ != state.fingerprint_)
     throw std::logic_error("NVIDIA executable was compiled for a different storage layout");
@@ -12576,6 +12654,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                                   "NVIDIA legacy flux publication");
     };
     const auto complete_finite_check = [&](const NvidiaCompiledOperation &op) {
+      if (!op.count) return;
       nvidia::copy_device_to_host_async(executable.finite_result_host_.data(),
                                         executable.finite_result_, 0, sizeof(uint64_t),
                                         *state.transfer_);

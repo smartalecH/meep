@@ -166,6 +166,17 @@ struct NvidiaRemoteBoundaryCompileStatistics {
         authority_signature(0) {}
 };
 
+struct NvidiaMpiTransportStatistics {
+  uint64_t messages_sent;
+  uint64_t messages_received;
+  uint64_t bytes_sent;
+  uint64_t bytes_received;
+  uint64_t testsome_polls;
+  uint64_t waitall_calls;
+  uint64_t slot_reuses;
+  uint64_t direct_bytes;
+};
+
 struct NvidiaCwStatistics {
   CwSolveResult result;
   size_t reduction_count;
@@ -402,6 +413,7 @@ public:
   NvidiaGraphStatistics graph_statistics_for_testing() const;
   NvidiaExecutableCacheStatistics executable_cache_statistics_for_testing() const;
   NvidiaRemoteBoundaryCompileStatistics remote_boundary_compile_statistics_for_testing() const;
+  NvidiaMpiTransportStatistics mpi_transport_statistics_for_testing() const;
   void mutate_prepared_initialization_upload_for_testing(BackendState &state, int mode);
   void set_next_executable_generation_for_testing(uint64_t generation) {
     next_executable_generation_ = generation;
