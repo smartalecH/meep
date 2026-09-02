@@ -36,6 +36,7 @@
 #include <vector>
 
 #include "backend/initialization_plan.hpp"
+#include "backend/dependency_region.hpp"
 #include "backend/graph_plan.hpp"
 #include "backend/mpi_context.hpp"
 #include "backend/material_recipe.hpp"
@@ -847,6 +848,26 @@ struct NvidiaCompiledGraphSegment {
   NvidiaCompiledGraphSegment &operator=(const NvidiaCompiledGraphSegment &) = delete;
 };
 
+struct NvidiaCompiledDependencyRow {
+  DependencyOperationKind kind;
+  nvidia::curl_launch curl_interior;
+  nvidia::constitutive_launch constitutive_interior;
+  std::vector<nvidia::curl_launch> curl_boundary;
+  std::vector<nvidia::constitutive_launch> constitutive_boundary;
+};
+
+struct NvidiaCompiledDependencyStage {
+  uint32_t halo_operation_index;
+  uint32_t update_operation_index;
+  field_type ft;
+  uint64_t signature;
+  std::vector<NvidiaCompiledDependencyRow> rows;
+};
+
+nvidia::flat_region flat_region_for(const DependencyBox &source);
+void shift_profile_for_dependency(nvidia::pml_profile_launch &profile,
+                                  const DependencyBox &box);
+
 struct NvidiaCapturedGraph {
   nvidia::graph definition;
   nvidia::graph_exec executable;
@@ -1179,6 +1200,7 @@ public:
   std::vector<NvidiaCompiledHostSegment> host_segments_;
   nvidia::compiled_boundary_artifact remote_boundaries_;
   std::unique_ptr<nvidia::staged_transport_epoch> transport_;
+  std::vector<NvidiaCompiledDependencyStage> dependency_regions_;
   GraphProgram graph_program_;
   std::vector<NvidiaCompiledGraphSegment> graph_segments_;
   std::vector<size_t> graph_cw_timestep_launches_;
@@ -1211,6 +1233,120 @@ public:
   nvidia::device_buffer legacy_flux_partials_;
   nvidia::pinned_buffer legacy_flux_host_;
 };
+
+NvidiaCompiledDependencyStage compile_dependency_stage(
+    const DependencyRegionPlan &plan, const StepPlan &step,
+    const std::vector<NvidiaCompiledOperation> &operations,
+    const std::vector<nvidia::curl_launch> &curls,
+    const std::vector<nvidia::constitutive_launch> &constitutives) {
+  if (plan.update_operation_index >= operations.size() ||
+      plan.update_operation_index >= step.operations.size())
+    throw std::invalid_argument("dependency region update operation is out of range");
+  const Operation &source_operation = step.operations[plan.update_operation_index];
+  const NvidiaCompiledOperation &compiled_operation = operations[plan.update_operation_index];
+  NvidiaCompiledDependencyStage result = {};
+  result.halo_operation_index = plan.halo_operation_index;
+  result.update_operation_index = plan.update_operation_index;
+  result.ft = plan.ft;
+  result.signature = plan.signature;
+  for (const DependencyRegionRow &source : plan.rows) {
+    if (source.descriptor_index < source_operation.descriptor_index ||
+        source.descriptor_index >=
+            source_operation.descriptor_index + source_operation.descriptor_count)
+      throw std::invalid_argument("dependency region descriptor is outside its operation span");
+    const size_t offset = source.descriptor_index - source_operation.descriptor_index;
+    const size_t compiled_index = compiled_operation.first + offset;
+    NvidiaCompiledDependencyRow row = {};
+    row.kind = source.kind;
+    if (source.kind == DependencyOperationKind::curl) {
+      if (compiled_index >= curls.size())
+        throw std::invalid_argument("dependency curl launch is out of range");
+      row.curl_interior = curls[compiled_index];
+      row.curl_interior.region = flat_region_for(source.interior);
+      shift_profile_for_dependency(row.curl_interior.pml, source.interior);
+      shift_profile_for_dependency(row.curl_interior.pml_u, source.interior);
+      for (const DependencyBox &box : source.boundary) {
+        nvidia::curl_launch launch = curls[compiled_index];
+        launch.region = flat_region_for(box);
+        shift_profile_for_dependency(launch.pml, box);
+        shift_profile_for_dependency(launch.pml_u, box);
+        row.curl_boundary.push_back(launch);
+      }
+    }
+    else {
+      if (source.kind != DependencyOperationKind::constitutive ||
+          compiled_index >= constitutives.size())
+        throw std::invalid_argument("dependency constitutive launch is out of range");
+      row.constitutive_interior = constitutives[compiled_index];
+      row.constitutive_interior.region = flat_region_for(source.interior);
+      shift_profile_for_dependency(row.constitutive_interior.pml, source.interior);
+      for (const DependencyBox &box : source.boundary) {
+        nvidia::constitutive_launch launch = constitutives[compiled_index];
+        launch.region = flat_region_for(box);
+        shift_profile_for_dependency(launch.pml, box);
+        row.constitutive_boundary.push_back(launch);
+      }
+    }
+    result.rows.push_back(row);
+  }
+  return result;
+}
+
+void launch_dependency_overlap(NvidiaExecutable &executable, NvidiaBackendState &state,
+                               const NvidiaCompiledDependencyStage &dependency) {
+  if (dependency.halo_operation_index >= executable.operations_.size() ||
+      dependency.update_operation_index >= executable.operations_.size())
+    throw std::logic_error("NVIDIA dependency overlap operation is stale");
+  const NvidiaCompiledOperation &halo =
+      executable.operations_[dependency.halo_operation_index];
+  if (halo.kind != OpKind::transfer_halo || halo.ft != dependency.ft ||
+      !executable.transport_ || !executable.transport_->has_stage(halo.ft))
+    throw std::logic_error("NVIDIA dependency overlap lost its remote halo stage");
+  for (size_t i = halo.first; i < halo.first + halo.count; ++i)
+    nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
+  for (size_t i = halo.halo_first; i < halo.halo_first + halo.halo_count; ++i)
+    nvidia::launch_halo_gather(executable.halo_plans_[i].gather,
+                               executable.halo_gathers_.opaque_handle(),
+                               executable.halo_scratch_.opaque_handle(), *state.transfer_);
+  std::string transport_error;
+  if (!executable.transport_->begin_stage(halo.ft, *state.transfer_, transport_error))
+    throw std::runtime_error(transport_error.empty()
+                                 ? "NVIDIA direct overlap transport begin failed"
+                                 : transport_error);
+  try {
+    for (size_t i = halo.halo_first; i < halo.halo_first + halo.halo_count; ++i)
+      nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
+                                  executable.halo_scatters_.opaque_handle(),
+                                  executable.halo_scratch_.opaque_handle(), *state.transfer_);
+    for (const NvidiaCompiledDependencyRow &row : dependency.rows) {
+      if (row.kind == DependencyOperationKind::curl)
+        nvidia::launch_curl(row.curl_interior, *state.transfer_);
+      else
+        nvidia::launch_constitutive(row.constitutive_interior, *state.transfer_);
+    }
+  }
+  catch (...) {
+    executable.transport_->abort_published_stage(
+        halo.ft, "dependency interior failure after remote request publication");
+  }
+  if (!executable.transport_->finish_stage(halo.ft, *state.transfer_, transport_error))
+    throw std::runtime_error(transport_error.empty()
+                                 ? "NVIDIA direct overlap transport completion failed"
+                                 : transport_error);
+  for (const NvidiaCompiledDependencyRow &row : dependency.rows)
+    if (row.kind == DependencyOperationKind::curl)
+      for (const nvidia::curl_launch &launch : row.curl_boundary)
+        nvidia::launch_curl(launch, *state.transfer_);
+    else
+      for (const nvidia::constitutive_launch &launch : row.constitutive_boundary)
+        nvidia::launch_constitutive(launch, *state.transfer_);
+  size_t boundary_launches = 0;
+  for (const NvidiaCompiledDependencyRow &row : dependency.rows)
+    boundary_launches += row.kind == DependencyOperationKind::curl
+                             ? row.curl_boundary.size()
+                             : row.constitutive_boundary.size();
+  executable.transport_->record_dependency_overlap(dependency.rows.size(), boundary_launches);
+}
 
 class NvidiaCwExecutable : public Executable {
 public:
@@ -1778,6 +1914,32 @@ nvidia::flat_region flat_region_for(const UpdateRegion &source) {
     result.strides[axis] = source.strides[axis];
   }
   return result;
+}
+
+nvidia::flat_region flat_region_for(const DependencyBox &source) {
+  nvidia::flat_region result = {};
+  result.base = source.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!source.counts[axis])
+      throw std::invalid_argument("dependency region has an empty axis");
+    if (source.strides[axis] < 0)
+      throw std::invalid_argument("dependency region has a negative storage stride");
+    result.counts[axis] = source.counts[axis];
+    result.strides[axis] = source.strides[axis];
+  }
+  return result;
+}
+
+void shift_profile_for_dependency(nvidia::pml_profile_launch &profile,
+                                  const DependencyBox &box) {
+  if (!profile.sigma) return;
+  for (int axis = 0; axis < 3; ++axis) {
+    ptrdiff_t delta = 0;
+    if (box.origin[axis] > size_t(std::numeric_limits<ptrdiff_t>::max()) ||
+        __builtin_mul_overflow(ptrdiff_t(box.origin[axis]), profile.strides[axis], &delta) ||
+        __builtin_add_overflow(profile.base, delta, &profile.base))
+      throw std::overflow_error("dependency-region PML offset overflows");
+  }
 }
 
 ptrdiff_t checked_region_max(const nvidia::flat_region &region) {
@@ -4029,6 +4191,9 @@ NvidiaMpiTransportStatistics NvidiaBackend::mpi_transport_statistics_for_testing
   result.waitall_calls = stats.waitall_calls;
   result.slot_reuses = stats.slot_reuses;
   result.direct_bytes = stats.direct_bytes;
+  result.overlap_stages = stats.overlap_stages;
+  result.overlap_interior_launches = stats.overlap_interior_launches;
+  result.overlap_boundary_launches = stats.overlap_boundary_launches;
   return result;
 }
 
@@ -8500,12 +8665,24 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                                          provider_query_available, provider_supports_direct,
                                          agreed_policy, resolved_route, policy_error))
     throw std::invalid_argument(policy_error);
-  if (agreed_policy == GpuMpiPolicy::direct)
-    throw std::invalid_argument(
-        "forced direct GPU MPI transport is not supported until PR7.3");
-  /* PR7.2 is the mandatory portable baseline. Auto never selects the direct
-     path until PR7.3 installs its provider-specific ownership contract. */
-  resolved_route = GpuMpiRoute::staged;
+  const DependencyOverlapPolicyParse parsed_overlap =
+      parse_dependency_overlap_policy(std::getenv("MEEP_NVIDIA_MPI_OVERLAP"));
+  const bool overlap_parse_valid = and_to_all(parsed_overlap.valid);
+  const int overlap_min = min_to_all(int(parsed_overlap.requested));
+  const int overlap_max = max_to_all(int(parsed_overlap.requested));
+  if (!overlap_parse_valid)
+    throw std::invalid_argument(parsed_overlap.error.empty()
+                                    ? "invalid NVIDIA MPI overlap policy on another rank"
+                                    : parsed_overlap.error);
+  if (overlap_min != overlap_max)
+    throw std::invalid_argument("NVIDIA MPI overlap policy differs across ranks");
+  const DependencyOverlapPolicy overlap_policy =
+      DependencyOverlapPolicy(overlap_min);
+  if (overlap_policy == DependencyOverlapPolicy::required &&
+      resolved_route != GpuMpiRoute::direct)
+    throw std::invalid_argument("required NVIDIA MPI overlap requires the direct route");
+  /* The collectively resolved route is part of the endpoint wire authority.
+     No rank may substitute staged buffers after request publication. */
   std::unique_ptr<NvidiaExecutable> executable;
   nvidia::compiled_boundary_artifact remote_boundaries;
   std::string local_error;
@@ -9848,16 +10025,59 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     if (local_error.empty()) local_error = "NVIDIA PR2 compilation was rejected on another rank";
     throw std::runtime_error(local_error);
   }
+  if (resolved_route == GpuMpiRoute::direct &&
+      overlap_policy != DependencyOverlapPolicy::off) {
+    std::vector<NvidiaCompiledDependencyStage> overlap_stages;
+    std::string overlap_error;
+    try {
+      if (remote_boundaries.wire.participation.device_owner)
+        for (size_t oi = 0; oi < plan.operations.size(); ++oi) {
+          const Operation &operation = plan.operations[oi];
+          if (operation.kind != OpKind::transfer_halo) continue;
+          bool has_remote_stage = false;
+          for (const nvidia::bound_boundary_stage &stage : remote_boundaries.bound.stages)
+            if (stage.ft == operation.ft && (!stage.receives.empty() || !stage.sends.empty())) {
+              has_remote_stage = true;
+              break;
+            }
+          if (!has_remote_stage) continue;
+          DependencyRegionPlan dependency;
+          if (!build_dependency_region_plan(plan, uint32_t(oi), remote_boundaries.lowered,
+                                            state.plan_, dependency, overlap_error))
+            break;
+          overlap_stages.push_back(compile_dependency_stage(
+              dependency, plan, executable->operations_, executable->curl_updates_,
+              executable->constitutive_updates_));
+        }
+    }
+    catch (const std::exception &error) { overlap_error = error.what(); }
+    catch (...) { overlap_error = "unknown NVIDIA dependency-region compilation failure"; }
+    const bool local_required_missing = remote_boundaries.wire.participation.device_owner &&
+                                        !remote_boundaries.wire.stages.empty() &&
+                                        overlap_stages.empty();
+    const bool overlap_failed = or_to_all(!overlap_error.empty() || local_required_missing);
+    if (overlap_failed) {
+      if (overlap_policy == DependencyOverlapPolicy::required)
+        throw std::invalid_argument(
+            overlap_error.empty() ? "required NVIDIA MPI overlap is unsupported on another rank"
+                                  : overlap_error);
+    }
+    else
+      executable->dependency_regions_ = std::move(overlap_stages);
+  }
   const bool needs_remote_transport =
       count_processors() > 1 && or_to_all(!remote_boundaries.wire.stages.empty());
   if (needs_remote_transport) {
     std::string transport_error;
-    executable->transport_ = nvidia::create_staged_transport_epoch(
-        executable->remote_boundaries_, state.device_, state.communication_.get(),
-        transport_error);
+    bool fell_back = false;
+    executable->transport_ = nvidia::create_transport_epoch_with_fallback(
+        executable->remote_boundaries_, state.device_, state.communication_.get(), agreed_policy,
+        overlap_policy, fell_back, transport_error);
+    if (fell_back)
+      executable->dependency_regions_.clear();
     if (!executable->transport_)
       throw std::runtime_error(transport_error.empty()
-                                   ? "NVIDIA staged MPI transport creation failed"
+                                   ? "NVIDIA MPI transport creation failed"
                                    : transport_error);
   }
   local_error.clear();
@@ -12067,6 +12287,7 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
   }
 
   GraphLoweringAuthorities authority;
+  GraphLoweringAuthorities ordinary_authority;
   GraphProgram graph_program;
   GraphProgram magnetic_half_program;
   GraphProgram magnetic_restore_program;
@@ -12074,7 +12295,18 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
   try {
     authority = build_graph_lowering_authorities(plan, f_.halos, f_.array_catalog,
                                                   f_.is_real ? 1 : 2);
-    graph_program = build_graph_program(plan, authority, GraphVariantKind::ordinary);
+    ordinary_authority = authority;
+    for (const NvidiaCompiledDependencyStage &dependency : executable.dependency_regions_) {
+      GraphRemoteOverlap overlap = {dependency.halo_operation_index,
+                                    dependency.update_operation_index,
+                                    dependency.signature, 0};
+      overlap.signature = compute_graph_remote_overlap_signature(overlap);
+      ordinary_authority.remote_overlaps.push_back(overlap);
+    }
+    ordinary_authority.signature =
+        compute_graph_lowering_authorities_signature(ordinary_authority);
+    graph_program =
+        build_graph_program(plan, ordinary_authority, GraphVariantKind::ordinary);
     magnetic_half_program =
         build_graph_program(plan, authority, GraphVariantKind::magnetic_half_step);
     magnetic_restore_program =
@@ -12092,7 +12324,7 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
   bool program_graphable = false;
   try {
     std::string graph_error;
-    if (!validate_graph_program(plan, authority, graph_program, &graph_error))
+    if (!validate_graph_program(plan, ordinary_authority, graph_program, &graph_error))
       throw std::invalid_argument(graph_error.empty() ? "invalid NVIDIA graph program"
                                                        : graph_error);
     if (!validate_graph_program(plan, authority, magnetic_half_program, &graph_error) ||
@@ -12807,6 +13039,20 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
           if (op.guard.kind == GuardKind::segment_boundary && !graph_segment_guard &&
               op.kind != OpKind::phase_material)
             continue;
+          if (boundary.kind == GraphBoundaryKind::remote_halo &&
+              boundary.operation_count == 2) {
+            const NvidiaCompiledDependencyStage *dependency = NULL;
+            for (const NvidiaCompiledDependencyStage &candidate :
+                 executable.dependency_regions_)
+              if (candidate.halo_operation_index == boundary.first_operation) {
+                dependency = &candidate;
+                break;
+              }
+            if (!dependency)
+              throw std::logic_error("NVIDIA graph overlap boundary lost its dependency plan");
+            launch_dependency_overlap(executable, state, *dependency);
+            continue;
+          }
           switch (op.kind) {
             case OpKind::host_callback:
               execute_host_segment(executable, state, boundary.first_operation,
@@ -12873,6 +13119,19 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         if (op.kind == OpKind::finite_value_check && account_cw && cw_profile_mode_requested())
           continue;
         if (op.kind == OpKind::finite_value_check && !finite_due) continue;
+        const NvidiaCompiledDependencyStage *dependency = NULL;
+        for (const NvidiaCompiledDependencyStage &candidate : executable.dependency_regions_)
+          if (candidate.halo_operation_index == oi) {
+            dependency = &candidate;
+            break;
+          }
+        if (dependency) {
+          if (dependency->update_operation_index != oi + 1)
+            throw std::logic_error("NVIDIA dependency overlap pair is not adjacent");
+          launch_dependency_overlap(executable, state, *dependency);
+          ++oi;
+          continue;
+        }
         if (launch_device_operation(executable, state, op, NULL, account_cw)) {
           if (op.kind == OpKind::update_flux) publish_legacy_flux(op);
           else if (op.kind == OpKind::finite_value_check) complete_finite_check(op);

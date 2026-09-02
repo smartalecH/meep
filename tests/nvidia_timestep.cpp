@@ -34,6 +34,7 @@
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/material_recipe.hpp"
+#include "backend/mpi_context.hpp"
 #include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/nvidia/nvidia_graph.hpp"
 #include "backend/nvidia/nvidia_initialization.hpp"
@@ -44,6 +45,7 @@
 #include "backend/prepare.hpp"
 #include "backend/step_plan.hpp"
 #include "backend/storage_plan.hpp"
+#include "backend/transport_plan.hpp"
 #include "material_data.hpp"
 #include "meep_internals.hpp"
 #include "meepgeom.hpp"
@@ -10555,6 +10557,16 @@ static void test_remote_boundary_staged_path() {
   }
   const precision_policy_kind policies[] = {precision_policy_kind::native,
                                              precision_policy_kind::f32};
+  const GpuMpiPolicyParse requested = parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
+  bool query_available = false, supports_direct = false;
+  std::string provider, provider_error;
+  require(query_gpu_aware_mpi_provider(query_available, supports_direct, provider, provider_error),
+          provider_error.c_str());
+  GpuMpiRoute expected_route = GpuMpiRoute::staged;
+  std::string route_error;
+  require(resolve_gpu_mpi_route(requested.requested, query_available, supports_direct,
+                                expected_route, route_error),
+          route_error.c_str());
   for (precision_policy_kind precision : policies) {
     const grid_volume gv = vol1d(4.0, 10.0);
     structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
@@ -10608,7 +10620,9 @@ static void test_remote_boundary_staged_path() {
             "production staged transport did not retain the expected active/idle "
             "real-HaloPlan descriptor authority");
     const bool local_transport_valid =
-        transport.direct_bytes == 0 &&
+        (expected_route == GpuMpiRoute::direct
+             ? transport.direct_bytes == transport.bytes_sent + transport.bytes_received
+             : transport.direct_bytes == 0) &&
         (!exercised_remote_transport ||
          (transport.messages_sent > 0 && transport.messages_received > 0 &&
           transport.bytes_sent > 0 && transport.bytes_received > 0 &&
@@ -10616,14 +10630,15 @@ static void test_remote_boundary_staged_path() {
           transport.slot_reuses > 0));
     require(and_to_all(local_transport_valid) &&
                 sum_to_all(int(exercised_remote_transport)) == 2,
-            "production staged transport execution/accounting did not distinguish "
+            "production transport execution/accounting did not distinguish "
             "active and idle ranks");
   }
   if (count_processors() == 4) {
     unsetenv("MEEP_ALLOW_GPU_SHARING");
     device_uuid_testing::set_overrides(NULL, NULL);
   }
-  master_printf("nvidia_timestep: remote boundary staged path PASS\n");
+  master_printf("nvidia_timestep: remote boundary %s path PASS\n",
+                gpu_mpi_route_name(expected_route));
 }
 
 static void test_remote_boundary_direct_rejection() {

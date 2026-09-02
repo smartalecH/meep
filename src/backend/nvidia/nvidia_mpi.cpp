@@ -21,11 +21,21 @@ namespace {
 testing::staged_transport_failure_point injected_failure =
     testing::staged_transport_failure_point::none;
 size_t minimum_presend_polls = 0;
+testing::mpi_request_operations *injected_request_operations = NULL;
 
 bool consume_failure(testing::staged_transport_failure_point point) {
   if (injected_failure != point) return false;
   injected_failure = testing::staged_transport_failure_point::none;
   return true;
+}
+
+testing::transport_presend_action presend_action(GpuMpiRoute route, bool gather_ready,
+                                                 bool staging_ready, bool copies_enqueued) {
+  if (!gather_ready) return testing::transport_presend_action::poll;
+  if (route == GpuMpiRoute::direct) return testing::transport_presend_action::post_sends;
+  if (!copies_enqueued) return testing::transport_presend_action::enqueue_device_to_host;
+  return staging_ready ? testing::transport_presend_action::post_sends
+                       : testing::transport_presend_action::poll;
 }
 
 bool resolve_staged_transport_retirement(bool backend_retired, bool lease_valid,
@@ -55,6 +65,47 @@ size_t checked_size_add(size_t value, size_t add, const char *what) {
 }
 
 #ifdef HAVE_MPI
+int transport_irecv(void *buffer, int bytes, int source, int tag, MPI_Comm communicator,
+                    MPI_Request *request) {
+  if (injected_request_operations)
+    return injected_request_operations->irecv(buffer, size_t(bytes), source, tag, request);
+  return MPI_Irecv(buffer, bytes, MPI_BYTE, source, tag, communicator, request);
+}
+
+int transport_isend(const void *buffer, int bytes, int destination, int tag,
+                    MPI_Comm communicator, MPI_Request *request) {
+  if (injected_request_operations)
+    return injected_request_operations->isend(buffer, size_t(bytes), destination, tag, request);
+  return MPI_Isend(buffer, bytes, MPI_BYTE, destination, tag, communicator, request);
+}
+
+int transport_testsome(std::vector<MPI_Request> &requests, int &count, int *completed,
+                       MPI_Status *statuses) {
+  if (injected_request_operations)
+    return injected_request_operations->testsome(requests.size(), requests.data(),
+                                                 sizeof(MPI_Request), count, completed);
+  return MPI_Testsome(int(requests.size()), requests.data(), &count, completed, statuses);
+}
+
+int transport_waitall(std::vector<MPI_Request> &requests, MPI_Status *statuses) {
+  if (injected_request_operations)
+    return injected_request_operations->waitall(requests.size(), requests.data(),
+                                                sizeof(MPI_Request));
+  return MPI_Waitall(int(requests.size()), requests.data(), statuses);
+}
+
+bool transport_request_is_null(const MPI_Request *request) {
+  return injected_request_operations ? injected_request_operations->request_is_null(request)
+                                     : *request == MPI_REQUEST_NULL;
+}
+
+void transport_clear_request(MPI_Request *request) {
+  if (injected_request_operations)
+    injected_request_operations->clear_request(request);
+  else
+    *request = MPI_REQUEST_NULL;
+}
+
 [[noreturn]] void fatal_transport(MPI_Comm communicator, const char *operation, int code) {
   std::fprintf(stderr, "fatal NVIDIA staged MPI transport failure in %s (MPI code %d)\n", operation,
                code);
@@ -75,6 +126,7 @@ staged_transport_statistics::staged_transport_statistics()
       device_to_host_calls(0), device_to_host_bytes(0), host_to_device_calls(0),
       host_to_device_bytes(0), direct_bytes(0), gather_launches(0), scatter_launches(0),
       testsome_polls(0), waitall_calls(0), request_completions(0), slot_reuses(0),
+      overlap_stages(0), overlap_interior_launches(0), overlap_boundary_launches(0),
       high_water_requests(0), device_bytes(0), pinned_bytes(0) {}
 
 struct staged_transport_epoch::impl {
@@ -167,6 +219,18 @@ bool staged_transport_epoch::has_stage(field_type ft) const {
   return stage != NULL;
 }
 
+void staged_transport_epoch::record_dependency_overlap(size_t interior_launches,
+                                                       size_t boundary_launches) {
+  if (!impl_ || impl_->retired || impl_->poisoned)
+    throw std::logic_error("cannot account dependency overlap on an inactive transport");
+  impl_->stats.overlap_stages =
+      checked_counter_add(impl_->stats.overlap_stages, 1, "overlap stage");
+  impl_->stats.overlap_interior_launches = checked_counter_add(
+      impl_->stats.overlap_interior_launches, interior_launches, "overlap interior launch");
+  impl_->stats.overlap_boundary_launches = checked_counter_add(
+      impl_->stats.overlap_boundary_launches, boundary_launches, "overlap boundary launch");
+}
+
 bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, std::string &why) {
   why.clear();
   if (!impl_) {
@@ -191,8 +255,8 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
   if (slot.phase != impl::slot_phase::idle)
     local_error = "NVIDIA staged transport slot was reused before completion";
 #ifdef HAVE_MPI
-  for (MPI_Request request : slot.requests)
-    if (request != MPI_REQUEST_NULL)
+  for (MPI_Request &request : slot.requests)
+    if (!transport_request_is_null(&request))
       local_error = "NVIDIA staged transport slot retained a live MPI request";
 #endif
   if (stage->generation >= 2)
@@ -231,11 +295,15 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
   }
   for (size_t i = 0; i < stage->plan.receives.size(); ++i) {
     const bound_boundary_message &message = stage->plan.receives[i];
-    unsigned char *destination = static_cast<unsigned char *>(stage->receive_staging.data()) +
-                                 message.arena_offsets[slot_index];
-    const int code =
-        MPI_Irecv(destination, int(message.wire_bytes), MPI_BYTE, message.key.source_rank,
-                  message.key.tag, communicator, &slot.requests[i]);
+    unsigned char *destination =
+        impl_->wire.resolved_route == GpuMpiRoute::direct
+            ? static_cast<unsigned char *>(stage->receive_arena.opaque_handle()) +
+                  message.arena_offsets[slot_index]
+            : static_cast<unsigned char *>(stage->receive_staging.data()) +
+                  message.arena_offsets[slot_index];
+    const int code = transport_irecv(destination, int(message.wire_bytes),
+                                     message.key.source_rank, message.key.tag, communicator,
+                                     &slot.requests[i]);
     if (code != MPI_SUCCESS) fatal_transport(communicator, "MPI_Irecv", code);
   }
   slot.phase = impl::slot_phase::begun;
@@ -300,13 +368,14 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
     fatal_transport(communicator, "CUDA local-scatter event record", 1);
   }
 
-  bool copies_enqueued = stage->plan.sends.empty();
+  const bool direct = impl_->wire.resolved_route == GpuMpiRoute::direct;
+  bool copies_enqueued = direct || stage->plan.sends.empty();
   bool all_sends_posted = stage->plan.sends.empty();
   size_t presend_polls = 0;
   while (!all_sends_posted) {
     int count = 0;
-    mpi_require(MPI_Testsome(int(slot.requests.size()), slot.requests.data(), &count,
-                             slot.completed.data(), slot.statuses.data()),
+    mpi_require(transport_testsome(slot.requests, count, slot.completed.data(),
+                                   slot.statuses.data()),
                 communicator, "MPI_Testsome before all sends are posted");
     try {
       impl_->stats.testsome_polls =
@@ -315,7 +384,13 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
         impl_->stats.request_completions = checked_counter_add(
             impl_->stats.request_completions, uint64_t(count), "request completion");
       ++presend_polls;
-      if (!copies_enqueued && presend_polls >= minimum_presend_polls && slot.gather_ready.ready()) {
+      const bool gather_ready =
+          presend_polls >= minimum_presend_polls && slot.gather_ready.ready();
+      const testing::transport_presend_action action =
+          presend_action(impl_->wire.resolved_route, gather_ready,
+                         !direct && copies_enqueued && slot.device_to_host_ready.ready(),
+                         copies_enqueued);
+      if (action == testing::transport_presend_action::enqueue_device_to_host) {
         if (consume_failure(testing::staged_transport_failure_point::device_to_host))
           throw std::runtime_error("injected NVIDIA staged transport D2H failure");
         for (const bound_boundary_message &message : stage->plan.sends) {
@@ -332,18 +407,23 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
         slot.device_to_host_ready.record(*impl_->communication);
         copies_enqueued = true;
       }
-      if (copies_enqueued && slot.device_to_host_ready.ready()) {
+      const bool staging_ready =
+          !direct && copies_enqueued && slot.device_to_host_ready.ready();
+      if (presend_action(impl_->wire.resolved_route, gather_ready, staging_ready,
+                         copies_enqueued) == testing::transport_presend_action::post_sends) {
         if (consume_failure(testing::staged_transport_failure_point::before_send_post))
           fatal_transport(communicator, "injected failure before MPI_Isend publication", 1);
         const size_t first_send = stage->plan.receives.size();
         for (size_t i = 0; i < stage->plan.sends.size(); ++i) {
           const bound_boundary_message &message = stage->plan.sends[i];
           const unsigned char *source =
-              static_cast<const unsigned char *>(stage->send_staging.data()) +
-              message.arena_offsets[slot_index];
-          mpi_require(MPI_Isend(source, int(message.wire_bytes), MPI_BYTE,
-                                message.key.destination_rank, message.key.tag, communicator,
-                                &slot.requests[first_send + i]),
+              direct ? static_cast<const unsigned char *>(stage->send_arena.opaque_handle()) +
+                           message.arena_offsets[slot_index]
+                     : static_cast<const unsigned char *>(stage->send_staging.data()) +
+                           message.arena_offsets[slot_index];
+          mpi_require(transport_isend(source, int(message.wire_bytes),
+                                      message.key.destination_rank, message.key.tag, communicator,
+                                      &slot.requests[first_send + i]),
                       communicator, "MPI_Isend");
           if (consume_failure(testing::staged_transport_failure_point::after_send_post))
             fatal_transport(communicator, "injected failure after MPI_Isend publication", 1);
@@ -359,14 +439,14 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
   }
 
   size_t waited_requests = 0;
-  for (MPI_Request request : slot.requests)
-    if (request != MPI_REQUEST_NULL) ++waited_requests;
+  for (MPI_Request &request : slot.requests)
+    if (!transport_request_is_null(&request)) ++waited_requests;
   if (!slot.requests.empty()) {
-    mpi_require(MPI_Waitall(int(slot.requests.size()), slot.requests.data(), slot.statuses.data()),
+    mpi_require(transport_waitall(slot.requests, slot.statuses.data()),
                 communicator, "MPI_Waitall after all sends are posted");
   }
   for (MPI_Request &request : slot.requests)
-    request = MPI_REQUEST_NULL;
+    transport_clear_request(&request);
 
   std::string local_error;
   try {
@@ -385,18 +465,26 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
     for (const bound_boundary_message &message : stage->plan.sends)
       impl_->stats.bytes_sent =
           checked_counter_add(impl_->stats.bytes_sent, message.wire_bytes, "sent bytes");
-    if (consume_failure(testing::staged_transport_failure_point::host_to_device))
+    if (!direct && consume_failure(testing::staged_transport_failure_point::host_to_device))
       throw std::runtime_error("injected NVIDIA staged transport H2D failure");
-    for (const bound_boundary_message &message : stage->plan.receives) {
-      const void *source = static_cast<const unsigned char *>(stage->receive_staging.data()) +
-                           message.arena_offsets[slot_index];
-      copy_host_to_device_async(stage->receive_arena, message.arena_offsets[slot_index], source,
-                                message.wire_bytes, *impl_->communication);
-      impl_->stats.host_to_device_calls =
-          checked_counter_add(impl_->stats.host_to_device_calls, 1, "H2D call");
-      impl_->stats.host_to_device_bytes =
-          checked_counter_add(impl_->stats.host_to_device_bytes, message.wire_bytes, "H2D bytes");
-    }
+    for (const bound_boundary_message &message : stage->plan.receives)
+      if (direct)
+        impl_->stats.direct_bytes =
+            checked_counter_add(impl_->stats.direct_bytes, message.wire_bytes, "direct bytes");
+      else {
+        const void *source = static_cast<const unsigned char *>(stage->receive_staging.data()) +
+                             message.arena_offsets[slot_index];
+        copy_host_to_device_async(stage->receive_arena, message.arena_offsets[slot_index], source,
+                                  message.wire_bytes, *impl_->communication);
+        impl_->stats.host_to_device_calls =
+            checked_counter_add(impl_->stats.host_to_device_calls, 1, "H2D call");
+        impl_->stats.host_to_device_bytes = checked_counter_add(
+            impl_->stats.host_to_device_bytes, message.wire_bytes, "H2D bytes");
+      }
+    if (direct)
+      for (const bound_boundary_message &message : stage->plan.sends)
+        impl_->stats.direct_bytes =
+            checked_counter_add(impl_->stats.direct_bytes, message.wire_bytes, "direct bytes");
     slot.local_scatter_ready.wait(*impl_->communication);
     if (consume_failure(testing::staged_transport_failure_point::scatter))
       throw std::runtime_error("injected NVIDIA staged transport scatter failure");
@@ -504,8 +592,8 @@ bool staged_transport_epoch::retire(std::string &why) noexcept {
           return false;
         }
 #ifdef HAVE_MPI
-        for (MPI_Request request : stage.slots[i].requests)
-          if (request != MPI_REQUEST_NULL) {
+        for (MPI_Request &request : stage.slots[i].requests)
+          if (!transport_request_is_null(&request)) {
             why = "cannot retire NVIDIA staged transport with a live MPI request";
             return false;
           }
@@ -585,8 +673,12 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
 #endif
   if (!create_backend_communicator_lease(result->impl_->communicator, why)) return NULL;
   std::string authority_error;
-  if (artifact.wire.resolved_route != GpuMpiRoute::staged)
-    authority_error = "PR7.2 supports only staged NVIDIA MPI transport";
+  if (artifact.wire.resolved_route == GpuMpiRoute::direct &&
+      consume_failure(testing::staged_transport_failure_point::direct_validation))
+    authority_error = "injected NVIDIA direct MPI transport validation failure";
+  else if (artifact.wire.resolved_route != GpuMpiRoute::staged &&
+           artifact.wire.resolved_route != GpuMpiRoute::direct)
+    authority_error = "NVIDIA MPI transport route is invalid";
   else if (artifact.wire.participation.device_owner != (device >= 0 && communication != NULL))
     authority_error = "NVIDIA staged transport device ownership is inconsistent";
   else if (!artifact.wire.participation.device_owner &&
@@ -703,11 +795,13 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
       }
       if (send_bytes) {
         stage.send_arena.allocate(send_bytes, device);
-        stage.send_staging.allocate(send_bytes);
+        if (artifact.wire.resolved_route == GpuMpiRoute::staged)
+          stage.send_staging.allocate(send_bytes);
       }
       if (receive_bytes) {
         stage.receive_arena.allocate(receive_bytes, device);
-        stage.receive_staging.allocate(receive_bytes);
+        if (artifact.wire.resolved_route == GpuMpiRoute::staged)
+          stage.receive_staging.allocate(receive_bytes);
       }
       result->impl_->stats.device_bytes = checked_size_add(
           result->impl_->stats.device_bytes,
@@ -715,9 +809,11 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
                            checked_size_add(send_bytes, receive_bytes, "arena bytes"),
                            "device epoch bytes"),
           "device epoch total");
-      result->impl_->stats.pinned_bytes = checked_size_add(
-          result->impl_->stats.pinned_bytes,
-          checked_size_add(send_bytes, receive_bytes, "pinned epoch bytes"), "pinned epoch total");
+      if (artifact.wire.resolved_route == GpuMpiRoute::staged)
+        result->impl_->stats.pinned_bytes = checked_size_add(
+            result->impl_->stats.pinned_bytes,
+            checked_size_add(send_bytes, receive_bytes, "pinned epoch bytes"),
+            "pinned epoch total");
     }
     if (communication) communication->synchronize();
   }
@@ -762,7 +858,44 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
   return result;
 }
 
+std::unique_ptr<staged_transport_epoch>
+create_transport_epoch_with_fallback(compiled_boundary_artifact &artifact, int device,
+                                     stream *communication, GpuMpiPolicy agreed_policy,
+                                     DependencyOverlapPolicy overlap_policy, bool &fell_back,
+                                     std::string &why) {
+  fell_back = false;
+  std::unique_ptr<staged_transport_epoch> result =
+      create_staged_transport_epoch(artifact, device, communication, why);
+  if (result || artifact.wire.resolved_route != GpuMpiRoute::direct ||
+      agreed_policy != GpuMpiPolicy::automatic ||
+      overlap_policy == DependencyOverlapPolicy::required)
+    return result;
+
+  compiled_boundary_artifact fallback = artifact;
+  fallback.wire.resolved_route = GpuMpiRoute::staged;
+  fallback.wire.signature = compute_remote_halo_program_signature(fallback.wire);
+  fallback.lowered.program_signature = fallback.wire.signature;
+  fallback.lowered.authority_signature = compute_remote_lowered_authority_signature(
+      fallback.lowered.program_signature, fallback.lowered.storage_signature);
+  fallback.bound.program_signature = fallback.lowered.program_signature;
+  fallback.bound.authority_signature = fallback.lowered.authority_signature;
+  why.clear();
+  result = create_staged_transport_epoch(fallback, device, communication, why);
+  if (result) {
+    artifact = std::move(fallback);
+    fell_back = true;
+  }
+  return result;
+}
+
 namespace testing {
+transport_presend_action transport_presend_action_for_testing(
+    GpuMpiRoute route, bool gather_ready, bool staging_ready, bool copies_enqueued) {
+  return presend_action(route, gather_ready, staging_ready, copies_enqueued);
+}
+void set_mpi_request_operations_for_testing(mpi_request_operations *operations) {
+  injected_request_operations = operations;
+}
 void fail_staged_transport_once(staged_transport_failure_point point) { injected_failure = point; }
 void set_staged_transport_minimum_presend_polls(size_t polls) { minimum_presend_polls = polls; }
 bool resolve_staged_transport_retirement_for_testing(bool backend_retired, bool lease_valid,

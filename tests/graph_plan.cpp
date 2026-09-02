@@ -9,6 +9,7 @@
 #include <meep.hpp>
 
 #include "backend/graph_plan.hpp"
+#include "backend/transport_plan.hpp"
 
 using namespace meep;
 
@@ -315,6 +316,45 @@ static void test_halo_authority_and_boundaries() {
   CHECK(!validate_graph_lowering_authorities(plan, stale, &fixture.halos, &fixture.catalog, 1, NULL,
                                              &error),
         "re-signed stale halo authority matched the live HaloPlan");
+}
+
+static void test_remote_overlap_boundary_consumes_update_once() {
+  StepPlan plan = signed_plan(
+      std::vector<Operation>{operation(OpKind::transfer_halo, B_stuff),
+                             operation(OpKind::update_eh, H_stuff),
+                             operation(OpKind::increment_time)});
+  HaloFixture fixture;
+  fixture.halos.plans.push_back(halo(B_stuff, false, 1, fixture.source));
+  GraphLoweringAuthorities authority = fixture.authority(plan);
+  GraphRemoteOverlap overlap = {0, 1, 37, 0};
+  overlap.signature = compute_graph_remote_overlap_signature(overlap);
+  authority.remote_overlaps.push_back(overlap);
+  authority.signature = compute_graph_lowering_authorities_signature(authority);
+  std::string error;
+  CHECK(validate_graph_lowering_authorities(plan, authority, &fixture.halos, &fixture.catalog, 1,
+                                            NULL, &error),
+        "valid remote-overlap authority rejected: %s", error.c_str());
+  const GraphProgram graph = build_graph_program(plan, authority, GraphVariantKind::ordinary);
+  CHECK(validate_graph_program(plan, authority, graph, &error),
+        "valid remote-overlap graph rejected: %s", error.c_str());
+  CHECK(graph.boundaries.size() == 2 && graph.boundaries[0].kind == GraphBoundaryKind::remote_halo &&
+            graph.boundaries[0].operation_count == 2,
+        "remote overlap was not represented by one two-operation host boundary");
+  size_t update_visits = 0;
+  for (const GraphSegment &segment : graph.segments)
+    for (const GraphOperationRef &ref : segment.operations)
+      update_visits += ref.operation_index == 1;
+  for (const GraphBoundary &boundary : graph.boundaries)
+    if (!boundary.completion_only && boundary.first_operation <= 1 &&
+        1 < boundary.first_operation + boundary.operation_count)
+      ++update_visits;
+  CHECK(update_visits == 1, "paired update is not consumed exactly once");
+
+  authority.remote_overlaps[0].update_operation = 2;
+  authority.signature = compute_graph_lowering_authorities_signature(authority);
+  CHECK(!validate_graph_lowering_authorities(plan, authority, &fixture.halos, &fixture.catalog, 1,
+                                             NULL, &error),
+        "non-adjacent remote-overlap authority was accepted");
 }
 
 static void test_host_covered_interval_once() {
@@ -824,6 +864,7 @@ int main(int argc, char **argv) {
   test_scalar_layout();
   test_update_eh_polarization_subtraction_contract();
   test_halo_authority_and_boundaries();
+  test_remote_overlap_boundary_consumes_update_once();
   test_host_covered_interval_once();
   test_variants_and_canonical_validation();
   test_all_operation_classes();

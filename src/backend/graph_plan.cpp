@@ -593,6 +593,13 @@ const GraphHostInterval *find_host_interval(const GraphLoweringAuthorities &auth
   return NULL;
 }
 
+const GraphRemoteOverlap *find_remote_overlap(const GraphLoweringAuthorities &authority,
+                                              uint32_t halo_operation) {
+  for (const GraphRemoteOverlap &overlap : authority.remote_overlaps)
+    if (overlap.halo_operation == halo_operation) return &overlap;
+  return NULL;
+}
+
 bool operation_is_covered(const GraphLoweringAuthorities &authority, uint32_t operation_index) {
   for (const GraphHostInterval &interval : authority.host_intervals)
     if (operation_index >= interval.first_covered_operation &&
@@ -1195,6 +1202,19 @@ bool operator==(const GraphHostInterval &a, const GraphHostInterval &b) {
          a.host_segment_index == b.host_segment_index && a.signature == b.signature;
 }
 
+bool operator==(const GraphRemoteOverlap &a, const GraphRemoteOverlap &b) {
+  return a.halo_operation == b.halo_operation && a.update_operation == b.update_operation &&
+         a.dependency_signature == b.dependency_signature && a.signature == b.signature;
+}
+
+uint64_t compute_graph_remote_overlap_signature(const GraphRemoteOverlap &overlap) {
+  uint64_t signature = 0xcbf29ce484222325ull;
+  mix(signature, overlap.halo_operation);
+  mix(signature, overlap.update_operation);
+  mix(signature, overlap.dependency_signature);
+  return signature;
+}
+
 uint64_t compute_graph_lowering_authorities_signature(const GraphLoweringAuthorities &authority) {
   uint64_t signature = 0xcbf29ce484222325ull;
   mix(signature, authority.halo_signature);
@@ -1251,6 +1271,13 @@ uint64_t compute_graph_lowering_authorities_signature(const GraphLoweringAuthori
     mix(signature, interval.covered_operation_count);
     mix(signature, interval.host_segment_index);
     mix(signature, interval.signature);
+  }
+  mix(signature, authority.remote_overlaps.size());
+  for (const GraphRemoteOverlap &overlap : authority.remote_overlaps) {
+    mix(signature, overlap.halo_operation);
+    mix(signature, overlap.update_operation);
+    mix(signature, overlap.dependency_signature);
+    mix(signature, overlap.signature);
   }
   return signature;
 }
@@ -1528,6 +1555,22 @@ bool validate_graph_lowering_authorities(const StepPlan &plan,
           authority.cw_plan_signature != expected.cw_plan_signature ||
           authority.cw_stable_signature != expected.cw_stable_signature)
         throw std::invalid_argument("graph lowering authorities differ from live inputs");
+    }
+    std::vector<uint8_t> overlap_seen(plan.operations.size(), 0);
+    for (const GraphRemoteOverlap &overlap : authority.remote_overlaps) {
+      if (overlap.halo_operation >= plan.operations.size() ||
+          overlap.update_operation != overlap.halo_operation + 1 ||
+          overlap.update_operation >= plan.operations.size() ||
+          plan.operations[overlap.halo_operation].kind != OpKind::transfer_halo ||
+          (plan.operations[overlap.update_operation].kind != OpKind::update_db &&
+           plan.operations[overlap.update_operation].kind != OpKind::update_eh) ||
+          overlap_seen[overlap.halo_operation] || overlap_seen[overlap.update_operation])
+        throw std::invalid_argument("graph remote-overlap authority is malformed");
+      if (!overlap.dependency_signature ||
+          overlap.signature != compute_graph_remote_overlap_signature(overlap))
+        throw std::invalid_argument("graph remote-overlap authority signature is stale");
+      overlap_seen[overlap.halo_operation] = 1;
+      overlap_seen[overlap.update_operation] = 1;
     }
     std::vector<uint8_t> covered(plan.operations.size(), 0);
     std::vector<GraphHostInterval> expected_intervals;
@@ -1815,7 +1858,19 @@ GraphProgram build_graph_program(const StepPlan &plan, const GraphLoweringAuthor
       flush_segment(result, segment);
       const GraphOperationRef ref = make_operation_ref(
           plan, operation_index, GraphNodeClass::host_boundary, result.scalar_layout, authority);
-      append_boundary(result, boundary, operation_index, 1, false, ref);
+      const GraphRemoteOverlap *overlap =
+          boundary == GraphBoundaryKind::remote_halo
+              ? find_remote_overlap(authority, operation_index)
+              : NULL;
+      const uint32_t covered_count = overlap ? 2 : 1;
+      append_boundary(result, boundary, operation_index, covered_count, false, ref);
+      if (overlap) {
+        if (selected_index + 1 >= selected.size() ||
+            selected[selected_index + 1] != overlap->update_operation)
+          throw std::invalid_argument(
+              "graph remote-overlap successor is not adjacent in the selected schedule");
+        ++selected_index;
+      }
       continue;
     }
 

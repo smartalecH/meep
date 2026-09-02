@@ -13,6 +13,7 @@
 #include <memory>
 #include <string>
 
+#include "backend/dependency_region.hpp"
 #include "backend/nvidia/nvidia_boundaries.hpp"
 
 namespace meep {
@@ -34,6 +35,9 @@ struct staged_transport_statistics {
   uint64_t waitall_calls;
   uint64_t request_completions;
   uint64_t slot_reuses;
+  uint64_t overlap_stages;
+  uint64_t overlap_interior_launches;
+  uint64_t overlap_boundary_launches;
   uint64_t high_water_requests;
   size_t device_bytes;
   size_t pinned_bytes;
@@ -59,6 +63,7 @@ public:
   bool finish_stage(field_type ft, const stream &compute, std::string &why);
   [[noreturn]] void abort_published_stage(field_type ft, const char *operation) noexcept;
   bool participate_idle_stage(std::string &why);
+  void record_dependency_overlap(size_t interior_launches, size_t boundary_launches);
   bool retire(std::string &why) noexcept;
   const staged_transport_statistics &statistics() const;
 
@@ -76,10 +81,37 @@ private:
 std::unique_ptr<staged_transport_epoch>
 create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int device,
                               stream *communication, std::string &why);
+std::unique_ptr<staged_transport_epoch>
+create_transport_epoch_with_fallback(compiled_boundary_artifact &artifact, int device,
+                                     stream *communication, GpuMpiPolicy agreed_policy,
+                                     DependencyOverlapPolicy overlap_policy, bool &fell_back,
+                                     std::string &why);
 
 namespace testing {
+enum class transport_presend_action { poll, enqueue_device_to_host, post_sends };
+transport_presend_action transport_presend_action_for_testing(
+    GpuMpiRoute route, bool gather_ready, bool staging_ready, bool copies_enqueued);
+/* Narrow request seam used to exercise the production direct-transport state
+   machine without requiring a CUDA-aware MPI provider.  Request storage is
+   still owned by the epoch; production uses the exact MPI calls whenever no
+   facade is installed. */
+class mpi_request_operations {
+public:
+  virtual ~mpi_request_operations() {}
+  virtual int irecv(void *buffer, size_t bytes, int source, int tag,
+                    void *request_storage) = 0;
+  virtual int isend(const void *buffer, size_t bytes, int destination, int tag,
+                    void *request_storage) = 0;
+  virtual int testsome(size_t request_count, void *request_storage, size_t request_stride,
+                       int &completed_count, int *completed_indices) = 0;
+  virtual int waitall(size_t request_count, void *request_storage, size_t request_stride) = 0;
+  virtual bool request_is_null(const void *request_storage) const = 0;
+  virtual void clear_request(void *request_storage) = 0;
+};
+void set_mpi_request_operations_for_testing(mpi_request_operations *operations);
 enum class staged_transport_failure_point {
   none,
+  direct_validation,
   before_receive_post,
   after_receive_post,
   gather,

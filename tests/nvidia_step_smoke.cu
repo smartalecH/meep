@@ -917,6 +917,25 @@ template <typename T> static void check_device(int device) {
                 4.0 * std::numeric_limits<T>::epsilon() * (1.0 + std::fabs(double(expected[i]))),
             "curl result differs from host reference");
 
+  /* PR7.3 executes a proven-safe interior while remote MPI is in flight and
+     the disjoint boundary remainder after publication. The two launches must
+     remain numerically identical to the original canonical row. */
+  copy_host_to_device_async(d_target, 0, target.data(), bytes, execution);
+  curl_launch curl_interior = curl;
+  --curl_interior.region.counts[2];
+  curl_launch curl_boundary = curl;
+  curl_boundary.region.base +=
+      (curl.region.counts[2] - 1) * size_t(curl.region.strides[2]);
+  curl_boundary.region.counts[2] = 1;
+  launch_curl(curl_interior, execution);
+  launch_curl(curl_boundary, execution);
+  copy_device_to_host_async(observed.data(), d_target, 0, bytes, execution);
+  execution.synchronize();
+  for (size_t i = 0; i < elements; ++i)
+    require(std::fabs(double(observed[i] - expected[i])) <=
+                4.0 * std::numeric_limits<T>::epsilon() * (1.0 + std::fabs(double(expected[i]))),
+            "split dependency-region curl differs from the canonical launch");
+
   constitutive_launch constitutive = {};
   constitutive.region = region;
   constitutive.target = d_output.opaque_handle();
@@ -939,6 +958,24 @@ template <typename T> static void check_device(int device) {
                 2.0 * std::numeric_limits<T>::epsilon() *
                     (1.0 + std::fabs(double(expected_output[i]))),
             "constitutive result or out-of-region sentinel differs");
+
+  copy_host_to_device_async(d_output, 0, output.data(), bytes, execution);
+  constitutive_launch constitutive_interior = constitutive;
+  --constitutive_interior.region.counts[2];
+  constitutive_launch constitutive_boundary = constitutive;
+  constitutive_boundary.region.base +=
+      (constitutive.region.counts[2] - 1) * size_t(constitutive.region.strides[2]);
+  constitutive_boundary.region.counts[2] = 1;
+  launch_constitutive(constitutive_interior, execution);
+  launch_constitutive(constitutive_boundary, execution);
+  copy_device_to_host_async(observed.data(), d_output, 0, bytes, execution);
+  execution.synchronize();
+  for (size_t i = 0; i < elements; ++i)
+    require(std::fabs(double(observed[i] - expected_output[i])) <=
+                2.0 * std::numeric_limits<T>::epsilon() *
+                    (1.0 + std::fabs(double(expected_output[i]))),
+            "split dependency-region constitutive update differs from the canonical launch");
+  if (std::getenv("MEEP_NVIDIA_STEP_DEPENDENCY_ONLY")) return;
 
   zero_launch zero = {};
   zero.region = region;

@@ -175,6 +175,9 @@ struct NvidiaMpiTransportStatistics {
   uint64_t waitall_calls;
   uint64_t slot_reuses;
   uint64_t direct_bytes;
+  uint64_t overlap_stages;
+  uint64_t overlap_interior_launches;
+  uint64_t overlap_boundary_launches;
 };
 
 struct NvidiaCwStatistics {

@@ -314,6 +314,9 @@ void fail_next(failure_point point);
 void fail_next_then(failure_point point, failure_point followup);
 void clear_failure();
 bool consume_failure_for_testing(failure_point point);
+bool opaque_pointer_is_device_for_testing(const void *pointer);
+bool copy_opaque_device_to_device_for_testing(void *destination, const void *source, size_t bytes,
+                                              int device);
 transfer_accounting current_transfer_accounting();
 void reset_transfer_accounting();
 material_transfer_accounting current_material_transfer_accounting();

@@ -7,11 +7,14 @@
 #include "backend/nvidia/runtime.hpp"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <exception>
 #include <memory>
+#include <set>
 #include <string>
+#include <vector>
 
 using namespace meep;
 
@@ -38,6 +41,165 @@ void test_retirement_resolution() {
             !retired,
         "failed retirement with a live communicator lease was accepted");
 }
+
+void test_route_state_machine() {
+  using meep::nvidia::testing::transport_presend_action;
+  using meep::nvidia::testing::transport_presend_action_for_testing;
+  CHECK(transport_presend_action_for_testing(GpuMpiRoute::direct, false, false, false) ==
+            transport_presend_action::poll,
+        "direct transport posted a send before the producer event");
+  CHECK(transport_presend_action_for_testing(GpuMpiRoute::direct, true, false, true) ==
+            transport_presend_action::post_sends,
+        "direct transport did not post from the device arena after the producer event");
+  CHECK(transport_presend_action_for_testing(GpuMpiRoute::staged, true, false, false) ==
+            transport_presend_action::enqueue_device_to_host,
+        "staged transport omitted its device-to-host transition");
+  CHECK(transport_presend_action_for_testing(GpuMpiRoute::staged, true, false, true) ==
+            transport_presend_action::poll,
+        "staged transport posted before its host copy completed");
+  CHECK(transport_presend_action_for_testing(GpuMpiRoute::staged, true, true, true) ==
+            transport_presend_action::post_sends,
+        "staged transport did not post after its host copy completed");
+}
+
+#ifdef HAVE_MPI
+class direct_request_mock : public meep::nvidia::testing::mpi_request_operations {
+public:
+  int device_;
+  struct request_record {
+    void *storage;
+    void *buffer;
+    size_t bytes;
+    bool receive;
+    bool active;
+  };
+
+  explicit direct_request_mock(int device)
+      : device_(device), irecvs(0), isends(0), testsome_calls(0), waitalls(0), clears(0),
+        polls_since_receive(0), pointers_are_device(true), delayed_send_window_armed(false),
+        delayed_send_window_expected(0), delayed_send_window_sends(0),
+        delayed_send_window_polls(0), delayed_send_window_premature_sends(0),
+        copies_completed(0) {}
+
+  void arm_delayed_send_window(size_t expected_sends) {
+    delayed_send_window_armed = true;
+    delayed_send_window_expected = expected_sends;
+    delayed_send_window_sends = 0;
+    delayed_send_window_polls = 0;
+    delayed_send_window_premature_sends = 0;
+  }
+
+  int irecv(void *buffer, size_t bytes, int, int, void *request_storage) override {
+    records.push_back(request_record{request_storage, buffer, bytes, true, true});
+    request_slots.insert(request_storage);
+    ++irecvs;
+    polls_since_receive = 0;
+    pointers_are_device = pointers_are_device && is_device_pointer(buffer);
+    return MPI_SUCCESS;
+  }
+
+  int isend(const void *buffer, size_t bytes, int, int, void *request_storage) override {
+    records.push_back(
+        request_record{request_storage, const_cast<void *>(buffer), bytes, false, true});
+    request_slots.insert(request_storage);
+    ++isends;
+    if (delayed_send_window_armed) {
+      ++delayed_send_window_sends;
+      if (polls_since_receive < 32) ++delayed_send_window_premature_sends;
+      if (delayed_send_window_sends == delayed_send_window_expected)
+        delayed_send_window_armed = false;
+    }
+    pointers_are_device = pointers_are_device && is_device_pointer(buffer);
+    return MPI_SUCCESS;
+  }
+
+  int testsome(size_t, void *, size_t, int &completed_count, int *) override {
+    ++testsome_calls;
+    ++polls_since_receive;
+    if (delayed_send_window_armed) ++delayed_send_window_polls;
+    completed_count = 0;
+    return MPI_SUCCESS;
+  }
+
+  int waitall(size_t request_count, void *request_storage, size_t request_stride) override {
+    ++waitalls;
+    request_record *receive = NULL, *send = NULL;
+    unsigned char *base = static_cast<unsigned char *>(request_storage);
+    for (size_t i = 0; i < request_count; ++i) {
+      void *slot = base + i * request_stride;
+      for (request_record &record : records)
+        if (record.storage == slot && record.active) {
+          if (record.receive)
+            receive = &record;
+          else
+            send = &record;
+        }
+    }
+    if (!receive || !send || receive->bytes != send->bytes) return MPI_ERR_OTHER;
+    if (!meep::nvidia::testing::copy_opaque_device_to_device_for_testing(
+            receive->buffer, send->buffer, send->bytes, device_))
+      return MPI_ERR_OTHER;
+    receive->active = false;
+    send->active = false;
+    ++copies_completed;
+    return MPI_SUCCESS;
+  }
+
+  bool request_is_null(const void *request_storage) const override {
+    for (const request_record &record : records)
+      if (record.storage == request_storage && record.active) return false;
+    return true;
+  }
+
+  void clear_request(void *request_storage) override {
+    for (request_record &record : records)
+      if (record.storage == request_storage) record.active = false;
+    ++clears;
+  }
+
+  void verify(const char *precision_name) const {
+    CHECK(pointers_are_device, "direct request facade did not receive device arena pointers");
+    CHECK(!delayed_send_window_armed &&
+              delayed_send_window_sends == delayed_send_window_expected &&
+              delayed_send_window_expected == 3 && delayed_send_window_premature_sends == 0,
+          "direct request facade observed Isend before gather readiness");
+    CHECK(delayed_send_window_polls >= 96,
+          "direct request facade did not poll Testsome through all delayed sends");
+    CHECK(irecvs >= 4 && irecvs == isends && waitalls == isends && copies_completed == waitalls,
+          "direct request facade did not exercise complete Irecv/Isend/Wait transitions");
+    CHECK(testsome_calls >= 96,
+          "direct request facade did not exercise delayed nonblocking Test progress");
+    CHECK(request_slots.size() >= 4,
+          "direct request facade did not exercise both request slots and reuse");
+    CHECK(clears >= 2 * waitalls,
+          "direct request facade did not clear completed receive/send requests");
+    (void)precision_name;
+  }
+
+  size_t irecvs, isends, testsome_calls, waitalls, clears, polls_since_receive;
+  bool pointers_are_device, delayed_send_window_armed;
+  size_t delayed_send_window_expected, delayed_send_window_sends, delayed_send_window_polls,
+      delayed_send_window_premature_sends;
+  size_t copies_completed;
+  std::vector<request_record> records;
+  std::set<void *> request_slots;
+
+private:
+  static bool is_device_pointer(const void *pointer) {
+    return meep::nvidia::testing::opaque_pointer_is_device_for_testing(pointer);
+  }
+};
+
+class request_operations_scope {
+public:
+  explicit request_operations_scope(meep::nvidia::testing::mpi_request_operations *operations) {
+    meep::nvidia::testing::set_mpi_request_operations_for_testing(operations);
+  }
+  ~request_operations_scope() {
+    meep::nvidia::testing::set_mpi_request_operations_for_testing(NULL);
+  }
+};
+#endif
 
 std::unique_ptr<meep::nvidia::staged_transport_epoch>
 make_live_finalization_epoch(int device, meep::nvidia::stream &communication, std::string &why) {
@@ -87,7 +249,8 @@ RemoteHaloMessage make_message(int source, int destination, int size, RemoteHalo
   return message;
 }
 
-template <typename T> int run_case(int device) {
+template <typename T>
+int run_case(int device, bool direct = false, bool direct_mock_local_payload = false) {
   const int rank = my_rank(), size = count_processors();
   if (size < 2) return 0;
   const int previous = (rank + size - 1) % size;
@@ -107,8 +270,8 @@ template <typename T> int run_case(int device) {
   artifact.wire.communicator_rank = rank;
   artifact.wire.communicator_size = size;
   artifact.wire.communicator_generation = current_backend_communicator_generation();
-  artifact.wire.requested_policy = GpuMpiPolicy::staged;
-  artifact.wire.resolved_route = GpuMpiRoute::staged;
+  artifact.wire.requested_policy = direct ? GpuMpiPolicy::direct : GpuMpiPolicy::staged;
+  artifact.wire.resolved_route = direct ? GpuMpiRoute::direct : GpuMpiRoute::staged;
   artifact.wire.participation = RemoteHaloParticipation{true, 1, 2, 1};
   RemoteHaloStage wire_stage;
   wire_stage.ft = E_stuff;
@@ -154,6 +317,89 @@ template <typename T> int run_case(int device) {
   artifact.bound.stages.push_back(bound);
 
   std::string why;
+  if (!direct) {
+    const DependencyOverlapPolicy fallback_policies[] = {
+        DependencyOverlapPolicy::off, DependencyOverlapPolicy::automatic};
+    for (DependencyOverlapPolicy overlap : fallback_policies)
+      for (int failure_kind = 0; failure_kind < 2; ++failure_kind) {
+        meep::nvidia::compiled_boundary_artifact fallback_artifact = artifact;
+        fallback_artifact.wire.requested_policy = GpuMpiPolicy::automatic;
+        fallback_artifact.wire.resolved_route = GpuMpiRoute::direct;
+        fallback_artifact.wire.signature =
+            compute_remote_halo_program_signature(fallback_artifact.wire);
+        fallback_artifact.bound.program_signature = fallback_artifact.wire.signature;
+        if (rank == 0) {
+          if (failure_kind == 0)
+            meep::nvidia::testing::fail_next(
+                meep::nvidia::testing::failure_point::device_allocate);
+          else
+            meep::nvidia::testing::fail_staged_transport_once(
+                meep::nvidia::testing::staged_transport_failure_point::direct_validation);
+        }
+        bool fell_back = false;
+        std::unique_ptr<meep::nvidia::staged_transport_epoch> fallback_epoch =
+            meep::nvidia::create_transport_epoch_with_fallback(
+                fallback_artifact, device, &communication, GpuMpiPolicy::automatic, overlap,
+                fell_back, why);
+        CHECK(bool(fallback_epoch) && fell_back,
+              "auto direct creation failure did not fall back collectively");
+        CHECK(fallback_artifact.wire.resolved_route == GpuMpiRoute::staged &&
+                  fallback_artifact.wire.signature ==
+                      compute_remote_halo_program_signature(fallback_artifact.wire) &&
+                  fallback_artifact.lowered.program_signature ==
+                      fallback_artifact.wire.signature &&
+                  fallback_artifact.lowered.authority_signature ==
+                      compute_remote_lowered_authority_signature(
+                          fallback_artifact.lowered.program_signature,
+                          fallback_artifact.lowered.storage_signature) &&
+                  fallback_artifact.bound.program_signature == fallback_artifact.wire.signature &&
+                  fallback_artifact.bound.authority_signature ==
+                      fallback_artifact.lowered.authority_signature,
+              "fallback published stale route or signature authority");
+        if (fallback_epoch) {
+          const meep::nvidia::staged_transport_statistics &fallback_stats =
+              fallback_epoch->statistics();
+          CHECK(fallback_stats.pinned_bytes != 0 && fallback_stats.direct_bytes == 0 &&
+                    fallback_stats.overlap_stages == 0,
+                "fallback statistics did not match the published staged route");
+          CHECK(fallback_epoch->retire(why), why.c_str());
+        }
+      }
+
+    for (int failure_kind = 0; failure_kind < 2; ++failure_kind) {
+      meep::nvidia::compiled_boundary_artifact required_artifact = artifact;
+      required_artifact.wire.requested_policy = GpuMpiPolicy::automatic;
+      required_artifact.wire.resolved_route = GpuMpiRoute::direct;
+      required_artifact.wire.signature =
+          compute_remote_halo_program_signature(required_artifact.wire);
+      required_artifact.bound.program_signature = required_artifact.wire.signature;
+      const meep::nvidia::memory_accounting before =
+          meep::nvidia::current_memory_accounting();
+      if (rank == 0) {
+        if (failure_kind == 0)
+          meep::nvidia::testing::fail_next(
+              meep::nvidia::testing::failure_point::device_allocate);
+        else
+          meep::nvidia::testing::fail_staged_transport_once(
+              meep::nvidia::testing::staged_transport_failure_point::direct_validation);
+      }
+      bool fell_back = false;
+      std::unique_ptr<meep::nvidia::staged_transport_epoch> required_epoch =
+          meep::nvidia::create_transport_epoch_with_fallback(
+              required_artifact, device, &communication, GpuMpiPolicy::automatic,
+              DependencyOverlapPolicy::required, fell_back, why);
+      CHECK(!required_epoch && !fell_back &&
+                required_artifact.wire.resolved_route == GpuMpiRoute::direct &&
+                required_artifact.wire.signature ==
+                    compute_remote_halo_program_signature(required_artifact.wire),
+            "required overlap silently downgraded after direct creation failure");
+      const meep::nvidia::memory_accounting after =
+          meep::nvidia::current_memory_accounting();
+      CHECK(before.device_bytes_current == after.device_bytes_current &&
+                before.pinned_bytes_current == after.pinned_bytes_current,
+            "required-overlap direct creation failure leaked transport ownership");
+    }
+  }
   meep::nvidia::compiled_boundary_artifact malformed = artifact;
   if (rank == 0) malformed.bound.program_signature ^= 1;
   std::unique_ptr<meep::nvidia::staged_transport_epoch> rejected =
@@ -229,11 +475,18 @@ template <typename T> int run_case(int device) {
       CHECK(!epoch->retire(why) && why.find("live request slot") != std::string::npos,
             "transport retirement accepted an occupied request slot");
     CHECK(epoch->finish_stage(E_stuff, compute, why), why.c_str());
+    if (direct_mock_local_payload) epoch->record_dependency_overlap(3, 2);
     meep::nvidia::copy_device_to_host_async(observed, target, 0, elements * sizeof(T), compute);
     compute.synchronize();
     for (size_t i = 0; i < elements; ++i) {
-      const T expected = T(previous * 1000 + iteration * 10) + T(i) / T(17);
+      const int payload_rank = direct_mock_local_payload ? rank : previous;
+      const T expected = T(payload_rank * 1000 + iteration * 10) + T(i) / T(17);
       if (observed[i] != expected) {
+        std::fprintf(stderr,
+                     "[rank %d] transport payload detail direct=%d mock=%d bytes=%zu "
+                     "iteration=%d index=%zu observed=%.17g expected=%.17g\n",
+                     rank, direct ? 1 : 0, direct_mock_local_payload ? 1 : 0, sizeof(T),
+                     iteration, i, double(observed[i]), double(expected));
         CHECK(false, "staged transport payload differs from previous rank");
         break;
       }
@@ -245,15 +498,25 @@ template <typename T> int run_case(int device) {
   CHECK(stats.bytes_sent == 3 * elements * sizeof(T) &&
             stats.bytes_received == 3 * elements * sizeof(T),
         "staged transport byte accounting differs");
-  CHECK(stats.device_to_host_calls == 3 && stats.host_to_device_calls == 3 &&
-            stats.device_to_host_bytes == 3 * elements * sizeof(T) &&
-            stats.host_to_device_bytes == 3 * elements * sizeof(T),
-        "staged transport copy accounting differs");
+  CHECK(direct ? (stats.device_to_host_calls == 0 && stats.host_to_device_calls == 0 &&
+                  stats.device_to_host_bytes == 0 && stats.host_to_device_bytes == 0)
+               : (stats.device_to_host_calls == 3 && stats.host_to_device_calls == 3 &&
+                  stats.device_to_host_bytes == 3 * elements * sizeof(T) &&
+                  stats.host_to_device_bytes == 3 * elements * sizeof(T)),
+        "transport copy accounting differs from the selected route");
   CHECK(stats.gather_launches == 3 && stats.scatter_launches == 3 &&
             stats.request_completions == 6 && stats.high_water_requests == 2,
         "staged transport kernel/request accounting differs");
-  CHECK(stats.direct_bytes == 0 && stats.slot_reuses == 1,
-        "staged-only route or two-slot reuse accounting differs");
+  CHECK(stats.direct_bytes == (direct ? 6 * elements * sizeof(T) : 0) &&
+            stats.slot_reuses == 1,
+        "route byte or two-slot reuse accounting differs");
+  CHECK(!direct || stats.pinned_bytes == 0,
+        "direct transport unexpectedly retained pinned staging storage");
+  CHECK(direct_mock_local_payload
+            ? (stats.overlap_stages == 3 && stats.overlap_interior_launches == 9 &&
+               stats.overlap_boundary_launches == 6)
+            : stats.overlap_stages == 0,
+        "overlap accounting differs from the published execution path");
   CHECK(stats.testsome_polls && stats.waitall_calls == 3,
         "staged progress did not exercise Testsome then Waitall");
   CHECK(stats.testsome_polls >= 96,
@@ -263,15 +526,19 @@ template <typename T> int run_case(int device) {
             steady_memory.pinned_bytes_current == after_warmup.pinned_bytes_current,
         "staged transport grew device or pinned storage after warmup");
   meep::nvidia::testing::set_staged_transport_minimum_presend_polls(0);
-  if (rank == 0)
-    meep::nvidia::testing::fail_staged_transport_once(
-        meep::nvidia::testing::staged_transport_failure_point::host_to_device);
-  CHECK(epoch->begin_stage(E_stuff, compute, why), why.c_str());
-  CHECK(!epoch->finish_stage(E_stuff, compute, why),
-        "post-completion H2D failure did not fail the whole stage");
-  CHECK(!epoch->begin_stage(E_stuff, compute, why) && why.find("poisoned") != std::string::npos,
-        "failed published stage left the transport retryable");
-  CHECK(epoch->retire(why), why.c_str());
+  if (!direct) {
+    if (rank == 0)
+      meep::nvidia::testing::fail_staged_transport_once(
+          meep::nvidia::testing::staged_transport_failure_point::host_to_device);
+    CHECK(epoch->begin_stage(E_stuff, compute, why), why.c_str());
+    CHECK(!epoch->finish_stage(E_stuff, compute, why),
+          "post-completion H2D failure did not fail the whole stage");
+    CHECK(!epoch->begin_stage(E_stuff, compute, why) && why.find("poisoned") != std::string::npos,
+          "failed published stage left the transport retryable");
+    CHECK(epoch->retire(why), why.c_str());
+  }
+  else
+    CHECK(epoch->retire(why), why.c_str());
 
   epoch = meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
   CHECK(bool(epoch), why.c_str());
@@ -288,7 +555,8 @@ template <typename T> int run_case(int device) {
   return failures;
 }
 
-void run_idle_np4_case(const std::vector<meep::nvidia::device_properties> &devices) {
+void run_idle_np4_case(const std::vector<meep::nvidia::device_properties> &devices,
+                       bool direct = false) {
   if (count_processors() != 4) return;
   const int rank = my_rank();
   const bool owner = rank < 2;
@@ -301,8 +569,8 @@ void run_idle_np4_case(const std::vector<meep::nvidia::device_properties> &devic
   artifact.wire.communicator_rank = rank;
   artifact.wire.communicator_size = 4;
   artifact.wire.communicator_generation = current_backend_communicator_generation();
-  artifact.wire.requested_policy = GpuMpiPolicy::staged;
-  artifact.wire.resolved_route = GpuMpiRoute::staged;
+  artifact.wire.requested_policy = direct ? GpuMpiPolicy::direct : GpuMpiPolicy::staged;
+  artifact.wire.resolved_route = direct ? GpuMpiRoute::direct : GpuMpiRoute::staged;
   artifact.wire.participation =
       RemoteHaloParticipation{owner, owner ? 1u : 0u, owner ? 2u : 0u, owner ? 1u : 0u};
   if (owner) {
@@ -395,6 +663,7 @@ int main(int argc, char **argv) {
   initialize mpi(argc, argv);
   try {
     test_retirement_resolution();
+    test_route_state_machine();
     const std::vector<meep::nvidia::device_properties> devices = meep::nvidia::enumerate_devices();
     CHECK(!devices.empty(), "no CUDA device is available");
     if (!devices.empty()) {
@@ -402,6 +671,32 @@ int main(int argc, char **argv) {
       run_case<double>(device);
       run_case<float>(device);
       run_idle_np4_case(devices);
+#ifdef HAVE_MPI
+      {
+        direct_request_mock requests(device);
+        requests.arm_delayed_send_window(3);
+        request_operations_scope request_scope(&requests);
+        run_case<double>(device, true, true);
+        requests.verify("native");
+      }
+      {
+        direct_request_mock requests(device);
+        requests.arm_delayed_send_window(3);
+        request_operations_scope request_scope(&requests);
+        run_case<float>(device, true, true);
+        requests.verify("f32");
+      }
+#endif
+      bool query_available = false, supports_direct = false;
+      std::string provider, provider_error;
+      CHECK(query_gpu_aware_mpi_provider(query_available, supports_direct, provider,
+                                         provider_error),
+            provider_error.c_str());
+      if (query_available && supports_direct) {
+        run_case<double>(device, true);
+        run_case<float>(device, true);
+        run_idle_np4_case(devices, true);
+      }
       if (count_processors() == 4) {
         divide_parallel_processes(2);
         run_case<double>(my_rank() % int(devices.size()));

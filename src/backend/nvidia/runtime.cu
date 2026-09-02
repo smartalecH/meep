@@ -703,6 +703,31 @@ void clear_failure() {
 
 bool consume_failure_for_testing(failure_point point) { return consume_failure(point); }
 
+bool opaque_pointer_is_device_for_testing(const void *pointer) {
+  cudaPointerAttributes attributes;
+  const cudaError_t result = cudaPointerGetAttributes(&attributes, pointer);
+  if (result != cudaSuccess) {
+    (void)cudaGetLastError();
+    return false;
+  }
+#if CUDART_VERSION >= 10000
+  return attributes.type == cudaMemoryTypeDevice;
+#else
+  return attributes.memoryType == cudaMemoryTypeDevice;
+#endif
+}
+
+bool copy_opaque_device_to_device_for_testing(void *destination, const void *source, size_t bytes,
+                                              int device) {
+  try {
+    device_scope scope(device);
+    if (cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToDevice) != cudaSuccess)
+      return false;
+    return cudaDeviceSynchronize() == cudaSuccess;
+  }
+  catch (...) { return false; }
+}
+
 transfer_accounting current_transfer_accounting() {
   transfer_accounting result;
   result.host_to_device_calls = host_to_device_calls.load(std::memory_order_relaxed);

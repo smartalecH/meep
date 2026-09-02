@@ -160,6 +160,19 @@ struct GraphHostInterval {
 bool operator==(const GraphHostInterval &a, const GraphHostInterval &b);
 inline bool operator!=(const GraphHostInterval &a, const GraphHostInterval &b) { return !(a == b); }
 
+struct GraphRemoteOverlap {
+  uint32_t halo_operation;
+  uint32_t update_operation;
+  uint64_t dependency_signature;
+  uint64_t signature;
+};
+
+bool operator==(const GraphRemoteOverlap &a, const GraphRemoteOverlap &b);
+inline bool operator!=(const GraphRemoteOverlap &a, const GraphRemoteOverlap &b) {
+  return !(a == b);
+}
+uint64_t compute_graph_remote_overlap_signature(const GraphRemoteOverlap &overlap);
+
 struct GraphLoweringAuthorities {
   uint64_t step_plan_signature;
   uint64_t halo_signature;
@@ -171,6 +184,7 @@ struct GraphLoweringAuthorities {
   std::vector<GraphZeroRow> zero_rows;
   std::vector<GraphZeroDisposition> zero_dispositions;
   std::vector<GraphHostInterval> host_intervals;
+  std::vector<GraphRemoteOverlap> remote_overlaps;
   uint64_t signature;
 
   GraphLoweringAuthorities()
