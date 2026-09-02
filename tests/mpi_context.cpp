@@ -46,6 +46,10 @@ void test_lease_and_agreement() {
   CHECK(create_backend_communicator_lease(lease, why), why.c_str());
   CHECK(lease.valid(), "communicator lease was not published");
   if (!lease.valid()) return;
+  BackendCommunicatorLease sibling;
+  CHECK(create_backend_communicator_lease(sibling, why), why.c_str());
+  CHECK(sibling.valid() && backend_communicator_context_use_count_for_testing() >= 3,
+        "communicator leases did not share the active context");
   CHECK(lease.info().generation == current_backend_communicator_generation(),
         "lease generation is stale at creation");
   CHECK(lease.info().rank == my_rank() && lease.info().size == count_processors(),
@@ -110,30 +114,42 @@ void test_lease_and_agreement() {
   }
   CHECK(retire_backend_communicator_lease(lease, why), why.c_str());
   CHECK(!lease.valid(), "communicator lease remained valid after retirement");
+  CHECK(sibling.valid(), "releasing one borrower invalidated a sibling lease");
+  CHECK(retire_backend_communicator_lease(sibling, why), why.c_str());
 }
 
-void test_collective_lease_rollback() {
+void test_collective_context_rollback() {
 #ifdef HAVE_MPI
-  std::string why;
-  BackendCommunicatorLease lease;
+  if (count_processors() < 2) return;
+  const uint64_t generation = current_backend_communicator_generation();
+  const void *identity = backend_communicator_context_identity_for_testing();
   if (my_rank() == 0) set_backend_communicator_failure_for_testing("before_dup");
-  CHECK(!create_backend_communicator_lease(lease, why),
-        "asymmetric communicator preflight failure did not reconcile");
-  CHECK(!lease.valid(), "failed communicator preflight published a lease");
+  bool rejected = false;
+  try { (void)divide_parallel_processes(2); }
+  catch (const std::runtime_error &) { rejected = true; }
+  CHECK(rejected, "asymmetric communicator preflight failure did not reconcile");
+  CHECK(current_backend_communicator_generation() == generation &&
+            backend_communicator_context_identity_for_testing() == identity,
+        "failed communicator preflight replaced the active context");
   set_backend_communicator_failure_for_testing(NULL);
   if (my_rank() == 0) set_backend_communicator_failure_for_testing("after_dup");
-  CHECK(!create_backend_communicator_lease(lease, why),
-        "asymmetric post-duplication failure did not roll back collectively");
-  CHECK(!lease.valid(), "failed communicator creation published a lease");
+  rejected = false;
+  try { (void)divide_parallel_processes(2); }
+  catch (const std::runtime_error &) { rejected = true; }
+  CHECK(rejected, "asymmetric post-duplication failure did not roll back collectively");
+  CHECK(current_backend_communicator_generation() == generation &&
+            backend_communicator_context_identity_for_testing() == identity,
+        "failed post-duplication candidate replaced the active context");
   set_backend_communicator_failure_for_testing(NULL);
-  CHECK(create_backend_communicator_lease(lease, why), why.c_str());
-  if (!lease.valid()) return;
   if (my_rank() == 0) set_backend_communicator_failure_for_testing("before_retire");
-  CHECK(!retire_backend_communicator_lease(lease, why),
-        "asymmetric retirement preflight failure did not preserve the lease");
-  CHECK(lease.valid(), "retirement preflight failure destroyed the live lease");
+  rejected = false;
+  try { (void)divide_parallel_processes(2); }
+  catch (const std::runtime_error &) { rejected = true; }
+  CHECK(rejected, "asymmetric context retirement failure did not reject transition");
+  CHECK(current_backend_communicator_generation() == generation &&
+            backend_communicator_context_identity_for_testing() == identity,
+        "failed context retirement changed the active context");
   set_backend_communicator_failure_for_testing(NULL);
-  CHECK(retire_backend_communicator_lease(lease, why), why.c_str());
 #endif
 }
 
@@ -167,9 +183,12 @@ void test_thread_and_generation_helpers() {
 void test_split_transitions() {
   if (count_processors() < 2) return;
   const uint64_t before = current_backend_communicator_generation();
+  const void *world_context = backend_communicator_context_identity_for_testing();
   divide_parallel_processes(2);
   CHECK(current_backend_communicator_generation() == before + 1,
         "divide did not advance communicator generation once");
+  CHECK(backend_communicator_context_identity_for_testing() != world_context,
+        "divide retained the old active communicator context");
   {
     std::string why;
     BackendCommunicatorLease stale;
@@ -184,6 +203,7 @@ void test_split_transitions() {
     program.participation = RemoteHaloParticipation{false, 0, 0, 0};
     program.signature = compute_remote_halo_program_signature(program);
     begin_global_communications();
+    CHECK(!stale.valid(), "communicator transition did not invalidate an old borrower");
     CHECK(!collective_validate_remote_halo_agreement(stale, program, why),
           "stale lease/program remained usable after a communicator transition");
     end_global_communications();
@@ -191,12 +211,18 @@ void test_split_transitions() {
   }
   test_lease_and_agreement();
   const uint64_t divided = current_backend_communicator_generation();
+  const void *divided_context = backend_communicator_context_identity_for_testing();
   begin_global_communications();
   CHECK(current_backend_communicator_generation() == divided + 1,
         "begin_global did not advance communicator generation");
+  CHECK(backend_communicator_context_identity_for_testing() != divided_context,
+        "begin_global retained the divided communicator context");
+  const void *global_context = backend_communicator_context_identity_for_testing();
   end_global_communications();
   CHECK(current_backend_communicator_generation() == divided + 2,
         "end_global did not advance communicator generation");
+  CHECK(backend_communicator_context_identity_for_testing() != global_context,
+        "end_global retained the global communicator context");
   end_divide_parallel();
   CHECK(current_backend_communicator_generation() == divided + 3,
         "end_divide did not advance communicator generation");
@@ -227,7 +253,7 @@ int main(int argc, char **argv) {
 #endif
   test_thread_and_generation_helpers();
   test_lease_and_agreement();
-  test_collective_lease_rollback();
+  test_collective_context_rollback();
   test_split_transitions();
   const int total = sum_to_all(failures);
   if (my_rank() == 0)

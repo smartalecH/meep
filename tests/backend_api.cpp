@@ -44,6 +44,7 @@
 #include "backend/lifecycle.hpp"
 #include "backend/material_ir.hpp"
 #include "backend/material_callback.hpp"
+#include "backend/mpi_context.hpp"
 #include "backend/prepare.hpp"
 #include "backend/precision.hpp"
 #include "backend/random_state.hpp"
@@ -83,6 +84,9 @@ static std::shared_ptr<AdjointDftSnapshot> synthetic_adjoint_snapshot() {
   std::shared_ptr<AdjointDftSnapshot> snapshot(new AdjointDftSnapshot);
   snapshot->material_signature = 11;
   snapshot->material_layout_signature = 13;
+  snapshot->communicator_generation = current_backend_communicator_generation();
+  snapshot->communicator_rank = my_rank();
+  snapshot->communicator_size = count_processors();
   AdjointDftSnapshotTerm term;
   term.identity = synthetic_adjoint_identity();
   term.resident = ArrayRef{ArrayId{1}, 0, 4};
@@ -113,6 +117,10 @@ static std::shared_ptr<AdjointDftSnapshot> synthetic_adjoint_snapshot_for(fields
   snapshot->precision_policy = owner.options.precision;
   snapshot->terms[0].storage_precision = policy_for(snapshot->precision_policy).monitor;
   snapshot->device_id = owner.options.device_id;
+  snapshot->checkpoint_publication_generation = owner.checkpoint_publication_generation;
+  snapshot->communicator_generation = current_backend_communicator_generation();
+  snapshot->communicator_rank = my_rank();
+  snapshot->communicator_size = count_processors();
   snapshot->structural_signature = adjoint_snapshot_structural_signature(*snapshot);
   snapshot->value_signature = adjoint_snapshot_value_signature(*snapshot);
   validate_adjoint_snapshot(*snapshot);
@@ -346,6 +354,12 @@ static void test_adjoint_reversible_semantic_freshness() {
   fields planar(&planar_structure);
   planar.use_bloch(X, 0.23);
   const std::shared_ptr<AdjointDftSnapshot> bloch = synthetic_adjoint_snapshot_for(planar);
+  planar.dirty_mask |= dirty_executable;
+  CHECK(!adjoint_snapshot_is_stale(*bloch, planar),
+        "executable-only invalidation rejected a current adjoint snapshot");
+  invalidate(planar, MutationKind::source_values, "adjoint route-only freshness test");
+  CHECK(!adjoint_snapshot_is_stale(*bloch, planar),
+        "route/value-only invalidation rejected a current adjoint snapshot");
   planar.use_bloch(X, -0.23);
   planar.use_bloch(X, 0.23);
   CHECK(!adjoint_snapshot_is_stale(*bloch, planar),
@@ -353,6 +367,51 @@ static void test_adjoint_reversible_semantic_freshness() {
   planar.use_bloch(X, 0.24);
   CHECK(adjoint_snapshot_is_stale(*bloch, planar),
         "genuine Bloch-k mutation retained a stale adjoint snapshot");
+  const std::shared_ptr<AdjointDftSnapshot> topology =
+      synthetic_adjoint_snapshot_for(planar);
+  invalidate(planar, MutationKind::chunk_topology, "adjoint ownership freshness test");
+  CHECK(adjoint_snapshot_is_stale(*topology, planar),
+        "chunk-topology publication retained a stale adjoint snapshot");
+
+  if (count_processors() > 1) {
+    const std::shared_ptr<AdjointDftSnapshot> communicator =
+        synthetic_adjoint_snapshot_for(planar);
+    const int ranks = count_processors();
+    divide_parallel_processes(ranks);
+    CHECK(adjoint_snapshot_is_stale(*communicator, planar),
+          "communicator transition retained a stale adjoint snapshot");
+    end_divide_parallel();
+
+    std::shared_ptr<AdjointDftSnapshot> forward =
+        synthetic_adjoint_snapshot_for(planar);
+    std::shared_ptr<AdjointDftSnapshot> adjoint =
+        synthetic_adjoint_snapshot_for(planar);
+    AdjointGradientRequest request = synthetic_adjoint_request();
+    request.forward = forward;
+    request.adjoint = adjoint;
+    request.material_signature = forward->material_signature;
+    request.material_layout_signature = forward->material_layout_signature;
+    request.structural_signature = adjoint_request_signature(request);
+    if (my_rank() == 0) {
+      ++forward->communicator_generation;
+      forward->structural_signature = adjoint_snapshot_structural_signature(*forward);
+      forward->value_signature = adjoint_snapshot_value_signature(*forward);
+      request.structural_signature = adjoint_request_signature(request);
+    }
+    const uint64_t forward_value_signature = forward->value_signature;
+    const uint64_t adjoint_value_signature = adjoint->value_signature;
+    double output[4] = {-41.0, -41.0, -41.0, -41.0};
+    bool rejected = false;
+    try {
+      backend_validate_adjoint_reduction(
+          planar, request, "asymmetric stale adjoint reduction preflight");
+    }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(and_to_all(rejected) && output[0] == -41.0 && output[3] == -41.0 &&
+              forward->value_signature == forward_value_signature &&
+              adjoint->value_signature == adjoint_value_signature,
+          "asymmetric stale adjoint reduction changed output/snapshots or stranded a peer");
+  }
 
   material_type cylindrical_material = make_dielectric(2.0);
   structure cylindrical_structure(volcyl(1.0, 1.0, 8.0), unit_epsilon, no_pml(), identity(), 1);
@@ -369,6 +428,100 @@ static void test_adjoint_reversible_semantic_freshness() {
   cylindrical.change_m(3.0);
   CHECK(adjoint_snapshot_is_stale(*angular, cylindrical),
         "genuine cylindrical-m mutation retained a stale adjoint snapshot");
+}
+
+static void test_adjoint_production_asymmetric_stale_snapshot() {
+  if (count_processors() < 2) return;
+  using namespace meep_geom;
+  geom_initialize();
+  dimensions = 2;
+  geometry_center = make_vector3();
+  ensure_periodicity = false;
+  set_default_material(vacuum);
+  geometry_lattice.size = make_vector3(1.0, 1.0, 0.0);
+  geometry_lattice.basis_size = make_vector3(1, 1, 1);
+  geometry_lattice.basis1 = make_vector3(1, 0, 0);
+  geometry_lattice.basis2 = make_vector3(0, 1, 0);
+  geometry_lattice.basis3 = make_vector3(0, 0, 1);
+  geom_fix_lattice();
+
+  grid_volume gv = vol2d(1.0, 1.0, 8.0);
+  material_type dielectric = make_dielectric(2.0);
+  geometric_object object =
+      make_block(dielectric, make_vector3(), make_vector3(1, 0, 0),
+                 make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                 make_vector3(0.75, 0.75, 1.0));
+  geometric_object_list geometry = {1, &object};
+  structure s(gv, unit_epsilon, no_pml(), identity(), count_processors());
+  geom_epsilon *geps = make_geom_epsilon(&s, &geometry, make_vector3(), false, vacuum);
+  set_materials_from_geom_epsilon(&s, geps, true, 1e-5, 128);
+  fields owner(&s);
+  owner.use_real_fields();
+  double frequency = 0.25;
+  component ex = Ex, ey = Ey, ez = Ez;
+  owner.require_component(ex);
+  owner.require_component(ey);
+  owner.require_component(ez);
+  dft_fields forward_x = owner.add_dft_fields(&ex, 1, owner.v, &frequency, 1, true, 1, true);
+  dft_fields forward_y = owner.add_dft_fields(&ey, 1, owner.v, &frequency, 1, true, 1, true);
+  dft_fields forward_z = owner.add_dft_fields(&ez, 1, owner.v, &frequency, 1, true, 1, true);
+  dft_fields adjoint_x = owner.add_dft_fields(&ex, 1, owner.v, &frequency, 1, true, 1, true);
+  dft_fields adjoint_y = owner.add_dft_fields(&ey, 1, owner.v, &frequency, 1, true, 1, true);
+  dft_fields adjoint_z = owner.add_dft_fields(&ez, 1, owner.v, &frequency, 1, true, 1, true);
+  owner.advance(1);
+  std::vector<dft_fields *> forward = {&forward_x, &forward_y, &forward_z};
+  std::vector<dft_fields *> adjoint = {&adjoint_x, &adjoint_y, &adjoint_z};
+
+  const std::shared_ptr<const AdjointDftSnapshot> current =
+      make_adjoint_dft_snapshot(forward);
+  if (my_rank() == 0) {
+    std::shared_ptr<AdjointDftSnapshot> stale(new AdjointDftSnapshot(*current));
+    ++stale->communicator_generation;
+    stale->structural_signature = adjoint_snapshot_structural_signature(*stale);
+    stale->value_signature = adjoint_snapshot_value_signature(*stale);
+    for (dft_fields *monitor : forward) monitor->adjoint_snapshot = stale;
+  }
+  const void *forward_snapshots[3] = {forward_x.adjoint_snapshot.get(),
+                                      forward_y.adjoint_snapshot.get(),
+                                      forward_z.adjoint_snapshot.get()};
+  const void *adjoint_snapshots[3] = {adjoint_x.adjoint_snapshot.get(),
+                                      adjoint_y.adjoint_snapshot.get(),
+                                      adjoint_z.adjoint_snapshot.get()};
+  dft_chunk *forward_chunks[3] = {forward_x.chunks, forward_y.chunks, forward_z.chunks};
+  dft_chunk *adjoint_chunks[3] = {adjoint_x.chunks, adjoint_y.chunks, adjoint_z.chunks};
+  double output = -53.0;
+  bool rejected = false;
+  try {
+    material_grids_addgradient(&output, 1, 1, adjoint, forward, &frequency, 1.0,
+                               gv, geps, 1e-6);
+  }
+  catch (const std::runtime_error &) { rejected = true; }
+  bool unchanged = output == -53.0;
+  for (size_t i = 0; i < 3; ++i)
+    unchanged = unchanged && forward[i]->adjoint_snapshot.get() == forward_snapshots[i] &&
+                adjoint[i]->adjoint_snapshot.get() == adjoint_snapshots[i] &&
+                forward[i]->chunks == forward_chunks[i] && adjoint[i]->chunks == adjoint_chunks[i];
+  CHECK(and_to_all(rejected) && and_to_all(unchanged),
+        "production adjoint path stranded a peer or consumed output/snapshots after asymmetric staleness");
+
+  for (dft_fields *monitor : adjoint) monitor->adjoint_snapshot.reset();
+  for (dft_fields *monitor : forward) monitor->adjoint_snapshot.reset();
+  output = -59.0;
+  material_grids_addgradient(&output, 1, 1, adjoint, forward, &frequency, 1.0,
+                             gv, geps, 1e-6);
+  bool captured_and_published = output == 0.0;
+  for (size_t i = 0; i < 3; ++i)
+    captured_and_published = captured_and_published && !adjoint[i]->chunks &&
+                             forward[i]->chunks == forward_chunks[i] &&
+                             !adjoint[i]->adjoint_snapshot && !forward[i]->adjoint_snapshot;
+  CHECK(and_to_all(captured_and_published),
+        "production adjoint recapture phases did not publish and consume atomically");
+
+  for (dft_fields *monitor : adjoint) monitor->remove();
+  for (dft_fields *monitor : forward) monitor->remove();
+  delete geps;
+  geometric_object_destroy(object);
+  material_free(dielectric);
 }
 
 class lifecycle_custom_susceptibility : public lorentzian_susceptibility {
@@ -522,6 +675,8 @@ struct lifetime_counts {
   int noisy_seed_refresh_attempts;
   int noisy_seed_refreshes;
   int custom_preflights;
+  int adjoint_support_calls;
+  int adjoint_compute_calls;
   RandomSeedSnapshot last_noisy_seed;
   size_t arrays_at_create;
   size_t material_arrays_at_create;
@@ -585,6 +740,10 @@ struct lifetime_counts {
   bool poison_noisy_seed_refresh;
   bool fail_custom_preflight;
   bool poison_custom_preflight;
+  bool adjoint_supported;
+  bool fail_adjoint_compute;
+  bool poison_adjoint_compute;
+  double adjoint_local_value;
   bool fail_custom_before_entry;
   bool fail_custom_later_before_entry;
   bool fail_custom_after_entry;
@@ -605,7 +764,8 @@ struct lifetime_counts {
         magnetic_synchronizes(0), magnetic_restores(0),
         cw_executables_created(0), cw_executables_destroyed(0), cw_preflights(0), cw_solves(0),
         cw_callback_effects(0), malformed_cw_result(0), noisy_seed_refresh_attempts(0),
-        noisy_seed_refreshes(0), custom_preflights(0), last_noisy_seed(), arrays_at_create(0),
+        noisy_seed_refreshes(0), custom_preflights(0), adjoint_support_calls(0),
+        adjoint_compute_calls(0), last_noisy_seed(), arrays_at_create(0),
         material_arrays_at_create(0), provisional_material_arrays_at_create(0),
         material_recipe_rows_at_initialize(0), material_recipe_signature_at_initialize(0),
         arrays_at_compile(0), retained_logical_suffix_at_compile(0),
@@ -637,7 +797,8 @@ struct lifetime_counts {
         mutate_cw_cache_during_preflight(false), mutate_after_cw_boundary(false),
         fail_noisy_seed_refresh(false), poison_noisy_seed_refresh(false),
         fail_custom_preflight(false),
-        poison_custom_preflight(false), fail_custom_before_entry(false),
+        poison_custom_preflight(false), adjoint_supported(true), fail_adjoint_compute(false),
+        poison_adjoint_compute(false), adjoint_local_value(0.0), fail_custom_before_entry(false),
         fail_custom_later_before_entry(false), fail_custom_after_entry(false),
         reenter_custom_callback(false), omit_custom_last_segment(false),
         undercount_custom_last_segment(false), redistribute_custom_callbacks(false),
@@ -933,6 +1094,21 @@ public:
     why = "tracking backend CW support is disabled";
     return false;
   }
+  bool supports_adjoint_gradient(const AdjointGradientRequest &, std::string &why) const override {
+    ++counts.adjoint_support_calls;
+    if (counts.adjoint_supported) return true;
+    why = "tracking backend adjoint support is disabled";
+    return false;
+  }
+  void compute_adjoint_gradient(const AdjointGradientRequest &, double *result,
+                                size_t result_count, BackendState &) override {
+    ++counts.adjoint_compute_calls;
+    if (counts.poison_adjoint_compute) poison();
+    if (counts.fail_adjoint_compute)
+      throw std::runtime_error("injected adjoint compute failure");
+    for (size_t i = 0; i < result_count; ++i)
+      result[i] = counts.adjoint_local_value * double(i + 1);
+  }
   Executable *preflight_cw(const CwSolveRequest &, const StepPlan &,
                            const StepPlan &step_plan, const CwPlan &cw_plan,
                            Executable &, Executable *cached, BackendState &state) override {
@@ -1074,6 +1250,88 @@ private:
 };
 
 static void build(structure **sp, fields **fp, const execution_options *opts = NULL);
+
+static void test_adjoint_collective_backend_contract() {
+  structure *s;
+  fields *f;
+  build(&s, &f);
+  lifetime_counts counts;
+  f->backend = new tracking_backend(*f, counts);
+  f->advance(1);
+  const AdjointGradientRequest request = synthetic_adjoint_request();
+  const uint64_t forward_signature = request.forward->value_signature;
+  const uint64_t adjoint_signature = request.adjoint->value_signature;
+  double local[4] = {-17.0, -17.0, -17.0, -17.0};
+
+  setenv("MEEP_NVIDIA_ADJOINT_MODE", "auto", 1);
+  counts.adjoint_supported = my_rank() != 0;
+  CHECK(!backend_try_compute_adjoint_gradient(*f, request, local, 4,
+                                               "tracking adjoint auto fallback"),
+        "automatic adjoint mode did not select all-host fallback collectively");
+  CHECK(counts.adjoint_compute_calls == 0 && local[0] == -17.0,
+        "unsupported automatic adjoint dispatch changed output or crossed compute");
+
+  setenv("MEEP_NVIDIA_ADJOINT_MODE", "required", 1);
+  bool required_rejected = false;
+  try {
+    (void)backend_try_compute_adjoint_gradient(*f, request, local, 4,
+                                                "tracking adjoint required rejection");
+  }
+  catch (const std::runtime_error &) { required_rejected = true; }
+  CHECK(and_to_all(required_rejected) && counts.adjoint_compute_calls == 0 && local[0] == -17.0,
+        "required adjoint mode did not reject one unsupported rank before compute");
+
+  setenv("MEEP_NVIDIA_ADJOINT_MODE", "auto", 1);
+  counts.adjoint_supported = true;
+  counts.adjoint_local_value = my_rank() == 0 ? 1.25 : 0.0;
+  CHECK(backend_try_compute_adjoint_gradient(*f, request, local, 4,
+                                              "tracking adjoint deterministic local"),
+        "supported adjoint dispatch unexpectedly selected host fallback");
+  double reduced[4] = {0.0, 0.0, 0.0, 0.0};
+  sum_to_all(local, reduced, 4);
+  for (size_t i = 0; i < 4; ++i)
+    CHECK(reduced[i] == 1.25 * double(i + 1),
+          "active-communicator adjoint sum mishandled deterministic/idle contributors");
+
+  for (double &value : local) value = -23.0;
+  counts.fail_adjoint_compute = my_rank() == 0;
+  counts.poison_adjoint_compute = my_rank() == 0;
+  bool poisoned_rejected = false;
+  try {
+    (void)backend_try_compute_adjoint_gradient(*f, request, local, 4,
+                                                "tracking adjoint poisoned failure");
+  }
+  catch (const std::runtime_error &) { poisoned_rejected = true; }
+  CHECK(and_to_all(poisoned_rejected) && f->backend->is_poisoned(),
+        "post-enqueue adjoint failure did not poison every resident peer");
+  CHECK(local[0] == -23.0 && local[3] == -23.0 &&
+            request.forward->value_signature == forward_signature &&
+            request.adjoint->value_signature == adjoint_signature,
+        "failed adjoint transaction changed output or consumed snapshots");
+
+  const char *poisoned_modes[] = {"auto", "required", "host"};
+  const int support_calls_after_poison = counts.adjoint_support_calls;
+  const int compute_calls_after_poison = counts.adjoint_compute_calls;
+  for (const char *mode : poisoned_modes) {
+    setenv("MEEP_NVIDIA_ADJOINT_MODE", mode, 1);
+    for (double &value : local) value = -31.0;
+    bool retry_rejected = false;
+    try {
+      (void)backend_try_compute_adjoint_gradient(*f, request, local, 4,
+                                                  "tracking adjoint poisoned retry");
+    }
+    catch (const std::runtime_error &) { retry_rejected = true; }
+    CHECK(and_to_all(retry_rejected) && f->backend->is_poisoned() &&
+              counts.adjoint_support_calls == support_calls_after_poison &&
+              counts.adjoint_compute_calls == compute_calls_after_poison &&
+              local[0] == -31.0 && local[3] == -31.0,
+          "poisoned adjoint retry in %s mode reached support/compute or changed output", mode);
+  }
+  unsetenv("MEEP_NVIDIA_ADJOINT_MODE");
+  delete f;
+  delete s;
+}
+
 static bool checkpoint_payload_equal(const CheckpointImage &expected,
                                      const CheckpointImage &actual);
 
@@ -12227,9 +12485,21 @@ static void test_checkpoint_noisy_rank_seed_continuation() {
 
 static void test_checkpoint_single_rank_repartition() {
   if (count_processors() != 1) return;
+  using namespace meep_geom;
   const grid_volume gv = vol2d(3.0, 2.0, 8.0);
   structure source_structure(gv, eps_slab, no_pml(), identity(), 3);
   structure target_structure(gv, eps_slab, no_pml(), identity(), 1);
+  material_type slab_material = make_dielectric(12.0);
+  const double infinite_extent = std::numeric_limits<double>::infinity();
+  geometric_object slab =
+      make_block(slab_material, make_vector3(), make_vector3(1, 0, 0),
+                 make_vector3(0, 1, 0), make_vector3(0, 0, 1),
+                 make_vector3(infinite_extent, 0.8, 1.0));
+  geometric_object_list slab_geometry = {1, &slab};
+  set_materials_from_geometry(&source_structure, slab_geometry, make_vector3(), false, 1e-5, 64,
+                              false, vacuum);
+  set_materials_from_geometry(&target_structure, slab_geometry, make_vector3(), false, 1e-5, 64,
+                              false, vacuum);
   fields source(&source_structure);
   fields target(&target_structure);
   source.use_real_fields();
@@ -12259,6 +12529,8 @@ static void test_checkpoint_single_rank_repartition() {
   BackendState *const state_before_reject = target.backend_state;
   Executable *const executable_before_reject = target.executable;
   const int time_before_reject = target.t;
+  const std::shared_ptr<AdjointDftSnapshot> before_repartition =
+      synthetic_adjoint_snapshot_for(target);
   bool missing_rejected = false;
   try {
     CheckpointTransaction::validate_target(target, missing_persistent);
@@ -12268,6 +12540,26 @@ static void test_checkpoint_single_rank_repartition() {
   CHECK(missing_rejected && target.backend_state == state_before_reject &&
             target.executable == executable_before_reject && target.t == time_before_reject,
         "checkpoint repartition accepted a missing persistent physical row");
+  CHECK(!adjoint_snapshot_is_stale(*before_repartition, target),
+        "failed checkpoint repartition invalidated the current adjoint snapshot");
+
+  CheckpointImage rich_repartition = source_image;
+  for (CheckpointRow &row : rich_repartition.rows)
+    if (!row.has_alias) {
+      row.key.kind = int(array_kind::dft);
+      row.spec.role = array_role::dft;
+      row.spec.element_type = ElementType::complex_realnum;
+      row.checksum = checkpoint_row_checksum(row);
+      break;
+    }
+  bool rich_rejected = false;
+  try { CheckpointTransaction::commit(target, rich_repartition); }
+  catch (const std::runtime_error &) { rich_rejected = true; }
+  CHECK(rich_rejected && target.backend_state == state_before_reject &&
+            target.executable == executable_before_reject && target.t == time_before_reject,
+        "checkpoint repartition did not reject rich state before backend retirement");
+  CHECK(!adjoint_snapshot_is_stale(*before_repartition, target),
+        "failed rich-state repartition invalidated the current adjoint snapshot");
 
   CheckpointImage extra_persistent = source_image;
   for (const CheckpointRow &row : source_image.rows)
@@ -12342,6 +12634,8 @@ static void test_checkpoint_single_rank_repartition() {
   snprintf(filename, sizeof(filename), "/tmp/meep-checkpoint-repartition-%ld.h5", long(getpid()));
   source.dump(filename, false);
   target.load(filename, false);
+  CHECK(adjoint_snapshot_is_stale(*before_repartition, target),
+        "successful checkpoint repartition retained a stale adjoint snapshot");
   CHECK(target.t == source.t, "checkpoint repartition did not restore the saved timestep");
   const vec probes[] = {vec(-1.1, -0.6), vec(-0.35, 0.2), vec(0.25, -0.3), vec(1.0, 0.55)};
   bool restored = true;
@@ -12355,6 +12649,117 @@ static void test_checkpoint_single_rank_repartition() {
     continued &= std::abs(source.get_field(Ez, probe) - target.get_field(Ez, probe)) < 1e-10;
   CHECK(continued, "checkpoint repartition did not preserve continuation semantics");
   std::remove(filename);
+  geometric_object_destroy(slab);
+  material_free(slab_material);
+}
+
+static void test_checkpoint_repartition_stop_gates() {
+  const grid_volume gv = vol2d(2.0, 2.0, 8.0);
+  structure source_structure(gv, unit_epsilon, no_pml(), identity(), count_processors());
+  fields source(&source_structure);
+  source.use_real_fields();
+  source.require_component(Ez);
+  source.advance(1);
+  CheckpointImage plain = CheckpointTransaction::snapshot(source);
+  plain.saved_rank_count = uint64_t(count_processors()) + 1;
+
+  const auto rejected_without_mutation = [&](fields &target, const CheckpointImage &image,
+                                             const char *what) {
+    const BackendEpochSnapshot before(target);
+    bool rejected = false;
+    try { CheckpointTransaction::commit(target, image); }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(and_to_all(rejected) && before.matches(target),
+          "checkpoint repartition %s crossed its rich-state stop gate", what);
+  };
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), count_processors());
+    fields target(&s);
+    target.use_real_fields();
+    target.require_component(Ez);
+    component monitored = Ez;
+    const double frequency = 0.25;
+    dft_fields monitor = target.add_dft_fields(&monitored, 1, target.v, &frequency, 1);
+    lifetime_counts counts;
+    target.backend = new tracking_backend(target, counts);
+    target.advance(1);
+    rejected_without_mutation(target, plain, "accepted an actual target-side DFT row");
+    monitor.remove();
+  }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), count_processors());
+    add_multilevel_lifecycle_states(s);
+    fields target(&s);
+    target.use_real_fields();
+    target.require_component(Ez);
+    target.require_component(Hz);
+    lifetime_counts counts;
+    target.backend = new tracking_backend(target, counts);
+    target.advance(1);
+    bool saw_polarization = false, saw_gamma_inv = false;
+    for (const CheckpointRow &row : CheckpointTransaction::snapshot(target).rows)
+      if (row.key.kind == int(array_kind::polarization_internal)) {
+        saw_polarization = true;
+        saw_gamma_inv |= row.key.component_ == int(Centered) && row.key.cmp == -1;
+      }
+    CHECK(or_to_all(saw_polarization) && or_to_all(saw_gamma_inv),
+          "checkpoint stop-gate fixture omitted polarization/GammaInv rows");
+    rejected_without_mutation(target, plain,
+                              "accepted actual target-side polarization/GammaInv state");
+  }
+
+  {
+    structure s(gv, unit_epsilon, pml(0.25), identity(), count_processors());
+    fields target(&s);
+    target.use_real_fields();
+    target.require_component(Ez);
+    lifetime_counts counts;
+    target.backend = new tracking_backend(target, counts);
+    target.advance(1);
+    bool saw_pml = false;
+    for (const CheckpointRow &row : CheckpointTransaction::snapshot(target).rows)
+      saw_pml = saw_pml || row.key.kind == int(array_kind::pml_sig) ||
+                row.key.kind == int(array_kind::pml_kap) ||
+                row.key.kind == int(array_kind::pml_siginv);
+    CHECK(or_to_all(saw_pml), "checkpoint stop-gate fixture omitted target-side PML rows");
+    rejected_without_mutation(target, plain, "accepted an actual target-side PML row");
+  }
+
+  {
+    structure s(gv, unit_epsilon, no_pml(), identity(), count_processors());
+    lifecycle_custom_susceptibility opaque(realnum(0.73), realnum(0.06));
+    s.add_susceptibility(unit_epsilon, E_stuff, opaque);
+    fields target(&s);
+    target.use_real_fields();
+    target.require_component(Ez);
+    target.advance(1);
+    rejected_without_mutation(target, plain,
+                              "accepted actual target-side opaque polarization state");
+  }
+
+  if (count_processors() > 1) {
+    structure s(gv, unit_epsilon, no_pml(), identity(), count_processors());
+    fields target(&s);
+    target.use_real_fields();
+    target.require_component(Ez);
+    lifetime_counts counts;
+    target.backend = new tracking_backend(target, counts);
+    target.advance(1);
+    CheckpointImage asymmetric = plain;
+    if (my_rank() == 0)
+      for (CheckpointRow &row : asymmetric.rows)
+        if (!row.has_alias) {
+          row.key.kind = int(array_kind::dft);
+          row.spec.role = array_role::dft;
+          row.spec.element_type = ElementType::complex_realnum;
+          row.checksum = checkpoint_row_checksum(row);
+          break;
+        }
+    rejected_without_mutation(target, asymmetric,
+                              "did not reconcile a peer-asymmetric rich saved row");
+  }
 }
 
 static void checkpoint_mpi_repartition_file(const char *filename, bool write_only) {
@@ -12723,6 +13128,12 @@ int main(int argc, char **argv) {
     checkpoint_cross_precision_file(filename, false);
     return failures ? 1 : 0;
   }
+  if (getenv("MEEP_BACKEND_API_CHECKPOINT_STOP_ONLY")) {
+    test_checkpoint_repartition_stop_gates();
+    if (sum_to_all(failures)) return 1;
+    master_printf("backend_api: checkpoint repartition stop gates passed\n");
+    return 0;
+  }
   if (getenv("MEEP_BACKEND_API_CHECKPOINT_ONLY")) {
 #ifdef HAVE_HDF5
     test_backend_safe_host_access();
@@ -12735,6 +13146,7 @@ int main(int argc, char **argv) {
     test_checkpoint_noisy_rank_seed_continuation();
     test_checkpoint_single_rank_repartition();
 #endif
+    test_checkpoint_repartition_stop_gates();
     if (sum_to_all(failures)) return 1;
     master_printf("backend_api: checkpoint checks passed\n");
     return 0;
@@ -12908,6 +13320,8 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_BACKEND_API_ADJOINT_ONLY")) {
     test_adjoint_plan_schema();
     test_adjoint_reversible_semantic_freshness();
+    test_adjoint_production_asymmetric_stale_snapshot();
+    test_adjoint_collective_backend_contract();
     failures = sum_to_all(failures);
     if (failures) return 1;
     master_printf("backend_api: adjoint plan checks passed\n");
@@ -12917,6 +13331,8 @@ int main(int argc, char **argv) {
   test_selection();
   test_adjoint_plan_schema();
   test_adjoint_reversible_semantic_freshness();
+  test_adjoint_production_asymmetric_stale_snapshot();
+  test_adjoint_collective_backend_contract();
   test_susceptibility_clone_coefficients();
   test_construction_equivalence();
   test_read_write_roundtrip();
@@ -12984,6 +13400,7 @@ int main(int argc, char **argv) {
   test_checkpoint_single_rank_repartition();
   test_sharded_dft_checkpoint_ordering();
 #endif
+  test_checkpoint_repartition_stop_gates();
   test_compact_dft_reduction_boundary();
 
   if (failures) {

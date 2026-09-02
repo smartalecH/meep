@@ -6569,8 +6569,45 @@ static void test_native_geometry_cuda_mpi_initialization() {
                 !split.backend_state && !split.executable,
             "CUDA geometry split communicator selected the wrong GPU or failed init");
   }
-  end_divide_parallel();
+
   backend_set_initialization_only_for_testing(false);
+  {
+    structure split_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    install_geometry_block_material(split_structure);
+    execution_options split_options = options;
+    split_options.device_id = my_global_rank();
+    fields split(&split_structure, split_options);
+    split.use_real_fields();
+    for (component c : {Ex, Ey, Ez}) split.require_component(c);
+    split.init_backend();
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(split.backend);
+    require(backend && split.backend_state && split.executable,
+            "singleton communicator fixture did not compile an NVIDIA executable");
+    std::string identity_error;
+    require(backend->executable_structural_identity_current(
+                *split.executable, *split.backend_state, identity_error),
+            "new singleton executable has stale communicator identity");
+    const NvidiaExecutableCacheStatistics before =
+        backend->executable_cache_statistics_for_testing();
+
+    begin_global_communications();
+    identity_error.clear();
+    require(count_processors() == ranks &&
+                !backend->executable_structural_identity_current(
+                    *split.executable, *split.backend_state, identity_error),
+            "singleton executable survived a size-one to world communicator transition");
+    end_global_communications();
+
+    split.advance(1);
+    const NvidiaExecutableCacheStatistics after =
+        backend->executable_cache_statistics_for_testing();
+    identity_error.clear();
+    require(after.executable_build_count > before.executable_build_count &&
+                backend->executable_structural_identity_current(
+                    *split.executable, *split.backend_state, identity_error),
+            "stale singleton executable was not transactionally rebuilt");
+  }
+  end_divide_parallel();
   master_printf("nvidia_timestep: material-geometry CUDA MPI init/rollback PASS\n");
 }
 

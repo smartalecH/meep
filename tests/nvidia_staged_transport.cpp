@@ -29,19 +29,6 @@ int failures = 0;
     }                                                                                              \
   } while (0)
 
-void test_retirement_resolution() {
-  bool retired = false;
-  CHECK(meep::nvidia::testing::resolve_staged_transport_retirement_for_testing(
-            false, false, retired) &&
-            retired,
-        "finalized local communicator discard was not accepted as retirement");
-  retired = false;
-  CHECK(!meep::nvidia::testing::resolve_staged_transport_retirement_for_testing(
-            false, true, retired) &&
-            !retired,
-        "failed retirement with a live communicator lease was accepted");
-}
-
 void test_route_state_machine() {
   using meep::nvidia::testing::transport_presend_action;
   using meep::nvidia::testing::transport_presend_action_for_testing;
@@ -408,6 +395,8 @@ int run_case(int device, bool direct = false, bool direct_mock_local_payload = f
         "rank-asymmetric transport authority mismatch did not reject collectively");
   const meep::nvidia::memory_accounting before_failed_create =
       meep::nvidia::current_memory_accounting();
+  const size_t context_users_before_failed_create =
+      backend_communicator_context_use_count_for_testing();
   if (rank == 0)
     meep::nvidia::testing::fail_next(meep::nvidia::testing::failure_point::device_allocate);
   rejected = meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
@@ -417,21 +406,34 @@ int run_case(int device, bool direct = false, bool direct_mock_local_payload = f
   CHECK(before_failed_create.device_bytes_current == after_failed_create.device_bytes_current &&
             before_failed_create.pinned_bytes_current == after_failed_create.pinned_bytes_current,
         "failed transport creation leaked device or pinned ownership");
+  CHECK(backend_communicator_context_use_count_for_testing() ==
+            context_users_before_failed_create,
+        "failed transport candidate leaked a communicator-context borrow");
   std::unique_ptr<meep::nvidia::staged_transport_epoch> epoch =
-      meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
+      meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why,
+                                                  UINT64_C(0x1234), UINT64_C(0x5678));
   CHECK(bool(epoch), why.c_str());
   if (!epoch) return failures;
+  const meep::nvidia::transport_structural_identity &identity = epoch->structural_identity();
+  CHECK(identity.version == meep::nvidia::transport_structural_identity::schema_version &&
+            identity.slot_count == 2 && identity.slot_layout_version == 1 &&
+            identity.communicator_generation == current_backend_communicator_generation() &&
+            identity.wire_signature == artifact.wire.signature &&
+            identity.device_signature == UINT64_C(0x1234) &&
+            identity.dependency_signature == UINT64_C(0x5678) &&
+            identity.signature ==
+                meep::nvidia::compute_transport_structural_identity_signature(identity),
+        "transport structural identity is incomplete or stale at creation");
   const meep::nvidia::memory_accounting steady_memory = meep::nvidia::current_memory_accounting();
 
   const char *fatal_mode = getenv("MEEP_NVIDIA_STAGED_FATAL");
   if (!fatal_mode && getenv("MEEP_NVIDIA_STAGED_FATAL_AFTER_RECV")) fatal_mode = "receive";
   if (fatal_mode) {
     if (!strcmp(fatal_mode, "retire")) {
-      if (rank == 0) set_backend_communicator_failure_for_testing("before_retire");
-      /* A collectively unretired, still-live communicator is not the
-         finalized-MPI discard case. Destruction must remain fatal. */
+      const size_t before = backend_communicator_context_use_count_for_testing();
       epoch.reset();
-      CHECK(false, "live communicator retirement failure unexpectedly returned");
+      CHECK(backend_communicator_context_use_count_for_testing() + 1 == before,
+            "local transport destruction retained its communicator-context borrow");
       return failures;
     }
     meep::nvidia::testing::staged_transport_failure_point failure =
@@ -539,6 +541,24 @@ int run_case(int device, bool direct = false, bool direct_mock_local_payload = f
   }
   else
     CHECK(epoch->retire(why), why.c_str());
+
+  /* Two executable-like epochs borrow one active communicator context. Local
+     destruction of one must not free or invalidate the shared communicator. */
+  const size_t context_users_before_pair = backend_communicator_context_use_count_for_testing();
+  std::unique_ptr<meep::nvidia::staged_transport_epoch> first =
+      meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
+  std::unique_ptr<meep::nvidia::staged_transport_epoch> second =
+      meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
+  CHECK(first && second, why.c_str());
+  CHECK(backend_communicator_context_use_count_for_testing() == context_users_before_pair + 2,
+        "same-communicator transport rebuild did not retain shared context ownership");
+  first.reset();
+  CHECK(second && second->structural_identity().communicator_generation ==
+                      current_backend_communicator_generation(),
+        "local executable destruction invalidated a sibling transport epoch");
+  CHECK(backend_communicator_context_use_count_for_testing() == context_users_before_pair + 1,
+        "local executable destruction retained its communicator-context borrow");
+  if (second) CHECK(second->retire(why), why.c_str());
 
   epoch = meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
   CHECK(bool(epoch), why.c_str());
@@ -662,13 +682,23 @@ int main(int argc, char **argv) {
 #endif
   initialize mpi(argc, argv);
   try {
-    test_retirement_resolution();
-    test_route_state_machine();
+  test_route_state_machine();
     const std::vector<meep::nvidia::device_properties> devices = meep::nvidia::enumerate_devices();
     CHECK(!devices.empty(), "no CUDA device is available");
     if (!devices.empty()) {
       const int device = my_rank() % int(devices.size());
       run_case<double>(device);
+      const char *fatal_mode = getenv("MEEP_NVIDIA_STAGED_FATAL");
+      if (fatal_mode && !strcmp(fatal_mode, "retire")) {
+        const int total = sum_to_all(failures);
+        if (my_rank() == 0)
+          std::printf("nvidia_staged_transport: %s (%d failures)\n",
+                      total ? "FAIL" : "PASS", total);
+#ifdef HAVE_MPI
+        if (MPI_Finalize() != MPI_SUCCESS) return 3;
+#endif
+        return total ? 1 : 0;
+      }
       run_case<float>(device);
       run_idle_np4_case(devices);
 #ifdef HAVE_MPI

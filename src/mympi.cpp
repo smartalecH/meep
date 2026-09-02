@@ -20,6 +20,7 @@
 #include <climits>
 #include <cstdio>
 #include <new>
+#include <memory>
 #include <thread>
 #include <utility>
 #include <stdarg.h>
@@ -81,7 +82,19 @@ using namespace std;
 
 namespace meep {
 
+struct BackendCommunicatorContext {
+#ifdef HAVE_MPI
+  MPI_Comm comm;
+  BackendCommunicatorContext() : comm(MPI_COMM_NULL), info() {}
+#else
+  BackendCommunicatorContext() : info() {}
+#endif
+  BackendCommunicatorInfo info;
+};
+
 namespace {
+
+std::shared_ptr<BackendCommunicatorContext> active_backend_communicator_context;
 
 #ifdef HAVE_MPI
 MPI_Comm mycomm = MPI_COMM_WORLD;
@@ -91,6 +104,16 @@ bool mpi_initialized_by_meep = false;
 int mpi_thread_level = MPI_THREAD_SINGLE;
 std::thread::id mpi_main_thread;
 std::string backend_communicator_failure_point;
+bool install_backend_communicator_context(MPI_Comm source, uint64_t generation,
+                                          std::string &why);
+bool retire_active_backend_communicator_context(std::string &why) noexcept;
+void discard_active_backend_communicator_context() noexcept;
+
+bool consume_backend_communicator_failure(const char *point) {
+  if (backend_communicator_failure_point != point) return false;
+  backend_communicator_failure_point.clear();
+  return true;
+}
 
 [[noreturn]] void fatal_backend_communicator(MPI_Comm communicator, const char *message) {
   std::fprintf(stderr, "fatal MPI communicator mutation: %s\n", message);
@@ -276,6 +299,9 @@ initialize::initialize(int &argc, char **&argv) {
   if (MPI_Is_thread_main(&is_main) != MPI_SUCCESS) abort("MPI_Is_thread_main failed");
   if (!is_main) abort("Meep MPI initialization must run on the MPI main thread");
   mpi_main_thread = std::this_thread::get_id();
+  std::string context_error;
+  if (!install_backend_communicator_context(mycomm, mycomm_generation, context_error))
+    abort("cannot initialize backend communicator context: %s", context_error.c_str());
   int major, minor;
   MPI_Get_version(&major, &minor);
   if (verbosity > 0)
@@ -283,6 +309,17 @@ initialize::initialize(int &argc, char **&argv) {
 #else
   UNUSED(argc);
   UNUSED(argv);
+  std::shared_ptr<BackendCommunicatorContext> context(new BackendCommunicatorContext());
+  context->info.generation = 1;
+  context->info.rank = 0;
+  context->info.size = 1;
+  context->info.tag_ub = std::numeric_limits<int>::max();
+  context->info.thread_level = 0;
+  context->info.thread_main = true;
+  context->info.provider_query_available = false;
+  context->info.provider_supports_direct = false;
+  context->info.provider = "none";
+  active_backend_communicator_context = std::move(context);
 #endif
 #if defined(DEBUG_FP) && defined(HAVE_FEENABLEEXCEPT)
   feenableexcept(FE_INVALID | FE_OVERFLOW); // crash if NaN created, or overflow
@@ -304,14 +341,19 @@ initialize::~initialize() {
   if (finalized) {
     /* MPI owns all communicator cleanup after externally initiated finalize.
        Do not call logging/timing helpers: both may enter MPI. */
+    discard_active_backend_communicator_context();
     mycomm = mycomm_save = MPI_COMM_WORLD;
     return;
   }
-  end_divide_parallel();
+  std::string context_error;
+  if (!retire_active_backend_communicator_context(context_error))
+    fatal_backend_communicator(mycomm, context_error.c_str());
+  retire_divided_communicators_without_generation();
   if (verbosity > 0) master_printf("\nElapsed run time = %g s\n", elapsed_time());
   if (mpi_initialized_by_meep && !finalized && MPI_Finalize() != MPI_SUCCESS)
     std::_Exit(EXIT_FAILURE);
 #else
+  active_backend_communicator_context.reset();
   if (verbosity > 0) master_printf("\nElapsed run time = %g s\n", elapsed_time());
 #endif
 }
@@ -920,6 +962,12 @@ int divide_parallel_processes(int numgroups) {
   MPI_Comm candidate = MPI_COMM_NULL;
   if (MPI_Comm_split(MPI_COMM_WORLD, mygroup, world_rank, &candidate) != MPI_SUCCESS)
     fatal_backend_communicator(MPI_COMM_WORLD, "MPI_Comm_split failed");
+  std::string context_error;
+  if (!install_backend_communicator_context(candidate, next, context_error)) {
+    if (candidate != MPI_COMM_NULL && MPI_Comm_free(&candidate) != MPI_SUCCESS)
+      fatal_backend_communicator(MPI_COMM_WORLD, "failed split rollback");
+    throw std::runtime_error(std::string("divide_parallel_processes: ") + context_error);
+  }
   retire_divided_communicators_without_generation();
   mycomm = candidate;
   mycomm_generation = next;
@@ -939,6 +987,9 @@ void begin_global_communications(void) {
   uint64_t next = 0;
   if (!next_generation(mycomm_generation, next))
     meep::abort("backend communicator generation overflow");
+  std::string context_error;
+  if (!install_backend_communicator_context(MPI_COMM_WORLD, next, context_error))
+    throw std::runtime_error(std::string("begin_global_communications: ") + context_error);
   mycomm_save = mycomm;
   mycomm = MPI_COMM_WORLD;
   mycomm_generation = next;
@@ -952,6 +1003,9 @@ void end_global_communications(void) {
   uint64_t next = 0;
   if (!next_generation(mycomm_generation, next))
     meep::abort("backend communicator generation overflow");
+  std::string context_error;
+  if (!install_backend_communicator_context(mycomm_save, next, context_error))
+    throw std::runtime_error(std::string("end_global_communications: ") + context_error);
   mycomm = mycomm_save;
   mycomm_save = MPI_COMM_WORLD;
   mycomm_generation = next;
@@ -965,6 +1019,9 @@ void end_divide_parallel(void) {
   uint64_t next = 0;
   if (!next_generation(mycomm_generation, next))
     meep::abort("backend communicator generation overflow");
+  std::string context_error;
+  if (!install_backend_communicator_context(MPI_COMM_WORLD, next, context_error))
+    throw std::runtime_error(std::string("end_divide_parallel: ") + context_error);
   retire_divided_communicators_without_generation();
   mycomm_generation = next;
 #endif
@@ -980,75 +1037,29 @@ int my_global_rank() {
 #endif
 }
 
-struct BackendCommunicatorLease::Impl {
-#ifdef HAVE_MPI
-  MPI_Comm comm;
-  Impl() : comm(MPI_COMM_NULL) {}
-#else
-  Impl() {}
-#endif
-};
+BackendCommunicatorLease::BackendCommunicatorLease() : context_(), info_() {}
 
-BackendCommunicatorLease::BackendCommunicatorLease() : impl_(NULL), info_() {}
-
-BackendCommunicatorLease::~BackendCommunicatorLease() {
-  /* MPI_Comm_free is collective and is therefore never attempted here. The
-     explicit retire transaction must run before destruction. After MPI has
-     finalized, the handle is inert and local deletion is sufficient. */
-  if (valid()) {
-#ifdef HAVE_MPI
-    int initialized = 0, finalized = 0;
-    if (MPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
-        MPI_Finalized(&finalized) == MPI_SUCCESS && finalized) {
-      impl_->comm = MPI_COMM_NULL;
-      delete impl_;
-      impl_ = NULL;
-      return;
-    }
-#endif
-    std::fprintf(stderr,
-                 "BackendCommunicatorLease destroyed before explicit collective retirement\n");
-    std::abort();
-  }
-  delete impl_;
-}
+BackendCommunicatorLease::~BackendCommunicatorLease() {}
 
 BackendCommunicatorLease::BackendCommunicatorLease(BackendCommunicatorLease &&other) noexcept
-    : impl_(other.impl_), info_(std::move(other.info_)) {
-  other.impl_ = NULL;
+    : context_(std::move(other.context_)), info_(std::move(other.info_)) {
   other.info_ = BackendCommunicatorInfo();
 }
 
 BackendCommunicatorLease &
 BackendCommunicatorLease::operator=(BackendCommunicatorLease &&other) noexcept {
   if (this == &other) return *this;
-  if (valid()) {
-#ifdef HAVE_MPI
-    int initialized = 0, finalized = 0;
-    if (MPI_Initialized(&initialized) == MPI_SUCCESS && initialized &&
-        MPI_Finalized(&finalized) == MPI_SUCCESS && finalized)
-      impl_->comm = MPI_COMM_NULL;
-    else
-#endif
-    {
-      std::fprintf(stderr,
-                   "BackendCommunicatorLease overwritten before explicit collective retirement\n");
-      std::abort();
-    }
-  }
-  delete impl_;
-  impl_ = other.impl_;
+  context_ = std::move(other.context_);
   info_ = std::move(other.info_);
-  other.impl_ = NULL;
   other.info_ = BackendCommunicatorInfo();
   return *this;
 }
 
 bool BackendCommunicatorLease::valid() const {
 #ifdef HAVE_MPI
-  return impl_ && impl_->comm != MPI_COMM_NULL;
+  return context_ && context_->comm != MPI_COMM_NULL;
 #else
-  return impl_ != NULL;
+  return bool(context_);
 #endif
 }
 
@@ -1066,7 +1077,7 @@ uint64_t current_backend_communicator_generation() {
 MPI_Comm current_backend_communicator() { return mycomm; }
 
 MPI_Comm backend_communicator(const BackendCommunicatorLease &lease) {
-  return lease.impl_ ? lease.impl_->comm : MPI_COMM_NULL;
+  return lease.context_ ? lease.context_->comm : MPI_COMM_NULL;
 }
 #endif
 
@@ -1184,25 +1195,25 @@ bool collective_resolve_gpu_mpi_policy(bool local_parse_valid, GpuMpiPolicy loca
 #endif
 }
 
-bool create_backend_communicator_lease(BackendCommunicatorLease &lease, std::string &why) {
-  why.clear();
-  if (lease.valid()) {
-    why = "backend communicator lease is already valid";
-    return false;
-  }
+namespace {
+
 #ifdef HAVE_MPI
+bool build_backend_communicator_context(
+    MPI_Comm source, uint64_t generation,
+    std::shared_ptr<BackendCommunicatorContext> &candidate, std::string &why) {
+  why.clear();
   if (!backend_mpi_thread_ready(why)) return false;
   BackendCommunicatorInfo info{};
-  info.generation = mycomm_generation;
+  info.generation = generation;
   int local_failed = 0;
-  if (MPI_Comm_rank(mycomm, &info.rank) != MPI_SUCCESS ||
-      MPI_Comm_size(mycomm, &info.size) != MPI_SUCCESS) {
+  if (MPI_Comm_rank(source, &info.rank) != MPI_SUCCESS ||
+      MPI_Comm_size(source, &info.size) != MPI_SUCCESS) {
     why = "MPI communicator identity query failed";
     local_failed = 1;
   }
   int *tag_ub = NULL, present = 0;
   if (!local_failed &&
-      MPI_Comm_get_attr(mycomm, MPI_TAG_UB, &tag_ub, &present) != MPI_SUCCESS) {
+      MPI_Comm_get_attr(source, MPI_TAG_UB, &tag_ub, &present) != MPI_SUCCESS) {
     why = "MPI_TAG_UB query failed";
     local_failed = 1;
   }
@@ -1228,51 +1239,49 @@ bool create_backend_communicator_lease(BackendCommunicatorLease &lease, std::str
       local_failed = 1;
     }
   }
-  if (backend_communicator_failure_point == "before_dup") {
+  if (consume_backend_communicator_failure("before_dup")) {
     why = "injected communicator creation preflight failure";
     local_failed = 1;
   }
-  const unsigned long long local_generation =
-      static_cast<unsigned long long>(mycomm_generation);
+  const unsigned long long local_generation = static_cast<unsigned long long>(generation);
   unsigned long long minimum_generation = 0, maximum_generation = 0;
   if (MPI_Allreduce(&local_generation, &minimum_generation, 1, MPI_UNSIGNED_LONG_LONG,
-                    MPI_MIN, mycomm) != MPI_SUCCESS)
-    fatal_backend_communicator(mycomm,
+                    MPI_MIN, source) != MPI_SUCCESS)
+    fatal_backend_communicator(source,
                                "communicator generation minimum reconciliation failed");
   if (MPI_Allreduce(&local_generation, &maximum_generation, 1, MPI_UNSIGNED_LONG_LONG,
-                    MPI_MAX, mycomm) != MPI_SUCCESS)
-    fatal_backend_communicator(mycomm,
+                    MPI_MAX, source) != MPI_SUCCESS)
+    fatal_backend_communicator(source,
                                "communicator generation maximum reconciliation failed");
   if (minimum_generation != maximum_generation) {
     why = "active communicator generation differs across ranks";
     local_failed = 1;
   }
   int any_failed = 0;
-  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, mycomm) != MPI_SUCCESS)
-    fatal_backend_communicator(mycomm, "communicator creation preflight reconciliation failed");
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, source) != MPI_SUCCESS)
+    fatal_backend_communicator(source, "communicator creation preflight reconciliation failed");
   if (any_failed) {
     if (!local_failed) why = "MPI communicator lease preflight failed on another rank";
     return false;
   }
 
-  BackendCommunicatorLease::Impl *candidate =
-      new (std::nothrow) BackendCommunicatorLease::Impl();
+  try { candidate.reset(new BackendCommunicatorContext()); }
+  catch (...) { candidate.reset(); }
   local_failed = candidate ? 0 : 1;
-  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, mycomm) != MPI_SUCCESS)
-    fatal_backend_communicator(mycomm, "communicator allocation reconciliation failed");
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, source) != MPI_SUCCESS)
+    fatal_backend_communicator(source, "communicator allocation reconciliation failed");
   if (any_failed) {
-    delete candidate;
     why = local_failed ? "backend communicator lease allocation failed"
                        : "backend communicator lease allocation failed on another rank";
     return false;
   }
-  if (MPI_Comm_dup(mycomm, &candidate->comm) != MPI_SUCCESS)
-    fatal_backend_communicator(mycomm, "MPI_Comm_dup failed");
+  if (MPI_Comm_dup(source, &candidate->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(source, "MPI_Comm_dup failed");
   if (MPI_Comm_set_errhandler(candidate->comm, MPI_ERRORS_RETURN) != MPI_SUCCESS)
     fatal_backend_communicator(candidate->comm,
                                "MPI communicator error-handler installation failed");
   local_failed = 0;
-  if (backend_communicator_failure_point == "after_dup") local_failed = 1;
+  if (consume_backend_communicator_failure("after_dup")) local_failed = 1;
   any_failed = 0;
   if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, candidate->comm) !=
       MPI_SUCCESS)
@@ -1280,65 +1289,125 @@ bool create_backend_communicator_lease(BackendCommunicatorLease &lease, std::str
                                "communicator creation reconciliation failed");
   if (any_failed) {
     if (MPI_Comm_free(&candidate->comm) != MPI_SUCCESS)
-      fatal_backend_communicator(mycomm, "communicator creation rollback failed");
-    delete candidate;
+      fatal_backend_communicator(source, "communicator creation rollback failed");
+    candidate.reset();
     why = "MPI communicator lease creation failed on at least one rank";
     return false;
   }
-  lease.impl_ = candidate;
-  lease.info_ = std::move(info);
+  candidate->info = std::move(info);
   return true;
-#else
-  BackendCommunicatorLease::Impl *candidate = new BackendCommunicatorLease::Impl();
-  BackendCommunicatorInfo info{};
-  info.generation = 1;
-  info.rank = 0;
-  info.size = 1;
-  info.tag_ub = std::numeric_limits<int>::max();
-  info.thread_level = 0;
-  info.thread_main = true;
-  info.provider_query_available = false;
-  info.provider_supports_direct = false;
-  info.provider = "none";
-  lease.impl_ = candidate;
-  lease.info_ = info;
+}
+
+bool retire_backend_communicator_context(
+    const std::shared_ptr<BackendCommunicatorContext> &context, std::string &why) noexcept {
+  why.clear();
+  if (!context || context->comm == MPI_COMM_NULL) return true;
+  int finalized = 0;
+  if (MPI_Finalized(&finalized) != MPI_SUCCESS)
+    fatal_backend_communicator(context->comm, "MPI_Finalized query failed");
+  if (finalized) {
+    context->comm = MPI_COMM_NULL;
+    why = "MPI is finalized; communicator context was discarded locally without MPI cleanup";
+    return true;
+  }
+  if (!backend_mpi_thread_ready(why)) return false;
+  int local_failed = consume_backend_communicator_failure("before_retire") ? 1 : 0;
+  int any_failed = 0;
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, context->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(context->comm, "communicator retirement reconciliation failed");
+  if (any_failed) {
+    why = "MPI communicator context retirement preflight failed on at least one rank";
+    return false;
+  }
+  MPI_Comm retiring = context->comm;
+  if (MPI_Comm_free(&context->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(retiring, "MPI_Comm_free failed");
   return true;
+}
+
+bool install_backend_communicator_context(MPI_Comm source, uint64_t generation,
+                                          std::string &why) {
+  std::shared_ptr<BackendCommunicatorContext> candidate;
+  const bool built = build_backend_communicator_context(source, generation, candidate, why);
+  int local_failed = built ? 0 : 1, any_failed = 0;
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD) !=
+      MPI_SUCCESS)
+    fatal_backend_communicator(MPI_COMM_WORLD,
+                               "communicator transition candidate reconciliation failed");
+  if (any_failed) {
+    if (candidate) {
+      std::string ignored;
+      if (!retire_backend_communicator_context(candidate, ignored))
+        fatal_backend_communicator(candidate->comm, "communicator candidate rollback failed");
+    }
+    if (why.empty()) why = "communicator candidate failed in another process group";
+    return false;
+  }
+  local_failed = consume_backend_communicator_failure("before_retire") ? 1 : 0;
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD) !=
+      MPI_SUCCESS)
+    fatal_backend_communicator(MPI_COMM_WORLD,
+                               "communicator transition retirement reconciliation failed");
+  if (any_failed) {
+    std::string ignored;
+    if (!retire_backend_communicator_context(candidate, ignored))
+      fatal_backend_communicator(candidate->comm, "communicator candidate rollback failed");
+    why = "MPI communicator context retirement preflight failed on at least one rank";
+    return false;
+  }
+  if (!retire_backend_communicator_context(active_backend_communicator_context, why)) {
+    std::string ignored;
+    if (!retire_backend_communicator_context(candidate, ignored))
+      fatal_backend_communicator(candidate->comm, "communicator candidate rollback failed");
+    return false;
+  }
+  active_backend_communicator_context = std::move(candidate);
+  return true;
+}
+
+bool retire_active_backend_communicator_context(std::string &why) noexcept {
+  if (!retire_backend_communicator_context(active_backend_communicator_context, why)) return false;
+  active_backend_communicator_context.reset();
+  return true;
+}
+
+void discard_active_backend_communicator_context() noexcept {
+  if (active_backend_communicator_context)
+    active_backend_communicator_context->comm = MPI_COMM_NULL;
+  active_backend_communicator_context.reset();
+}
 #endif
+
+} // namespace
+
+bool create_backend_communicator_lease(BackendCommunicatorLease &lease, std::string &why) {
+  why.clear();
+  if (lease.valid()) {
+    why = "backend communicator lease is already valid";
+    return false;
+  }
+  if (!active_backend_communicator_context) {
+    why = "backend communicator context is not initialized";
+    return false;
+  }
+  lease.context_ = active_backend_communicator_context;
+  lease.info_ = active_backend_communicator_context->info;
+  return true;
 }
 
 bool retire_backend_communicator_lease(BackendCommunicatorLease &lease, std::string &why) {
   why.clear();
-  if (!lease.valid()) return true;
-#ifdef HAVE_MPI
-  int finalized = 0;
-  if (MPI_Finalized(&finalized) != MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm, "MPI_Finalized query failed");
-  if (finalized) {
-    delete lease.impl_;
-    lease.impl_ = NULL;
-    lease.info_ = BackendCommunicatorInfo();
-    why = "MPI is finalized; communicator lease was discarded locally without MPI cleanup";
-    return false;
-  }
-  if (!backend_mpi_thread_ready(why)) return false;
-  int local_failed = backend_communicator_failure_point == "before_retire" ? 1 : 0;
-  int any_failed = 0;
-  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, lease.impl_->comm) !=
-      MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
-                               "communicator retirement reconciliation failed");
-  if (any_failed) {
-    why = "MPI communicator lease retirement preflight failed on at least one rank";
-    return false;
-  }
-  MPI_Comm retiring = lease.impl_->comm;
-  if (MPI_Comm_free(&lease.impl_->comm) != MPI_SUCCESS)
-    fatal_backend_communicator(retiring, "MPI_Comm_free failed");
-#endif
-  delete lease.impl_;
-  lease.impl_ = NULL;
+  lease.context_.reset();
   lease.info_ = BackendCommunicatorInfo();
   return true;
+}
+
+const void *backend_communicator_context_identity_for_testing() {
+  return active_backend_communicator_context.get();
+}
+
+size_t backend_communicator_context_use_count_for_testing() {
+  return active_backend_communicator_context ? active_backend_communicator_context.use_count() : 0;
 }
 
 bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &lease,
@@ -1364,9 +1433,9 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   if (!local_invalid && !validate_remote_halo_program(program, lease.info().tag_ub, local_why))
     local_invalid = 1;
   int any_invalid = 0;
-  if (MPI_Allreduce(&local_invalid, &any_invalid, 1, MPI_INT, MPI_LOR, lease.impl_->comm) !=
+  if (MPI_Allreduce(&local_invalid, &any_invalid, 1, MPI_INT, MPI_LOR, lease.context_->comm) !=
       MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
+    fatal_backend_communicator(lease.context_->comm,
                                "remote halo preflight reconciliation failed");
   if (any_invalid) {
     why = local_invalid ? local_why : "remote halo program is invalid on another rank";
@@ -1407,17 +1476,17 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   }
   int any_prepare_failed = 0;
   if (MPI_Allreduce(&local_prepare_failed, &any_prepare_failed, 1, MPI_INT, MPI_LOR,
-                    lease.impl_->comm) != MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
+                    lease.context_->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(lease.context_->comm,
                                "remote halo metadata preparation reconciliation failed");
   if (any_prepare_failed) {
     why = local_prepare_failed ? local_why
                                : "remote halo metadata preparation failed on another rank";
     return false;
   }
-  if (MPI_Allgather(&local_bytes, 1, MPI_INT, counts.data(), 1, MPI_INT, lease.impl_->comm) !=
+  if (MPI_Allgather(&local_bytes, 1, MPI_INT, counts.data(), 1, MPI_INT, lease.context_->comm) !=
       MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
+    fatal_backend_communicator(lease.context_->comm,
                                "remote halo agreement count exchange failed");
   int total = 0;
   for (int i = 0; i < lease.info().size; ++i) {
@@ -1437,8 +1506,8 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   }
   any_prepare_failed = 0;
   if (MPI_Allreduce(&local_prepare_failed, &any_prepare_failed, 1, MPI_INT, MPI_LOR,
-                    lease.impl_->comm) != MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
+                    lease.context_->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(lease.context_->comm,
                                "remote halo receive allocation reconciliation failed");
   if (any_prepare_failed) {
     why = local_prepare_failed ? local_why
@@ -1447,8 +1516,8 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   }
   if (MPI_Allgatherv(local.empty() ? NULL : static_cast<void *>(local.data()), local_bytes,
                      MPI_BYTE, gathered.empty() ? NULL : gathered.data(), counts.data(),
-                     displacements.data(), MPI_BYTE, lease.impl_->comm) != MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
+                     displacements.data(), MPI_BYTE, lease.context_->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(lease.context_->comm,
                                "remote halo agreement record exchange failed");
   std::vector<RemoteHaloAgreementRecord> records;
   int local_decode_failed = 0;
@@ -1481,8 +1550,8 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   }
   int any_decode_failed = 0;
   if (MPI_Allreduce(&local_decode_failed, &any_decode_failed, 1, MPI_INT, MPI_LOR,
-                    lease.impl_->comm) != MPI_SUCCESS)
-    fatal_backend_communicator(lease.impl_->comm,
+                    lease.context_->comm) != MPI_SUCCESS)
+    fatal_backend_communicator(lease.context_->comm,
                                "remote halo agreement result reconciliation failed");
   if (any_decode_failed) {
     why = local_decode_failed ? local_why : "remote halo agreement failed on another rank";

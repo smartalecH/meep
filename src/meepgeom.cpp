@@ -3259,58 +3259,79 @@ AdjointForwardLoad adjoint_forward_load(const meep::dft_chunk &chunk,
   return result;
 }
 
-meep::AdjointGradientRequest build_adjoint_gradient_request(
+struct AdjointGradientPreparation {
+  size_t output_count;
+  meep::fields *owner;
+  std::shared_ptr<const meep::AdjointDftSnapshot> forward;
+  std::shared_ptr<const meep::AdjointDftSnapshot> adjoint;
+
+  AdjointGradientPreparation() : output_count(0), owner(NULL) {}
+};
+
+std::shared_ptr<const meep::AdjointDftSnapshot> existing_adjoint_snapshot(
+    const std::vector<meep::dft_fields *> &monitors, meep::fields &owner,
+    const double *frequencies, size_t count, const char *which) {
+  std::shared_ptr<const meep::AdjointDftSnapshot> snapshot;
+  for (meep::dft_fields *monitor : monitors) {
+    if (!monitor->adjoint_snapshot) continue;
+    const std::shared_ptr<const meep::AdjointDftSnapshot> candidate =
+        std::static_pointer_cast<const meep::AdjointDftSnapshot>(monitor->adjoint_snapshot);
+    if (snapshot && snapshot.get() != candidate.get())
+      throw std::invalid_argument(std::string(which) +
+                                  " monitors reference different adjoint snapshots");
+    snapshot = candidate;
+  }
+  if (!snapshot) return snapshot;
+  for (meep::dft_fields *monitor : monitors)
+    if (monitor->adjoint_snapshot.get() != snapshot.get())
+      throw std::invalid_argument(std::string(which) + " adjoint snapshot is incomplete");
+  meep::validate_adjoint_snapshot(*snapshot);
+  meep::validate_adjoint_snapshot_freshness(*snapshot, owner);
+  validate_adjoint_frequency_binding(*snapshot, frequencies, count, which);
+  return snapshot;
+}
+
+AdjointGradientPreparation prepare_adjoint_gradient_inputs(
     size_t ng, size_t nf, const std::vector<meep::dft_fields *> &fields_a,
     const std::vector<meep::dft_fields *> &fields_f, const double *frequencies,
-    double scalegrad, meep::grid_volume &gv, geom_epsilon *geps, double du) {
+    double scalegrad, geom_epsilon *geps, double du) {
   if (fields_a.size() != 3 || fields_f.size() != 3 || !frequencies || !geps || !ng || !nf)
     throw std::invalid_argument("adjoint gradient inputs are incomplete");
   if (!(du > 0.0) || !std::isfinite(du) || !std::isfinite(scalegrad))
     throw std::invalid_argument("adjoint gradient scalar is invalid");
-  const size_t output_count = checked_adjoint_product(ng, nf, "adjoint gradient output size");
-  checked_adjoint_add(output_count, size_t(1), "adjoint gradient offset count");
-  checked_adjoint_product(output_count, sizeof(double), "adjoint gradient result bytes");
-  checked_adjoint_product(checked_adjoint_add(output_count, size_t(1),
+  AdjointGradientPreparation prepared;
+  prepared.output_count = checked_adjoint_product(ng, nf, "adjoint gradient output size");
+  checked_adjoint_add(prepared.output_count, size_t(1), "adjoint gradient offset count");
+  checked_adjoint_product(prepared.output_count, sizeof(double),
+                          "adjoint gradient result bytes");
+  checked_adjoint_product(checked_adjoint_add(prepared.output_count, size_t(1),
                                               "adjoint gradient offset count"),
                           sizeof(uint64_t), "adjoint gradient offset bytes");
-  if (output_count > std::vector<double>().max_size())
+  if (prepared.output_count > std::vector<double>().max_size())
     throw std::length_error("adjoint gradient result exceeds vector capacity");
-  meep::fields *owner = adjoint_owner(fields_a, "adjoint");
-  if (adjoint_owner(fields_f, "forward") != owner)
+  prepared.owner = adjoint_owner(fields_a, "adjoint");
+  if (adjoint_owner(fields_f, "forward") != prepared.owner)
     throw std::invalid_argument("forward and adjoint monitors have different fields owners");
-  if (!geps->recipe_matches(*owner))
+  if (!geps->recipe_matches(*prepared.owner))
     throw std::invalid_argument("adjoint material compatibility handle is stale");
+  prepared.forward = existing_adjoint_snapshot(fields_f, *prepared.owner, frequencies, nf,
+                                                "forward");
+  prepared.adjoint = existing_adjoint_snapshot(fields_a, *prepared.owner, frequencies, nf,
+                                                "adjoint");
+  return prepared;
+}
 
-  std::shared_ptr<const meep::AdjointDftSnapshot> forward;
-  for (meep::dft_fields *monitor : fields_f) {
-    if (!monitor->adjoint_snapshot) continue;
-    const std::shared_ptr<const meep::AdjointDftSnapshot> candidate =
-        std::static_pointer_cast<const meep::AdjointDftSnapshot>(monitor->adjoint_snapshot);
-    if (forward && forward.get() != candidate.get())
-      throw std::invalid_argument("forward monitors reference different adjoint snapshots");
-    forward = candidate;
-  }
-  if (!forward) forward = meep::capture_adjoint_dft_snapshot(fields_f);
-  for (meep::dft_fields *monitor : fields_f)
-    if (monitor->adjoint_snapshot.get() != forward.get())
-      throw std::invalid_argument("forward adjoint snapshot is incomplete");
-  meep::validate_adjoint_snapshot_freshness(*forward, *owner);
-  validate_adjoint_frequency_binding(*forward, frequencies, nf, "forward");
-  std::shared_ptr<const meep::AdjointDftSnapshot> adjoint;
-  for (meep::dft_fields *monitor : fields_a) {
-    if (!monitor->adjoint_snapshot) continue;
-    const std::shared_ptr<const meep::AdjointDftSnapshot> candidate =
-        std::static_pointer_cast<const meep::AdjointDftSnapshot>(monitor->adjoint_snapshot);
-    if (adjoint && adjoint.get() != candidate.get())
-      throw std::invalid_argument("adjoint monitors reference different immutable snapshots");
-    adjoint = candidate;
-  }
-  if (!adjoint) adjoint = meep::capture_adjoint_dft_snapshot(fields_a);
-  for (meep::dft_fields *monitor : fields_a)
-    if (monitor->adjoint_snapshot.get() != adjoint.get())
-      throw std::invalid_argument("adjoint immutable snapshot is incomplete");
-  meep::validate_adjoint_snapshot_freshness(*adjoint, *owner);
-  validate_adjoint_frequency_binding(*adjoint, frequencies, nf, "adjoint");
+meep::AdjointGradientRequest build_adjoint_gradient_request(
+    size_t ng, size_t nf, const std::vector<meep::dft_fields *> &fields_a,
+    const std::vector<meep::dft_fields *> &fields_f, const double *frequencies,
+    double scalegrad, meep::grid_volume &gv, geom_epsilon *geps, double du,
+    const AdjointGradientPreparation &prepared) {
+  const size_t output_count = prepared.output_count;
+  meep::fields *owner = prepared.owner;
+  const std::shared_ptr<const meep::AdjointDftSnapshot> &forward = prepared.forward;
+  const std::shared_ptr<const meep::AdjointDftSnapshot> &adjoint = prepared.adjoint;
+  if (!owner || !forward || !adjoint)
+    throw std::logic_error("adjoint gradient request preparation is incomplete");
 
   meep::AdjointGradientRequest request;
   request.forward = forward;
@@ -3469,16 +3490,66 @@ void material_grids_addgradient(double *v, size_t ng, size_t nf,
                                 double scalegrad, meep::grid_volume &gv, geom_epsilon *geps,
                                 double du) {
   if (!v) throw std::invalid_argument("adjoint gradient output is null");
-  meep::AdjointGradientRequest request = build_adjoint_gradient_request(
-      ng, nf, fields_a, fields_f, frequencies, scalegrad, gv, geps, du);
+  AdjointGradientPreparation prepared;
+  std::string local_error;
+  try {
+    prepared = prepare_adjoint_gradient_inputs(
+        ng, nf, fields_a, fields_f, frequencies, scalegrad, geps, du);
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown adjoint gradient input validation failure"; }
+  meep::backend_reconcile_host_access(local_error,
+                                      "material_grids_addgradient input validation");
+
+  const auto capture_snapshot = [&](const std::vector<meep::dft_fields *> &monitors,
+                                    std::shared_ptr<const meep::AdjointDftSnapshot> &snapshot,
+                                    const char *which) {
+    std::shared_ptr<const meep::AdjointDftSnapshot> candidate;
+    std::string capture_error;
+    try {
+      candidate = meep::make_adjoint_dft_snapshot(monitors);
+      meep::validate_adjoint_snapshot_freshness(*candidate, *prepared.owner);
+      validate_adjoint_frequency_binding(*candidate, frequencies, nf, which);
+    }
+    catch (const std::exception &error) { capture_error = error.what(); }
+    catch (...) { capture_error = "unknown adjoint DFT snapshot capture failure"; }
+    const std::string capture_site =
+        std::string("material_grids_addgradient ") + which + " snapshot capture";
+    meep::backend_reconcile_host_access(capture_error, capture_site.c_str());
+    snapshot = candidate;
+  };
+
+  const bool capture_forward = meep::or_to_all(!prepared.forward);
+  if (capture_forward) capture_snapshot(fields_f, prepared.forward, "forward");
+  const bool capture_adjoint = meep::or_to_all(!prepared.adjoint);
+  if (capture_adjoint) capture_snapshot(fields_a, prepared.adjoint, "adjoint");
+  /* Publish only after both collective capture phases validate, so an
+     adjoint-side failure cannot leave a newly installed forward snapshot. */
+  if (capture_forward)
+    for (meep::dft_fields *monitor : fields_f) monitor->adjoint_snapshot = prepared.forward;
+  if (capture_adjoint)
+    for (meep::dft_fields *monitor : fields_a) monitor->adjoint_snapshot = prepared.adjoint;
+
+  meep::AdjointGradientRequest request;
+  local_error.clear();
+  try {
+    request = build_adjoint_gradient_request(
+        ng, nf, fields_a, fields_f, frequencies, scalegrad, gv, geps, du, prepared);
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown adjoint gradient request construction failure"; }
+  meep::backend_reconcile_host_access(local_error,
+                                      "material_grids_addgradient request construction");
   meep::adjoint_failure_checkpoint();
   std::vector<double> local(request.output_count, 0.0);
   std::vector<double> reduced(request.output_count, 0.0);
-  meep::fields *owner = adjoint_owner(fields_a, "adjoint");
+  meep::fields *owner = prepared.owner;
   if (!meep::backend_try_compute_adjoint_gradient(*owner, request, local.data(), local.size(),
                                                    "material_grids_addgradient"))
     meep::compute_adjoint_gradient_oracle(request, local.data(), local.size());
   meep::adjoint_failure_checkpoint();
+  meep::backend_validate_adjoint_reduction(
+      *owner, request, "material_grids_addgradient reduction preflight");
   meep::sum_to_all(local.data(), reduced.data(), reduced.size());
   meep::adjoint_failure_checkpoint();
   std::copy(reduced.begin(), reduced.end(), v);

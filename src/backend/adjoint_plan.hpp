@@ -68,13 +68,16 @@ public:
 };
 
 struct AdjointDftSnapshot {
-  static const uint32_t schema_version = 1;
+  static const uint32_t schema_version = 2;
 
   uint32_t version;
   uint64_t material_signature;
   uint64_t material_layout_signature;
   uint64_t mutation_generation[fields::num_mutation_kinds];
   uint64_t checkpoint_publication_generation;
+  uint64_t communicator_generation;
+  int communicator_rank;
+  int communicator_size;
   std::complex<double> bloch_k[5];
   int boundary_conditions[2][5];
   double cylindrical_m;

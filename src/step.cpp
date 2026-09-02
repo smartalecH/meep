@@ -182,10 +182,16 @@ void fields::ensure_backend_executable() {
   /* step_plan_for clears dirty_executable, so remember whether the compiled
      backend artifact was stale before asking it to rebuild the data plan. */
   const DirtyMask entry_dirty_mask = DirtyMask(dirty_mask);
-  const bool local_recompile =
+  bool local_recompile =
       !executable || is_dirty(*this, dirty_executable) ||
       (backend->requires_full_storage_preparation() && backend_state &&
        backend_state->host_custom_policy_pending);
+  if (!local_recompile && executable && backend_state) {
+    std::string identity_error;
+    if (!backend->executable_structural_identity_current(*executable, *backend_state,
+                                                         identity_error))
+      local_recompile = true;
+  }
   const StepPlan &plan = step_plan_for(StepProgram::ordinary);
   bool recompile = local_recompile;
   bool staged_multilevel_presence = false;
@@ -348,6 +354,11 @@ void fields::ensure_backend_executable() {
       throw std::runtime_error("backend compilation failed on another MPI rank");
     throw std::runtime_error(local_error);
   }
+  /* Compilation and every fallible collective completed above. Retirement is
+     now an irreversible, no-throw local commit; a backend teardown failure is
+     terminal and must never restore a partially retired previous artifact. */
+  if (previous && backend_state)
+    backend->retire_executable(*previous, *backend_state);
   executable = replacement;
   delete previous;
   if (staged_multilevel_validation) {

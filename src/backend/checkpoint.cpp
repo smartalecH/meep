@@ -561,6 +561,70 @@ bool row_is_full_spatial(const CheckpointRow &row, ndim dim) {
          row.spec.elements == points;
 }
 
+void set_row_corners(CheckpointRow &row, const fields &owner);
+
+bool repartition_stable_kind(array_kind kind) {
+  return (kind >= array_kind::f && kind <= array_kind::f_rderiv_int) ||
+         (kind >= array_kind::chi1inv && kind <= array_kind::sigma);
+}
+
+bool repartition_stable_row(const CheckpointRow &row, ndim dim) {
+  if (row.key.kind < 0 || row.key.kind >= int(array_kind::num_kinds)) return false;
+  const array_kind kind = array_kind(row.key.kind);
+  return repartition_stable_kind(kind) &&
+         (row.spec.role == array_role::field || row.spec.role == array_role::material) &&
+         row_is_full_spatial(row, dim);
+}
+
+void validate_repartition_subset(fields &owner, const CheckpointImage &image) {
+  std::unordered_map<StorageKey, const CheckpointRow *, StorageKeyHash> saved;
+  for (const CheckpointRow &row : image.rows) saved[row.key] = &row;
+  for (const CheckpointRow &row : image.rows) {
+    if (!repartition_stable_row(row, owner.gv.dim))
+      throw std::invalid_argument(
+          std::string("checkpoint repartition saved row is not a supported canonical full-grid "
+                      "realnum field/material row: ") +
+          array_kind_name(array_kind(row.key.kind)));
+    if (row.has_alias) {
+      const auto canonical = saved.find(row.alias_key);
+      if (canonical == saved.end() || canonical->second->has_alias ||
+          !repartition_stable_row(*canonical->second, owner.gv.dim))
+        throw std::invalid_argument(
+            "checkpoint repartition saved alias has no supported canonical row");
+    }
+  }
+
+  CpuArrayCatalog catalog;
+  StoragePlan plan;
+  build_storage_catalog(owner, catalog, plan);
+  for (size_t i = 0; i < plan.arrays.size(); ++i) {
+    const ArraySpec &spec = plan.arrays[i];
+    if (!persistent_checkpoint_row(spec, plan.keys[i])) continue;
+    CheckpointRow row;
+    row.key = plan.keys[i];
+    row.spec = spec;
+    row.has_alias = is_valid(spec.alias_of);
+    if (row.has_alias) row.alias_key = catalog.key(spec.alias_of);
+    set_row_corners(row, owner);
+    if (!repartition_stable_row(row, owner.gv.dim))
+      throw std::invalid_argument(
+          std::string("checkpoint repartition target row is not a supported canonical full-grid "
+                      "realnum field/material row: ") +
+          array_kind_name(array_kind(row.key.kind)));
+    if (row.has_alias) {
+      const ArraySpec &canonical = catalog.spec(spec.alias_of);
+      CheckpointRow canonical_row;
+      canonical_row.key = catalog.key(spec.alias_of);
+      canonical_row.spec = canonical;
+      canonical_row.has_alias = is_valid(canonical.alias_of);
+      set_row_corners(canonical_row, owner);
+      if (canonical_row.has_alias || !repartition_stable_row(canonical_row, owner.gv.dim))
+        throw std::invalid_argument(
+            "checkpoint repartition target alias has no supported canonical row");
+    }
+  }
+}
+
 bool saved_spatial_index(const CheckpointRow &row, const grid_volume &target_gv,
                          const ivec &point, size_t &index) {
   const ndim dim = target_gv.dim;
@@ -1720,6 +1784,10 @@ void CheckpointTransaction::validate_target(fields &owner, const CheckpointImage
 }
 
 void CheckpointTransaction::commit(fields &owner, const CheckpointImage &image) {
+  /* Commit is public and is also exercised directly by transaction tests.
+     Recheck the live-state stop gates here so callers cannot bypass the
+     eligibility phase and retire a resident epoch for unsupported rich state. */
+  validate_eligible(owner, "fields::load checkpoint commit eligibility");
   std::unique_ptr<PreparedCheckpointCommit> prepared;
   std::string error;
   bool local_exact_layout = false;
@@ -1729,6 +1797,13 @@ void CheckpointTransaction::commit(fields &owner, const CheckpointImage &image) 
   backend_reconcile_host_access(error, "fields::load checkpoint layout classification");
   const bool exact_layout = image.saved_rank_count == uint64_t(count_processors()) &&
                             and_to_all(local_exact_layout);
+  if (!exact_layout) {
+    error.clear();
+    try { validate_repartition_subset(owner, image); }
+    catch (const std::exception &e) { error = e.what(); }
+    catch (...) { error = "unknown checkpoint repartition eligibility failure"; }
+    backend_reconcile_host_access(error, "fields::load checkpoint repartition eligibility");
+  }
   error.clear();
   try {
     prepared.reset(new PreparedCheckpointCommit(owner, image, exact_layout));

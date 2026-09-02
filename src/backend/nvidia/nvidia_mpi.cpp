@@ -23,6 +23,61 @@ testing::staged_transport_failure_point injected_failure =
 size_t minimum_presend_polls = 0;
 testing::mpi_request_operations *injected_request_operations = NULL;
 
+uint64_t identity_mix(uint64_t hash, uint64_t value) {
+  for (unsigned i = 0; i < 8; ++i) {
+    hash ^= (value >> (8 * i)) & 0xffu;
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+uint64_t identity_string(const std::string &value) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (unsigned char c : value) {
+    hash ^= c;
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
+uint64_t provider_identity(const BackendCommunicatorInfo &info) {
+  uint64_t hash = identity_string(info.provider);
+  hash = identity_mix(hash, info.provider_query_available ? 1 : 0);
+  return identity_mix(hash, info.provider_supports_direct ? 1 : 0);
+}
+
+uint64_t provider_identity(bool query_available, bool supports_direct,
+                           const std::string &provider) {
+  uint64_t hash = identity_string(provider);
+  hash = identity_mix(hash, query_available ? 1 : 0);
+  return identity_mix(hash, supports_direct ? 1 : 0);
+}
+
+uint64_t arena_layout_identity(const compiled_boundary_artifact &artifact) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = identity_mix(hash, 1); // slot-layout schema
+  hash = identity_mix(hash, 2); // fixed double buffering
+  hash = identity_mix(hash, uint64_t(artifact.wire.resolved_route));
+  for (const bound_boundary_stage &stage : artifact.bound.stages) {
+    hash = identity_mix(hash, uint64_t(stage.ft));
+    hash = identity_mix(hash, stage.receive_slot_bytes);
+    hash = identity_mix(hash, stage.send_slot_bytes);
+    hash = identity_mix(hash, stage.receives.size());
+    for (const bound_boundary_message &message : stage.receives) {
+      hash = identity_mix(hash, message.wire_bytes);
+      hash = identity_mix(hash, message.arena_offsets[0]);
+      hash = identity_mix(hash, message.arena_offsets[1]);
+    }
+    hash = identity_mix(hash, stage.sends.size());
+    for (const bound_boundary_message &message : stage.sends) {
+      hash = identity_mix(hash, message.wire_bytes);
+      hash = identity_mix(hash, message.arena_offsets[0]);
+      hash = identity_mix(hash, message.arena_offsets[1]);
+    }
+  }
+  return hash;
+}
+
 bool consume_failure(testing::staged_transport_failure_point point) {
   if (injected_failure != point) return false;
   injected_failure = testing::staged_transport_failure_point::none;
@@ -36,20 +91,6 @@ testing::transport_presend_action presend_action(GpuMpiRoute route, bool gather_
   if (!copies_enqueued) return testing::transport_presend_action::enqueue_device_to_host;
   return staging_ready ? testing::transport_presend_action::post_sends
                        : testing::transport_presend_action::poll;
-}
-
-bool resolve_staged_transport_retirement(bool backend_retired, bool lease_valid,
-                                         bool &epoch_retired) noexcept {
-  /* retire_backend_communicator_lease deliberately reports false after MPI
-     finalization because collective MPI cleanup was no longer possible. It
-     nevertheless invalidates and discards the local lease. That is a complete
-     retirement from the epoch's ownership perspective. Conversely, a live
-     lease must remain retryable/fatal even if a backend ever misreports
-     success. */
-  (void)backend_retired;
-  if (lease_valid) return false;
-  epoch_retired = true;
-  return true;
 }
 
 uint64_t checked_counter_add(uint64_t value, uint64_t add, const char *what) {
@@ -129,6 +170,53 @@ staged_transport_statistics::staged_transport_statistics()
       overlap_stages(0), overlap_interior_launches(0), overlap_boundary_launches(0),
       high_water_requests(0), device_bytes(0), pinned_bytes(0) {}
 
+transport_structural_identity::transport_structural_identity()
+    : version(schema_version), slot_layout_version(1), slot_count(2),
+      communicator_generation(0), communicator_rank(0), communicator_size(1), tag_ub(0),
+      requested_policy(GpuMpiPolicy::automatic), resolved_route(GpuMpiRoute::staged),
+      overlap_policy(DependencyOverlapPolicy::off), wire_signature(0), authority_signature(0),
+      provider_signature(0), device_signature(0), owner_map_signature(0),
+      arena_layout_signature(0), dependency_signature(0), signature(0) {}
+
+uint64_t compute_transport_structural_identity_signature(
+    const transport_structural_identity &identity) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  hash = identity_mix(hash, identity.version);
+  hash = identity_mix(hash, identity.slot_layout_version);
+  hash = identity_mix(hash, identity.slot_count);
+  hash = identity_mix(hash, identity.communicator_generation);
+  hash = identity_mix(hash, uint64_t(uint32_t(identity.communicator_rank)));
+  hash = identity_mix(hash, uint64_t(uint32_t(identity.communicator_size)));
+  hash = identity_mix(hash, uint64_t(uint32_t(identity.tag_ub)));
+  hash = identity_mix(hash, uint64_t(identity.requested_policy));
+  hash = identity_mix(hash, uint64_t(identity.resolved_route));
+  hash = identity_mix(hash, uint64_t(identity.overlap_policy));
+  hash = identity_mix(hash, identity.wire_signature);
+  hash = identity_mix(hash, identity.authority_signature);
+  hash = identity_mix(hash, identity.provider_signature);
+  hash = identity_mix(hash, identity.device_signature);
+  hash = identity_mix(hash, identity.owner_map_signature);
+  hash = identity_mix(hash, identity.arena_layout_signature);
+  return identity_mix(hash, identity.dependency_signature);
+}
+
+bool operator==(const transport_structural_identity &a,
+                const transport_structural_identity &b) {
+  return a.version == b.version && a.slot_layout_version == b.slot_layout_version &&
+         a.slot_count == b.slot_count &&
+         a.communicator_generation == b.communicator_generation &&
+         a.communicator_rank == b.communicator_rank &&
+         a.communicator_size == b.communicator_size && a.tag_ub == b.tag_ub &&
+         a.requested_policy == b.requested_policy && a.resolved_route == b.resolved_route &&
+         a.overlap_policy == b.overlap_policy && a.wire_signature == b.wire_signature &&
+         a.authority_signature == b.authority_signature &&
+         a.provider_signature == b.provider_signature &&
+         a.device_signature == b.device_signature &&
+         a.owner_map_signature == b.owner_map_signature &&
+         a.arena_layout_signature == b.arena_layout_signature &&
+         a.dependency_signature == b.dependency_signature && a.signature == b.signature;
+}
+
 struct staged_transport_epoch::impl {
   enum class slot_phase { idle, begun };
 
@@ -166,6 +254,7 @@ struct staged_transport_epoch::impl {
   RemoteHaloProgram wire;
   std::vector<stage_state> stages;
   staged_transport_statistics stats;
+  transport_structural_identity identity;
   bool retired;
   bool poisoned;
 
@@ -620,10 +709,12 @@ bool staged_transport_epoch::retire(std::string &why) noexcept {
     why = "unknown NVIDIA staged transport drain failure";
     return false;
   }
-  const bool backend_retired = retire_backend_communicator_lease(impl_->communicator, why);
-  if (!resolve_staged_transport_retirement(backend_retired, impl_->communicator.valid(),
-                                           impl_->retired))
-    return false;
+  /* The active communicator context owns the duplicated MPI communicator.
+     Transport retirement only releases this epoch's local borrow after every
+     request and CUDA resource is gone; no executable teardown may initiate an
+     MPI collective. */
+  if (!retire_backend_communicator_lease(impl_->communicator, why)) return false;
+  impl_->retired = true;
   why.clear();
   return true;
 }
@@ -633,9 +724,49 @@ const staged_transport_statistics &staged_transport_epoch::statistics() const {
   return impl_->stats;
 }
 
+const transport_structural_identity &staged_transport_epoch::structural_identity() const {
+  if (!impl_) throw std::logic_error("NVIDIA staged transport has no implementation");
+  return impl_->identity;
+}
+
+bool staged_transport_epoch::structural_identity_matches_current(
+    uint64_t device_signature, GpuMpiPolicy requested_policy,
+    DependencyOverlapPolicy overlap_policy, std::string &why) const {
+  why.clear();
+  if (!impl_ || impl_->retired || !impl_->communicator.valid()) {
+    why = "NVIDIA transport structural identity has no active communicator context";
+    return false;
+  }
+  const transport_structural_identity &identity = impl_->identity;
+  BackendCommunicatorLease current;
+  if (!create_backend_communicator_lease(current, why)) return false;
+  const BackendCommunicatorInfo &current_info = current.info();
+  GpuMpiRoute route = GpuMpiRoute::staged;
+  if (!resolve_gpu_mpi_route(requested_policy, current_info.provider_query_available,
+                             current_info.provider_supports_direct, route, why))
+    return false;
+  const bool route_is_current =
+      identity.resolved_route == route ||
+      (requested_policy == GpuMpiPolicy::automatic && route == GpuMpiRoute::direct &&
+       identity.resolved_route == GpuMpiRoute::staged);
+  if (identity.signature != compute_transport_structural_identity_signature(identity) ||
+      identity.communicator_generation != current_info.generation ||
+      identity.communicator_rank != current_info.rank ||
+      identity.communicator_size != current_info.size || identity.tag_ub != current_info.tag_ub ||
+      identity.requested_policy != requested_policy || !route_is_current ||
+      identity.overlap_policy != overlap_policy || identity.device_signature != device_signature ||
+      identity.provider_signature != provider_identity(current_info)) {
+    why = "NVIDIA transport structural identity is stale";
+    return false;
+  }
+  return true;
+}
+
 std::unique_ptr<staged_transport_epoch>
 create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int device,
-                              stream *communication, std::string &why) {
+                              stream *communication, std::string &why,
+                              uint64_t device_signature, uint64_t dependency_signature,
+                              DependencyOverlapPolicy overlap_policy) {
   why.clear();
   if (artifact.wire.communicator_size <= 1) return std::unique_ptr<staged_transport_epoch>();
   std::unique_ptr<staged_transport_epoch> result;
@@ -672,6 +803,43 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
   }
 #endif
   if (!create_backend_communicator_lease(result->impl_->communicator, why)) return NULL;
+  result->impl_->identity.communicator_generation =
+      result->impl_->communicator.info().generation;
+  result->impl_->identity.communicator_rank = result->impl_->communicator.info().rank;
+  result->impl_->identity.communicator_size = result->impl_->communicator.info().size;
+  result->impl_->identity.tag_ub = result->impl_->communicator.info().tag_ub;
+  result->impl_->identity.requested_policy = artifact.wire.requested_policy;
+  result->impl_->identity.resolved_route = artifact.wire.resolved_route;
+  result->impl_->identity.overlap_policy = overlap_policy;
+  result->impl_->identity.wire_signature = artifact.wire.signature;
+  result->impl_->identity.authority_signature = artifact.bound.authority_signature;
+  result->impl_->identity.provider_signature =
+      provider_identity(result->impl_->communicator.info());
+  result->impl_->identity.device_signature = device_signature;
+  result->impl_->identity.arena_layout_signature = arena_layout_identity(artifact);
+  result->impl_->identity.dependency_signature = dependency_signature;
+#ifdef HAVE_MPI
+  {
+    uint64_t local_owner = UINT64_C(1469598103934665603);
+    local_owner = identity_mix(local_owner,
+                               uint64_t(result->impl_->communicator.info().rank));
+    local_owner = identity_mix(local_owner,
+                               artifact.wire.participation.device_owner ? 1 : 0);
+    local_owner = identity_mix(local_owner, device_signature);
+    const unsigned long long local = static_cast<unsigned long long>(local_owner);
+    unsigned long long owners = 0;
+    mpi_require(MPI_Allreduce(&local, &owners, 1, MPI_UNSIGNED_LONG_LONG, MPI_BXOR,
+                              backend_communicator(result->impl_->communicator)),
+                backend_communicator(result->impl_->communicator),
+                "transport owner-map reconciliation");
+    result->impl_->identity.owner_map_signature = static_cast<uint64_t>(owners);
+  }
+#else
+  result->impl_->identity.owner_map_signature =
+      artifact.wire.participation.device_owner ? (device_signature ? device_signature : 1) : 0;
+#endif
+  result->impl_->identity.signature =
+      compute_transport_structural_identity_signature(result->impl_->identity);
   std::string authority_error;
   if (artifact.wire.resolved_route == GpuMpiRoute::direct &&
       consume_failure(testing::staged_transport_failure_point::direct_validation))
@@ -716,8 +884,7 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
               authority_communicator, "transport authority reconciliation");
   if (any_authority_failed) {
     std::string retire_error;
-    if (!retire_backend_communicator_lease(result->impl_->communicator, retire_error))
-      fatal_transport(authority_communicator, "transport authority rollback", 1);
+    (void)retire_backend_communicator_lease(result->impl_->communicator, retire_error);
     why = authority_error.empty() ? "NVIDIA staged transport authority failed on another rank"
                                   : authority_error;
     result->impl_->retired = true;
@@ -731,8 +898,7 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
 #endif
   if (!collective_validate_remote_halo_agreement(result->impl_->communicator, artifact.wire, why)) {
     std::string retire_error;
-    if (!retire_backend_communicator_lease(result->impl_->communicator, retire_error) &&
-        why.empty())
+    if (!retire_backend_communicator_lease(result->impl_->communicator, retire_error) && why.empty())
       why = retire_error;
     return NULL;
   }
@@ -842,8 +1008,7 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
       fatal_transport(communicator, "transport allocation cleanup", 1);
     }
     std::string retire_error;
-    if (!retire_backend_communicator_lease(result->impl_->communicator, retire_error))
-      fatal_transport(communicator, "transport allocation rollback", 1);
+    (void)retire_backend_communicator_lease(result->impl_->communicator, retire_error);
     why = local_error.empty() ? "NVIDIA staged transport allocation failed on another rank"
                               : local_error;
     result->impl_->retired = true;
@@ -862,10 +1027,12 @@ std::unique_ptr<staged_transport_epoch>
 create_transport_epoch_with_fallback(compiled_boundary_artifact &artifact, int device,
                                      stream *communication, GpuMpiPolicy agreed_policy,
                                      DependencyOverlapPolicy overlap_policy, bool &fell_back,
-                                     std::string &why) {
+                                     std::string &why, uint64_t device_signature,
+                                     uint64_t dependency_signature) {
   fell_back = false;
   std::unique_ptr<staged_transport_epoch> result =
-      create_staged_transport_epoch(artifact, device, communication, why);
+      create_staged_transport_epoch(artifact, device, communication, why, device_signature,
+                                    dependency_signature, overlap_policy);
   if (result || artifact.wire.resolved_route != GpuMpiRoute::direct ||
       agreed_policy != GpuMpiPolicy::automatic ||
       overlap_policy == DependencyOverlapPolicy::required)
@@ -880,7 +1047,8 @@ create_transport_epoch_with_fallback(compiled_boundary_artifact &artifact, int d
   fallback.bound.program_signature = fallback.lowered.program_signature;
   fallback.bound.authority_signature = fallback.lowered.authority_signature;
   why.clear();
-  result = create_staged_transport_epoch(fallback, device, communication, why);
+  result = create_staged_transport_epoch(fallback, device, communication, why, device_signature,
+                                         0, overlap_policy);
   if (result) {
     artifact = std::move(fallback);
     fell_back = true;
@@ -898,10 +1066,6 @@ void set_mpi_request_operations_for_testing(mpi_request_operations *operations) 
 }
 void fail_staged_transport_once(staged_transport_failure_point point) { injected_failure = point; }
 void set_staged_transport_minimum_presend_polls(size_t polls) { minimum_presend_polls = polls; }
-bool resolve_staged_transport_retirement_for_testing(bool backend_retired, bool lease_valid,
-                                                     bool &epoch_retired) noexcept {
-  return resolve_staged_transport_retirement(backend_retired, lease_valid, epoch_retired);
-}
 } // namespace testing
 
 } // namespace nvidia

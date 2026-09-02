@@ -9,6 +9,7 @@
 #include "config.h"
 
 #include <stdint.h>
+#include <memory>
 #include <string>
 
 #ifdef HAVE_MPI
@@ -18,6 +19,8 @@
 #include "backend/transport_plan.hpp"
 
 namespace meep {
+
+struct BackendCommunicatorContext;
 
 struct BackendCommunicatorInfo {
   uint64_t generation;
@@ -44,8 +47,7 @@ public:
 private:
   BackendCommunicatorLease(const BackendCommunicatorLease &);
   BackendCommunicatorLease &operator=(const BackendCommunicatorLease &);
-  struct Impl;
-  Impl *impl_;
+  std::shared_ptr<BackendCommunicatorContext> context_;
   BackendCommunicatorInfo info_;
   friend bool create_backend_communicator_lease(BackendCommunicatorLease &, std::string &);
   friend bool retire_backend_communicator_lease(BackendCommunicatorLease &, std::string &);
@@ -70,12 +72,17 @@ bool collective_resolve_gpu_mpi_policy(bool local_parse_valid, GpuMpiPolicy loca
                                        bool local_query_available, bool local_direct_support,
                                        GpuMpiPolicy &agreed_policy, GpuMpiRoute &route,
                                        std::string &why);
+/* These operations only acquire/release a local borrow of the shared active
+   context. The duplicated communicator itself is created and freed by Meep's
+   explicit initialization and communicator-transition transactions. */
 bool create_backend_communicator_lease(BackendCommunicatorLease &lease, std::string &why);
 bool retire_backend_communicator_lease(BackendCommunicatorLease &lease, std::string &why);
 bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &lease,
                                                const RemoteHaloProgram &program,
                                                std::string &why);
 void set_backend_communicator_failure_for_testing(const char *point);
+const void *backend_communicator_context_identity_for_testing();
+size_t backend_communicator_context_use_count_for_testing();
 
 } // namespace meep
 

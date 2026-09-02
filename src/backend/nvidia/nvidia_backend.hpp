@@ -366,6 +366,9 @@ public:
                         BackendState &state) override;
 
   Executable *compile(const StepPlan &plan, BackendState &state) override;
+  void retire_executable(Executable &executable, BackendState &state) noexcept override;
+  bool executable_structural_identity_current(Executable &executable, BackendState &state,
+                                              std::string &why) const override;
   bool refresh_source_values(const StepPlan &plan, Executable &executable,
                              BackendState &state) override;
   bool supports_atomic_cw_source_refresh() const override { return true; }

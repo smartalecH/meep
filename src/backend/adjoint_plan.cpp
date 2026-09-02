@@ -13,6 +13,7 @@
 
 #include "backend/backend.hpp"
 #include "backend/material_ir.hpp"
+#include "backend/mpi_context.hpp"
 #ifdef HAVE_NVIDIA_BACKEND
 #include "backend/nvidia/runtime.hpp"
 #endif
@@ -180,7 +181,8 @@ bool adjoint_same_spatial_image(const AdjointDftIdentity &a, const AdjointDftIde
 
 AdjointDftSnapshot::AdjointDftSnapshot()
     : version(schema_version), material_signature(0), material_layout_signature(0),
-      checkpoint_publication_generation(0), cylindrical_m(0.0),
+      checkpoint_publication_generation(0), communicator_generation(0),
+      communicator_rank(0), communicator_size(1), cylindrical_m(0.0),
       precision_policy(precision_policy_kind::native), device_id(automatic_device),
       structural_signature(0), value_signature(0) {
   std::fill(mutation_generation, mutation_generation + fields::num_mutation_kinds, 0);
@@ -218,6 +220,9 @@ uint64_t adjoint_snapshot_structural_signature(const AdjointDftSnapshot &snapsho
   mix(hash, uint64_t(snapshot.precision_policy));
   mix(hash, uint64_t(uint32_t(snapshot.device_id)));
   mix(hash, snapshot.checkpoint_publication_generation);
+  mix(hash, snapshot.communicator_generation);
+  mix(hash, uint64_t(uint32_t(snapshot.communicator_rank)));
+  mix(hash, uint64_t(uint32_t(snapshot.communicator_size)));
   for (int d = 0; d < 5; ++d) {
     mix_double(hash, snapshot.bloch_k[d].real());
     mix_double(hash, snapshot.bloch_k[d].imag());
@@ -309,6 +314,10 @@ void validate_adjoint_snapshot(const AdjointDftSnapshot &snapshot) {
     throw std::invalid_argument("adjoint DFT snapshot version is unsupported");
   if (!snapshot.material_signature || !snapshot.material_layout_signature)
     throw std::invalid_argument("adjoint DFT snapshot has no material identity");
+  if (!snapshot.communicator_generation || snapshot.communicator_size <= 0 ||
+      snapshot.communicator_rank < 0 ||
+      snapshot.communicator_rank >= snapshot.communicator_size)
+    throw std::invalid_argument("adjoint DFT snapshot communicator identity is invalid");
   if (!std::isfinite(snapshot.cylindrical_m))
     throw std::invalid_argument("adjoint DFT snapshot cylindrical coordinate is not finite");
   for (int d = 0; d < 5; ++d) {
@@ -566,6 +575,9 @@ make_adjoint_dft_snapshot(const std::vector<dft_fields *> &monitors) {
   for (int i = 0; i < fields::num_mutation_kinds; ++i)
     snapshot->mutation_generation[i] = owner->mutation_generation[i];
   snapshot->checkpoint_publication_generation = owner->checkpoint_publication_generation;
+  snapshot->communicator_generation = current_backend_communicator_generation();
+  snapshot->communicator_rank = my_rank();
+  snapshot->communicator_size = count_processors();
   for (int d = 0; d < 5; ++d) {
     snapshot->bloch_k[d] = owner->k[d];
     for (int side = 0; side < 2; ++side)
@@ -624,6 +636,10 @@ AdjointDftIdentity adjoint_dft_identity(const fields &owner, const dft_chunk &ch
 
 void validate_adjoint_snapshot_freshness(const AdjointDftSnapshot &snapshot,
                                          const fields &owner) {
+  if (snapshot.communicator_generation != current_backend_communicator_generation() ||
+      snapshot.communicator_rank != my_rank() ||
+      snapshot.communicator_size != count_processors())
+    throw std::invalid_argument("adjoint DFT snapshot communicator ownership is stale");
   const MaterialIR *ir = material_ir_for(owner);
   if (!ir || snapshot.material_signature != ir->signature ||
       snapshot.material_layout_signature != ir->layout_signature)

@@ -45,7 +45,39 @@ struct staged_transport_statistics {
   staged_transport_statistics();
 };
 
-/* One executable-owned communicator/buffer epoch. begin_stage is called after
+/* Immutable cache identity for one remote transport epoch. Rolling per-stage
+   slot generations are deliberately excluded. */
+struct transport_structural_identity {
+  static const uint32_t schema_version = 1;
+  uint32_t version;
+  uint32_t slot_layout_version;
+  uint32_t slot_count;
+  uint64_t communicator_generation;
+  int communicator_rank;
+  int communicator_size;
+  int tag_ub;
+  GpuMpiPolicy requested_policy;
+  GpuMpiRoute resolved_route;
+  DependencyOverlapPolicy overlap_policy;
+  uint64_t wire_signature;
+  uint64_t authority_signature;
+  uint64_t provider_signature;
+  uint64_t device_signature;
+  uint64_t owner_map_signature;
+  uint64_t arena_layout_signature;
+  uint64_t dependency_signature;
+  uint64_t signature;
+
+  transport_structural_identity();
+};
+
+bool operator==(const transport_structural_identity &a,
+                const transport_structural_identity &b);
+uint64_t compute_transport_structural_identity_signature(
+    const transport_structural_identity &identity);
+
+/* One executable-owned request/event/buffer epoch borrowing the active shared
+   communicator context. begin_stage is called after
    zeroing and local gathers have been enqueued. It posts receives first and
    fences remote gather ahead of the caller's local scatters. finish_stage is
    called after those local scatters have been enqueued; it completes the
@@ -66,6 +98,11 @@ public:
   void record_dependency_overlap(size_t interior_launches, size_t boundary_launches);
   bool retire(std::string &why) noexcept;
   const staged_transport_statistics &statistics() const;
+  const transport_structural_identity &structural_identity() const;
+  bool structural_identity_matches_current(uint64_t device_signature,
+                                           GpuMpiPolicy requested_policy,
+                                           DependencyOverlapPolicy overlap_policy,
+                                           std::string &why) const;
 
 private:
   staged_transport_epoch();
@@ -75,17 +112,23 @@ private:
   impl *impl_;
 
   friend std::unique_ptr<staged_transport_epoch>
-  create_staged_transport_epoch(const compiled_boundary_artifact &, int, stream *, std::string &);
+  create_staged_transport_epoch(const compiled_boundary_artifact &, int, stream *, std::string &,
+                                uint64_t, uint64_t, DependencyOverlapPolicy);
 };
 
 std::unique_ptr<staged_transport_epoch>
 create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int device,
-                              stream *communication, std::string &why);
+                              stream *communication, std::string &why,
+                              uint64_t device_signature = 0,
+                              uint64_t dependency_signature = 0,
+                              DependencyOverlapPolicy overlap_policy =
+                                  DependencyOverlapPolicy::off);
 std::unique_ptr<staged_transport_epoch>
 create_transport_epoch_with_fallback(compiled_boundary_artifact &artifact, int device,
                                      stream *communication, GpuMpiPolicy agreed_policy,
                                      DependencyOverlapPolicy overlap_policy, bool &fell_back,
-                                     std::string &why);
+                                     std::string &why, uint64_t device_signature = 0,
+                                     uint64_t dependency_signature = 0);
 
 namespace testing {
 enum class transport_presend_action { poll, enqueue_device_to_host, post_sends };
@@ -123,11 +166,6 @@ enum class staged_transport_failure_point {
 };
 void fail_staged_transport_once(staged_transport_failure_point point);
 void set_staged_transport_minimum_presend_polls(size_t polls);
-/* Unit seam for the ownership rule shared by explicit and destructor-driven
-   retirement. A backend failure is terminal only while its communicator
-   lease remains live; MPI finalization invalidates the lease locally. */
-bool resolve_staged_transport_retirement_for_testing(bool backend_retired, bool lease_valid,
-                                                     bool &epoch_retired) noexcept;
 } // namespace testing
 
 } // namespace nvidia

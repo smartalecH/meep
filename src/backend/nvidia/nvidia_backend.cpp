@@ -329,6 +329,15 @@ uint64_t mix_fingerprint(uint64_t hash, uint64_t value) {
   return hash;
 }
 
+uint64_t string_fingerprint(const std::string &value) {
+  uint64_t hash = UINT64_C(1469598103934665603);
+  for (unsigned char byte : value) {
+    hash ^= byte;
+    hash *= UINT64_C(1099511628211);
+  }
+  return hash;
+}
+
 uint64_t storage_fingerprint(const StoragePlan &plan) {
   uint64_t hash = UINT64_C(1469598103934665603);
   hash = mix_fingerprint(hash, plan.arrays.size());
@@ -985,7 +994,11 @@ public:
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
         material_target_signature_(material_target_signature),
         source_scalar_count_(source_scalar_count), host_segments_(host_segments),
-        remote_boundaries_(remote_boundaries), graph_enabled_(false), cw_workspace_(NULL) {
+        remote_boundaries_(remote_boundaries),
+        communicator_generation_(remote_boundaries.wire.communicator_generation),
+        communicator_rank_(remote_boundaries.wire.communicator_rank),
+        communicator_size_(remote_boundaries.wire.communicator_size), graph_enabled_(false),
+        cw_workspace_(NULL) {
     for (int i = 0; i < mutation_kind_count; ++i) freshness_[i] = freshness[i];
     for (const nvidia::compiled_polarization_update &update : polarization_updates_)
       has_noisy_updates_ = has_noisy_updates_ ||
@@ -1199,6 +1212,9 @@ public:
   size_t source_scalar_count_;
   std::vector<NvidiaCompiledHostSegment> host_segments_;
   nvidia::compiled_boundary_artifact remote_boundaries_;
+  uint64_t communicator_generation_;
+  int communicator_rank_;
+  int communicator_size_;
   std::unique_ptr<nvidia::staged_transport_epoch> transport_;
   std::vector<NvidiaCompiledDependencyStage> dependency_regions_;
   GraphProgram graph_program_;
@@ -8687,6 +8703,13 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   nvidia::compiled_boundary_artifact remote_boundaries;
   std::string local_error;
   try {
+    BackendCommunicatorLease communicator;
+    std::string communicator_error;
+    if (!create_backend_communicator_lease(communicator, communicator_error))
+      throw std::runtime_error(communicator_error.empty()
+                                   ? "NVIDIA compile has no active communicator context"
+                                   : communicator_error);
+    const BackendCommunicatorInfo &communicator_info = communicator.info();
     bool owns_field_chunks = false;
     for (int chunk = 0; chunk < f_.num_chunks; ++chunk)
       owns_field_chunks = owns_field_chunks || f_.chunks[chunk]->is_mine();
@@ -8743,20 +8766,13 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       boundary_zeroes.insert(boundary_zeroes.end(), canonical_halos.zeros[ft].begin(),
                              canonical_halos.zeros[ft].end());
     std::string boundary_error;
-    int mpi_tag_ub = INT_MAX;
-#ifdef HAVE_MPI
-    int *tag_bound = NULL, tag_bound_present = 0;
-    if (MPI_Comm_get_attr(current_backend_communicator(), MPI_TAG_UB, &tag_bound,
-                          &tag_bound_present) != MPI_SUCCESS ||
-        !tag_bound_present || !tag_bound)
-      throw std::runtime_error("NVIDIA boundary compilation could not query MPI_TAG_UB");
-    mpi_tag_ub = *tag_bound;
-#endif
+    const int mpi_tag_ub = communicator_info.tag_ub;
     remote_boundary_compile_statistics_ = NvidiaRemoteBoundaryCompileStatistics();
     remote_boundary_compile_statistics_.attempted = true;
     if (!compile_remote_boundary_artifact(
-            f_.comms_sequence_for_field, canonical_halos, state.plan_, chunk_ranks, my_rank(),
-            count_processors(), current_backend_communicator_generation(), agreed_policy,
+            f_.comms_sequence_for_field, canonical_halos, state.plan_, chunk_ranks,
+            communicator_info.rank, communicator_info.size, communicator_info.generation,
+            agreed_policy,
             resolved_route, true, plan.operations.size(), mpi_tag_ub, f_.is_real != 0,
             boundary_zeroes, *state.arenas_, remote_boundaries, boundary_error))
       throw std::invalid_argument(boundary_error);
@@ -10068,11 +10084,15 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   const bool needs_remote_transport =
       count_processors() > 1 && or_to_all(!remote_boundaries.wire.stages.empty());
   if (needs_remote_transport) {
+    uint64_t dependency_signature = UINT64_C(1469598103934665603);
+    for (const NvidiaCompiledDependencyStage &dependency : executable->dependency_regions_)
+      dependency_signature = mix_fingerprint(dependency_signature, dependency.signature);
     std::string transport_error;
     bool fell_back = false;
     executable->transport_ = nvidia::create_transport_epoch_with_fallback(
         executable->remote_boundaries_, state.device_, state.communication_.get(), agreed_policy,
-        overlap_policy, fell_back, transport_error);
+        overlap_policy, fell_back, transport_error,
+        string_fingerprint(normalized_device_uuid_), dependency_signature);
     if (fell_back)
       executable->dependency_regions_.clear();
     if (!executable->transport_)
@@ -10144,6 +10164,51 @@ bool NvidiaBackend::refresh_source_values(const StepPlan &plan,
   if (plan.program == StepProgram::ordinary)
     state.graph_statistics_ = executable.graph_statistics_;
   return true;
+}
+
+void NvidiaBackend::retire_executable(Executable &raw_executable,
+                                      BackendState &raw_state) noexcept {
+  try {
+    NvidiaBackendState &state = checked_state(raw_state);
+    NvidiaExecutable &executable = checked_executable(raw_executable, state);
+    if (!executable.transport_) return;
+    nvidia::device_scope scope(state.device_);
+    std::string error;
+    if (!executable.transport_->retire(error))
+      meep::abort("NVIDIA transport retirement failed: %s",
+                  error.empty() ? "unknown failure" : error.c_str());
+    executable.transport_.reset();
+  }
+  catch (const std::exception &error) {
+    meep::abort("NVIDIA executable retirement failed after teardown began: %s", error.what());
+  }
+  catch (...) {
+    meep::abort("NVIDIA executable retirement failed after teardown began");
+  }
+}
+
+bool NvidiaBackend::executable_structural_identity_current(
+    Executable &raw_executable, BackendState &raw_state, std::string &why) const {
+  NvidiaBackendState &state = checked_state(raw_state);
+  NvidiaExecutable &executable = checked_executable(raw_executable, state);
+  why.clear();
+  if (executable.communicator_generation_ != current_backend_communicator_generation() ||
+      executable.communicator_rank_ != my_rank() ||
+      executable.communicator_size_ != count_processors()) {
+    why = "NVIDIA executable communicator structural identity is stale";
+    return false;
+  }
+  if (!executable.transport_) return true;
+  const GpuMpiPolicyParse policy =
+      parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
+  const DependencyOverlapPolicyParse overlap =
+      parse_dependency_overlap_policy(std::getenv("MEEP_NVIDIA_MPI_OVERLAP"));
+  if (!policy.valid || !overlap.valid) {
+    why = !policy.valid ? policy.error : overlap.error;
+    return false;
+  }
+  return executable.transport_->structural_identity_matches_current(
+      string_fingerprint(normalized_device_uuid_), policy.requested, overlap.requested, why);
 }
 
 namespace {

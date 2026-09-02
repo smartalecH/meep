@@ -831,6 +831,8 @@ std::vector<std::vector<point_sampler> > &sampler_registry() {
    losing its live state. */
 void release_backend_state_for_rebuild(fields &f, DirtyMask reasons) {
   if (f.backend_state) f.backend->prepare_state_rebuild(*f.backend_state, reasons);
+  if (f.executable && f.backend_state)
+    f.backend->retire_executable(*f.executable, *f.backend_state);
   delete f.executable;
   f.executable = NULL;
   destroy_backend_state(f.backend_state);
@@ -1483,6 +1485,8 @@ public:
 
   void commit() {
     if (committed_) return;
+    if (old_executable_ && old_state_)
+      owner_.backend->retire_executable(*old_executable_, *old_state_);
     fields_chunk **staged_chunks = owner_.chunks;
     for (int i = 0; i < owner_.num_chunks; ++i) {
       fields_chunk &live = *old_chunks_[i];
@@ -2286,6 +2290,8 @@ ResidentCandidateResult build_resident_epoch_candidate(
     f.backend_state->host_custom_policy_pending = false;
   }
   backend_publish_material_fallback_policy(f, *f.backend_state);
+  if (old_executable && old_state)
+    f.backend->retire_executable(*old_executable, *old_state);
   if (old_state) old_state->clear_cw_executable();
   delete old_executable; destroy_backend_state(old_state); delete old_initialization;
   delete old_ordinary; delete old_cw; delete old_descriptors; delete old_catalog;
@@ -2621,6 +2627,8 @@ bool backend_try_refresh_legacy_flux(fields &f, const char *site) {
     f.backend_state->host_custom_validated_plan_signature = f.step_plans[0]->signature;
   }
   clear_dirty(f, dirty_flux_plan | dirty_regions | dirty_executable);
+  if (old_executable && f.backend_state)
+    f.backend->retire_executable(*old_executable, *f.backend_state);
   delete old_executable;
   delete old_plans[0];
   delete old_descriptors;
@@ -2649,6 +2657,7 @@ void backend_preflight_field_layout_change(fields &f, DirtyMask reasons, const c
 
 void backend_commit_field_layout_change(fields &f) {
   if (f.backend_state) {
+    if (f.executable) f.backend->retire_executable(*f.executable, *f.backend_state);
     delete f.executable;
     f.executable = NULL;
     destroy_backend_state(f.backend_state);
@@ -2886,6 +2895,14 @@ bool backend_try_compute_adjoint_gradient(fields &owner, const AdjointGradientRe
   const int maximum_mode = max_to_all(int(mode));
   if (minimum_mode != maximum_mode)
     throw std::invalid_argument("NVIDIA adjoint mode differs across MPI ranks");
+  const bool local_poisoned = owner.backend && owner.backend->is_poisoned();
+  if (or_to_all(local_poisoned)) {
+    if (owner.backend) owner.backend->poison();
+    throw std::runtime_error(
+        std::string(site) +
+        (local_poisoned ? ": resident backend is poisoned by a failed adjoint transition"
+                        : ": resident backend is poisoned on another MPI rank"));
+  }
   if (mode == AdjointExecutionMode::host) return false;
 
   std::string why;
@@ -2900,20 +2917,44 @@ bool backend_try_compute_adjoint_gradient(fields &owner, const AdjointGradientRe
   }
 
   std::string local_error;
+  std::vector<double> staged_result;
   try {
-    owner.backend->compute_adjoint_gradient(request, local_result, result_count,
+    if (!local_result && result_count)
+      throw std::invalid_argument("adjoint backend has no result buffer");
+    staged_result.assign(result_count, 0.0);
+    owner.backend->compute_adjoint_gradient(request, staged_result.data(), result_count,
                                             *owner.backend_state);
   }
   catch (const std::exception &error) { local_error = error.what(); }
   catch (...) { local_error = "unknown adjoint backend failure"; }
   const bool any_error = or_to_all(!local_error.empty());
   const bool any_poison = or_to_all(owner.backend->is_poisoned());
-  if (!any_error) return true;
+  if (!any_error && !any_poison) {
+    std::copy(staged_result.begin(), staged_result.end(), local_result);
+    return true;
+  }
+  if (any_poison) owner.backend->poison();
   if (mode == AdjointExecutionMode::required || any_poison)
     throw std::runtime_error(local_error.empty()
                                  ? std::string(site) + ": adjoint backend failed on another rank"
                                  : std::string(site) + ": " + local_error);
   return false;
+}
+
+void backend_validate_adjoint_reduction(const fields &owner,
+                                        const AdjointGradientRequest &request,
+                                        const char *site) {
+  std::string local_error;
+  try {
+    validate_adjoint_request(request);
+    if (!request.forward || !request.adjoint)
+      throw std::invalid_argument("adjoint reduction has incomplete snapshots");
+    validate_adjoint_snapshot_freshness(*request.forward, owner);
+    validate_adjoint_snapshot_freshness(*request.adjoint, owner);
+  }
+  catch (const std::exception &error) { local_error = error.what(); }
+  catch (...) { local_error = "unknown adjoint reduction validation failure"; }
+  backend_reconcile_host_access(local_error, site);
 }
 
 void backend_prepare_checkpoint_load(fields &f) {

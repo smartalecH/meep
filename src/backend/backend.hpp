@@ -323,6 +323,15 @@ public:
                                 BackendState &) = 0;
 
   virtual Executable *compile(const StepPlan &, BackendState &) = 0;
+  /* Explicitly drain executable-owned asynchronous resources before replacing
+     an installed artifact. This local-only hook is the irreversible commit
+     boundary: implementations must finish teardown or terminate the job, and
+     must never throw after partially retiring an installed artifact. */
+  virtual void retire_executable(Executable &, BackendState &) noexcept {}
+  virtual bool executable_structural_identity_current(Executable &, BackendState &,
+                                                      std::string &) const {
+    return true;
+  }
   /* A value-only source mutation may retain a compiled artifact only when the
      backend proves that every captured target and descriptor pointer is
      allocation-stable. Returning false is a pre-enqueue unsupported result
@@ -709,6 +718,11 @@ bool backend_try_reduce_dft(fields &owner, const DftReductionRequest &request,
 bool backend_try_compute_adjoint_gradient(fields &owner, const AdjointGradientRequest &request,
                                           double *local_result, size_t result_count,
                                           const char *site);
+/* Reconcile immutable-snapshot validity across the active communicator before
+   entering the final numeric reduction. */
+void backend_validate_adjoint_reduction(const fields &owner,
+                                        const AdjointGradientRequest &request,
+                                        const char *site);
 
 /* A checkpoint load may replace array allocations. Preserve authoritative
    resident state before those host pointers change, then retire the stale
