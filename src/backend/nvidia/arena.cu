@@ -360,6 +360,7 @@ device_allocation device_arenas::resolve(allocation_id id) const {
   result.address = base + layout.offset;
   result.bytes = layout.bytes;
   result.offset = layout.offset;
+  result.alignment = layout.alignment;
   return result;
 }
 

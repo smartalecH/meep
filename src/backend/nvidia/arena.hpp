@@ -129,6 +129,7 @@ struct device_allocation {
   void *address;
   size_t bytes;
   size_t offset;
+  size_t alignment;
 
   bool is_alias() const { return id != canonical_id; }
 };

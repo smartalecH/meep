@@ -7,9 +7,11 @@
 */
 
 #include "backend/nvidia/nvidia_step.hpp"
+#include "backend/nvidia/nvidia_boundaries.hpp"
 #include "backend/nvidia/nvidia_coordinates.hpp"
 #include "backend/nvidia/nvidia_magnetic.hpp"
 #include "backend/nvidia/nvidia_sources.hpp"
+#include "backend/storage_plan.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,6 +24,10 @@
 using meep::nvidia::constitutive_launch;
 using meep::nvidia::array_copy_launch;
 using meep::nvidia::beta_launch;
+using meep::nvidia::boundary_gather_entry;
+using meep::nvidia::boundary_launch;
+using meep::nvidia::boundary_scatter_entry;
+using meep::nvidia::boundary_zero_entry;
 using meep::nvidia::bfast_launch;
 using meep::nvidia::cylindrical_axis_launch;
 using meep::nvidia::cylindrical_m_launch;
@@ -42,6 +48,10 @@ using meep::nvidia::halo_scatter_entry;
 using meep::nvidia::launch_constitutive;
 using meep::nvidia::launch_array_copy;
 using meep::nvidia::launch_beta;
+using meep::nvidia::launch_boundary_gather;
+using meep::nvidia::launch_boundary_scatter_parallel;
+using meep::nvidia::launch_boundary_scatter_serial;
+using meep::nvidia::launch_boundary_zero;
 using meep::nvidia::launch_bfast;
 using meep::nvidia::launch_cylindrical_axis;
 using meep::nvidia::launch_cylindrical_m;
@@ -1456,6 +1466,434 @@ template <typename T> static void check_device(int device) {
               std::fabs(double(halo_observed[5] - phase_imag)) <=
                   phase_tolerance * (1.0 + std::fabs(double(phase_imag))),
           "halo PHASE result differs");
+
+  /* Remote descriptors are byte-addressed and allocation-free at launch. A
+     259-scalar payload covers the non-block-aligned tail used by halo faces. */
+  const size_t remote_count = 259;
+  std::vector<T> remote_source(remote_count + 8), remote_target(remote_count + 8, T(-77));
+  for (size_t i = 0; i < remote_source.size(); ++i) remote_source[i] = T(0.125 * (i + 1));
+  device_buffer d_remote_source(remote_source.size() * sizeof(T), device);
+  device_buffer d_remote_target(remote_target.size() * sizeof(T), device);
+  device_buffer d_remote_arena((remote_count + 4) * sizeof(T), device);
+  copy_host_to_device_async(d_remote_source, 0, remote_source.data(),
+                            remote_source.size() * sizeof(T), execution);
+  copy_host_to_device_async(d_remote_target, 0, remote_target.data(),
+                            remote_target.size() * sizeof(T), execution);
+
+  meep::StoragePlan bind_storage;
+  for (uint32_t i = 0; i < 2; ++i) {
+    meep::ArraySpec spec;
+    spec.id = meep::ArrayId{i};
+    spec.role = meep::array_role::field;
+    spec.element_type = meep::ElementType::realnum_value;
+    spec.storage = sizeof(T) == sizeof(float) ? meep::Precision::f32 : meep::Precision::f64;
+    spec.elements = remote_source.size();
+    spec.alignment = alignof(T);
+    spec.alias_of = meep::invalid_array();
+    spec.classification_provisional = false;
+    spec.classification_elided = false;
+    bind_storage.arrays.push_back(spec);
+    bind_storage.keys.push_back(
+        meep::StorageKey{0, int(meep::array_kind::f), int(meep::Ex), int(i), 0});
+  }
+  meep::LoweredRemoteHaloProgram bind_lowered;
+  bind_lowered.version = meep::LoweredRemoteHaloProgram::schema_version;
+  bind_lowered.program_signature = 17;
+  bind_lowered.storage_signature =
+      meep::compute_remote_storage_authority_signature(bind_storage);
+  bind_lowered.authority_signature = meep::compute_remote_lowered_authority_signature(
+      bind_lowered.program_signature, bind_lowered.storage_signature);
+  const auto scalar_ref = [&](uint32_t id, ptrdiff_t index) {
+    const meep::ArraySpec &spec = bind_storage.arrays[id];
+    meep::RemoteHaloScalarRef ref;
+    ref.root = meep::ArrayId{id};
+    ref.key = bind_storage.keys[id];
+    ref.role = spec.role;
+    ref.element_type = spec.element_type;
+    ref.storage_precision = spec.storage;
+    ref.elements = spec.elements;
+    ref.alignment = spec.alignment;
+    ref.byte_extent = spec.elements * sizeof(T);
+    ref.index = index;
+    return ref;
+  };
+  const meep::nvidia::arena_storage_precision bind_precision =
+      sizeof(T) == sizeof(float) ? meep::nvidia::arena_storage_precision::f32
+                                 : meep::nvidia::arena_storage_precision::f64;
+  const std::vector<meep::nvidia::allocation_request> bind_requests{
+      meep::nvidia::allocation_request(0, meep::nvidia::arena_role::field,
+                                       remote_source.size() * sizeof(T), alignof(T),
+                                       meep::nvidia::no_allocation,
+                                       meep::nvidia::arena_element_type::realnum_value,
+                                       bind_precision),
+      meep::nvidia::allocation_request(1, meep::nvidia::arena_role::field,
+                                       remote_target.size() * sizeof(T), alignof(T),
+                                       meep::nvidia::no_allocation,
+                                       meep::nvidia::arena_element_type::realnum_value,
+                                       bind_precision)};
+  const meep::nvidia::arena_plan bind_plan(bind_requests);
+  meep::nvidia::device_arenas bind_arenas(bind_plan, device);
+  bind_arenas.copy_from_host_async(0, 0, remote_source.data(),
+                                   remote_source.size() * sizeof(T), execution);
+  bind_arenas.copy_from_host_async(1, 0, remote_target.data(),
+                                   remote_target.size() * sizeof(T), execution);
+  std::vector<meep::nvidia::boundary_device_allocation> bind_allocations;
+  for (uint32_t i = 0; i < 2; ++i) {
+    const meep::nvidia::device_allocation allocation = bind_arenas.resolve(i);
+    bind_allocations.push_back(meep::nvidia::boundary_device_allocation{
+        meep::ArrayId{i}, meep::ArrayId{i}, bind_storage.keys[i],
+        bind_storage.arrays[i].role, allocation.role, allocation.offset,
+        allocation.address, allocation.bytes, allocation.alignment, bind_arenas.device()});
+  }
+  meep::LoweredRemoteHaloStage bind_stage;
+  bind_stage.ft = meep::E_stuff;
+  bind_stage.receive_slot_bytes = sizeof(T);
+  bind_stage.send_slot_bytes = sizeof(T);
+  bind_stage.publication = meep::RemoteHaloPublicationMode::parallel_unique;
+  bind_stage.canonical_receive_order.push_back(0);
+  meep::LoweredRemoteHaloMessage bind_send;
+  bind_send.key = meep::RemoteHaloWireKey{0, 1, meep::E_stuff, 0, 1, 3, 1};
+  bind_send.direction = meep::RemoteHaloDirection::outgoing;
+  bind_send.storage_precision = bind_storage.arrays[0].storage;
+  bind_send.element_bytes = sizeof(T);
+  bind_send.wire_bytes = sizeof(T);
+  bind_send.slot_offsets[0] = 0;
+  bind_send.slot_offsets[1] = sizeof(T);
+  bind_send.arena_offsets[0] = 0;
+  bind_send.arena_offsets[1] = sizeof(T);
+  bind_send.gathers.push_back(
+      meep::RemoteHaloGatherDescriptor{scalar_ref(0, 1), 0});
+  meep::LoweredRemoteHaloMessage bind_receive = bind_send;
+  bind_receive.direction = meep::RemoteHaloDirection::incoming;
+  bind_receive.gathers.clear();
+  bind_receive.scatters.push_back(meep::RemoteHaloScatterDescriptor{
+      scalar_ref(1, 0), meep::invalid_remote_halo_scalar_ref(), 0, 1.0, 0.0, 0});
+  bind_stage.sends.push_back(bind_send);
+  bind_stage.receives.push_back(bind_receive);
+  bind_lowered.stages.push_back(bind_stage);
+  meep::nvidia::bound_boundary_program bound;
+  std::string bind_why;
+  require(meep::nvidia::bind_remote_boundaries(
+              bind_lowered, bind_storage, bind_arenas,
+              bound, bind_why),
+          bind_why.c_str());
+  require(bound.program_signature == 17 &&
+              bound.storage_signature == bind_lowered.storage_signature &&
+              bound.authority_signature == bind_lowered.authority_signature &&
+              bound.stages.size() == 1 &&
+              bound.stages[0].gathers.size() == 1 && bound.stages[0].scatters.size() == 1 &&
+              bound.stages[0].sends[0].launch.count == 1 &&
+              bound.stages[0].sends[0].launch.extent == 1 &&
+              bound.stages[0].receives[0].launch.count == 1 &&
+              bound.stages[0].receives[0].launch.extent == 1,
+          "remote boundary device binding lost canonical descriptors");
+  device_buffer d_bound_gathers(sizeof(boundary_gather_entry), device);
+  device_buffer d_bound_scatters(sizeof(boundary_scatter_entry), device);
+  device_buffer d_bound_arena(2 * sizeof(T), device);
+  copy_host_to_device_async(d_bound_gathers, 0, bound.stages[0].gathers.data(),
+                            sizeof(boundary_gather_entry), execution);
+  copy_host_to_device_async(d_bound_scatters, 0, bound.stages[0].scatters.data(),
+                            sizeof(boundary_scatter_entry), execution);
+  launch_boundary_gather(bound.stages[0].sends[0].launch,
+                         d_bound_gathers.opaque_handle(), d_bound_arena.opaque_handle(),
+                         execution);
+  launch_boundary_scatter_parallel(bound.stages[0].receives[0].launch,
+                                   d_bound_scatters.opaque_handle(),
+                                   d_bound_arena.opaque_handle(), execution);
+  std::vector<T> authoritative_target(remote_target.size());
+  bind_arenas.copy_to_host_async(authoritative_target.data(), 1, 0,
+                                 authoritative_target.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(authoritative_target[0] == remote_source[1],
+          "authoritative arena bind/gather/scatter path differs");
+  meep::LoweredRemoteHaloProgram malformed_binding = bind_lowered;
+  malformed_binding.stages[0].receives[0].scatters[0].buffer_byte_offset = sizeof(T);
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas,
+              bound, bind_why),
+          "remote boundary binding accepted an out-of-message scatter span");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].receives[0].scatters[0].target_real.index = -1;
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas,
+              bound, bind_why),
+          "remote boundary binding accepted a negative target index");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].publication =
+      meep::RemoteHaloPublicationMode::canonical_serial;
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas,
+              bound, bind_why),
+          "remote boundary binding accepted stale overlap disposition");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].sends[0].arena_offsets[1] += sizeof(T);
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted a wrong second-slot address");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].send_slot_bytes = std::numeric_limits<size_t>::max();
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted an overflowing two-slot arena");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].sends[0].wire_bytes = 2 * sizeof(T);
+  malformed_binding.stages[0].sends[0].slot_offsets[1] = 2 * sizeof(T);
+  malformed_binding.stages[0].sends[0].arena_offsets[1] = 2 * sizeof(T);
+  malformed_binding.stages[0].send_slot_bytes = 2 * sizeof(T);
+  malformed_binding.stages[0].sends[0].gathers.push_back(
+      malformed_binding.stages[0].sends[0].gathers[0]);
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted duplicate wire-byte coverage");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].receives[0].wire_bytes = 2 * sizeof(T);
+  malformed_binding.stages[0].receives[0].slot_offsets[1] = 2 * sizeof(T);
+  malformed_binding.stages[0].receives[0].arena_offsets[1] = 2 * sizeof(T);
+  malformed_binding.stages[0].receive_slot_bytes = 2 * sizeof(T);
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted a hole in wire-byte coverage");
+  malformed_binding = bind_lowered;
+  malformed_binding.stages[0].sends[0].gathers[0].source.key.aux += 1;
+  require(!meep::nvidia::bind_remote_boundaries(
+              malformed_binding, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted stale scalar StorageKey authority");
+  meep::StoragePlan stale_storage = bind_storage;
+  ++stale_storage.keys[0].aux;
+  require(!meep::nvidia::bind_remote_boundaries(
+              bind_lowered, stale_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted a stale StoragePlan signature");
+  std::vector<meep::nvidia::boundary_device_allocation> wrong_allocation = bind_allocations;
+  --wrong_allocation[0].bytes;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong allocation extent");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[1].id = meep::ArrayId{0};
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong allocation ArrayId");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].canonical_id = meep::ArrayId{1};
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong canonical allocation ID");
+  wrong_allocation = bind_allocations;
+  ++wrong_allocation[0].key.aux;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong allocation StorageKey");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].role = meep::array_role::scratch;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong logical allocation role");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].arena = meep::nvidia::arena_role::scratch;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong physical arena role");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].arena_offset += sizeof(T);
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a forged arena offset");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].alignment = 1;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted an underspecified allocation alignment");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[1].address = wrong_allocation[0].address;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted overlapping canonical allocations");
+  std::vector<meep::nvidia::boundary_device_allocation> missing_allocation = bind_allocations;
+  missing_allocation.pop_back();
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, missing_allocation, device, bound, bind_why),
+          "remote boundary binding accepted an absent target allocation");
+  wrong_allocation = bind_allocations;
+  std::swap(wrong_allocation[0].address, wrong_allocation[1].address);
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted equal-size allocation-address swaps");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].address = remote_source.data();
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted host storage");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].device = device + 1;
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a wrong-device allocation identity");
+  wrong_allocation = bind_allocations;
+  wrong_allocation[0].address = static_cast<unsigned char *>(wrong_allocation[0].address) +
+                                sizeof(T);
+  require(!meep::nvidia::testing::bind_remote_boundaries_with_allocations(
+              bind_lowered, bind_storage, wrong_allocation, device, bound, bind_why),
+          "remote boundary binding accepted a forged allocation subrange");
+
+  meep::LoweredRemoteHaloProgram hostile_layout = bind_lowered;
+  meep::LoweredRemoteHaloMessage second_send = hostile_layout.stages[0].sends[0];
+  second_send.key.tag += 1;
+  second_send.key.canonical_ordinal += 1;
+  second_send.arena_offsets[0] = sizeof(T);
+  second_send.arena_offsets[1] = 3 * sizeof(T);
+  hostile_layout.stages[0].sends.push_back(second_send);
+  hostile_layout.stages[0].send_slot_bytes = 2 * sizeof(T);
+  hostile_layout.stages[0].sends[0].arena_offsets[1] = 2 * sizeof(T);
+  require(meep::nvidia::bind_remote_boundaries(
+              hostile_layout, bind_storage, bind_arenas, bound, bind_why),
+          bind_why.c_str());
+  std::swap(hostile_layout.stages[0].sends[0], hostile_layout.stages[0].sends[1]);
+  require(!meep::nvidia::bind_remote_boundaries(
+              hostile_layout, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted reordered stage messages");
+  std::swap(hostile_layout.stages[0].sends[0], hostile_layout.stages[0].sends[1]);
+  hostile_layout.stages[0].sends[1].arena_offsets[0] += sizeof(T);
+  hostile_layout.stages[0].sends[1].arena_offsets[1] += sizeof(T);
+  hostile_layout.stages[0].send_slot_bytes = 3 * sizeof(T);
+  require(!meep::nvidia::bind_remote_boundaries(
+              hostile_layout, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted a gap in stage layout");
+  hostile_layout = bind_lowered;
+  hostile_layout.stages[0].send_slot_bytes += sizeof(T);
+  hostile_layout.stages[0].sends[0].arena_offsets[1] += sizeof(T);
+  require(!meep::nvidia::bind_remote_boundaries(
+              hostile_layout, bind_storage, bind_arenas, bound, bind_why),
+          "remote boundary binding accepted stale final slot padding");
+
+  std::vector<boundary_gather_entry> remote_gathers(remote_count);
+  std::vector<boundary_scatter_entry> remote_scatters(remote_count);
+  for (size_t i = 0; i < remote_count; ++i) {
+    remote_gathers[i] = boundary_gather_entry{d_remote_source.opaque_handle(), ptrdiff_t(i + 1),
+                                               (i + 1) * sizeof(T)};
+    remote_scatters[i] = boundary_scatter_entry{d_remote_target.opaque_handle(), ptrdiff_t(i),
+                                                NULL, 0, (i + 1) * sizeof(T), 1.0, 0.0};
+  }
+  device_buffer d_remote_gathers(remote_gathers.size() * sizeof(remote_gathers[0]), device);
+  device_buffer d_remote_scatters(remote_scatters.size() * sizeof(remote_scatters[0]), device);
+  copy_host_to_device_async(d_remote_gathers, 0, remote_gathers.data(),
+                            remote_gathers.size() * sizeof(remote_gathers[0]), execution);
+  copy_host_to_device_async(d_remote_scatters, 0, remote_scatters.data(),
+                            remote_scatters.size() * sizeof(remote_scatters[0]), execution);
+  launch_boundary_gather(boundary_launch{0, remote_count, remote_count, precision},
+                         d_remote_gathers.opaque_handle(), d_remote_arena.opaque_handle(),
+                         execution);
+  launch_boundary_scatter_parallel(boundary_launch{0, remote_count, remote_count, precision},
+                                   d_remote_scatters.opaque_handle(),
+                                   d_remote_arena.opaque_handle(), execution);
+  copy_device_to_host_async(remote_target.data(), d_remote_target, 0,
+                            remote_target.size() * sizeof(T), execution);
+  execution.synchronize();
+  for (size_t i = 0; i < remote_count; ++i)
+    require(remote_target[i] == remote_source[i + 1],
+            "remote boundary gather/scatter tail differs");
+  require(remote_target[remote_count] == T(-77),
+          "remote boundary scatter changed an out-of-range sentinel");
+
+  std::vector<T> serial_arena(4);
+  serial_arena[0] = T(2);
+  serial_arena[1] = T(3);
+  serial_arena[2] = T(5);
+  serial_arena[3] = T(7);
+  std::vector<boundary_scatter_entry> ordered;
+  ordered.push_back(boundary_scatter_entry{d_remote_target.opaque_handle(), 0, NULL, 0,
+                                            0, 1.0, 0.0});
+  ordered.push_back(boundary_scatter_entry{d_remote_target.opaque_handle(), 0, NULL, 0,
+                                            sizeof(T), -1.0, 0.0});
+  ordered.push_back(boundary_scatter_entry{d_remote_target.opaque_handle(), 1,
+                                            d_remote_target.opaque_handle(), 2,
+                                            2 * sizeof(T), 0.6, 0.8});
+  device_buffer d_ordered(ordered.size() * sizeof(ordered[0]), device);
+  copy_host_to_device_async(d_ordered, 0, ordered.data(), ordered.size() * sizeof(ordered[0]),
+                            execution);
+  copy_host_to_device_async(d_remote_arena, 0, serial_arena.data(),
+                            serial_arena.size() * sizeof(T), execution);
+  launch_boundary_scatter_serial(boundary_launch{0, ordered.size(), ordered.size(), precision},
+                                 d_ordered.opaque_handle(), d_remote_arena.opaque_handle(),
+                                 execution);
+  meep::nvidia::bound_boundary_zeroes bound_zeroes;
+  require(meep::nvidia::bind_boundary_zeroes(
+              std::vector<meep::LoweredHaloZeroDescriptor>(
+                  1, meep::LoweredHaloZeroDescriptor{
+                         scalar_ref(1, 3),
+                         bind_storage.arrays[1].storage}),
+              bind_storage, bind_arenas,
+              bound_zeroes, bind_why),
+          bind_why.c_str());
+  require(bound_zeroes.entries.size() == 1 && bound_zeroes.launches.size() == 1 &&
+              bound_zeroes.launches[0].count == 1,
+          "remote boundary zero binding accounting differs");
+  device_buffer d_zero_entries(sizeof(boundary_zero_entry), device);
+  copy_host_to_device_async(d_zero_entries, 0, bound_zeroes.entries.data(),
+                            sizeof(boundary_zero_entry), execution);
+  launch_boundary_zero(bound_zeroes.launches[0], d_zero_entries.opaque_handle(), execution);
+  copy_device_to_host_async(remote_target.data(), d_remote_target, 0,
+                            remote_target.size() * sizeof(T), execution);
+  std::vector<T> bound_target_observed(remote_target.size());
+  bind_arenas.copy_to_host_async(bound_target_observed.data(), 1, 0,
+                                 bound_target_observed.size() * sizeof(T), execution);
+  execution.synchronize();
+  require(remote_target[0] == T(-3),
+          "ordered remote duplicate publication did not preserve canonical last write");
+  const T remote_phase_real = T(0.6) * T(5) - T(0.8) * T(7);
+  const T remote_phase_imag = T(0.6) * T(7) + T(0.8) * T(5);
+  require(std::fabs(double(remote_target[1] - remote_phase_real)) <=
+                  phase_tolerance * (1.0 + std::fabs(double(remote_phase_real))) &&
+              std::fabs(double(remote_target[2] - remote_phase_imag)) <=
+                  phase_tolerance * (1.0 + std::fabs(double(remote_phase_imag))),
+          "ordered remote PHASE publication differs");
+  require(bound_target_observed[3] == T(0), "remote boundary zero descriptor differs");
+
+  bool invalid_remote_launch_rejected = false;
+  try {
+    launch_boundary_gather(boundary_launch{0, 0, remote_count, precision},
+                           d_remote_gathers.opaque_handle(),
+                           d_remote_arena.opaque_handle(), execution);
+  }
+  catch (const std::invalid_argument &) { invalid_remote_launch_rejected = true; }
+  require(invalid_remote_launch_rejected, "empty remote boundary launch was accepted");
+  invalid_remote_launch_rejected = false;
+  try {
+    launch_boundary_gather(boundary_launch{2, 1, 1, precision},
+                           d_remote_gathers.opaque_handle(),
+                           d_remote_arena.opaque_handle(), execution);
+  }
+  catch (const std::out_of_range &) { invalid_remote_launch_rejected = true; }
+  require(invalid_remote_launch_rejected,
+          "remote boundary launch accepted first beyond descriptor extent");
+  invalid_remote_launch_rejected = false;
+  try {
+    launch_boundary_scatter_parallel(boundary_launch{1, 2, 2, precision},
+                                     d_remote_scatters.opaque_handle(),
+                                     d_remote_arena.opaque_handle(), execution);
+  }
+  catch (const std::out_of_range &) { invalid_remote_launch_rejected = true; }
+  require(invalid_remote_launch_rejected,
+          "remote boundary launch accepted count beyond descriptor extent");
+  invalid_remote_launch_rejected = false;
+  try {
+    launch_boundary_scatter_serial(
+        boundary_launch{std::numeric_limits<size_t>::max(), 1,
+                        std::numeric_limits<size_t>::max(), precision},
+        d_remote_scatters.opaque_handle(), d_remote_arena.opaque_handle(), execution);
+  }
+  catch (const std::out_of_range &) { invalid_remote_launch_rejected = true; }
+  require(invalid_remote_launch_rejected,
+          "remote boundary launch accepted overflowing first/count span");
+  invalid_remote_launch_rejected = false;
+  try {
+    launch_boundary_zero(boundary_launch{0, std::numeric_limits<size_t>::max(),
+                                         std::numeric_limits<size_t>::max(), precision},
+                         d_zero_entries.opaque_handle(), execution);
+  }
+  catch (const std::overflow_error &) { invalid_remote_launch_rejected = true; }
+  require(invalid_remote_launch_rejected,
+          "remote boundary launch accepted a grid larger than the CUDA device limit");
+  if (std::getenv("MEEP_NVIDIA_STEP_BOUNDARY_ONLY")) return;
 
   /* A 259-point descriptor crosses the 256-thread launch boundary and models
      the packed plane data used by volume/eigenmode sources. The following

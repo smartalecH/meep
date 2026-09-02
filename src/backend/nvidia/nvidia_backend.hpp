@@ -147,6 +147,25 @@ struct NvidiaExecutableCacheStatistics {
         executable_build_count(0), source_value_reuse_count(0) {}
 };
 
+struct NvidiaRemoteBoundaryCompileStatistics {
+  bool attempted;
+  bool valid;
+  size_t stages;
+  size_t receives;
+  size_t sends;
+  size_t gathers;
+  size_t scatters;
+  size_t zeroes;
+  uint64_t program_signature;
+  uint64_t storage_signature;
+  uint64_t authority_signature;
+
+  NvidiaRemoteBoundaryCompileStatistics()
+      : attempted(false), valid(false), stages(0), receives(0), sends(0), gathers(0),
+        scatters(0), zeroes(0), program_signature(0), storage_signature(0),
+        authority_signature(0) {}
+};
+
 struct NvidiaCwStatistics {
   CwSolveResult result;
   size_t reduction_count;
@@ -382,6 +401,7 @@ public:
   NvidiaMaterialInitializationStatistics material_initialization_statistics_for_testing() const;
   NvidiaGraphStatistics graph_statistics_for_testing() const;
   NvidiaExecutableCacheStatistics executable_cache_statistics_for_testing() const;
+  NvidiaRemoteBoundaryCompileStatistics remote_boundary_compile_statistics_for_testing() const;
   void mutate_prepared_initialization_upload_for_testing(BackendState &state, int mode);
   void set_next_executable_generation_for_testing(uint64_t generation) {
     next_executable_generation_ = generation;
@@ -428,6 +448,7 @@ private:
       pending_initialization_classification_rows_;
   mutable MaterialRecipeDisposition pending_initialization_route_;
   mutable bool pending_initialization_reserve_valid_;
+  NvidiaRemoteBoundaryCompileStatistics remote_boundary_compile_statistics_;
 };
 
 /* Device selection must already be resolved and collectively validated. This

@@ -9,6 +9,7 @@
 #include "backend/nvidia/nvidia_backend.hpp"
 #include "backend/adjoint_plan.hpp"
 #include "backend/nvidia/nvidia_adjoint.hpp"
+#include "backend/nvidia/nvidia_boundaries.hpp"
 #include "backend/nvidia/nvidia_coordinates.hpp"
 #include "backend/nvidia/nvidia_cw.hpp"
 
@@ -35,6 +36,7 @@
 
 #include "backend/initialization_plan.hpp"
 #include "backend/graph_plan.hpp"
+#include "backend/mpi_context.hpp"
 #include "backend/material_recipe.hpp"
 #include "backend/descriptors.hpp"
 #include "backend/diagnostics.hpp"
@@ -931,6 +933,7 @@ public:
                    size_t source_scalar_count, size_t source_staging_elements,
                    const std::vector<NvidiaCompiledHostSegment> &host_segments,
                    size_t host_staging_bytes,
+                   const nvidia::compiled_boundary_artifact &remote_boundaries,
                    NvidiaBackendState &state)
       : Executable(state.material_phase_active), owner_(owner), state_token_(state_token),
         program_(program), signature_(signature), structural_signature_(structural_signature),
@@ -957,7 +960,7 @@ public:
         magnetic_half_step_(magnetic_half_step), material_refreshes_(material_refreshes),
         material_target_signature_(material_target_signature),
         source_scalar_count_(source_scalar_count), host_segments_(host_segments),
-        graph_enabled_(false), cw_workspace_(NULL) {
+        remote_boundaries_(remote_boundaries), graph_enabled_(false), cw_workspace_(NULL) {
     for (int i = 0; i < mutation_kind_count; ++i) freshness_[i] = freshness[i];
     for (const nvidia::compiled_polarization_update &update : polarization_updates_)
       has_noisy_updates_ = has_noisy_updates_ ||
@@ -1163,6 +1166,7 @@ public:
   uint64_t material_target_signature_;
   size_t source_scalar_count_;
   std::vector<NvidiaCompiledHostSegment> host_segments_;
+  nvidia::compiled_boundary_artifact remote_boundaries_;
   GraphProgram graph_program_;
   std::vector<NvidiaCompiledGraphSegment> graph_segments_;
   std::vector<size_t> graph_cw_timestep_launches_;
@@ -3993,6 +3997,11 @@ std::string NvidiaBackend::normalized_device_uuid_for_testing() const {
 
 const void *NvidiaBackend::device_reservation_identity_for_testing() const {
   return device_reservation_.get();
+}
+
+NvidiaRemoteBoundaryCompileStatistics
+NvidiaBackend::remote_boundary_compile_statistics_for_testing() const {
+  return remote_boundary_compile_statistics_;
 }
 
 uint64_t NvidiaBackend::claim_executable_generation() {
@@ -8416,6 +8425,34 @@ void commit_source_value_refresh(fields &f, const StepPlan &plan,
     executable.freshness_[i] = f.mutation_generation[i];
 }
 
+bool compile_remote_boundary_artifact(
+    const comms_sequence sequences[NUM_FIELD_TYPES], const halo_plan_set &halos,
+    const StoragePlan &storage, const std::vector<int> &chunk_ranks,
+    int communicator_rank, int communicator_size, uint64_t communicator_generation,
+    GpuMpiPolicy requested_policy, GpuMpiRoute resolved_route, bool device_owner,
+    size_t cuda_required_operations, int mpi_tag_ub, bool real_fields,
+    const std::vector<ZeroPlan> &zeroes,
+    const nvidia::device_arenas &device_allocations,
+    nvidia::compiled_boundary_artifact &artifact, std::string &why) {
+  why.clear();
+  nvidia::compiled_boundary_artifact staged;
+  if (!build_remote_halo_program(sequences, halos, storage, chunk_ranks,
+                                 communicator_rank, communicator_size,
+                                 communicator_generation, requested_policy, resolved_route,
+                                 device_owner, cuda_required_operations, mpi_tag_ub,
+                                 staged.wire, why) ||
+      !lower_remote_halo_program(staged.wire, halos, storage, real_fields, mpi_tag_ub,
+                                 staged.lowered, why) ||
+      !lower_canonical_halo_zeroes(zeroes, storage, staged.lowered_zeroes, why) ||
+      !nvidia::bind_remote_boundaries(staged.lowered, storage, device_allocations,
+                                      staged.bound, why) ||
+      !nvidia::bind_boundary_zeroes(staged.lowered_zeroes, storage, device_allocations,
+                                    staged.bound_zeroes, why))
+    return false;
+  artifact = std::move(staged);
+  return true;
+}
+
 } // namespace
 
 Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state) {
@@ -8423,6 +8460,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
   if (!state.initialized_)
     throw std::logic_error("cannot compile against uninitialized NVIDIA storage");
   std::unique_ptr<NvidiaExecutable> executable;
+  nvidia::compiled_boundary_artifact remote_boundaries;
   std::string local_error;
   try {
     if (has_provisional_material_storage(state.plan_))
@@ -8436,6 +8474,92 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       if (!validate_cw_state_layout(f_, plan.cw_state_layout, &layout_error))
         throw std::invalid_argument(layout_error.empty() ? "invalid solve_cw state layout"
                                                          : layout_error);
+    }
+    /* PR7.1 deliberately compiles and binds the complete remote boundary
+       artifact before the legacy production dispatch rejection. This ensures
+       PR7.2 consumes an already-validated production compiler output rather
+       than a test-only descriptor path; no request is posted here. */
+    if (!f_.halos)
+      throw std::invalid_argument("NVIDIA boundary compilation has no canonical HaloPlan set");
+    if (!f_.array_catalog)
+      throw std::invalid_argument("NVIDIA boundary compilation has no canonical array catalog");
+    halo_plan_set canonical_halos;
+    for (const HaloPlan &source : f_.halos->plans) {
+      HaloPlan canonical;
+      std::string remap_error;
+      if (!remap_halo_plan(source, f_.halos->arrays, f_.halos->host_arrays,
+                           *f_.array_catalog, f_.is_real ? 1 : 2, canonical,
+                           remap_error))
+        throw std::invalid_argument(remap_error);
+      canonical_halos.get_or_create(comms_key{canonical.ft, canonical.phase,
+                                              canonical.chunks}) = canonical;
+    }
+    FOR_FIELD_TYPES(ft) {
+      canonical_halos.zeros[ft].resize(f_.halos->zeros[ft].size());
+      for (size_t chunk = 0; chunk < f_.halos->zeros[ft].size(); ++chunk) {
+        std::string remap_error;
+        if (!remap_zero_plan(f_.halos->zeros[ft][chunk], f_.halos->arrays,
+                             *f_.array_catalog, canonical_halos.zeros[ft][chunk],
+                             remap_error))
+          throw std::invalid_argument(remap_error);
+      }
+    }
+    std::vector<int> chunk_ranks;
+    chunk_ranks.reserve(f_.num_chunks);
+    for (int chunk = 0; chunk < f_.num_chunks; ++chunk) {
+      if (!f_.chunks[chunk])
+        throw std::invalid_argument("NVIDIA boundary compilation has a missing field chunk");
+      chunk_ranks.push_back(f_.chunks[chunk]->n_proc());
+    }
+    std::vector<ZeroPlan> boundary_zeroes;
+    FOR_FIELD_TYPES(ft)
+      boundary_zeroes.insert(boundary_zeroes.end(), canonical_halos.zeros[ft].begin(),
+                             canonical_halos.zeros[ft].end());
+    const GpuMpiPolicyParse parsed_policy =
+        parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
+    bool provider_query_available = false, provider_supports_direct = false;
+    std::string provider, boundary_error = parsed_policy.error;
+    if (parsed_policy.valid &&
+        !query_gpu_aware_mpi_provider(provider_query_available, provider_supports_direct,
+                                      provider, boundary_error))
+      throw std::invalid_argument(boundary_error);
+    const GpuMpiPolicy agreed_policy = parsed_policy.requested;
+    GpuMpiRoute resolved_route = GpuMpiRoute::staged;
+    if (!parsed_policy.valid ||
+        !resolve_gpu_mpi_route(agreed_policy, provider_query_available,
+                               provider_supports_direct, resolved_route, boundary_error))
+      throw std::invalid_argument(boundary_error);
+    int mpi_tag_ub = INT_MAX;
+#ifdef HAVE_MPI
+    int *tag_bound = NULL, tag_bound_present = 0;
+    if (MPI_Comm_get_attr(current_backend_communicator(), MPI_TAG_UB, &tag_bound,
+                          &tag_bound_present) != MPI_SUCCESS ||
+        !tag_bound_present || !tag_bound)
+      throw std::runtime_error("NVIDIA boundary compilation could not query MPI_TAG_UB");
+    mpi_tag_ub = *tag_bound;
+#endif
+    remote_boundary_compile_statistics_ = NvidiaRemoteBoundaryCompileStatistics();
+    remote_boundary_compile_statistics_.attempted = true;
+    if (!compile_remote_boundary_artifact(
+            f_.comms_sequence_for_field, canonical_halos, state.plan_, chunk_ranks, my_rank(),
+            count_processors(), current_backend_communicator_generation(), agreed_policy,
+            resolved_route, true, plan.operations.size(), mpi_tag_ub, f_.is_real != 0,
+            boundary_zeroes, *state.arenas_, remote_boundaries, boundary_error))
+      throw std::invalid_argument(boundary_error);
+    remote_boundary_compile_statistics_.valid = true;
+    remote_boundary_compile_statistics_.stages = remote_boundaries.bound.stages.size();
+    remote_boundary_compile_statistics_.zeroes = remote_boundaries.bound_zeroes.entries.size();
+    remote_boundary_compile_statistics_.program_signature =
+        remote_boundaries.bound.program_signature;
+    remote_boundary_compile_statistics_.storage_signature =
+        remote_boundaries.bound.storage_signature;
+    remote_boundary_compile_statistics_.authority_signature =
+        remote_boundaries.bound.authority_signature;
+    for (const nvidia::bound_boundary_stage &stage : remote_boundaries.bound.stages) {
+      remote_boundary_compile_statistics_.receives += stage.receives.size();
+      remote_boundary_compile_statistics_.sends += stage.sends.size();
+      remote_boundary_compile_statistics_.gathers += stage.gathers.size();
+      remote_boundary_compile_statistics_.scatters += stage.scatters.size();
     }
     if (count_processors() != 1)
       throw std::invalid_argument("NVIDIA PR2 does not yet support MPI timestepping");
@@ -9667,7 +9791,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
           plan.magnetic_half_step, material_refreshes, material_staging_bytes,
           plan.material_phase_target_signature,
           source_plan ? source_plan->scalars.size() : 0,
-          source_staging_elements, host_segments, host_staging_bytes, state));
+          source_staging_elements, host_segments, host_staging_bytes,
+          remote_boundaries, state));
     }
   }
   catch (const std::exception &error) {

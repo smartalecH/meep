@@ -10542,6 +10542,50 @@ static void test_rejections() {
 
 }
 
+static void test_remote_boundary_compile_only_path() {
+  require(count_processors() == 2,
+          "remote boundary compile-only validation requires exactly two ranks");
+  const precision_policy_kind policies[] = {precision_policy_kind::native,
+                                             precision_policy_kind::f32};
+  for (precision_policy_kind precision : policies) {
+    const grid_volume gv = vol1d(4.0, 10.0);
+    structure s(gv, isotropic_eps, no_pml(), identity(), 2);
+    execution_options options;
+    options.backend = backend_kind::nvidia;
+    options.device_id = my_rank();
+    options.precision = precision;
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+    fields f(&s, options);
+    f.use_real_fields();
+    f.require_component(Ex);
+    bool rejected = false;
+    std::string reason;
+    try { f.init_backend(); }
+    catch (const std::exception &error) {
+      rejected = true;
+      reason = error.what();
+    }
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(f.backend);
+    const NvidiaRemoteBoundaryCompileStatistics statistics =
+        backend ? backend->remote_boundary_compile_statistics_for_testing()
+                : NvidiaRemoteBoundaryCompileStatistics();
+    if (!rejected || reason.find("does not yet support MPI timestepping") == std::string::npos)
+      std::fprintf(stderr, "rank %d remote compile rejection: rejected=%d reason=%s\n",
+                   my_rank(), int(rejected), reason.c_str());
+    require(and_to_all(rejected) &&
+                reason.find("does not yet support MPI timestepping") != std::string::npos,
+            "PR7.1 production multi-rank dispatch did not remain rejected");
+    require(backend && statistics.attempted && statistics.valid && statistics.stages > 0 &&
+                statistics.receives + statistics.sends > 0 &&
+                statistics.gathers + statistics.scatters > 0 &&
+                statistics.storage_signature != 0 && statistics.authority_signature != 0 &&
+                !f.backend_state && !f.executable,
+            "production compile did not validate and retain real-HaloPlan descriptor evidence");
+  }
+  master_printf("nvidia_timestep: remote boundary compile-only path PASS\n");
+}
+
 static void test_compile_allocation_retry() {
   const grid_volume gv = vol2d(3.0, 3.0, 8.0);
   structure s(gv, isotropic_eps, pml(0.5), identity(), 2);
@@ -10613,6 +10657,10 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_NVIDIA_GRAPH_MPI_ONLY")) {
     test_graph_collective_reconciliation();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_REMOTE_COMPILE_ONLY")) {
+    test_remote_boundary_compile_only_path();
     return 0;
   }
   require(count_processors() == 1, "nvidia_timestep is a single-rank test");

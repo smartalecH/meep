@@ -7,7 +7,9 @@
 */
 
 #include <climits>
+#include <algorithm>
 #include <cstdio>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -293,6 +295,337 @@ void test_zero_length_wire_message() {
   CHECK(validate_remote_halo_agreement(records, why), why.c_str());
 }
 
+void test_neutral_remote_lowering() {
+  RemoteHaloProgram sender, receiver;
+  halo_plan_set send_halos, receive_halos;
+  StoragePlan send_storage, receive_storage;
+  make_endpoint(true, 0, sender, send_halos, send_storage);
+  make_endpoint(false, 0, receiver, receive_halos, receive_storage);
+  receive_halos.find(comms_key{E_stuff, CONNECT_PHASE, chunk_pair{0, 1}})
+      ->phase_values.push_back(std::complex<realnum>(realnum(0.6), realnum(0.8)));
+
+  LoweredRemoteHaloProgram lowered_send, lowered_receive;
+  std::string why;
+  CHECK(lower_remote_halo_program(sender, send_halos, send_storage, false, 100,
+                                  lowered_send, why),
+        why.c_str());
+  CHECK(lower_remote_halo_program(receiver, receive_halos, receive_storage, false, 100,
+                                  lowered_receive, why),
+        why.c_str());
+  CHECK(lowered_send.stages.empty() || lowered_receive.stages.empty() ||
+            (lowered_send.stages[0].sends[0].slot_offsets[0] ==
+                 lowered_receive.stages[0].receives[0].slot_offsets[0] &&
+             lowered_send.stages[0].sends[0].slot_offsets[1] ==
+                 lowered_receive.stages[0].receives[0].slot_offsets[1]),
+        "sender and receiver reconstructed different wire-local slot offsets");
+  CHECK(lowered_send.version == LoweredRemoteHaloProgram::schema_version &&
+            lowered_send.program_signature == sender.signature &&
+            lowered_send.storage_signature ==
+                compute_remote_storage_authority_signature(send_storage) &&
+            lowered_send.authority_signature == compute_remote_lowered_authority_signature(
+                                                     sender.signature,
+                                                     lowered_send.storage_signature) &&
+            lowered_send.stages.size() == 1,
+        "lowered sender did not retain its authority identity");
+  if (!lowered_send.stages.empty()) {
+    const LoweredRemoteHaloStage &stage = lowered_send.stages[0];
+    CHECK(stage.send_slot_bytes == 3 * sizeof(float) && stage.sends.size() == 1,
+          "lowered sender has an incorrect byte layout");
+    if (!stage.sends.empty()) {
+      const LoweredRemoteHaloMessage &message = stage.sends[0];
+      CHECK(message.gathers.size() == 3 && message.slot_offsets[0] == 0 &&
+                message.slot_offsets[1] == 3 * sizeof(float) &&
+                message.arena_offsets[0] == 0 &&
+                message.arena_offsets[1] == 3 * sizeof(float),
+            "lowered sender did not build two exact arena slots");
+      CHECK(message.gathers.size() < 3 ||
+                (message.gathers[0].buffer_byte_offset == 0 &&
+                 message.gathers[1].buffer_byte_offset == sizeof(float) &&
+                 message.gathers[2].buffer_byte_offset == 2 * sizeof(float)),
+            "lowered gather order is not byte-exact");
+    }
+  }
+  if (!lowered_receive.stages.empty()) {
+    const LoweredRemoteHaloStage &stage = lowered_receive.stages[0];
+    CHECK(stage.receive_slot_bytes == 3 * sizeof(float) && stage.receives.size() == 1 &&
+              stage.publication == RemoteHaloPublicationMode::parallel_unique,
+          "unique receive lowering did not select parallel publication");
+    if (!stage.receives.empty()) {
+      const LoweredRemoteHaloMessage &message = stage.receives[0];
+      CHECK(message.scatters.size() == 2,
+            "PHASE pair plus COPY did not compile to two scatter descriptors");
+      CHECK(message.scatters.size() < 2 ||
+                (message.scatters[0].phase_real == 0.6 &&
+                 message.scatters[0].phase_imag == 0.8 &&
+                 message.scatters[1].phase_real == 1.0 &&
+                 !is_valid(message.scatters[1].target_imag.root)),
+            "lowered transforms differ from canonical phase order");
+    }
+  }
+
+  RemoteHaloProgram overlapping = receiver;
+  overlapping.communicator_size = 3;
+  RemoteHaloMessage second = overlapping.stages[0].receives[0];
+  second.key.source_rank = 2;
+  second.key.source_chunk = 2;
+  second.key.tag = 8;
+  second.key.canonical_ordinal += 8;
+  second.wire_digest = compute_remote_halo_wire_digest(second);
+  overlapping.stages[0].receives.insert(overlapping.stages[0].receives.begin(), second);
+  overlapping.participation.transport_messages = 2;
+  overlapping.stages[0].signature =
+      compute_remote_halo_stage_signature(overlapping.stages[0]);
+  overlapping.signature = compute_remote_halo_program_signature(overlapping);
+  for (connect_phase p : all_connect_phases) {
+    const HaloPlan *original =
+        receive_halos.find(comms_key{E_stuff, p, chunk_pair{0, 1}});
+    if (!original) continue;
+    const HaloPlan copy = *original;
+    HaloPlan &other = receive_halos.get_or_create(comms_key{E_stuff, p, chunk_pair{2, 1}});
+    other = copy;
+    other.chunks = chunk_pair{2, 1};
+    other.peer_rank = 2;
+  }
+  CHECK(lower_remote_halo_program(overlapping, receive_halos, receive_storage, false, 100,
+                                  lowered_receive, why),
+        why.c_str());
+  CHECK(lowered_receive.stages.empty() ||
+            (lowered_receive.stages[0].publication ==
+                 RemoteHaloPublicationMode::canonical_serial &&
+             lowered_receive.stages[0].canonical_receive_order.size() == 2 &&
+             lowered_receive.stages[0].canonical_receive_order[0] == 1 &&
+             lowered_receive.stages[0].canonical_receive_order[1] == 0),
+        "cross-message overlap did not select endpoint-invariant publication order");
+
+  HaloPlan *copy =
+      receive_halos.find(comms_key{E_stuff, CONNECT_COPY, chunk_pair{0, 1}});
+  CHECK(copy && copy->scatter.size() == 1, "receive fixture lacks COPY target");
+  if (copy && copy->scatter.size() == 1) copy->scatter[0].index = 0;
+  CHECK(lower_remote_halo_program(receiver, receive_halos, receive_storage, false, 100,
+                                  lowered_receive, why),
+        why.c_str());
+  CHECK(lowered_receive.stages.empty() ||
+            lowered_receive.stages[0].publication ==
+                RemoteHaloPublicationMode::canonical_serial,
+        "duplicate physical destination did not select canonical serial publication");
+
+  if (copy && copy->scatter.size() == 1) copy->scatter[0].index = 2;
+  receive_storage.arrays.push_back(array_spec(1, Precision::f32, 8));
+  receive_storage.arrays[1].alias_of = ArrayId{0};
+  receive_storage.keys.push_back(StorageKey{0, int(array_kind::f), int(Ey), 0, 0});
+  if (copy && copy->scatter.size() == 1) {
+    copy->scatter[0].array = ArrayId{1};
+    copy->scatter[0].index = 0;
+  }
+  CHECK(lower_remote_halo_program(receiver, receive_halos, receive_storage, false, 100,
+                                  lowered_receive, why),
+        why.c_str());
+  CHECK(lowered_receive.stages.empty() ||
+            lowered_receive.stages[0].publication ==
+                RemoteHaloPublicationMode::canonical_serial,
+        "alias-root destination overlap was not detected");
+
+  receive_storage.arrays[0].alias_of = ArrayId{1};
+  CHECK(!lower_remote_halo_program(receiver, receive_halos, receive_storage, false, 100,
+                                   lowered_receive, why),
+        "cyclic storage aliases were accepted by remote lowering");
+  receive_storage.arrays[0].alias_of = invalid_array();
+  receive_storage.arrays[1].alias_of = ArrayId{0};
+  receive_halos.find(comms_key{E_stuff, CONNECT_PHASE, chunk_pair{0, 1}})
+      ->phase_values.clear();
+  CHECK(!lower_remote_halo_program(receiver, receive_halos, receive_storage, false, 100,
+                                   lowered_receive, why),
+        "malformed PHASE literal coverage was accepted by remote lowering");
+
+  RemoteHaloProgram malformed_receiver;
+  halo_plan_set malformed_halos;
+  StoragePlan malformed_storage;
+  make_endpoint(false, 0, malformed_receiver, malformed_halos, malformed_storage);
+  malformed_halos.find(comms_key{E_stuff, CONNECT_PHASE, chunk_pair{0, 1}})
+      ->phase_values.push_back(std::complex<realnum>(realnum(0.6), realnum(0.8)));
+  malformed_halos.find(comms_key{E_stuff, CONNECT_COPY, chunk_pair{0, 1}})->block_offset = 1;
+  CHECK(!lower_remote_halo_program(malformed_receiver, malformed_halos, malformed_storage,
+                                   false, 100, lowered_receive, why),
+        "receiver reconstruction accepted a HaloPlan phase-span mismatch");
+
+  RemoteHaloProgram real_receiver;
+  halo_plan_set real_halos;
+  StoragePlan real_storage;
+  make_endpoint(false, 0, real_receiver, real_halos, real_storage);
+  real_halos.find(comms_key{E_stuff, CONNECT_PHASE, chunk_pair{0, 1}})
+      ->phase_values.push_back(std::complex<realnum>(realnum(0.6), realnum(0.8)));
+  CHECK(!lower_remote_halo_program(real_receiver, real_halos, real_storage,
+                                   true, 100, lowered_receive, why),
+        "real-field lowering accepted a PHASE communication block");
+
+  StoragePlan zero_storage;
+  zero_storage.arrays.push_back(array_spec(0, Precision::f64, 8));
+  zero_storage.arrays.push_back(array_spec(1, Precision::f64, 8));
+  zero_storage.arrays[1].alias_of = ArrayId{0};
+  zero_storage.keys.push_back(StorageKey{0, int(array_kind::f), int(Ex), 0, 0});
+  zero_storage.keys.push_back(StorageKey{0, int(array_kind::f), int(Hx), 0, 0});
+  ZeroPlan zero;
+  zero.residue.push_back(ElementRef{ArrayId{0}, 3});
+  zero.residue.push_back(ElementRef{ArrayId{1}, 4});
+  std::vector<LoweredHaloZeroDescriptor> lowered_zeroes;
+  CHECK(lower_canonical_halo_zeroes(std::vector<ZeroPlan>(1, zero), zero_storage,
+                                    lowered_zeroes, why),
+        why.c_str());
+  CHECK(lowered_zeroes.size() == 2 && lowered_zeroes[0].target.root == ArrayId{0} &&
+            lowered_zeroes[1].target.root == ArrayId{0} &&
+            lowered_zeroes[1].target.index == 4,
+        "canonical halo zero lowering did not preserve alias-root identity");
+  zero.residue[1].index = -1;
+  CHECK(!lower_canonical_halo_zeroes(std::vector<ZeroPlan>(1, zero), zero_storage,
+                                     lowered_zeroes, why),
+        "canonical halo zero lowering accepted a negative scalar index");
+}
+
+void test_checked_descriptor_inputs() {
+  RemoteHaloProgram sender;
+  halo_plan_set halos;
+  StoragePlan storage;
+  make_endpoint(true, 0, sender, halos, storage);
+  LoweredRemoteHaloProgram baseline;
+  std::string why;
+  CHECK(lower_remote_halo_program(sender, halos, storage, false, 100, baseline, why),
+        why.c_str());
+  const uint64_t baseline_signature = baseline.authority_signature;
+  const size_t baseline_stages = baseline.stages.size();
+
+  HaloPlan *copy = halos.find(comms_key{E_stuff, CONNECT_COPY, chunk_pair{0, 1}});
+  CHECK(copy && !copy->gather_order.empty() && !copy->gather.empty(),
+        "checked-input fixture has no COPY residue");
+  if (!copy || copy->gather_order.empty() || copy->gather.empty()) return;
+  const HaloPlan saved = *copy;
+  copy->gather_order[0].residue = UINT32_MAX;
+  CHECK(!lower_remote_halo_program(sender, halos, storage, false, 100, baseline, why) &&
+            baseline.authority_signature == baseline_signature &&
+            baseline.stages.size() == baseline_stages,
+        "out-of-range residue segment did not reject transactionally");
+  *copy = saved;
+  copy->gather[0].index = std::numeric_limits<ptrdiff_t>::max();
+  CHECK(!lower_remote_halo_program(sender, halos, storage, false, 100, baseline, why),
+        "out-of-allocation residue index was expanded before rejection");
+  *copy = saved;
+  copy->gather.clear();
+  copy->gather_order.clear();
+  SlabRef malformed;
+  malformed.array = ArrayId{0};
+  malformed.base = 0;
+  malformed.counts[0] = -1;
+  malformed.counts[1] = malformed.counts[2] = 1;
+  malformed.strides[0] = 1;
+  malformed.strides[1] = malformed.strides[2] = 0;
+  copy->gather_slabs.push_back(malformed);
+  copy->gather_order.push_back(HaloSegment{0, 1, 1, 0});
+  CHECK(!lower_remote_halo_program(sender, halos, storage, false, 100, baseline, why),
+        "negative halo slab count was accepted");
+  copy->gather_slabs[0].counts[0] = 2;
+  copy->gather_slabs[0].base = std::numeric_limits<ptrdiff_t>::max();
+  copy->gather_slabs[0].strides[0] = std::numeric_limits<ptrdiff_t>::max();
+  copy->gather_order[0].count = 2;
+  copy->block_elements = 2;
+  sender.stages[0].sends[0].phases.back().block_elements = 2;
+  sender.stages[0].sends[0].total_elements = 4;
+  sender.stages[0].sends[0].wire_bytes = 4 * sizeof(float);
+  sender.stages[0].sends[0].wire_digest =
+      compute_remote_halo_wire_digest(sender.stages[0].sends[0]);
+  sender.stages[0].signature = compute_remote_halo_stage_signature(sender.stages[0]);
+  sender.signature = compute_remote_halo_program_signature(sender);
+  CHECK(!lower_remote_halo_program(sender, halos, storage, false, 100, baseline, why),
+        "signed halo slab arithmetic overflow was accepted");
+
+  StoragePlan zero_storage;
+  zero_storage.arrays.push_back(array_spec(0, Precision::f64, 8));
+  zero_storage.keys.push_back(StorageKey{0, int(array_kind::f), int(Ex), 0, 0});
+  ZeroPlan zero;
+  zero.residue.push_back(ElementRef{ArrayId{0}, 2});
+  zero.residue.push_back(ElementRef{ArrayId{0}, 2});
+  std::vector<LoweredHaloZeroDescriptor> lowered_zeroes;
+  CHECK(lower_canonical_halo_zeroes(std::vector<ZeroPlan>(1, zero), zero_storage,
+                                    lowered_zeroes, why) && lowered_zeroes.size() == 1,
+        "duplicate physical zero target was not deterministically deduplicated");
+  zero.residue.clear();
+  SlabRef bad_zero;
+  bad_zero.array = ArrayId{0};
+  bad_zero.base = 0;
+  bad_zero.counts[0] = -1;
+  bad_zero.counts[1] = bad_zero.counts[2] = 1;
+  bad_zero.strides[0] = 1;
+  bad_zero.strides[1] = bad_zero.strides[2] = 0;
+  zero.slabs.push_back(bad_zero);
+  CHECK(!lower_canonical_halo_zeroes(std::vector<ZeroPlan>(1, zero), zero_storage,
+                                     lowered_zeroes, why) && lowered_zeroes.size() == 1,
+        "negative zero slab count did not reject transactionally");
+  zero.slabs[0].counts[0] = 2;
+  zero.slabs[0].base = std::numeric_limits<ptrdiff_t>::max();
+  zero.slabs[0].strides[0] = std::numeric_limits<ptrdiff_t>::max();
+  CHECK(!lower_canonical_halo_zeroes(std::vector<ZeroPlan>(1, zero), zero_storage,
+                                     lowered_zeroes, why),
+        "signed zero slab arithmetic overflow was accepted");
+}
+
+void test_mixed_precision_slot_alignment() {
+  StoragePlan storage;
+  storage.arrays.push_back(array_spec(0, Precision::f32, 4));
+  storage.arrays.push_back(array_spec(1, Precision::f64, 4));
+  storage.keys.push_back(StorageKey{0, int(array_kind::f), int(Ex), 0, 0});
+  storage.keys.push_back(StorageKey{0, int(array_kind::f), int(Ey), 0, 0});
+  halo_plan_set halos;
+  const auto add_plan = [&](int destination, ArrayId array) {
+    HaloPlan &plan = halos.get_or_create(
+        comms_key{E_stuff, CONNECT_COPY, chunk_pair{0, destination}});
+    plan.peer_rank = destination;
+    plan.same_rank = false;
+    plan.storage = HaloStorageDisposition::canonical;
+    plan.block_offset = 0;
+    plan.block_elements = 1;
+    plan.gather.push_back(ElementRef{array, 0});
+    plan.gather_order.push_back(HaloSegment{0, 0, 0, 1});
+  };
+  add_plan(1, ArrayId{0});
+  add_plan(2, ArrayId{1});
+  const auto operation = [](int destination, int tag) {
+    comms_operation op;
+    op.my_chunk_idx = 0;
+    op.other_chunk_idx = destination;
+    op.other_proc_id = destination;
+    op.pair_idx = destination * 3;
+    op.transfer_size = 1;
+    op.comm_direction = Outgoing;
+    op.tag = tag;
+    return op;
+  };
+  comms_sequence sequences[NUM_FIELD_TYPES];
+  sequences[E_stuff].send_ops.push_back(operation(1, 7));
+  sequences[E_stuff].send_ops.push_back(operation(2, 8));
+  std::string why;
+  RemoteHaloProgram program;
+  LoweredRemoteHaloProgram lowered;
+  CHECK(build_remote_halo_program(sequences, halos, storage, std::vector<int>{0, 1, 2},
+                                  0, 3, 1, GpuMpiPolicy::staged, GpuMpiRoute::staged,
+                                  true, 1, 100, program, why) &&
+            lower_remote_halo_program(program, halos, storage, false, 100, lowered, why),
+        why.c_str());
+  CHECK(lowered.stages.size() == 1 && lowered.stages[0].send_slot_bytes == 16 &&
+            lowered.stages[0].sends[0].arena_offsets[0] == 0 &&
+            lowered.stages[0].sends[1].arena_offsets[0] == 8 &&
+            lowered.stages[0].sends[1].arena_offsets[1] == 24,
+        "f32-before-f64 stage slot was not padded to maximum alignment");
+  std::reverse(sequences[E_stuff].send_ops.begin(), sequences[E_stuff].send_ops.end());
+  CHECK(build_remote_halo_program(sequences, halos, storage, std::vector<int>{0, 1, 2},
+                                  0, 3, 1, GpuMpiPolicy::staged, GpuMpiRoute::staged,
+                                  true, 1, 100, program, why) &&
+            lower_remote_halo_program(program, halos, storage, false, 100, lowered, why),
+        why.c_str());
+  CHECK(lowered.stages.size() == 1 && lowered.stages[0].send_slot_bytes == 16 &&
+            lowered.stages[0].sends[0].arena_offsets[0] == 0 &&
+            lowered.stages[0].sends[1].arena_offsets[0] == 8 &&
+            lowered.stages[0].sends[1].arena_offsets[1] == 24,
+        "f64-before-f32 stage slot was not padded to maximum alignment");
+}
+
 } // namespace
 
 int main() {
@@ -302,6 +635,9 @@ int main() {
   test_manual_validation();
   test_idle_admission();
   test_zero_length_wire_message();
+  test_neutral_remote_lowering();
+  test_checked_descriptor_inputs();
+  test_mixed_precision_slot_alignment();
   if (failures) {
     std::fprintf(stderr, "transport_plan: %d failures\n", failures);
     return 1;
