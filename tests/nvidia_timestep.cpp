@@ -10237,6 +10237,9 @@ static remote_route_acceptance_result run_remote_route_acceptance(
               result.report.mpi_wait_nanoseconds > 0 &&
               result.report.scatter_unpack_nanoseconds > 0,
           "production transport timing counters did not advance");
+  require(result.report.material_recipe_prepare_nanoseconds > 0 &&
+              result.report.material_initialize_nanoseconds > 0,
+          "production setup timing counters did not advance");
   require(policy == GpuMpiPolicy::direct
               ? (result.report.device_to_host_nanoseconds == 0 &&
                  result.report.host_to_device_nanoseconds == 0)
@@ -10316,7 +10319,9 @@ static void test_remote_boundary_direct_acceptance() {
     if (const char *graph_mode = std::getenv("MEEP_NVIDIA_GRAPH_MODE"))
       if (!::strcmp(graph_mode, "required"))
         require(staged.report.graph_enabled && direct.report.graph_enabled &&
-                    staged.report.graph_launch_count > 0 && direct.report.graph_launch_count > 0,
+                    staged.report.graph_launch_count > 0 && direct.report.graph_launch_count > 0 &&
+                    staged.report.graph_build_nanoseconds > 0 &&
+                    direct.report.graph_build_nanoseconds > 0,
                 "required graph mode did not execute on staged/direct production routes");
   }
   unsetenv("MEEP_GPU_AWARE_MPI");

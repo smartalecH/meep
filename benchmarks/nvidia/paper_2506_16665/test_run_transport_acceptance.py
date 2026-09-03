@@ -144,6 +144,49 @@ class AcceptanceArtifactValidationTest(unittest.TestCase):
         with self.assertRaisesRegex(acceptance.mpi_runner.RunnerError, "required counter set"):
             acceptance.validate_acceptance_artifact(value, "direct")
 
+    def test_steady_state_side_effect_counters_are_rejected(self):
+        for name in (
+            "steady_allocation_count", "graph_recapture_count", "full_field_copy_count"
+        ):
+            with self.subTest(counter=name):
+                value = artifact("direct")
+                value["rank_records"][0]["counter_deltas"][name] = 1
+                with self.assertRaisesRegex(
+                    acceptance.mpi_runner.RunnerError, f"steady-state counter {name}"
+                ):
+                    acceptance.validate_acceptance_artifact(value, "direct")
+
+    def test_measurement_window_warms_and_fences_before_reports(self):
+        events = []
+
+        class Fields:
+            t = 0
+
+            def advance(self, steps):
+                events.append(("advance", steps))
+                self.t += steps
+
+        class Simulation:
+            fields = Fields()
+
+            def get_execution_runtime_report(self):
+                events.append(("report", self.fields.t))
+                return {"step": self.fields.t}
+
+        class Meep:
+            @staticmethod
+            def all_wait():
+                events.append(("barrier", Simulation.fields.t))
+
+        before, start = acceptance._steady_measurement_start(Meep, Simulation())
+        self.assertEqual(before, {"step": 1})
+        self.assertEqual(start, 1)
+        self.assertEqual(events, [("advance", 1), ("barrier", 1), ("report", 1)])
+        events.clear()
+        after = acceptance._steady_measurement_end(Meep, Simulation())
+        self.assertEqual(after, {"step": 1})
+        self.assertEqual(events, [("barrier", 1), ("report", 1)])
+
     def test_loader_validates_before_returning_artifact(self):
         value = artifact("direct")
         value["rank_records"] = []

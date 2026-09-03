@@ -102,6 +102,13 @@ def validate_acceptance_artifact(value: Mapping[str, Any], expected_route: str |
                 raise mpi_runner.RunnerError(
                     f"{route} rank {index} counter {name} is invalid"
                 )
+        for name in (
+            "steady_allocation_count", "graph_recapture_count", "full_field_copy_count"
+        ):
+            if counters[name] != 0:
+                raise mpi_runner.RunnerError(
+                    f"{route} rank {index} steady-state counter {name} is nonzero"
+                )
         if route == "staged" and (
             counters["messages_sent"] <= 0 or counters["messages_received"] <= 0 or
             counters["bytes_sent"] <= 0 or counters["bytes_received"] <= 0 or
@@ -148,6 +155,19 @@ def load_acceptance_artifact(path: pathlib.Path, expected_route: str) -> dict[st
     return value
 
 
+def _steady_measurement_start(mp: Any, sim: Any) -> tuple[dict[str, Any], int]:
+    """Warm resident execution once, fence all ranks, then snapshot counters."""
+    sim.fields.advance(1)
+    mp.all_wait()
+    return sim.get_execution_runtime_report(), int(sim.fields.t)
+
+
+def _steady_measurement_end(mp: Any, sim: Any) -> dict[str, Any]:
+    """Fence timed work before reading counters; monitor queries follow this."""
+    mp.all_wait()
+    return sim.get_execution_runtime_report()
+
+
 def _atomic(value: Mapping[str, Any], path: pathlib.Path, schema_path: pathlib.Path = SCHEMA) -> None:
     schema = bm.load_json_object(schema_path, "transport acceptance schema")
     bm._validate_schema_structure(value, schema, schema, "transport acceptance")
@@ -179,17 +199,21 @@ def _worker(route: str, output: pathlib.Path) -> int:
               "sources": [mp.Source(mp.GaussianSource(CASE["frequency"], fwidth=CASE["fwidth"]), component=mp.Ex, center=mp.Vector3(z=CASE["source_z"]), amplitude=CASE["amplitude"])],
               "backend": backend, "accelerator_strict": False}
     if route != "cpu": kwargs["device_id"] = int(os.environ["OMPI_COMM_WORLD_LOCAL_RANK"])
-    sim = mp.Simulation(**kwargs); sim.init_sim(); before = sim.get_execution_runtime_report()
-    start_step = int(sim.fields.t)
+    sim = mp.Simulation(**kwargs)
+    sim.init_sim()
+    # Force resident compilation/allocation before the measurement baseline.
+    # The same deterministic step is applied to CPU, staged, and direct runs.
+    before, start_step = _steady_measurement_start(mp, sim)
     decay = mp.stop_when_fields_decayed(CASE["decay_dt"], mp.Ex, mp.Vector3(z=0.5), CASE["decay_by"])
     sim.run(until_after_sources=decay)
+    after = _steady_measurement_end(mp, sim)
     steps = int(sim.fields.t) - start_step
     if steps > CASE["max_steps"]:
         raise mpi_runner.RunnerError("acceptance decay exceeded its declared max_steps")
     reason = "field_energy_decay"
     observables = {"samples": [[float(complex(sim.get_field_point(mp.Ex, mp.Vector3(z=z))).real),
                                 float(complex(sim.get_field_point(mp.Ex, mp.Vector3(z=z))).imag)] for z in CASE["sample_z"]]}
-    after = sim.get_execution_runtime_report(); rank = int(after["communicator_rank"])
+    rank = int(after["communicator_rank"])
     local = {"rank": rank, "runtime": after, "steps": steps, "stop_reason": reason,
              "observables": observables,
              "counter_deltas": {name: int(after[name]) - int(before[name])
