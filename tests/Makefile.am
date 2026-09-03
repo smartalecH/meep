@@ -185,6 +185,7 @@ if HAVE_NVIDIA_BACKEND
 NVIDIA_EAGER_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke nvidia_adjoint_smoke
 NVIDIA_RUNTIME_TESTS = $(NVIDIA_EAGER_RUNTIME_TESTS)
 NVIDIA_INTEGRATION_TESTS = nvidia_backend_state nvidia_device_reservation nvidia_timestep nvidia_dft nvidia_cw
+NVIDIA_PHONY_TARGETS = nvidia-eager-runtime-check nvidia-runtime-check amd-eager-check
 
 if USE_CUDA_DEVICE_COMPILER
 NVIDIA_DEVICE_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
@@ -215,6 +216,12 @@ NVIDIA_DEVICE_LIBS = $(HIP_LIBS)
 NVIDIA_DEVICE_SOURCE_FLAGS = -x hip
 NVIDIA_DEVICE_LINK_FLAGS = -x none
 NVIDIA_DEVICE_PRECISE_FLAGS = $(HIP_PRECISE_FLAGS)
+if HAVE_HIP_GRAPHS
+NVIDIA_RUNTIME_TESTS += nvidia_graph_smoke
+NVIDIA_PHONY_TARGETS += amd-graph-check
+else
+NVIDIA_PHONY_TARGETS += amd-required-graph-rejection-check
+endif
 endif
 
 if WITH_MPI
@@ -256,9 +263,14 @@ endif
 
 if USE_HIP_DEVICE_COMPILER
 	$(MAKE) amd-eager-check
+if HAVE_HIP_GRAPHS
+	$(MAKE) amd-graph-check
+else
+	$(MAKE) amd-required-graph-rejection-check
+endif
 endif
 
-.PHONY: nvidia-eager-runtime-check nvidia-runtime-check amd-eager-check
+.PHONY: $(NVIDIA_PHONY_TARGETS)
 nvidia-eager-runtime-check: $(NVIDIA_EAGER_RUNTIME_TESTS)
 	./nvidia_runtime_smoke
 	./nvidia_arena_smoke
@@ -318,6 +330,27 @@ amd-eager-check: nvidia-eager-runtime-check $(NVIDIA_INTEGRATION_TESTS)
 	  ./nvidia_cw --precision=mixed
 	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_HIP_EAGER_TOLERANCE=1 \
 	  ./nvidia_cw --precision=f32
+
+if HAVE_HIP_GRAPHS
+# PR3 requires native HIP graphs when the selected compiler headers advertise
+# HIP 7 or newer. These are the existing CUDA graph lifecycle, integration,
+# value-reuse, recapture, rollback, and numerical-parity gates.
+amd-graph-check: nvidia_graph_smoke nvidia_timestep nvidia_cw
+	./nvidia_graph_smoke
+	MEEP_NVIDIA_GRAPH_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=required MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_GRAPH_EXPECT_ENABLED=1 MEEP_NVIDIA_GRAPH_MAGNETIC_ONLY=1 \
+	  ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=required MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_GRAPH_EXPECT_ENABLED=1 MEEP_NVIDIA_SOURCE_REUSE_ONLY=1 \
+	  ./nvidia_timestep
+	MEEP_NVIDIA_CW_GRAPH_ONLY=1 ./nvidia_cw --precision=native
+	MEEP_NVIDIA_CW_GRAPH_ONLY=1 ./nvidia_cw --precision=mixed
+	MEEP_NVIDIA_CW_GRAPH_ONLY=1 ./nvidia_cw --precision=f32
+else
+# HIP before version 7 remains an eager-capable production build, but required
+# graph mode must continue to fail closed with the specific capability error.
+amd-required-graph-rejection-check: nvidia_backend_state
 	@set -e; log=nvidia-required-graph-rejection.log; \
 	  if MEEP_NVIDIA_GRAPH_MODE=required ./nvidia_backend_state >$$log 2>&1; then \
 	    cat $$log; \
@@ -327,6 +360,7 @@ amd-eager-check: nvidia-eager-runtime-check $(NVIDIA_INTEGRATION_TESTS)
 	  cat $$log; \
 	  grep -F "required CUDA graph mode is unsupported" $$log >/dev/null; \
 	  rm -f $$log
+endif
 endif
 
 $(NVIDIA_DEVICE_LIBRARY):
@@ -342,9 +376,10 @@ nvidia_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
 	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
 nvidia_graph_smoke: $(srcdir)/nvidia_graph_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_DEVICE_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
 nvidia_arena_smoke: $(srcdir)/nvidia_arena_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
 	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \

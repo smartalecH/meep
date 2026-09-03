@@ -521,10 +521,12 @@ graph_capability query_graph_capability() {
   graph_capability result;
   result.runtime = runtime_version();
   result.driver = driver_version();
-  result.capture_supported = MEEP_GRAPH_RUNTIME_CAPABILITY_ENABLED && result.runtime >= 10000 &&
-                             result.driver >= 10000;
-  result.update_supported = MEEP_GRAPH_RUNTIME_CAPABILITY_ENABLED && result.runtime >= 10020 &&
-                            result.driver >= 10020;
+  result.capture_supported = MEEP_GRAPH_RUNTIME_CAPABILITY_ENABLED &&
+                             result.runtime >= MEEP_GRAPH_CAPTURE_MIN_RUNTIME_VERSION &&
+                             result.driver >= MEEP_GRAPH_CAPTURE_MIN_RUNTIME_VERSION;
+  result.update_supported = MEEP_GRAPH_RUNTIME_CAPABILITY_ENABLED &&
+                            result.runtime >= MEEP_GRAPH_UPDATE_MIN_RUNTIME_VERSION &&
+                            result.driver >= MEEP_GRAPH_UPDATE_MIN_RUNTIME_VERSION;
   return result;
 }
 

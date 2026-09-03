@@ -2414,6 +2414,8 @@ static void test_source_value_refresh_failures_and_resource_overflow() {
     Executable *const overflow_original = gpu.executable;
     const NvidiaExecutableCacheStatistics before =
         backend->executable_cache_statistics_for_testing();
+    const nvidia::graph_accounting graphs_before =
+        nvidia::testing::current_graph_accounting();
     backend->set_next_executable_generation_for_testing(
         std::numeric_limits<uint64_t>::max());
     rejected = false;
@@ -2429,9 +2431,13 @@ static void test_source_value_refresh_failures_and_resource_overflow() {
     gpu.advance(1);
     const NvidiaExecutableCacheStatistics after =
         backend->executable_cache_statistics_for_testing();
+    const nvidia::graph_accounting graphs_after =
+        nvidia::testing::current_graph_accounting();
     require(gpu.executable != overflow_original &&
-                after.ordinary_resource_generation > before.ordinary_resource_generation,
-            "structural retry did not publish a newer executable generation");
+                after.ordinary_resource_generation > before.ordinary_resource_generation &&
+                graphs_after.begin_captures > graphs_before.begin_captures &&
+                graphs_after.instantiates > graphs_before.instantiates,
+            "structural retry did not recapture and publish a newer graph executable");
   }
 
   nvidia::testing::reset_graph_accounting();

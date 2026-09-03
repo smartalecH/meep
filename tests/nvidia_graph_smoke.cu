@@ -5,8 +5,7 @@
 #include <stdexcept>
 #include <utility>
 
-#include <cuda_runtime_api.h>
-
+#include "backend/nvidia/cuda_hip_compat.hpp"
 #include "backend/nvidia/nvidia_graph.hpp"
 
 using namespace meep;
@@ -94,16 +93,27 @@ int main() {
   replacement.end_capture(work);
   std::string update_diagnostic;
   const graph_update_status update = executable.update(replacement, &update_diagnostic);
+#if defined(MEEP_HIP_PORTABILITY)
+  if (update != graph_update_status::success)
+    std::fprintf(stderr, "HIP same-topology graph update failed: %s\n", update_diagnostic.c_str());
+  CHECK(update == graph_update_status::success,
+        "HIP same-topology graph update did not succeed");
+#else
   CHECK(update == graph_update_status::success || update == graph_update_status::topology_changed ||
             update == graph_update_status::unsupported,
         "graph update returned an invalid status");
-  if (update == graph_update_status::success) {
-    executable.launch(work);
-    copy_device_to_host_async(scalar_host.data(), scalar_device, 0, sizeof(StepScalars), work);
-    work.synchronize();
-    CHECK(static_cast<const StepScalars *>(scalar_host.data())->entry_timestep == 9,
-          "updated CUDA graph retained stale scalar parameters");
+#endif
+  graph_exec replacement_executable;
+  graph_exec *updated_executable = &executable;
+  if (update != graph_update_status::success) {
+    replacement_executable.instantiate(replacement);
+    updated_executable = &replacement_executable;
   }
+  updated_executable->launch(work);
+  copy_device_to_host_async(scalar_host.data(), scalar_device, 0, sizeof(StepScalars), work);
+  work.synchronize();
+  CHECK(static_cast<const StepScalars *>(scalar_host.data())->entry_timestep == 9,
+        "updated or recaptured graph retained stale scalar parameters");
 
   graph moved(std::move(definition));
   CHECK(!definition.opaque_handle() && moved.node_count() == 1,

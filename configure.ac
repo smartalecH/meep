@@ -335,6 +335,7 @@ if test -z "$HIP_PRECISE_FLAGS"; then
 fi
 
 build_hip_device_objects=no
+have_hip_graphs=no
 if test "x$enable_hip_portability_check" = "xyes" -o \
         "x$use_hip_device_compiler" = "xyes"; then
   build_hip_device_objects=yes
@@ -461,6 +462,25 @@ if test "x$enable_hip_portability_check" = "xyes" -o \
   HIP_LIBS=-lamdhip64
   HIP_PIC_FLAGS=-fPIC
 
+  if test "x$use_hip_device_compiler" = "xyes"; then
+    AC_MSG_CHECKING([whether the selected HIP compiler headers support graphs])
+    cat > conftest-hip-graphs.cpp <<'_ACEOF'
+#include <hip/hip_version.h>
+#if defined(HIP_VERSION_MAJOR) && HIP_VERSION_MAJOR >= 7
+meep_hip_graph_headers_available
+#endif
+_ACEOF
+    if $HIPCC -x hip -E $HIPCCFLAGS $HIP_ARCH_FLAGS $HIP_CPPFLAGS \
+         conftest-hip-graphs.cpp > conftest-hip-graphs.i 2>&AS_MESSAGE_LOG_FD && \
+         grep meep_hip_graph_headers_available conftest-hip-graphs.i >/dev/null 2>&1; then
+      have_hip_graphs=yes
+      AC_MSG_RESULT([yes])
+    else
+      AC_MSG_RESULT([no])
+    fi
+    rm -f conftest-hip-graphs.cpp conftest-hip-graphs.i
+  fi
+
   AC_MSG_CHECKING([whether hipcc can compile and link a HIP kernel])
   cat > conftest.hip.cpp <<'_ACEOF'
 #include <hip/hip_runtime.h>
@@ -494,6 +514,8 @@ AM_CONDITIONAL([BUILD_HIP_PORTABILITY_CHECK],
                [test "x$enable_hip_portability_check" = "xyes"])
 AM_CONDITIONAL([BUILD_HIP_DEVICE_OBJECTS],
                [test "x$build_hip_device_objects" = "xyes"])
+AM_CONDITIONAL([HAVE_HIP_GRAPHS],
+               [test "x$have_hip_graphs" = "xyes"])
 
 ##############################################################################
 # Compiler flags

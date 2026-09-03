@@ -1150,7 +1150,11 @@ int main(int argc, char **argv) {
                                   "device-restore", true);
     test_cw_graph_workspace_replacement();
     test_cw_graph_operator_fixture(precision_policy);
+#ifdef HAVE_HDF5
     test_cw_graph_checkpoint_roundtrip(precision_policy);
+#else
+    master_printf("nvidia_cw: graph checkpoint SKIP (HDF5 disabled)\n");
+#endif
     test_cw_source_value_graph_reuse();
     test_cw_graph_launch_failure();
     return 0;
