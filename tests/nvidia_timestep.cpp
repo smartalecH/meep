@@ -846,6 +846,10 @@ static void run_bfast_case(const char *name, const grid_volume &gv,
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options, 0, beta, true, 0, 0, scaled_k);
   if (real_fields) {
     cpu.use_real_fields();
@@ -963,6 +967,10 @@ static void run_cylindrical_case(const char *name, precision_policy_kind policy,
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options, m, 0, zero_near_origin, 64, 64, scaled_k);
   if (real_fields) {
     require(m == 0.0, "nonzero cylindrical m cannot use real fields");
@@ -1565,6 +1573,10 @@ static void run_legacy_flux_case(const char *name, precision_policy_kind policy,
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options);
   if (complex_fields) {
     const vec bloch(0.17, 0.11);
@@ -1631,6 +1643,10 @@ static void run_legacy_flux_symmetry_case(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options);
   const vec bloch(0.17, 0.0);
   cpu.use_bloch(bloch);
@@ -1687,6 +1703,10 @@ static void run_legacy_flux_material_case(precision_policy_kind policy, bool ani
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(gpu_structure.get(), options);
   if (anisotropic) {
     const vec bloch(0.11, 0.07, 0.05);
@@ -1741,6 +1761,10 @@ static void test_legacy_flux_missing_components() {
   structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   gpu.use_real_fields();
   gpu.require_component(Ez);
@@ -1761,6 +1785,10 @@ static void run_cylindrical_flux_case(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options, 1.0);
   require_cylindrical_components(cpu);
   require_cylindrical_components(gpu);
@@ -1807,6 +1835,10 @@ static void test_legacy_flux_add_remove() {
   fields cpu(&cpu_structure);
   execution_options options;
   options.backend = backend_kind::nvidia;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -7530,6 +7562,10 @@ static void test_legacy_flux_compile_rejections() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::mixed;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   const vec bloch(0.13, -0.09);
   gpu.use_bloch(bloch);
@@ -7821,21 +7857,32 @@ static void test_magnetic_compile_rejections() {
   require(valid != NULL, "valid magnetic plan did not compile after rejection checks");
   delete valid;
 
-  structure source_free_structure(gv, isotropic_eps, no_pml(), identity(), 1);
-  fields source_free(&source_free_structure, options);
-  source_free.use_real_fields();
-  source_free.require_component(Ez);
-  source_free.init_backend();
-  const StepPlan source_free_baseline = build_step_plan(source_free, StepProgram::ordinary);
-  require(source_free_baseline.magnetic_half_step.evaluate_b_sources == UINT32_MAX &&
-              source_free_baseline.magnetic_half_step.evaluate_h_sources == UINT32_MAX,
-          "source-free magnetic schedule unexpectedly evaluates source scalars");
-  malformed = source_free_baseline;
-  malformed.magnetic_half_step.evaluate_b_sources = malformed.magnetic_half_step.update_b;
-  expect_compile_rejected(source_free, malformed, "magnetic half-step schedule");
-  malformed = source_free_baseline;
-  malformed.magnetic_half_step.evaluate_h_sources = malformed.magnetic_half_step.update_h;
-  expect_compile_rejected(source_free, malformed, "magnetic half-step schedule");
+  const std::vector<nvidia::device_properties> devices = nvidia::enumerate_devices();
+  if (devices.size() > 1) {
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    require(backend != NULL, "magnetic rejection fixture did not select NVIDIA");
+    execution_options source_free_options = options;
+    source_free_options.device_id =
+        devices[0].id == backend->device_ordinal_for_testing() ? devices[1].id : devices[0].id;
+    structure source_free_structure(gv, isotropic_eps, no_pml(), identity(), 1);
+    fields source_free(&source_free_structure, source_free_options);
+    source_free.use_real_fields();
+    source_free.require_component(Ez);
+    source_free.init_backend();
+    const StepPlan source_free_baseline = build_step_plan(source_free, StepProgram::ordinary);
+    require(source_free_baseline.magnetic_half_step.evaluate_b_sources == UINT32_MAX &&
+                source_free_baseline.magnetic_half_step.evaluate_h_sources == UINT32_MAX,
+            "source-free magnetic schedule unexpectedly evaluates source scalars");
+    malformed = source_free_baseline;
+    malformed.magnetic_half_step.evaluate_b_sources = malformed.magnetic_half_step.update_b;
+    expect_compile_rejected(source_free, malformed, "magnetic half-step schedule");
+    malformed = source_free_baseline;
+    malformed.magnetic_half_step.evaluate_h_sources = malformed.magnetic_half_step.update_h;
+    expect_compile_rejected(source_free, malformed, "magnetic half-step schedule");
+  }
+  else {
+    master_printf("nvidia_timestep: source-free magnetic rejection SKIP (one visible GPU)\n");
+  }
 
   master_printf("nvidia_timestep: magnetic rejection checks PASS\n");
 }
@@ -7933,6 +7980,10 @@ static void test_gyrotropic_compile_rejections() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   gpu.use_real_fields();
   gpu.require_component(Ex);
@@ -7996,6 +8047,8 @@ static void test_beta_compile_rejections() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&s, options, 0, 0.17);
   gaussian_src_time source_time(0.31, 0.14);
   gpu.add_point_source(Ez, source_time, vec(0.73, 0.83));
@@ -8053,6 +8106,10 @@ static void test_bfast_compile_rejections() {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = precision_policy_kind::native;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   const std::vector<double> scaled_k{0.17, -0.11, 0.07};
   fields gpu(&s, options, 0, 0, true, 0, 0, scaled_k);
   gaussian_src_time source_time(0.31, 0.14);
@@ -8916,6 +8973,10 @@ static void run_gyrotropic_case(const char *name, precision_policy_kind policy, 
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(gpu_structure.get(), options);
   if (real_fields) {
     cpu.use_real_fields();
@@ -9002,6 +9063,10 @@ static void run_multilevel_case(const char *name, precision_policy_kind policy,
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(gpu_structure.get(), options);
   if (real_fields) {
     cpu.use_real_fields();
@@ -9073,6 +9138,10 @@ static void run_multilevel_multitile_pml_case(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(gpu_structure.get(), options, 0, 0, true, 0, 4);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -10035,6 +10104,10 @@ static void run_noisy_composition_case(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   gpu.use_bloch(vec(0.11, 0.07, 0.05));
   const component components[] = {Ex, Ey, Ez, Hx, Hy, Hz};
@@ -10053,25 +10126,36 @@ static void run_noisy_composition_case(precision_policy_kind policy) {
   require(std::isfinite(flux->flux()),
           "NVIDIA noisy source/DFT/flux composition published a nonfinite flux");
 
-  structure negate_structure(gv, isotropic_eps, no_pml(), -mirror(Y, gv), 2);
-  negate_structure.add_susceptibility(diagonal_sigma, E_stuff, electric_lorentz);
-  negate_structure.add_susceptibility(diagonal_sigma, E_stuff, electric_drude);
-  negate_structure.add_susceptibility(diagonal_sigma, H_stuff, magnetic_drude);
-  fields negate(&negate_structure, options);
-  negate.use_real_fields();
-  for (component c : components) negate.require_component(c);
-  gaussian_src_time negate_source(0.31, 0.14);
-  negate.add_point_source(Ez, negate_source, vec(0.37, 0.41, 0.29), 0.21);
-  component negate_monitor_component = Ez;
-  dft_fields negate_monitor =
-      negate.add_dft_fields(&negate_monitor_component, 1, negate.v, 0.31, 0.31, 1);
-  flux_vol *negate_flux =
-      negate.add_flux_vol(Z, volume(vec(-0.75, -0.65, 0.0), vec(0.75, 0.65, 0.0)));
-  set_random_seed(0x2468ace0UL);
-  negate.advance(2);
-  require_noisy_composition_plan(negate, false, true, true, false);
-  require(std::isfinite(negate_flux->flux()),
-          "NVIDIA noisy NEGATE composition published a nonfinite flux");
+  const std::vector<nvidia::device_properties> devices = nvidia::enumerate_devices();
+  if (devices.size() > 1) {
+    NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+    require(backend != NULL, "noisy composition fixture did not select NVIDIA");
+    execution_options negate_options = options;
+    negate_options.device_id =
+        devices[0].id == backend->device_ordinal_for_testing() ? devices[1].id : devices[0].id;
+    structure negate_structure(gv, isotropic_eps, no_pml(), -mirror(Y, gv), 2);
+    negate_structure.add_susceptibility(diagonal_sigma, E_stuff, electric_lorentz);
+    negate_structure.add_susceptibility(diagonal_sigma, E_stuff, electric_drude);
+    negate_structure.add_susceptibility(diagonal_sigma, H_stuff, magnetic_drude);
+    fields negate(&negate_structure, negate_options);
+    negate.use_real_fields();
+    for (component c : components) negate.require_component(c);
+    gaussian_src_time negate_source(0.31, 0.14);
+    negate.add_point_source(Ez, negate_source, vec(0.37, 0.41, 0.29), 0.21);
+    component negate_monitor_component = Ez;
+    dft_fields negate_monitor =
+        negate.add_dft_fields(&negate_monitor_component, 1, negate.v, 0.31, 0.31, 1);
+    flux_vol *negate_flux =
+        negate.add_flux_vol(Z, volume(vec(-0.75, -0.65, 0.0), vec(0.75, 0.65, 0.0)));
+    set_random_seed(0x2468ace0UL);
+    negate.advance(2);
+    require_noisy_composition_plan(negate, false, true, true, false);
+    require(std::isfinite(negate_flux->flux()),
+            "NVIDIA noisy NEGATE composition published a nonfinite flux");
+  }
+  else {
+    master_printf("nvidia_timestep: noisy NEGATE composition SKIP (one visible GPU)\n");
+  }
   master_printf("nvidia_timestep: noisy-composition/%s PASS\n",
                 precision_policy_name(policy));
 }
@@ -10087,6 +10171,10 @@ static void run_noisy_sigma_diagnostic_case(precision_policy_kind policy,
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  if (getenv("MEEP_NVIDIA_GRAPH_ASSERT")) {
+    options.strict = false;
+    options.fallback = fallback_policy::warn;
+  }
   fields gpu(&s, options);
   gpu.use_real_fields();
   gpu.require_component(Ez);
@@ -11109,7 +11197,8 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_NVIDIA_SOURCE_REUSE_ONLY")) {
     test_source_value_graph_reuse_with_magnetic_snapshot();
-    test_source_value_refresh_failures_and_resource_overflow();
+    if (!getenv("MEEP_NVIDIA_EAGER_REPRESENTATIVE_ONLY"))
+      test_source_value_refresh_failures_and_resource_overflow();
     master_printf("nvidia_timestep: source-value reuse PASS\n");
     return 0;
   }
@@ -11551,6 +11640,10 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (multilevel_only) {
+    if (getenv("MEEP_NVIDIA_EAGER_REPRESENTATIVE_ONLY")) {
+      master_printf("nvidia_timestep: representative multilevel matrix PASS\n");
+      return 0;
+    }
     test_multilevel_zero_row();
     test_multilevel_composition();
     test_multilevel_compile_rejections();

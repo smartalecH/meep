@@ -68,6 +68,10 @@ noinst_LTLIBRARIES =
 CLEANFILES =
 
 if HAVE_NVIDIA_BACKEND
+libmeep_la_SOURCES += backend/nvidia/nvidia_backend.cpp backend/nvidia/nvidia_mpi.cpp
+endif
+
+if USE_CUDA_DEVICE_COMPILER
 NVIDIA_CUDA_OBJECTS = backend/nvidia/runtime.cuda.lo backend/nvidia/arena.cuda.lo \
 backend/nvidia/nvidia_graph.cuda.lo \
 backend/nvidia/nvidia_step.cuda.lo backend/nvidia/nvidia_boundaries.cuda.lo \
@@ -96,7 +100,6 @@ backend/nvidia/.libs/nvidia_sources.cuda.o backend/nvidia/.libs/nvidia_polarizat
 backend/nvidia/.libs/nvidia_cw.cuda.o
 NVIDIA_CUDA_ARCHIVE = libmeep_nvidia_runtime.la
 noinst_LTLIBRARIES += $(NVIDIA_CUDA_ARCHIVE)
-libmeep_la_SOURCES += backend/nvidia/nvidia_backend.cpp backend/nvidia/nvidia_mpi.cpp
 libmeep_nvidia_runtime_la_SOURCES =
 libmeep_nvidia_runtime_la_DEPENDENCIES = $(NVIDIA_CUDA_OBJECTS)
 libmeep_nvidia_runtime_la_LIBADD = $(NVIDIA_CUDA_OBJECTS)
@@ -355,10 +358,10 @@ $(srcdir)/backend/nvidia/runtime.hpp
 CLEANFILES += $(NVIDIA_CUDA_OBJECTS) $(NVIDIA_CUDA_PIC_OBJECTS)
 endif
 
-if BUILD_HIP_PORTABILITY_CHECK
-HIP_PORTABILITY_RUNTIME_OBJECTS = backend/nvidia/runtime.hip.lo \
+if BUILD_HIP_DEVICE_OBJECTS
+HIP_DEVICE_RUNTIME_OBJECTS = backend/nvidia/runtime.hip.lo \
 backend/nvidia/arena.hip.lo
-HIP_PORTABILITY_SYNTAX_OBJECTS = backend/nvidia/nvidia_graph.hip.lo \
+HIP_DEVICE_OTHER_OBJECTS = backend/nvidia/nvidia_graph.hip.lo \
 backend/nvidia/nvidia_step.hip.lo backend/nvidia/nvidia_boundaries.hip.lo \
 backend/nvidia/nvidia_coordinates.hip.lo backend/nvidia/nvidia_dft.hip.lo \
 backend/nvidia/nvidia_flux.hip.lo backend/nvidia/nvidia_multilevel.hip.lo \
@@ -366,9 +369,8 @@ backend/nvidia/nvidia_magnetic.hip.lo backend/nvidia/nvidia_adjoint.hip.lo \
 backend/nvidia/nvidia_initialization.hip.lo backend/nvidia/nvidia_materials.hip.lo \
 backend/nvidia/nvidia_sources.hip.lo backend/nvidia/nvidia_polarization.hip.lo \
 backend/nvidia/nvidia_cw.hip.lo
-HIP_PORTABILITY_OBJECTS = $(HIP_PORTABILITY_RUNTIME_OBJECTS) \
-$(HIP_PORTABILITY_SYNTAX_OBJECTS)
-HIP_PORTABILITY_HEADER_DEPS = $(srcdir)/backend/nvidia/cuda_hip_compat.hpp \
+HIP_DEVICE_OBJECTS = $(HIP_DEVICE_RUNTIME_OBJECTS) $(HIP_DEVICE_OTHER_OBJECTS)
+HIP_DEVICE_HEADER_DEPS = $(srcdir)/backend/nvidia/cuda_hip_compat.hpp \
 $(srcdir)/backend/nvidia/runtime.hpp $(srcdir)/backend/nvidia/arena.hpp \
 $(srcdir)/backend/nvidia/nvidia_graph.hpp $(srcdir)/backend/graph_plan.hpp \
 $(srcdir)/backend/nvidia/nvidia_step.hpp \
@@ -386,27 +388,20 @@ $(top_builddir)/src/meep/meep-config.h \
 $(srcdir)/backend/nvidia/nvidia_sources.hpp \
 $(srcdir)/backend/nvidia/nvidia_polarization.hpp \
 $(srcdir)/backend/nvidia/nvidia_cw.hpp
-HIP_PORTABILITY_PIC_OBJECTS = \
-$(HIP_PORTABILITY_OBJECTS:backend/nvidia/%.lo=backend/nvidia/.libs/%.o)
-HIP_PORTABILITY_ARCHIVE = libmeep_hip_portability.la
+HIP_DEVICE_PIC_OBJECTS = $(HIP_DEVICE_OBJECTS:backend/nvidia/%.lo=backend/nvidia/.libs/%.o)
 
-noinst_LTLIBRARIES += $(HIP_PORTABILITY_ARCHIVE)
-libmeep_hip_portability_la_SOURCES =
-libmeep_hip_portability_la_DEPENDENCIES = $(HIP_PORTABILITY_RUNTIME_OBJECTS)
-libmeep_hip_portability_la_LIBADD = $(HIP_PORTABILITY_RUNTIME_OBJECTS)
-
-HIP_PORTABILITY_PRECISE_OBJECTS = backend/nvidia/nvidia_coordinates.hip.lo \
+HIP_DEVICE_PRECISE_OBJECTS = backend/nvidia/nvidia_coordinates.hip.lo \
 backend/nvidia/nvidia_multilevel.hip.lo backend/nvidia/nvidia_magnetic.hip.lo \
 backend/nvidia/nvidia_adjoint.hip.lo backend/nvidia/nvidia_initialization.hip.lo \
 backend/nvidia/nvidia_materials.hip.lo backend/nvidia/nvidia_polarization.hip.lo \
 backend/nvidia/nvidia_cw.hip.lo
-$(HIP_PORTABILITY_PRECISE_OBJECTS): HIP_PORTABILITY_LOCAL_FLAGS = $(HIP_PRECISE_FLAGS)
+$(HIP_DEVICE_PRECISE_OBJECTS): HIP_DEVICE_LOCAL_FLAGS = $(HIP_PRECISE_FLAGS)
 
-$(HIP_PORTABILITY_OBJECTS): backend/nvidia/%.hip.lo: \
-$(srcdir)/backend/nvidia/%.cu $(HIP_PORTABILITY_HEADER_DEPS)
+$(HIP_DEVICE_OBJECTS): backend/nvidia/%.hip.lo: \
+$(srcdir)/backend/nvidia/%.cu $(HIP_DEVICE_HEADER_DEPS)
 	$(AM_V_at)$(MKDIR_P) $(dir $@).libs
 	$(AM_V_GEN)$(HIPCC) -std=c++11 $(HIPCCFLAGS) $(HIP_ARCH_FLAGS) \
-	  $(HIP_PIC_FLAGS) $(HIP_CPPFLAGS) $(AM_CPPFLAGS) $(HIP_PORTABILITY_LOCAL_FLAGS) \
+	  $(HIP_PIC_FLAGS) $(HIP_CPPFLAGS) $(AM_CPPFLAGS) $(HIP_DEVICE_LOCAL_FLAGS) \
 	  -c $< -o $(dir $@).libs/$(notdir $(@:.lo=.o))
 	$(AM_V_at){ \
 	  echo "# $@ - a libtool object file"; \
@@ -417,12 +412,33 @@ $(srcdir)/backend/nvidia/%.cu $(HIP_PORTABILITY_HEADER_DEPS)
 	  echo "non_pic_object='none'"; \
 	} > $@
 
+CLEANFILES += $(HIP_DEVICE_OBJECTS) $(HIP_DEVICE_PIC_OBJECTS)
+endif
+
+if USE_HIP_DEVICE_COMPILER
+AMD_HIP_ARCHIVE = libmeep_amd_runtime.la
+noinst_LTLIBRARIES += $(AMD_HIP_ARCHIVE)
+libmeep_amd_runtime_la_SOURCES =
+libmeep_amd_runtime_la_DEPENDENCIES = $(HIP_DEVICE_OBJECTS)
+libmeep_amd_runtime_la_LIBADD = $(HIP_DEVICE_OBJECTS)
+libmeep_la_LIBADD += $(AMD_HIP_ARCHIVE) $(HIP_LIBS)
+libmeep_la_LDFLAGS += $(HIP_LDFLAGS)
+
+.PHONY: amd-eager-build-check
+amd-eager-build-check: $(AMD_HIP_ARCHIVE)
+endif
+
+if BUILD_HIP_PORTABILITY_CHECK
+HIP_PORTABILITY_ARCHIVE = libmeep_hip_portability.la
+noinst_LTLIBRARIES += $(HIP_PORTABILITY_ARCHIVE)
+libmeep_hip_portability_la_SOURCES =
+libmeep_hip_portability_la_DEPENDENCIES = $(HIP_DEVICE_RUNTIME_OBJECTS)
+libmeep_hip_portability_la_LIBADD = $(HIP_DEVICE_RUNTIME_OBJECTS)
+
 .PHONY: hip-portability-build-check
-hip-portability-build-check: $(HIP_PORTABILITY_ARCHIVE) $(HIP_PORTABILITY_SYNTAX_OBJECTS)
+hip-portability-build-check: $(HIP_PORTABILITY_ARCHIVE) $(HIP_DEVICE_OTHER_OBJECTS)
 
 all-local: hip-portability-build-check
-
-CLEANFILES += $(HIP_PORTABILITY_OBJECTS) $(HIP_PORTABILITY_PIC_OBJECTS)
 endif
 
 PRELUDE = "/* This file was automatically generated --- DO NOT EDIT */"

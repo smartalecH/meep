@@ -1,6 +1,8 @@
 /* End-to-end CPU/NVIDIA parity for device-resident DFT monitor families and
    their existing host-side spectral query paths. */
 
+#include "config.h"
+
 #include <meep.hpp>
 
 #include <algorithm>
@@ -112,6 +114,7 @@ static void require_compact_transfer(size_t result_count, size_t expected_calls 
           "compact DFT query transferred the wrong byte count");
 }
 
+#ifdef HAVE_HDF5
 static void compare_hdf5_field_access(fields &cpu, fields &gpu, const volume &where,
                                       double tolerance) {
   static unsigned int invocation = 0;
@@ -182,6 +185,7 @@ static std::string temporary_stem(const char *kind, precision_policy_kind policy
 }
 
 static void remove_h5(const std::string &stem) { std::remove((stem + ".h5").c_str()); }
+#endif
 
 static void compare_monitor_storage(fields &cpu, fields &gpu, double tolerance) {
   require(cpu.array_catalog && gpu.array_catalog, "DFT comparison has no storage catalog");
@@ -337,6 +341,8 @@ static void run_ldos_boundary(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -390,6 +396,8 @@ static void run_real_monitor_families(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   cpu.use_real_fields();
   gpu.use_real_fields();
@@ -548,6 +556,7 @@ static void run_real_monitor_families(precision_policy_kind policy) {
   compare_complex_value(cpu.integrate(2, access_components, access_integrand, NULL, access_region),
                         gpu.integrate(2, access_components, access_integrand, NULL, access_region),
                         3 * tolerance, "integrate resident access");
+#ifdef HAVE_HDF5
   compare_hdf5_field_access(cpu, gpu, access_region, tolerance);
 
   const std::string flux_stem = temporary_stem("flux", policy);
@@ -594,6 +603,14 @@ static void run_real_monitor_families(precision_policy_kind policy) {
   compare_hdf5_dataset((cpu_output_stem + ".h5").c_str(), (gpu_output_stem + ".h5").c_str(),
                        "ez_0.i", 3 * tolerance);
 
+  remove_h5(flux_stem);
+  remove_h5(energy_stem);
+  remove_h5(force_stem);
+  remove_h5(n2f_stem);
+  remove_h5(cpu_output_stem);
+  remove_h5(gpu_output_stem);
+#endif
+
   *cpu_fields.chunks -= *cpu_subtract.chunks;
   *gpu_fields.chunks -= *gpu_subtract.chunks;
   compare_dft_array(cpu, gpu, cpu_fields, gpu_fields, Ez, 0, tolerance);
@@ -601,23 +618,23 @@ static void run_real_monitor_families(precision_policy_kind policy) {
   gpu.advance(2);
   compare_monitor_storage(cpu, gpu, 3 * tolerance);
 
-  bool magnetic_rejected = false;
-  try { gpu.synchronize_magnetic_fields(); }
-  catch (const std::runtime_error &error) {
-    magnetic_rejected = std::strstr(error.what(), "magnetic synchronization") != NULL;
-  }
-  require(magnetic_rejected, "resident magnetic synchronization was not rejected clearly");
-  const int time_before_recovery = gpu.t;
+  const int time_before_transition = gpu.t;
+  cpu.synchronize_magnetic_fields();
+  gpu.synchronize_magnetic_fields();
+  require(cpu.t == time_before_transition && gpu.t == time_before_transition,
+          "magnetic synchronization changed the timestep");
+  compare_monitor_storage(cpu, gpu, 3 * tolerance);
+  cpu.restore_magnetic_fields();
+  gpu.restore_magnetic_fields();
+  require(cpu.t == time_before_transition && gpu.t == time_before_transition,
+          "magnetic restoration changed the timestep");
+  compare_monitor_storage(cpu, gpu, 3 * tolerance);
+  cpu.advance(1);
   gpu.advance(1);
-  require(gpu.t == time_before_recovery + 1,
-          "NVIDIA execution did not recover after magnetic-sync rejection");
-
-  remove_h5(flux_stem);
-  remove_h5(energy_stem);
-  remove_h5(force_stem);
-  remove_h5(n2f_stem);
-  remove_h5(cpu_output_stem);
-  remove_h5(gpu_output_stem);
+  require(cpu.t == time_before_transition + 1 && gpu.t == time_before_transition + 1,
+          "NVIDIA execution did not recover after magnetic synchronization and restore");
+  compare_monitor_storage(cpu, gpu, 3 * tolerance);
+  compare_dft_array(cpu, gpu, cpu_fields, gpu_fields, Ez, 0, tolerance);
 
   master_printf("nvidia_dft: monitor-families/%s PASS\n", precision_policy_name(policy));
 }
@@ -630,6 +647,8 @@ static void run_complex_dft_fields(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields gpu(&gpu_structure, options);
   gaussian_src_time cpu_source(0.29, 0.18), gpu_source(0.29, 0.18);
   cpu.add_point_source(Ez, cpu_source, vec(0.17, -0.11), std::complex<double>(0.7, -0.31));

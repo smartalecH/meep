@@ -110,10 +110,10 @@ if test "x$enable_ccache" != "xno"; then
 fi
 
 ##############################################################################
-# optional NVIDIA accelerator backend
+# optional accelerator backend
 
 AC_ARG_WITH([accelerator],
-            [AS_HELP_STRING([--with-accelerator=no|nvidia],
+            [AS_HELP_STRING([--with-accelerator=no|nvidia|amd],
                             [build an accelerator backend (default: no)])],
             [with_accelerator=$withval], [with_accelerator=no])
 AC_ARG_WITH([cuda],
@@ -131,9 +131,8 @@ AC_ARG_WITH([cuda-host-compiler],
 AC_ARG_VAR([NVCC], [NVIDIA CUDA compiler])
 AC_ARG_VAR([NVCCFLAGS], [additional NVIDIA CUDA compiler flags])
 
-# This is intentionally a private build/portability check, not a selectable
-# backend.  Production AMD selection is added only after the shared device
-# implementation is integrated and tested.
+# This switch remains a private build/portability check.  Production AMD
+# selection is controlled independently by --with-accelerator=amd.
 AC_ARG_ENABLE([hip-portability-check],
               [AS_HELP_STRING([--enable-hip-portability-check],
                               [build the private HIP portability checks (default: no)])],
@@ -141,7 +140,7 @@ AC_ARG_ENABLE([hip-portability-check],
               [enable_hip_portability_check=no])
 AC_ARG_WITH([rocm],
             [AS_HELP_STRING([--with-rocm=DIR],
-                            [ROCm toolkit prefix for the private HIP portability checks])],
+                            [ROCm toolkit prefix for AMD/HIP builds])],
             [rocm_prefix=$withval], [rocm_prefix=])
 AC_ARG_WITH([hip-architectures],
             [AS_HELP_STRING([--with-hip-architectures=LIST],
@@ -155,10 +154,40 @@ AC_ARG_VAR([HIP_PRECISE_FLAGS],
            [HIP flags for sources that disable fused multiply-add])
 
 case "$with_accelerator" in
-  no) have_nvidia_backend=no ;;
-  nvidia) have_nvidia_backend=yes ;;
-  *) AC_MSG_ERROR([--with-accelerator must be no or nvidia]) ;;
+  no)
+    have_nvidia_backend=no
+    use_cuda_device_compiler=no
+    use_hip_device_compiler=no
+    ;;
+  nvidia)
+    have_nvidia_backend=yes
+    use_cuda_device_compiler=yes
+    use_hip_device_compiler=no
+    ;;
+  amd)
+    have_nvidia_backend=yes
+    use_cuda_device_compiler=no
+    use_hip_device_compiler=yes
+    ;;
+  *) AC_MSG_ERROR([--with-accelerator must be no, nvidia, or amd]) ;;
 esac
+
+if test "x$use_hip_device_compiler" = "xyes" -a "x$with_mpi" = "xyes"; then
+  AC_MSG_ERROR([--with-accelerator=amd does not support MPI until staged HIP transport is enabled])
+fi
+
+if test "x$use_hip_device_compiler" = "xyes"; then
+  if test -n "$cuda_prefix" -o -n "$cuda_architectures" -o \
+          -n "$cuda_host_compiler"; then
+    AC_MSG_ERROR([CUDA toolkit options cannot be used with --with-accelerator=amd])
+  fi
+fi
+if test "x$use_cuda_device_compiler" = "xyes" -a \
+        "x$enable_hip_portability_check" != "xyes"; then
+  if test -n "$rocm_prefix" -o -n "$hip_architectures"; then
+    AC_MSG_ERROR([ROCm toolkit options cannot be used with --with-accelerator=nvidia])
+  fi
+fi
 
 CUDA_CPPFLAGS=
 CUDA_LDFLAGS=
@@ -168,7 +197,7 @@ CUDA_ARCH_FLAGS=
 CUDA_PIC_FLAGS=
 CUDA_HOST_FLAGS=
 
-if test "x$have_nvidia_backend" = "xyes"; then
+if test "x$use_cuda_device_compiler" = "xyes"; then
   if test "x$cuda_prefix" = "xyes" -o "x$cuda_prefix" = "xno"; then
     AC_MSG_ERROR([--with-cuda requires an explicit toolkit directory])
   fi
@@ -265,8 +294,6 @@ _ACEOF
   fi
   rm -f conftest.cu conftest-cuda
 
-  AC_DEFINE([HAVE_NVIDIA_BACKEND], [1],
-            [Define if the private NVIDIA accelerator backend is enabled])
 fi
 
 AC_SUBST([CUDA_ARCHITECTURES])
@@ -279,9 +306,18 @@ AC_SUBST([CUDA_PIC_FLAGS])
 AC_SUBST([CUDA_HOST_FLAGS])
 AM_CONDITIONAL([HAVE_NVIDIA_BACKEND],
                [test "x$have_nvidia_backend" = "xyes"])
+AM_CONDITIONAL([USE_CUDA_DEVICE_COMPILER],
+               [test "x$use_cuda_device_compiler" = "xyes"])
+AM_CONDITIONAL([USE_HIP_DEVICE_COMPILER],
+               [test "x$use_hip_device_compiler" = "xyes"])
+
+if test "x$have_nvidia_backend" = "xyes"; then
+  AC_DEFINE([HAVE_NVIDIA_BACKEND], [1],
+            [Define if the NVIDIA-compatible accelerator backend is enabled])
+fi
 
 ##############################################################################
-# private AMD HIP portability checks
+# AMD HIP device compiler (production and private portability checks)
 
 case "$enable_hip_portability_check" in
   yes|no) ;;
@@ -298,7 +334,10 @@ if test -z "$HIP_PRECISE_FLAGS"; then
   HIP_PRECISE_FLAGS=-ffp-contract=off
 fi
 
-if test "x$enable_hip_portability_check" = "xyes"; then
+build_hip_device_objects=no
+if test "x$enable_hip_portability_check" = "xyes" -o \
+        "x$use_hip_device_compiler" = "xyes"; then
+  build_hip_device_objects=yes
   rocm_prefix_was_explicit=no
   hipcc_was_explicit=no
   if test -n "$HIPCC"; then
@@ -349,14 +388,14 @@ if test "x$enable_hip_portability_check" = "xyes"; then
     *) HIPCONFIG=`command -v "$HIPCONFIG" 2>/dev/null` ;;
   esac
   if test ! -x "$HIPCC"; then
-    AC_MSG_ERROR([hipcc is required for --enable-hip-portability-check])
+    AC_MSG_ERROR([hipcc is required for AMD/HIP builds])
   fi
   if test "x$rocm_prefix_was_explicit" = "xyes" -a \
           "x$hipcc_was_explicit" = "xyes"; then
     AC_MSG_NOTICE([using user-supplied HIPCC override with requested ROCm toolkit: $HIPCC])
   fi
   if test ! -x "$HIPCONFIG"; then
-    AC_MSG_ERROR([hipconfig is required for --enable-hip-portability-check])
+    AC_MSG_ERROR([hipconfig is required for AMD/HIP builds])
   fi
   hipconfig_prefix=`$HIPCONFIG --path 2>/dev/null`
   hipconfig_prefix=`cd "$hipconfig_prefix" 2>/dev/null && pwd -P`
@@ -370,7 +409,7 @@ if test "x$enable_hip_portability_check" = "xyes"; then
   rocm_prefix=$hipconfig_prefix
   hip_platform=`$HIPCONFIG --platform 2>/dev/null`
   if test "x$hip_platform" != "xamd"; then
-    AC_MSG_ERROR([the HIP portability checks require the AMD HIP platform])
+    AC_MSG_ERROR([AMD/HIP builds require the AMD HIP platform])
   fi
   if test -z "$rocm_prefix"; then
     AC_MSG_ERROR([hipconfig did not report a ROCm toolkit prefix])
@@ -380,7 +419,7 @@ if test "x$enable_hip_portability_check" = "xyes"; then
     AC_MSG_ERROR([ROCm toolkit directory does not exist])
   fi
   if test -z "$hip_architectures"; then
-    AC_MSG_ERROR([--with-hip-architectures is required for the HIP portability checks])
+    AC_MSG_ERROR([--with-hip-architectures is required for AMD/HIP builds])
   fi
   case "$hip_architectures" in
     ,*|*,|*,,*)
@@ -453,6 +492,8 @@ AC_SUBST([HIP_PIC_FLAGS])
 AC_SUBST([HIP_PRECISE_FLAGS])
 AM_CONDITIONAL([BUILD_HIP_PORTABILITY_CHECK],
                [test "x$enable_hip_portability_check" = "xyes"])
+AM_CONDITIONAL([BUILD_HIP_DEVICE_OBJECTS],
+               [test "x$build_hip_device_objects" = "xyes"])
 
 ##############################################################################
 # Compiler flags

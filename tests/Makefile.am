@@ -182,20 +182,53 @@ else
 endif
 
 if HAVE_NVIDIA_BACKEND
-NVIDIA_CUDA_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
-NVIDIA_CUDA_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
-NVIDIA_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_graph_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke nvidia_adjoint_smoke
+NVIDIA_EAGER_RUNTIME_TESTS = nvidia_runtime_smoke nvidia_arena_smoke nvidia_step_smoke nvidia_polarization_smoke nvidia_multilevel_smoke nvidia_dft_smoke nvidia_dft_reduction_smoke nvidia_flux_smoke nvidia_cw_smoke nvidia_initialization_smoke nvidia_adjoint_smoke
+NVIDIA_RUNTIME_TESTS = $(NVIDIA_EAGER_RUNTIME_TESTS)
+NVIDIA_INTEGRATION_TESTS = nvidia_backend_state nvidia_device_reservation nvidia_timestep nvidia_dft nvidia_cw
+
+if USE_CUDA_DEVICE_COMPILER
+NVIDIA_DEVICE_LIBRARY = $(top_builddir)/src/libmeep_nvidia_runtime.la
+NVIDIA_DEVICE_ARCHIVE = $(top_builddir)/src/.libs/libmeep_nvidia_runtime.a
+NVIDIA_DEVICE_BUILD_TARGET = libmeep_nvidia_runtime.la
+NVIDIA_DEVICE_COMPILER = $(NVCC)
+NVIDIA_DEVICE_HOST_FLAGS = $(CUDA_HOST_FLAGS)
+NVIDIA_DEVICE_FLAGS = $(NVCCFLAGS)
+NVIDIA_DEVICE_ARCH_FLAGS = $(CUDA_ARCH_FLAGS)
+NVIDIA_DEVICE_CPPFLAGS = $(CUDA_CPPFLAGS)
+NVIDIA_DEVICE_LINKER_FLAGS = $(CUDA_NVCC_LDFLAGS)
+NVIDIA_DEVICE_LIBS = $(CUDA_LIBS)
+NVIDIA_DEVICE_PRECISE_FLAGS = --fmad=false
+NVIDIA_RUNTIME_TESTS += nvidia_graph_smoke
+TESTS += $(NVIDIA_INTEGRATION_TESTS)
+endif
+
+if USE_HIP_DEVICE_COMPILER
+NVIDIA_DEVICE_LIBRARY = $(top_builddir)/src/libmeep_amd_runtime.la
+NVIDIA_DEVICE_ARCHIVE = $(top_builddir)/src/.libs/libmeep_amd_runtime.a
+NVIDIA_DEVICE_BUILD_TARGET = amd-eager-build-check
+NVIDIA_DEVICE_COMPILER = $(HIPCC)
+NVIDIA_DEVICE_FLAGS = $(HIPCCFLAGS)
+NVIDIA_DEVICE_ARCH_FLAGS = $(HIP_ARCH_FLAGS)
+NVIDIA_DEVICE_CPPFLAGS = $(HIP_CPPFLAGS)
+NVIDIA_DEVICE_LINKER_FLAGS = $(HIP_LDFLAGS)
+NVIDIA_DEVICE_LIBS = $(HIP_LIBS)
+NVIDIA_DEVICE_SOURCE_FLAGS = -x hip
+NVIDIA_DEVICE_LINK_FLAGS = -x none
+NVIDIA_DEVICE_PRECISE_FLAGS = $(HIP_PRECISE_FLAGS)
+endif
+
 if WITH_MPI
+if USE_CUDA_DEVICE_COMPILER
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
 check_PROGRAMS += nvidia_staged_transport
 TESTS += nvidia_staged_transport
 nvidia_staged_transport_SOURCES = nvidia_staged_transport.cpp
 nvidia_staged_transport_LDADD = $(MEEPLIBS)
 endif
+endif
 check_SCRIPTS += $(NVIDIA_RUNTIME_TESTS)
-check_PROGRAMS += nvidia_backend_state nvidia_device_reservation nvidia_timestep nvidia_dft nvidia_cw
-TESTS += nvidia_backend_state nvidia_device_reservation nvidia_timestep nvidia_dft nvidia_cw
-CLEANFILES += $(NVIDIA_RUNTIME_TESTS)
+check_PROGRAMS += $(NVIDIA_INTEGRATION_TESTS)
+CLEANFILES += $(NVIDIA_RUNTIME_TESTS) nvidia-required-graph-rejection.log
 nvidia_backend_state_SOURCES = nvidia_backend_state.cpp
 nvidia_backend_state_LDADD = $(MEEPLIBS)
 nvidia_device_reservation_SOURCES = nvidia_device_reservation.cpp
@@ -207,13 +240,27 @@ nvidia_dft_LDADD = $(MEEPLIBS)
 nvidia_cw_SOURCES = nvidia_cw.cpp
 nvidia_cw_LDADD = $(MEEPLIBS)
 
-check-local: check-TESTS
-	$(MAKE) nvidia-runtime-check
+if USE_HIP_DEVICE_COMPILER
+nvidia_backend_state_LDFLAGS = $(HIP_LDFLAGS)
+nvidia_device_reservation_LDFLAGS = $(HIP_LDFLAGS)
+nvidia_timestep_LDFLAGS = $(HIP_LDFLAGS)
+nvidia_dft_LDFLAGS = $(HIP_LDFLAGS)
+nvidia_cw_LDFLAGS = $(HIP_LDFLAGS)
+endif
 
-.PHONY: nvidia-runtime-check
-nvidia-runtime-check: $(NVIDIA_RUNTIME_TESTS)
+check-local: check-TESTS
+
+if USE_CUDA_DEVICE_COMPILER
+	$(MAKE) nvidia-runtime-check
+endif
+
+if USE_HIP_DEVICE_COMPILER
+	$(MAKE) amd-eager-check
+endif
+
+.PHONY: nvidia-eager-runtime-check nvidia-runtime-check amd-eager-check
+nvidia-eager-runtime-check: $(NVIDIA_EAGER_RUNTIME_TESTS)
 	./nvidia_runtime_smoke
-	./nvidia_graph_smoke
 	./nvidia_arena_smoke
 	./nvidia_step_smoke
 	./nvidia_polarization_smoke
@@ -224,82 +271,152 @@ nvidia-runtime-check: $(NVIDIA_RUNTIME_TESTS)
 	./nvidia_cw_smoke
 	./nvidia_initialization_smoke
 	./nvidia_adjoint_smoke
+
+nvidia-runtime-check: nvidia-eager-runtime-check $(NVIDIA_RUNTIME_TESTS)
+if USE_CUDA_DEVICE_COMPILER
+	./nvidia_graph_smoke
 if WITH_MPI
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=staged
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=auto
 endif
+endif
 
-$(NVIDIA_CUDA_LIBRARY):
-	$(MAKE) -C $(top_builddir)/src libmeep_nvidia_runtime.la
+if USE_HIP_DEVICE_COMPILER
+# PR2 validates eager, single-rank execution. The field-layout switch narrowly
+# defers an existing backend-neutral candidate-preparation lifecycle defect.
+amd-eager-check: nvidia-eager-runtime-check $(NVIDIA_INTEGRATION_TESTS)
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_SKIP_FIELD_LAYOUT_REBUILD=1 \
+	  ./nvidia_backend_state
+	MEEP_NVIDIA_GRAPH_MODE=eager ./nvidia_device_reservation
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_BETA_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_GYRO_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_BFAST_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_CYLINDRICAL_ONLY=1 \
+	  MEEP_NVIDIA_CYLINDRICAL_CASE=m0-real-pml-conductive ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_MAGNETIC_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_MATERIAL_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_FLUX_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_NOISY_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_TIMESTEP_MULTILEVEL_ONLY=1 \
+	  MEEP_NVIDIA_EAGER_REPRESENTATIVE_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_GRAPH_ASSERT=1 \
+	  MEEP_NVIDIA_SOURCE_REUSE_ONLY=1 \
+	  MEEP_NVIDIA_EAGER_REPRESENTATIVE_ONLY=1 ./nvidia_timestep
+	MEEP_NVIDIA_GRAPH_MODE=eager ./nvidia_dft
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_HIP_EAGER_TOLERANCE=1 \
+	  ./nvidia_cw --precision=native
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_HIP_EAGER_TOLERANCE=1 \
+	  ./nvidia_cw --precision=mixed
+	MEEP_NVIDIA_GRAPH_MODE=eager MEEP_NVIDIA_HIP_EAGER_TOLERANCE=1 \
+	  ./nvidia_cw --precision=f32
+	@set -e; log=nvidia-required-graph-rejection.log; \
+	  if MEEP_NVIDIA_GRAPH_MODE=required ./nvidia_backend_state >$$log 2>&1; then \
+	    cat $$log; \
+	    echo "required graph mode unexpectedly succeeded" >&2; \
+	    exit 1; \
+	  fi; \
+	  cat $$log; \
+	  grep -F "required CUDA graph mode is unsupported" $$log >/dev/null; \
+	  rm -f $$log
+endif
 
-$(NVIDIA_CUDA_ARCHIVE): $(NVIDIA_CUDA_LIBRARY)
+$(NVIDIA_DEVICE_LIBRARY):
+	$(MAKE) -C $(top_builddir)/src $(NVIDIA_DEVICE_BUILD_TARGET)
+
+$(NVIDIA_DEVICE_ARCHIVE): $(NVIDIA_DEVICE_LIBRARY)
 	$(AM_V_at)test -f $@
 
-nvidia_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+nvidia_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
+
+nvidia_graph_smoke: $(srcdir)/nvidia_graph_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
 	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
+	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_DEVICE_ARCHIVE) \
 	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
 
-nvidia_graph_smoke: $(srcdir)/nvidia_graph_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_arena_smoke: $(srcdir)/nvidia_arena_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_arena_smoke: $(srcdir)/nvidia_arena_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_step_smoke: $(srcdir)/nvidia_step_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_step_smoke: $(srcdir)/nvidia_step_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_polarization_smoke: $(srcdir)/nvidia_polarization_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_polarization_smoke: $(srcdir)/nvidia_polarization_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_multilevel_smoke: $(srcdir)/nvidia_multilevel_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_PRECISE_FLAGS) $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) \
+	  $(NVIDIA_DEVICE_CPPFLAGS) $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< \
+	  $(NVIDIA_DEVICE_LINK_FLAGS) $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) \
+	  $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_multilevel_smoke: $(srcdir)/nvidia_multilevel_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 --fmad=false $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_dft_smoke: $(srcdir)/nvidia_dft_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_dft_smoke: $(srcdir)/nvidia_dft_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_dft_reduction_smoke: $(srcdir)/nvidia_dft_reduction_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_dft_reduction_smoke: $(srcdir)/nvidia_dft_reduction_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_flux_smoke: $(srcdir)/nvidia_flux_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) $(NVIDIA_DEVICE_CPPFLAGS) \
+	  $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< $(NVIDIA_DEVICE_LINK_FLAGS) \
+	  $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_flux_smoke: $(srcdir)/nvidia_flux_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_cw_smoke: $(srcdir)/nvidia_cw_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_PRECISE_FLAGS) $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) \
+	  $(NVIDIA_DEVICE_CPPFLAGS) $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< \
+	  $(NVIDIA_DEVICE_LINK_FLAGS) $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) \
+	  $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_cw_smoke: $(srcdir)/nvidia_cw_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 --fmad=false $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_initialization_smoke: $(srcdir)/nvidia_initialization_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_PRECISE_FLAGS) $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) \
+	  $(NVIDIA_DEVICE_CPPFLAGS) $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< \
+	  $(NVIDIA_DEVICE_LINK_FLAGS) $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) \
+	  $(NVIDIA_DEVICE_LIBS) -o $@
 
-nvidia_initialization_smoke: $(srcdir)/nvidia_initialization_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 --fmad=false $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
-
-nvidia_adjoint_smoke: $(srcdir)/nvidia_adjoint_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 --fmad=false $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
-	  $(CUDA_CPPFLAGS) $(AM_CPPFLAGS) $< $(NVIDIA_CUDA_ARCHIVE) \
-	  $(CUDA_NVCC_LDFLAGS) $(CUDA_LIBS) -o $@
+nvidia_adjoint_smoke: $(srcdir)/nvidia_adjoint_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
+	$(AM_V_GEN)$(NVIDIA_DEVICE_COMPILER) $(NVIDIA_DEVICE_HOST_FLAGS) -std=c++11 \
+	  $(NVIDIA_DEVICE_PRECISE_FLAGS) $(NVIDIA_DEVICE_FLAGS) $(NVIDIA_DEVICE_ARCH_FLAGS) \
+	  $(NVIDIA_DEVICE_CPPFLAGS) $(AM_CPPFLAGS) $(NVIDIA_DEVICE_SOURCE_FLAGS) $< \
+	  $(NVIDIA_DEVICE_LINK_FLAGS) $(NVIDIA_DEVICE_ARCHIVE) $(NVIDIA_DEVICE_LINKER_FLAGS) \
+	  $(NVIDIA_DEVICE_LIBS) -o $@
 
 if WITH_MPI
-nvidia_mpi_runtime_smoke: $(srcdir)/nvidia_mpi_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
+if USE_CUDA_DEVICE_COMPILER
+nvidia_mpi_runtime_smoke: $(srcdir)/nvidia_mpi_runtime_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
 	$(AM_V_GEN)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(CPPFLAGS) $(AM_CPPFLAGS) \
 	  $(CXXFLAGS) -x c++ $< -x none \
-	  $(NVIDIA_CUDA_ARCHIVE) $(CUDA_LDFLAGS) $(CUDA_LIBS) $(LIBS) -o $@
+	  $(NVIDIA_DEVICE_ARCHIVE) $(CUDA_LDFLAGS) $(CUDA_LIBS) $(LIBS) -o $@
+endif
 endif
 endif
 
