@@ -303,6 +303,37 @@ nvidia_mpi_runtime_smoke: $(srcdir)/nvidia_mpi_runtime_smoke.cu $(NVIDIA_CUDA_AR
 endif
 endif
 
+if BUILD_HIP_PORTABILITY_CHECK
+HIP_PORTABILITY_ARCHIVE = $(top_builddir)/src/.libs/libmeep_hip_portability.a
+HIP_PORTABILITY_RUNTIME_TESTS = hip_portability_runtime_smoke hip_portability_arena_smoke
+CLEANFILES += $(HIP_PORTABILITY_RUNTIME_TESTS)
+
+.PHONY: hip-portability-runtime-check hip-portability-source-build-check
+hip-portability-runtime-check: $(HIP_PORTABILITY_RUNTIME_TESTS)
+	./hip_portability_runtime_smoke
+	./hip_portability_arena_smoke
+
+# The source-side target also compiles the other device units as syntax gates.
+# Keeping this prerequisite phony makes the explicit runtime target revalidate
+# the complete private portability surface before it executes either smoke.
+hip-portability-source-build-check:
+	$(MAKE) -C $(top_builddir)/src hip-portability-build-check
+	$(AM_V_at)test -f $(HIP_PORTABILITY_ARCHIVE)
+
+$(HIP_PORTABILITY_ARCHIVE): hip-portability-source-build-check
+	$(AM_V_at)test -f $@
+
+hip_portability_runtime_smoke: $(srcdir)/nvidia_runtime_smoke.cu $(HIP_PORTABILITY_ARCHIVE)
+	$(AM_V_GEN)$(HIPCC) -std=c++11 $(HIPCCFLAGS) $(HIP_ARCH_FLAGS) \
+	  $(HIP_PIC_FLAGS) $(HIP_CPPFLAGS) $(AM_CPPFLAGS) -x hip $< -x none \
+	  $(HIP_PORTABILITY_ARCHIVE) $(HIP_LDFLAGS) $(HIP_LIBS) -o $@
+
+hip_portability_arena_smoke: $(srcdir)/nvidia_arena_smoke.cu $(HIP_PORTABILITY_ARCHIVE)
+	$(AM_V_GEN)$(HIPCC) -std=c++11 $(HIPCCFLAGS) $(HIP_ARCH_FLAGS) \
+	  $(HIP_PIC_FLAGS) $(HIP_CPPFLAGS) $(AM_CPPFLAGS) -x hip $< -x none \
+	  $(HIP_PORTABILITY_ARCHIVE) $(HIP_LDFLAGS) $(HIP_LIBS) -o $@
+endif
+
 # Note: this requires GNU make
 
 .o.dac:

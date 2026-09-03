@@ -7,8 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_magnetic.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <limits>
 #include <stdexcept>

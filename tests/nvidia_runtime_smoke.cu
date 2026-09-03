@@ -1,4 +1,4 @@
-/* Standalone CUDA runtime smoke test. It intentionally has no dependency on
+/* Standalone accelerator runtime smoke test. It intentionally has no dependency on
    libmeep so it can be compiled before the Phase-1 backend API is finalized. */
 
 #include "backend/nvidia/runtime.hpp"
@@ -61,6 +61,8 @@ private:
 void test_selection(int count) {
   saved_environment saved("MEEP_DEVICE_ID");
   unsetenv("MEEP_DEVICE_ID");
+  const int collision_test_size = count > 1 ? count : 2;
+  const bool collision_test_sharing = count == 1;
 
   const device_selection rank_selected = select_device(-1, count - 1, count, false);
   require(rank_selected.device == count - 1, "node-local rank selection failed");
@@ -70,20 +72,23 @@ void test_selection(int count) {
           "automatic rank mapping should not require collision validation");
 
   setenv("MEEP_DEVICE_ID", "0", 1);
-  const device_selection environment_selected = select_device(-1, count - 1, count, false);
+  const device_selection environment_selected =
+      select_device(-1, collision_test_size - 1, collision_test_size, collision_test_sharing);
   require(environment_selected.device == 0, "MEEP_DEVICE_ID selection failed");
   require(environment_selected.source == selection_source::environment,
           "environment source not reported");
   require(environment_selected.collective_collision_check_required,
           "environment assignment did not request collective collision validation");
 
-  const device_selection duplicate_environment = select_device(-1, 0, count, false);
+  const device_selection duplicate_environment =
+      select_device(-1, 0, collision_test_size, collision_test_sharing);
   require(duplicate_environment.device == environment_selected.device,
           "duplicate environment assignment was not reproduced locally");
   require(duplicate_environment.collective_collision_check_required,
           "duplicate environment assignment was incorrectly declared collision-free");
 
-  const device_selection explicit_selected = select_device(count - 1, 0, count, false);
+  const device_selection explicit_selected =
+      select_device(count - 1, 0, collision_test_size, collision_test_sharing);
   require(explicit_selected.device == count - 1, "explicit selection did not take precedence");
   require(explicit_selected.source == selection_source::explicit_option,
           "explicit source not reported");
@@ -294,7 +299,7 @@ void test_move_operations() {
           "pinned accounting changed across move operations");
 }
 
-void test_checked_release_failures() {
+void test_checked_release_failures(int other_device) {
   const size_t bytes = 4096;
   const memory_accounting before = current_memory_accounting();
   device_scope selected(0);
@@ -303,15 +308,16 @@ void test_checked_release_failures() {
   void *device_address = device_storage.opaque_handle();
   bool device_reset_failed = false;
   {
-    device_scope other(1);
+    device_scope other(other_device);
     fail_next(failure_point::device_free);
     try {
       device_storage.reset();
     }
     catch (const meep::nvidia::runtime_error &) { device_reset_failed = true; }
-    require_active_device(1, "failed cross-current-device reset did not restore the caller");
+    require_active_device(other_device,
+                          "failed cross-current-device reset did not restore the caller");
   }
-  require(device_reset_failed, "injected cudaFree failure was not reported");
+  require(device_reset_failed, "injected device-free failure was not reported");
   require(device_storage.opaque_handle() == device_address && device_storage.size() == bytes,
           "failed device reset discarded the live allocation");
   require(current_memory_accounting().device_bytes_current == before.device_bytes_current + bytes,
@@ -333,7 +339,7 @@ void test_checked_release_failures() {
     device_storage.allocate(2 * bytes, 0);
   }
   catch (const meep::nvidia::runtime_error &) { device_reallocate_failed = true; }
-  require(device_reallocate_failed, "injected cudaMalloc failure was not reported");
+  require(device_reallocate_failed, "injected device-allocation failure was not reported");
   require(device_storage.opaque_handle() == NULL && device_storage.size() == 0,
           "failed replacement allocation did not leave an empty buffer");
   require(current_memory_accounting().device_bytes_current == before.device_bytes_current,
@@ -345,10 +351,10 @@ void test_checked_release_failures() {
   device_buffer move_source(2 * bytes, 0);
   void *move_source_address = move_source.opaque_handle();
   {
-    device_scope other(1);
+    device_scope other(other_device);
     fail_next(failure_point::device_free);
     device_storage = std::move(move_source);
-    require_active_device(1,
+    require_active_device(other_device,
                           "failed cross-current-device move did not restore the caller's device");
   }
   require(device_storage.opaque_handle() == device_address,
@@ -358,19 +364,21 @@ void test_checked_release_failures() {
   device_storage.reset();
   move_source.reset();
 
-  device_buffer restore_failure(bytes, 0);
-  fail_next(failure_point::device_restore);
-  bool restore_failed = false;
-  {
-    device_scope other(1);
-    try {
-      restore_failure.reset();
+  if (other_device != 0) {
+    device_buffer restore_failure(bytes, 0);
+    fail_next(failure_point::device_restore);
+    bool restore_failed = false;
+    {
+      device_scope other(other_device);
+      try {
+        restore_failure.reset();
+      }
+      catch (const meep::nvidia::runtime_error &) { restore_failed = true; }
     }
-    catch (const meep::nvidia::runtime_error &) { restore_failed = true; }
+    require(restore_failed, "injected device restore failure was not reported");
+    require(restore_failure.opaque_handle() == NULL && restore_failure.size() == 0,
+            "successful free followed by restore failure retained a stale allocation");
   }
-  require(restore_failed, "injected device restore failure was not reported");
-  require(restore_failure.opaque_handle() == NULL && restore_failure.size() == 0,
-          "successful free followed by restore failure retained a stale allocation");
 
   pinned_buffer pinned(bytes);
   void *pinned_address = pinned.data();
@@ -380,7 +388,7 @@ void test_checked_release_failures() {
     pinned.reset();
   }
   catch (const meep::nvidia::runtime_error &) { pinned_reset_failed = true; }
-  require(pinned_reset_failed, "injected cudaFreeHost failure was not reported");
+  require(pinned_reset_failed, "injected pinned-free failure was not reported");
   require(pinned.data() == pinned_address && pinned.size() == bytes,
           "failed pinned reset discarded the live allocation");
 
@@ -390,7 +398,7 @@ void test_checked_release_failures() {
     pinned.allocate(2 * bytes);
   }
   catch (const meep::nvidia::runtime_error &) { pinned_reallocate_failed = true; }
-  require(pinned_reallocate_failed, "injected cudaHostAlloc failure was not reported");
+  require(pinned_reallocate_failed, "injected pinned-allocation failure was not reported");
   require(pinned.data() == NULL && pinned.size() == 0,
           "failed replacement pinned allocation did not leave an empty buffer");
   require(current_memory_accounting().pinned_bytes_current == before.pinned_bytes_current,
@@ -418,7 +426,7 @@ void test_checked_release_failures() {
           "pinned accounting did not recover after checked failures");
 }
 
-void test_error_paths() {
+void test_error_paths(int visible_device_count) {
   const size_t bytes = 4096;
   device_scope device_zero(0);
   device_buffer storage(bytes, 0);
@@ -431,18 +439,20 @@ void test_error_paths() {
   catch (const std::out_of_range &) { range_failed = true; }
   require(range_failed, "out-of-range fill was not rejected");
 
-  stream *stream_one = NULL;
-  {
-    device_scope device_one(1);
-    stream_one = new stream();
+  if (visible_device_count >= 2) {
+    stream *stream_one = NULL;
+    {
+      device_scope device_one(1);
+      stream_one = new stream();
+    }
+    bool wrong_device_failed = false;
+    try {
+      fill_byte_async(storage, 0, 0, bytes, *stream_one);
+    }
+    catch (const std::invalid_argument &) { wrong_device_failed = true; }
+    require(wrong_device_failed, "wrong-device stream was not rejected");
+    delete stream_one;
   }
-  bool wrong_device_failed = false;
-  try {
-    fill_byte_async(storage, 0, 0, bytes, *stream_one);
-  }
-  catch (const std::invalid_argument &) { wrong_device_failed = true; }
-  require(wrong_device_failed, "wrong-device stream was not rejected");
-  delete stream_one;
 
   std::vector<unsigned char> source(bytes, 0x5a);
   fail_next(failure_point::host_to_device_copy);
@@ -456,13 +466,14 @@ void test_error_paths() {
   stream_zero.synchronize();
 }
 
-void test_portable_pinned_memory() {
+void test_portable_pinned_memory(int visible_device_count) {
   const size_t bytes = 4096;
   pinned_buffer source(bytes);
   pinned_buffer destination(bytes);
   std::memset(source.data(), 0x5a, bytes);
 
-  for (int device = 0; device < 2; ++device) {
+  const int devices_to_test = visible_device_count < 2 ? visible_device_count : 2;
+  for (int device = 0; device < devices_to_test; ++device) {
     device_scope selected(device);
     stream transfer;
     device_buffer storage(bytes, device);
@@ -470,7 +481,7 @@ void test_portable_pinned_memory() {
     meep::nvidia::copy_device_to_host_async(destination.data(), storage, 0, bytes, transfer);
     transfer.synchronize();
     require(std::memcmp(source.data(), destination.data(), bytes) == 0,
-            "portable pinned memory failed on a second CUDA device");
+            "portable pinned memory failed on a visible accelerator device");
   }
 }
 
@@ -501,7 +512,7 @@ void round_trip(int device) {
     meep::nvidia::copy_device_to_device_async(mirror, 0, storage, 0, bytes, compute);
     meep::nvidia::copy_device_to_host_async(destination_values, mirror, 0, bytes, compute);
     compute.synchronize();
-    require(copied.ready(), "recorded CUDA event did not become ready");
+    require(copied.ready(), "recorded accelerator event did not become ready");
     require(std::memcmp(source_values, destination_values, bytes) == 0,
             "host/device round trip changed data");
 
@@ -530,12 +541,21 @@ void round_trip(int device) {
 int main() {
   try {
     const std::vector<device_properties> devices = enumerate_devices();
+#if defined(MEEP_HIP_PORTABILITY)
+    require(!devices.empty(), "HIP smoke test requires one visible AMD device");
+#else
     require(devices.size() >= 2, "smoke test requires at least two visible NVIDIA devices");
+#endif
 
-    std::cout << "CUDA driver/runtime: " << meep::nvidia::driver_version() << "/"
+    std::cout << "accelerator driver/runtime: " << meep::nvidia::driver_version() << "/"
               << meep::nvidia::runtime_version() << "\n";
     for (size_t i = 0; i < devices.size(); ++i) {
       const device_properties &d = devices[i];
+#if defined(MEEP_HIP_PORTABILITY)
+      require(!d.uuid.empty(), "visible accelerator has an empty UUID");
+      for (size_t j = 0; j < i; ++j)
+        require(d.uuid != devices[j].uuid, "visible accelerators have duplicate UUIDs");
+#endif
       std::cout << "device " << d.id << ": " << d.name << " cc " << d.compute_major << "."
                 << d.compute_minor << ", bytes=" << d.total_memory << ", uuid=" << d.uuid
                 << ", peer01="
@@ -546,11 +566,12 @@ int main() {
     }
 
     test_selection(static_cast<int>(devices.size()));
-    test_cross_device_ownership();
+    if (devices.size() >= 2) test_cross_device_ownership();
     test_move_operations();
-    test_checked_release_failures();
-    test_error_paths();
-    test_portable_pinned_memory();
+    const int other_device = devices.size() >= 2 ? 1 : 0;
+    test_checked_release_failures(other_device);
+    test_error_paths(static_cast<int>(devices.size()));
+    test_portable_pinned_memory(static_cast<int>(devices.size()));
     for (size_t i = 0; i < devices.size(); ++i) {
       round_trip(static_cast<int>(i));
       std::cout << "round-trip device " << i << ": PASS\n";

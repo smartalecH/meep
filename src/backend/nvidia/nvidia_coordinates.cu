@@ -7,8 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_coordinates.hpp"
-
-#include <cuda_runtime.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <cmath>
 #include <limits>

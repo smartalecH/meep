@@ -7,8 +7,7 @@
 */
 
 #include "backend/nvidia/runtime.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -724,11 +723,7 @@ bool opaque_pointer_is_device_for_testing(const void *pointer) {
     (void)cudaGetLastError();
     return false;
   }
-#if CUDART_VERSION >= 10000
-  return attributes.type == cudaMemoryTypeDevice;
-#else
-  return attributes.memoryType == cudaMemoryTypeDevice;
-#endif
+  return MEEP_POINTER_MEMORY_TYPE(attributes) == cudaMemoryTypeDevice;
 }
 
 bool copy_opaque_device_to_device_for_testing(void *destination, const void *source, size_t bytes,

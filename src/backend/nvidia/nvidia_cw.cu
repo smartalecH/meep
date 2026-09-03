@@ -7,9 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_cw.hpp"
-
-#include <cuda_runtime_api.h>
-#include <math_constants.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -210,7 +208,7 @@ __global__ void reduction_partials_kernel(cw_reduction_launch launch,
     const double xv = double(x[i]);
     if (Operation == 0) value += double(T(x[i] * y[i]));
     else if (Operation == 1)
-      value = isfinite(xv) ? fmax(value, fabs(xv)) : CUDART_INF;
+      value = isfinite(xv) ? fmax(value, fabs(xv)) : MEEP_DEVICE_INFINITY;
     else {
       const double scaled = scale * xv;
       value += scaled * scaled;

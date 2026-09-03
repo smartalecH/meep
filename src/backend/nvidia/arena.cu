@@ -12,8 +12,7 @@
 */
 
 #include "backend/nvidia/arena.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <algorithm>
 #include <limits>

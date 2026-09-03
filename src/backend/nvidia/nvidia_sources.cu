@@ -7,8 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_sources.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <limits>
 #include <stdexcept>

@@ -1,9 +1,8 @@
 /* Copyright (C) 2005-2026 Massachusetts Institute of Technology */
 
 #include "backend/nvidia/nvidia_polarization.hpp"
+#include "backend/nvidia/cuda_hip_compat.hpp"
 #include "meep/meep-config.h"
-
-#include <cuda_runtime_api.h>
 
 #include <limits>
 #include <stdexcept>

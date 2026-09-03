@@ -131,6 +131,29 @@ AC_ARG_WITH([cuda-host-compiler],
 AC_ARG_VAR([NVCC], [NVIDIA CUDA compiler])
 AC_ARG_VAR([NVCCFLAGS], [additional NVIDIA CUDA compiler flags])
 
+# This is intentionally a private build/portability check, not a selectable
+# backend.  Production AMD selection is added only after the shared device
+# implementation is integrated and tested.
+AC_ARG_ENABLE([hip-portability-check],
+              [AS_HELP_STRING([--enable-hip-portability-check],
+                              [build the private HIP portability checks (default: no)])],
+              [enable_hip_portability_check=$enableval],
+              [enable_hip_portability_check=no])
+AC_ARG_WITH([rocm],
+            [AS_HELP_STRING([--with-rocm=DIR],
+                            [ROCm toolkit prefix for the private HIP portability checks])],
+            [rocm_prefix=$withval], [rocm_prefix=])
+AC_ARG_WITH([hip-architectures],
+            [AS_HELP_STRING([--with-hip-architectures=LIST],
+                            [comma-separated HIP targets, e.g. gfx950,gfx942])],
+            [hip_architectures=$withval], [hip_architectures=])
+AC_ARG_VAR([HIPCC],
+           [AMD HIP compiler or wrapper (overrides DIR/bin/hipcc with --with-rocm=DIR)])
+AC_ARG_VAR([HIPCONFIG], [HIP installation query tool])
+AC_ARG_VAR([HIPCCFLAGS], [additional AMD HIP compiler flags])
+AC_ARG_VAR([HIP_PRECISE_FLAGS],
+           [HIP flags for sources that disable fused multiply-add])
+
 case "$with_accelerator" in
   no) have_nvidia_backend=no ;;
   nvidia) have_nvidia_backend=yes ;;
@@ -256,6 +279,180 @@ AC_SUBST([CUDA_PIC_FLAGS])
 AC_SUBST([CUDA_HOST_FLAGS])
 AM_CONDITIONAL([HAVE_NVIDIA_BACKEND],
                [test "x$have_nvidia_backend" = "xyes"])
+
+##############################################################################
+# private AMD HIP portability checks
+
+case "$enable_hip_portability_check" in
+  yes|no) ;;
+  *) AC_MSG_ERROR([--enable-hip-portability-check accepts only yes or no]) ;;
+esac
+
+HIP_ARCHITECTURES=
+HIP_ARCH_FLAGS=
+HIP_CPPFLAGS=
+HIP_LDFLAGS=
+HIP_LIBS=
+HIP_PIC_FLAGS=
+if test -z "$HIP_PRECISE_FLAGS"; then
+  HIP_PRECISE_FLAGS=-ffp-contract=off
+fi
+
+if test "x$enable_hip_portability_check" = "xyes"; then
+  rocm_prefix_was_explicit=no
+  hipcc_was_explicit=no
+  if test -n "$HIPCC"; then
+    hipcc_was_explicit=yes
+  fi
+  if test "x$rocm_prefix" = "xyes" -o "x$rocm_prefix" = "xno"; then
+    AC_MSG_ERROR([--with-rocm requires an explicit toolkit directory])
+  fi
+
+  if test -n "$rocm_prefix"; then
+    rocm_prefix_was_explicit=yes
+    rocm_prefix=`cd "$rocm_prefix" 2>/dev/null && pwd -P`
+    if test -z "$rocm_prefix"; then
+      AC_MSG_ERROR([ROCm toolkit directory does not exist])
+    fi
+    if test -z "$HIPCC"; then
+      HIPCC=$rocm_prefix/bin/hipcc
+      if test ! -x "$HIPCC"; then
+        AC_MSG_ERROR([hipcc not found below the requested ROCm toolkit: $rocm_prefix (set HIPCC to use an intentional compiler wrapper override)])
+      fi
+    fi
+    if test -z "$HIPCONFIG"; then
+      AC_PATH_PROG([HIPCONFIG], [hipconfig], [], [$rocm_prefix/bin:$PATH])
+    fi
+  else
+    AC_PATH_PROG([HIPCC], [hipcc])
+    case "$HIPCC" in
+      */*) hip_bindir=`dirname "$HIPCC"` ;;
+      *) hip_bindir= ;;
+    esac
+    if test -z "$HIPCONFIG" -a -n "$hip_bindir" -a -x "$hip_bindir/hipconfig"; then
+      HIPCONFIG=$hip_bindir/hipconfig
+    fi
+    if test -z "$HIPCONFIG"; then
+      AC_PATH_PROG([HIPCONFIG], [hipconfig])
+    fi
+    if test -n "$HIPCONFIG"; then
+      rocm_prefix=`$HIPCONFIG --path 2>/dev/null`
+    fi
+  fi
+
+  case "$HIPCC" in
+    */*) ;;
+    *) HIPCC=`command -v "$HIPCC" 2>/dev/null` ;;
+  esac
+  case "$HIPCONFIG" in
+    */*) ;;
+    *) HIPCONFIG=`command -v "$HIPCONFIG" 2>/dev/null` ;;
+  esac
+  if test ! -x "$HIPCC"; then
+    AC_MSG_ERROR([hipcc is required for --enable-hip-portability-check])
+  fi
+  if test "x$rocm_prefix_was_explicit" = "xyes" -a \
+          "x$hipcc_was_explicit" = "xyes"; then
+    AC_MSG_NOTICE([using user-supplied HIPCC override with requested ROCm toolkit: $HIPCC])
+  fi
+  if test ! -x "$HIPCONFIG"; then
+    AC_MSG_ERROR([hipconfig is required for --enable-hip-portability-check])
+  fi
+  hipconfig_prefix=`$HIPCONFIG --path 2>/dev/null`
+  hipconfig_prefix=`cd "$hipconfig_prefix" 2>/dev/null && pwd -P`
+  if test -z "$hipconfig_prefix"; then
+    AC_MSG_ERROR([hipconfig did not report a valid ROCm toolkit prefix])
+  fi
+  if test "x$rocm_prefix_was_explicit" = "xyes" -a \
+          "x$hipconfig_prefix" != "x$rocm_prefix"; then
+    AC_MSG_ERROR([HIPCONFIG does not belong to the requested ROCm toolkit: $rocm_prefix])
+  fi
+  rocm_prefix=$hipconfig_prefix
+  hip_platform=`$HIPCONFIG --platform 2>/dev/null`
+  if test "x$hip_platform" != "xamd"; then
+    AC_MSG_ERROR([the HIP portability checks require the AMD HIP platform])
+  fi
+  if test -z "$rocm_prefix"; then
+    AC_MSG_ERROR([hipconfig did not report a ROCm toolkit prefix])
+  fi
+  rocm_prefix=`cd "$rocm_prefix" 2>/dev/null && pwd -P`
+  if test -z "$rocm_prefix"; then
+    AC_MSG_ERROR([ROCm toolkit directory does not exist])
+  fi
+  if test -z "$hip_architectures"; then
+    AC_MSG_ERROR([--with-hip-architectures is required for the HIP portability checks])
+  fi
+  case "$hip_architectures" in
+    ,*|*,|*,,*)
+      AC_MSG_ERROR([--with-hip-architectures contains an empty architecture])
+      ;;
+  esac
+
+  hip_arch_list=`echo "$hip_architectures" | sed 's/,/ /g'`
+  for hip_arch in $hip_arch_list; do
+    case "$hip_arch" in
+      gfx*) ;;
+      *) AC_MSG_ERROR([invalid HIP architecture in --with-hip-architectures: $hip_arch]) ;;
+    esac
+    case "$hip_arch" in
+      ''|*@<:@!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.:+-@:>@*)
+        AC_MSG_ERROR([invalid HIP architecture in --with-hip-architectures: $hip_arch])
+        ;;
+    esac
+    HIP_ARCH_FLAGS="$HIP_ARCH_FLAGS --offload-arch=$hip_arch"
+    if test -z "$HIP_ARCHITECTURES"; then
+      HIP_ARCHITECTURES=$hip_arch
+    else
+      HIP_ARCHITECTURES="$HIP_ARCHITECTURES,$hip_arch"
+    fi
+  done
+
+  if test ! -f "$rocm_prefix/include/hip/hip_runtime_api.h"; then
+    AC_MSG_ERROR([HIP runtime headers not found below $rocm_prefix])
+  fi
+  if test -f "$rocm_prefix/lib64/libamdhip64.so"; then
+    hip_libdir=$rocm_prefix/lib64
+  elif test -f "$rocm_prefix/lib/libamdhip64.so"; then
+    hip_libdir=$rocm_prefix/lib
+  else
+    AC_MSG_ERROR([HIP runtime library not found below $rocm_prefix])
+  fi
+  HIP_CPPFLAGS="-DMEEP_HIP_PORTABILITY=1 -D__HIP_PLATFORM_AMD__=1 -I$rocm_prefix/include"
+  HIP_LDFLAGS="-L$hip_libdir -Wl,-rpath,$hip_libdir"
+  HIP_LIBS=-lamdhip64
+  HIP_PIC_FLAGS=-fPIC
+
+  AC_MSG_CHECKING([whether hipcc can compile and link a HIP kernel])
+  cat > conftest.hip.cpp <<'_ACEOF'
+#include <hip/hip_runtime.h>
+__global__ void meep_hip_conftest_kernel(int *value) { *value = 1; }
+int main() {
+  int *value = 0;
+  if (hipMalloc(&value, sizeof(*value)) != hipSuccess) return 1;
+  hipLaunchKernelGGL(meep_hip_conftest_kernel, dim3(1), dim3(1), 0, 0, value);
+  return hipFree(value) == hipSuccess ? 0 : 1;
+}
+_ACEOF
+  if $HIPCC -std=c++11 $HIPCCFLAGS $HIP_ARCH_FLAGS $HIP_PIC_FLAGS \
+       $HIP_CPPFLAGS conftest.hip.cpp $HIP_LDFLAGS $HIP_LIBS \
+       -o conftest-hip >&AS_MESSAGE_LOG_FD; then
+    AC_MSG_RESULT([yes])
+  else
+    rm -f conftest.hip.cpp conftest-hip
+    AC_MSG_ERROR([hipcc could not compile and link a HIP kernel program])
+  fi
+  rm -f conftest.hip.cpp conftest-hip
+fi
+
+AC_SUBST([HIP_ARCHITECTURES])
+AC_SUBST([HIP_ARCH_FLAGS])
+AC_SUBST([HIP_CPPFLAGS])
+AC_SUBST([HIP_LDFLAGS])
+AC_SUBST([HIP_LIBS])
+AC_SUBST([HIP_PIC_FLAGS])
+AC_SUBST([HIP_PRECISE_FLAGS])
+AM_CONDITIONAL([BUILD_HIP_PORTABILITY_CHECK],
+               [test "x$enable_hip_portability_check" = "xyes"])
 
 ##############################################################################
 # Compiler flags

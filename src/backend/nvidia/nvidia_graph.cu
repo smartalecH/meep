@@ -7,8 +7,7 @@
 */
 
 #include "backend/nvidia/nvidia_graph.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <atomic>
 #include <cstdio>
@@ -429,7 +428,7 @@ graph_update_status graph_exec::update(const graph &definition, std::string *dia
     if (diagnostic) *diagnostic = "injected CUDA graph update failure";
     return graph_update_status::failed;
   }
-#if CUDART_VERSION >= 10020
+#if MEEP_GRAPH_EXEC_UPDATE_AVAILABLE
   cudaGraphNode_t error_node = NULL;
   cudaGraphExecUpdateResult update_result = cudaGraphExecUpdateError;
   const cudaError_t result =
@@ -522,8 +521,10 @@ graph_capability query_graph_capability() {
   graph_capability result;
   result.runtime = runtime_version();
   result.driver = driver_version();
-  result.capture_supported = result.runtime >= 10000 && result.driver >= 10000;
-  result.update_supported = result.runtime >= 10020 && result.driver >= 10020;
+  result.capture_supported = MEEP_GRAPH_RUNTIME_CAPABILITY_ENABLED && result.runtime >= 10000 &&
+                             result.driver >= 10000;
+  result.update_supported = MEEP_GRAPH_RUNTIME_CAPABILITY_ENABLED && result.runtime >= 10020 &&
+                            result.driver >= 10020;
   return result;
 }
 

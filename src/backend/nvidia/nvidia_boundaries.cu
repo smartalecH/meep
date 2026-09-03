@@ -7,9 +7,8 @@
 */
 
 #include "backend/nvidia/nvidia_boundaries.hpp"
+#include "backend/nvidia/cuda_hip_compat.hpp"
 #include "backend/storage_plan.hpp"
-
-#include <cuda_runtime_api.h>
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -128,11 +127,8 @@ bool validate_allocations(const StoragePlan &storage,
       why = "NVIDIA remote boundary allocation is not CUDA device storage";
       return false;
     }
-#if CUDART_VERSION >= 10000
-    if (attributes.type != cudaMemoryTypeDevice || attributes.device != owning_device) {
-#else
-    if (attributes.memoryType != cudaMemoryTypeDevice || attributes.device != owning_device) {
-#endif
+    if (MEEP_POINTER_MEMORY_TYPE(attributes) != cudaMemoryTypeDevice ||
+        attributes.device != owning_device) {
       why = "NVIDIA remote boundary allocation is on the wrong CUDA device";
       return false;
     }

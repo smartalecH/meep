@@ -1,5 +1,5 @@
 /* Standalone role-arena smoke test. It has no dependency on libmeep or the
-   Phase-1 backend API and performs all malformed-plan checks before CUDA use. */
+   Phase-1 backend API and performs all malformed-plan checks before device use. */
 
 #include "backend/nvidia/arena.hpp"
 
@@ -473,7 +473,7 @@ void test_device(int device, int other_device) {
       require(meep::nvidia::current_memory_accounting().device_bytes_current == move_accounting,
               "arena move assignment changed device accounting");
 
-      /* A swap-based move performs no CUDA teardown. Prove the injected free is
+      /* A swap-based move performs no device teardown. Prove the injected free is
          still pending, then retry successfully so the test itself does not leak. */
       device_buffer failure_probe(64, device);
       require_throws<meep::nvidia::runtime_error>([&]() { failure_probe.reset(); },
@@ -495,6 +495,15 @@ int main() {
   try {
     test_cpu_planning();
     const std::vector<device_properties> devices = enumerate_devices();
+#if defined(MEEP_HIP_PORTABILITY)
+    require(!devices.empty(), "arena smoke test requires one visible AMD device");
+    for (size_t i = 0; i < devices.size(); ++i) {
+      std::cout << "device " << devices[i].id << ": " << devices[i].name << "\n";
+      const int other_device =
+          devices.size() > 1 ? devices[(i + 1) % devices.size()].id : devices[i].id;
+      test_device(devices[i].id, other_device);
+    }
+#else
     require(devices.size() >= 2, "arena smoke test requires both GB200 devices");
     size_t gb200_count = 0;
     for (size_t i = 0; i < devices.size(); ++i) {
@@ -506,6 +515,7 @@ int main() {
       }
     }
     require(gb200_count >= 2, "fewer than two visible GB200 devices were tested");
+#endif
     std::cout << "PASS\n";
     return 0;
   }

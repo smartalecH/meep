@@ -1,8 +1,7 @@
 /* Copyright (C) 2005-2026 Massachusetts Institute of Technology */
 
 #include "backend/nvidia/nvidia_materials.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <cmath>
 #include <cfloat>
@@ -11,7 +10,16 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(MEEP_HIP_PORTABILITY)
+/* material_geometry_numeric.hpp uses __CUDACC__ solely to add host/device
+   annotations.  Keep this HIP accommodation local to the NVIDIA device unit
+   rather than changing the backend-neutral header. */
+#define __CUDACC__ 1
+#endif
 #include "backend/material_geometry_numeric.hpp"
+#if defined(MEEP_HIP_PORTABILITY)
+#undef __CUDACC__
+#endif
 #include "backend/nvidia/nvidia_initialization.hpp"
 
 namespace meep {

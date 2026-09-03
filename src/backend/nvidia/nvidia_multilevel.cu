@@ -1,8 +1,7 @@
 /* Copyright (C) 2005-2026 Massachusetts Institute of Technology */
 
 #include "backend/nvidia/nvidia_multilevel.hpp"
-
-#include <cuda_runtime_api.h>
+#include "backend/nvidia/cuda_hip_compat.hpp"
 
 #include <limits>
 #include <stdexcept>
