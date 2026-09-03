@@ -21,7 +21,9 @@
 #include <vector>
 
 #include "backend/backend.hpp"
+#include "backend/dependency_region.hpp"
 #include "backend/graph_plan.hpp"
+#include "backend/transport_plan.hpp"
 
 namespace meep {
 
@@ -167,17 +169,52 @@ struct NvidiaRemoteBoundaryCompileStatistics {
 };
 
 struct NvidiaMpiTransportStatistics {
+  bool active;
+  GpuMpiPolicy requested_policy;
+  GpuMpiRoute resolved_route;
+  DependencyOverlapPolicy overlap_policy;
+  uint64_t communicator_generation;
+  uint64_t provider_signature;
+  uint64_t dependency_signature;
+  size_t dependency_region_count;
+  int communicator_rank;
+  int communicator_size;
   uint64_t messages_sent;
   uint64_t messages_received;
   uint64_t bytes_sent;
   uint64_t bytes_received;
+  uint64_t gather_launches;
+  uint64_t scatter_launches;
   uint64_t testsome_polls;
   uint64_t waitall_calls;
+  uint64_t request_completions;
   uint64_t slot_reuses;
+  uint64_t device_to_host_calls;
+  uint64_t device_to_host_bytes;
+  uint64_t host_to_device_calls;
+  uint64_t host_to_device_bytes;
   uint64_t direct_bytes;
   uint64_t overlap_stages;
   uint64_t overlap_interior_launches;
   uint64_t overlap_boundary_launches;
+  uint64_t high_water_requests;
+  uint64_t gather_pack_nanoseconds;
+  uint64_t device_to_host_nanoseconds;
+  uint64_t mpi_progress_nanoseconds;
+  uint64_t mpi_wait_nanoseconds;
+  uint64_t host_to_device_nanoseconds;
+  uint64_t scatter_unpack_nanoseconds;
+  size_t device_bytes;
+  size_t pinned_bytes;
+};
+
+struct NvidiaExecutionTimingStatistics {
+  uint64_t graph_build_nanoseconds;
+  uint64_t graph_build_count;
+  uint64_t full_field_copy_count;
+
+  NvidiaExecutionTimingStatistics()
+      : graph_build_nanoseconds(0), graph_build_count(0), full_field_copy_count(0) {}
 };
 
 struct NvidiaCwStatistics {
@@ -420,6 +457,7 @@ public:
   NvidiaExecutableCacheStatistics executable_cache_statistics_for_testing() const;
   NvidiaRemoteBoundaryCompileStatistics remote_boundary_compile_statistics_for_testing() const;
   NvidiaMpiTransportStatistics mpi_transport_statistics_for_testing() const;
+  NvidiaExecutionTimingStatistics execution_timing_statistics_for_testing() const;
   void mutate_prepared_initialization_upload_for_testing(BackendState &state, int mode);
   void set_next_executable_generation_for_testing(uint64_t generation) {
     next_executable_generation_ = generation;
@@ -467,6 +505,7 @@ private:
   mutable MaterialRecipeDisposition pending_initialization_route_;
   mutable bool pending_initialization_reserve_valid_;
   NvidiaRemoteBoundaryCompileStatistics remote_boundary_compile_statistics_;
+  NvidiaExecutionTimingStatistics execution_timing_statistics_;
 };
 
 /* Device selection must already be resolved and collectively validated. This

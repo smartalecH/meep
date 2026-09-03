@@ -8,6 +8,7 @@
 #include <meep.hpp>
 
 #include "config.h"
+#include "backend/backend.hpp"
 #include "backend/mpi_context.hpp"
 
 using namespace meep;
@@ -180,6 +181,53 @@ void test_thread_and_generation_helpers() {
 #endif
 }
 
+void test_frontend_json_allgather() {
+  const std::vector<std::string> empty = active_communicator_allgather_json_records("");
+  CHECK(empty.size() == size_t(count_processors()),
+        "empty frontend JSON gather returned the wrong rank count");
+  for (const std::string &value : empty)
+    CHECK(value.empty(), "empty frontend JSON gather changed the payload");
+
+  const std::string payload = std::string("{\"rank\":") + std::to_string(my_rank()) + "}";
+  const std::vector<std::string> gathered =
+      active_communicator_allgather_json_records(payload);
+  CHECK(gathered.size() == size_t(count_processors()),
+        "frontend JSON gather returned the wrong rank count");
+  for (int rank = 0; rank < count_processors(); ++rank)
+    CHECK(gathered[size_t(rank)] ==
+              std::string("{\"rank\":") + std::to_string(rank) + "}",
+          "frontend JSON gather did not preserve rank order or bytes");
+
+  if (count_processors() > 1) {
+    bool rejected = false;
+    try {
+      (void)active_communicator_allgather_json_records(
+          payload, my_rank() != count_processors() - 1, "injected invalid JSON payload");
+    }
+    catch (const std::runtime_error &) { rejected = true; }
+    CHECK(rejected, "asymmetric invalid frontend JSON payload was not rejected collectively");
+  }
+
+  for (int point = 1; point <= 3; ++point) {
+    backend_set_runtime_report_failure_for_testing(0, point);
+    bool rejected = false;
+    try { (void)active_communicator_allgather_json_records(payload); }
+    catch (const std::exception &) { rejected = true; }
+    CHECK(rejected, "asymmetric frontend JSON allocation failure was not reconciled");
+    backend_set_runtime_report_failure_for_testing(-1, 0);
+  }
+
+#ifdef HAVE_MPI
+  bool worker_rejected = false;
+  std::thread worker([&]() {
+    try { (void)active_communicator_allgather_json_records(payload); }
+    catch (const std::runtime_error &) { worker_rejected = true; }
+  });
+  worker.join();
+  CHECK(worker_rejected, "frontend JSON gather accepted a non-main MPI thread");
+#endif
+}
+
 void test_split_transitions() {
   if (count_processors() < 2) return;
   const uint64_t before = current_backend_communicator_generation();
@@ -189,6 +237,10 @@ void test_split_transitions() {
         "divide did not advance communicator generation once");
   CHECK(backend_communicator_context_identity_for_testing() != world_context,
         "divide retained the old active communicator context");
+  const std::vector<std::string> split_records =
+      active_communicator_allgather_json_records(std::to_string(my_rank()));
+  CHECK(split_records.size() == size_t(count_processors()),
+        "frontend JSON gather used the wrong split communicator");
   {
     std::string why;
     BackendCommunicatorLease stale;
@@ -238,7 +290,11 @@ void test_split_transitions() {
 } // namespace
 
 int main(int argc, char **argv) {
+  int total = 0;
+  int saved_rank = 0;
+  {
   initialize mpi(argc, argv);
+  saved_rank = my_rank();
 #ifdef HAVE_MPI
   bool query_available = false, supports_direct = false;
   std::string provider, provider_why;
@@ -252,11 +308,19 @@ int main(int argc, char **argv) {
 #endif
 #endif
   test_thread_and_generation_helpers();
+  test_frontend_json_allgather();
   test_lease_and_agreement();
   test_collective_context_rollback();
   test_split_transitions();
-  const int total = sum_to_all(failures);
-  if (my_rank() == 0)
+  total = sum_to_all(failures);
+  }
+#ifdef HAVE_MPI
+  bool finalized_rejected = false;
+  try { (void)active_communicator_allgather_json_records("{}"); }
+  catch (const std::runtime_error &) { finalized_rejected = true; }
+  if (!finalized_rejected) ++total;
+#endif
+  if (saved_rank == 0)
     std::printf("mpi_context: %s (%d failures)\n", total ? "FAIL" : "PASS", total);
   return total ? 1 : 0;
 }

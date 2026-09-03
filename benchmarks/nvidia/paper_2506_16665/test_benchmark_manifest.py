@@ -344,6 +344,8 @@ class ManifestTests(unittest.TestCase):
             with self.subTest(name=name):
                 manifest = self.manifest(device_name=name)
                 json.dumps(manifest, allow_nan=False)
+                self.assertEqual(manifest["execution"]["requested"]["overlap"], "off")
+                self.assertEqual(manifest["execution"]["requested"]["graph"], "eager")
                 self.assertTrue(manifest["case"]["ports"])
                 self.assertIn("source", manifest["case"])
                 self.assertTrue(manifest["case"]["monitors"])
@@ -630,7 +632,7 @@ class ResultTests(unittest.TestCase):
         manifest_schema = bm.load_json_object(
             bm.DEFAULT_MANIFEST_SCHEMA, "run manifest schema"
         )
-        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 3)
+        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 4)
 
     def test_result_rejects_nonfinite_and_grid_mismatch(self):
         temporary, result, _manifest = self.template()

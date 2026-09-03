@@ -1151,6 +1151,7 @@ bool query_gpu_aware_mpi_provider(bool &query_available, bool &supports_direct,
     return false;
   }
   provider.assign(text, size_t(std::max(0, length)));
+  while (!provider.empty() && provider.back() == '\0') provider.pop_back();
 #ifdef HAVE_MPIX_QUERY_CUDA_SUPPORT
   query_available = true;
   supports_direct = MPIX_Query_cuda_support() > 0;

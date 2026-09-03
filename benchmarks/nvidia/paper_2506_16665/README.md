@@ -1,5 +1,103 @@
 # arXiv 2506.16665 benchmark runner
 
+## Normative multi-rank runner (PR7.5)
+
+`run_benchmark.py` remains the legacy PR3 single-rank diagnostic. It is not a
+multi-GPU evidence producer. `run_mpi_benchmark.py` is the version-2 normative
+MPI result producer and validates `mpi_benchmark_result.schema.json` before
+communicator rank 0 atomically publishes the final JSON file.
+
+The launcher intentionally uses the branch-matched environment at
+`/home/alechammond/meep-env`: both `mpirun` and Python are absolute paths. For
+same-node provider-positive runs it sets these variables before `MPI_Init`:
+
+```text
+OMPI_MCA_opal_cuda_support=true
+OMPI_MCA_pml=ucx
+UCX_TLS=self,sm,cuda_copy,cuda_ipc
+```
+
+Route, overlap, graph mode, and precision are mandatory arguments and must
+match the immutable manifest. The result records the exact launcher argv,
+environment, timeout, MPI/UCX versions, manifest hash, communicator identity,
+host/local rank, GPU identity, provider query, requested/resolved policies,
+per-rank repetitions, and rank-local transport counters. Each repetition uses
+the maximum rank duration as its critical path and records rank median and
+imbalance. Every aggregate counter carries an explicit `sum` or `max` rule.
+The real benchmark path is intentionally restricted to two ranks/GPUs until
+the planned two-owner plus two-idle decomposition is available. The built-in
+acceptance path below uses a collective point-field decay decision. Paper
+end-to-end manifests currently request `total_field_energy`; the runner rejects
+that mode explicitly because the resident multi-rank host-energy query remains
+a known crash, instead of publishing a misleading fixed-step substitute.
+
+Example two-rank provider-positive run:
+
+```sh
+/home/alechammond/meep-env/bin/python run_mpi_benchmark.py \
+  --manifest /absolute/path/run-manifest.json \
+  --physics-reference /absolute/path/cpu-native-baseline.json \
+  --output /absolute/path/raw-result.json \
+  --build-directory /absolute/path/meep-build \
+  --route direct --overlap required --graph required --precision native \
+  --timeout 1800
+```
+
+`--prefix` is configurable for reproducibility, with
+`/home/alechammond/meep-env` as the local default. The launcher explicitly
+records `CUDA_VISIBLE_DEVICES`, `PYTHONPATH`, and `LD_LIBRARY_PATH` as well as
+the configured build flags, compiler, executable and loaded-module hashes,
+observed CPU affinity, and GPU mapping. `--build-directory` is required and
+must identify the configured build used for the run.
+
+The CPU reference must be a hash-authenticated `cpu_native_baseline` bound to
+the same paper corpus, case definitions, case ID, and physics-configuration
+hash. Every repetition derives the declared observables from raw monitor
+arrays. Non-ring mode-power ratios use linear interpolation at the exact
+center wavelength; excess loss is `-10 log10(ratio)`. Ring extraction uses
+SciPy's not-a-knot cubic spline on 1000 inclusive wavelength samples and the
+declared half-depth crossings. No result is published unless every observable
+passes the manifest tolerance.
+
+After matching staged and direct runs, create the route comparison artifact:
+
+```sh
+/home/alechammond/meep-env/bin/python compare_mpi_benchmarks.py \
+  --staged staged.json --direct direct.json --output route-comparison.json
+```
+
+The comparison requires identical manifests, references, builds, rank/GPU
+mapping, simulation shape/steps, raw monitor arrays, derived observables, and
+wire totals, then enforces the route-specific staging/direct byte contract.
+Replay schema, hash, baseline, and raw-observable validation with
+`validate_mpi_benchmark.py --result raw-result.json`.
+
+For a checkout-independent provider gate, `run_transport_acceptance.py` runs a
+small deterministic 1D case against CPU-native, two-rank staged, and two-rank
+direct execution. It uses collective point-field decay, compares GPU samples
+to CPU tolerances and staged to direct bitwise, and rejects direct mode unless
+both ranks report a positive provider query, a resolved direct route, and
+positive direct halo bytes:
+
+```sh
+/home/alechammond/meep-env/bin/python run_transport_acceptance.py \
+  --output-dir /tmp/meep-transport-acceptance \
+  --pythonpath /tmp/meep-pr75-python-stage \
+  --library-path /tmp/meep-custom-pr7-5-python-build/src/.libs
+```
+
+This is an acceptance-scale transport proof, not paper-performance evidence.
+
+Workers never parse stdout. They call
+`meep.active_communicator_allgather_json(payload)`, which must collectively
+return the same communicator-rank-ordered list of JSON strings on every rank.
+This helper uses Meep's active communicator, including split communicators;
+`mpi4py.COMM_WORLD` is not an acceptable substitute. All workers verify the
+manifest hash, communicator generation/size, rank coverage, requested policy,
+resolved policy, and repetition count. Only active-communicator rank 0 writes.
+
+Run the schema/reconciliation/atomic-publication tests with `make check`.
+
 This directory contains an authenticated manifest and smoke/throughput runner for the six-device
 benchmark corpus described in [arXiv:2506.16665](https://arxiv.org/html/2506.16665).
 `benchmark_manifest.py` remains standard-library-only. `run_benchmark.py`
@@ -54,7 +152,8 @@ Gaussian center frequency and `fwidth`. These values are versioned benchmark
 inputs rather than hidden runner defaults. Each manifest also contains the
 expanded wavelength/frequency arrays and the resolved DFT decimation factor.
 
-`benchmark_manifest.schema.json` defines the complete version-3 run document.
+`benchmark_manifest.schema.json` defines the complete version-4 run document,
+including the requested overlap and graph policies.
 Result validation rechecks that schema and the bundled manifest-schema,
 paper-reference, case-definition, result-schema, pinned-commit, GDS, YAML, and
 layer-stack identities; a result cannot authenticate a handwritten partial
@@ -121,6 +220,8 @@ python3 benchmark_manifest.py manifest \
   --precision mixed \
   --ranks 2 \
   --mpi-transport auto \
+  --overlap auto \
+  --graph auto \
   --output mode-converter-e2e.json
 ```
 

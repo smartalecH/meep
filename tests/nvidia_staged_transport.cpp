@@ -424,6 +424,15 @@ int run_case(int device, bool direct = false, bool direct_mock_local_payload = f
             identity.signature ==
                 meep::nvidia::compute_transport_structural_identity_signature(identity),
         "transport structural identity is incomplete or stale at creation");
+  meep::nvidia::transport_structural_identity changed = identity;
+  changed.requested_policy = meep::GpuMpiPolicy::automatic;
+  CHECK(!(changed == identity), "transport policy mutation preserved structural identity");
+  changed = identity;
+  changed.overlap_policy = meep::DependencyOverlapPolicy::required;
+  CHECK(!(changed == identity), "overlap policy mutation preserved structural identity");
+  changed = identity;
+  ++changed.provider_signature;
+  CHECK(!(changed == identity), "MPI provider mutation preserved structural identity");
   const meep::nvidia::memory_accounting steady_memory = meep::nvidia::current_memory_accounting();
 
   const char *fatal_mode = getenv("MEEP_NVIDIA_STAGED_FATAL");
@@ -523,9 +532,19 @@ int run_case(int device, bool direct = false, bool direct_mock_local_payload = f
         "staged progress did not exercise Testsome then Waitall");
   CHECK(stats.testsome_polls >= 96,
         "delayed send-ready fixture did not remain in nonblocking progress");
+  CHECK(stats.gather_pack_nanoseconds > 0 && stats.mpi_progress_nanoseconds > 0 &&
+            stats.mpi_wait_nanoseconds > 0 && stats.scatter_unpack_nanoseconds > 0,
+        "transport phase timing counters did not advance");
+  CHECK(direct ? (stats.device_to_host_nanoseconds == 0 &&
+                  stats.host_to_device_nanoseconds == 0)
+               : (stats.device_to_host_nanoseconds > 0 &&
+                  stats.host_to_device_nanoseconds > 0),
+        "transport copy timing counters differ from the selected route");
   const meep::nvidia::memory_accounting after_warmup = meep::nvidia::current_memory_accounting();
   CHECK(steady_memory.device_bytes_current == after_warmup.device_bytes_current &&
-            steady_memory.pinned_bytes_current == after_warmup.pinned_bytes_current,
+            steady_memory.pinned_bytes_current == after_warmup.pinned_bytes_current &&
+            steady_memory.device_allocation_count == after_warmup.device_allocation_count &&
+            steady_memory.pinned_allocation_count == after_warmup.pinned_allocation_count,
         "staged transport grew device or pinned storage after warmup");
   meep::nvidia::testing::set_staged_transport_minimum_presend_polls(0);
   if (!direct) {
@@ -666,6 +685,12 @@ void run_idle_np4_case(const std::vector<meep::nvidia::device_properties> &devic
   else if (epoch) {
     CHECK(epoch->participate_idle_stage(why), why.c_str());
     CHECK(epoch->participate_idle_stage(why), why.c_str());
+    const meep::nvidia::staged_transport_statistics &idle = epoch->statistics();
+    CHECK(idle.gather_pack_nanoseconds == 0 && idle.device_to_host_nanoseconds == 0 &&
+              idle.mpi_progress_nanoseconds == 0 && idle.mpi_wait_nanoseconds == 0 &&
+              idle.host_to_device_nanoseconds == 0 &&
+              idle.scatter_unpack_nanoseconds == 0,
+          "idle transport participant accumulated device/transport timing");
   }
   CHECK(epoch && epoch->retire(why), why.c_str());
   (void)devices;

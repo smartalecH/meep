@@ -101,7 +101,8 @@ struct BackendState {
         material_phase_active(false),
         material_fallback_local_presence(false), material_fallback_global_presence(false),
         material_fallback_presence_validated(false), material_fallback_policy_pending(false),
-        noisy_first_stream_tag(0) {}
+        noisy_first_stream_tag(0), material_recipe_prepare_nanoseconds(0),
+        material_initialize_nanoseconds(0) {}
   virtual ~BackendState() { delete cw_executable; }
 
   void clear_cw_executable() {
@@ -154,6 +155,10 @@ struct BackendState {
   bool material_fallback_policy_pending;
   MaterialFallbackStatistics material_fallback_statistics;
   uint64_t noisy_first_stream_tag;
+  /* Monotonic timing/count telemetry scoped to this published backend state.
+     A replacement state establishes a new baseline. */
+  uint64_t material_recipe_prepare_nanoseconds;
+  uint64_t material_initialize_nanoseconds;
 };
 
 /* Host-custom polarization fallback is deliberately split from its eventual
@@ -708,6 +713,9 @@ void backend_set_material_candidate_plan_failure_for_testing(int rank, int mode)
 void backend_set_initialization_only_for_testing(bool enabled);
 void set_adjoint_failure_after_for_testing(int checkpoints);
 void set_nvidia_adjoint_failure_for_testing(const char *point);
+/* Collective frontend-report allocation failure seam. Point 0 disables;
+   points 1/2/3 fail rank-layout, payload, and result materialization. */
+void backend_set_runtime_report_failure_for_testing(int rank, int point);
 
 /* Execute one synchronous, rank-local compact DFT reduction, then reconcile
    construction or backend failures before the caller enters its numeric MPI

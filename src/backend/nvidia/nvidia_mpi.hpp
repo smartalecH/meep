@@ -39,6 +39,15 @@ struct staged_transport_statistics {
   uint64_t overlap_interior_launches;
   uint64_t overlap_boundary_launches;
   uint64_t high_water_requests;
+  /* Monotonic host elapsed-time counters for this transport epoch.  CUDA
+     work remains asynchronous; synchronization time is charged to the first
+     later phase that must observe completion. */
+  uint64_t gather_pack_nanoseconds;
+  uint64_t device_to_host_nanoseconds;
+  uint64_t mpi_progress_nanoseconds;
+  uint64_t mpi_wait_nanoseconds;
+  uint64_t host_to_device_nanoseconds;
+  uint64_t scatter_unpack_nanoseconds;
   size_t device_bytes;
   size_t pinned_bytes;
 

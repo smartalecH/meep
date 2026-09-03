@@ -1,6 +1,10 @@
 /* Standalone two-rank CUDA/MPI transport smoke test. It intentionally has no
    dependency on libmeep and does not select a production MPI transport policy. */
 
+#ifdef HAVE_CONFIG_H
+#include "config.h"
+#endif
+
 #include "backend/nvidia/runtime.hpp"
 
 #include <mpi.h>
@@ -143,6 +147,16 @@ void validate_payload(const void *address, size_t bytes, int source_rank, const 
   }
 }
 
+uint64_t payload_digest(const void *address, size_t bytes) {
+  const uint8_t *values = static_cast<const uint8_t *>(address);
+  uint64_t digest = UINT64_C(1469598103934665603);
+  for (size_t i = 0; i < bytes; ++i) {
+    digest ^= values[i];
+    digest *= UINT64_C(1099511628211);
+  }
+  return digest;
+}
+
 bool collectively_report(bool local_success, const std::string &local_error, MPI_Comm communicator,
                          int rank, const char *phase) {
   int local = local_success ? 1 : 0;
@@ -174,8 +188,10 @@ bool collectively_report(bool local_success, const std::string &local_error, MPI
 }
 
 bool cuda_aware_mpi_enabled() {
-#if MEEP_TEST_HAVE_MPI_EXT && defined(OMPI_HAVE_MPI_EXT_CUDA) && OMPI_HAVE_MPI_EXT_CUDA &&         \
-    defined(MPIX_CUDA_AWARE_SUPPORT) && MPIX_CUDA_AWARE_SUPPORT
+#if defined(HAVE_MPIX_QUERY_CUDA_SUPPORT) && HAVE_MPIX_QUERY_CUDA_SUPPORT
+#if !MEEP_TEST_HAVE_MPI_EXT
+  extern int MPIX_Query_cuda_support(void);
+#endif
   return MPIX_Query_cuda_support() > 0;
 #else
   return false;
@@ -243,7 +259,7 @@ struct staged_exchange_state {
 };
 
 bool exchange_staged(int device, int rank, int peer, MPI_Comm communicator,
-                     bool inject_preflight_failure) {
+                     bool inject_preflight_failure, uint64_t *received_digest) {
   const memory_accounting before = current_memory_accounting();
   std::unique_ptr<staged_exchange_state> state;
   bool preflight_ok = true;
@@ -304,6 +320,8 @@ bool exchange_staged(int device, int rank, int peer, MPI_Comm communicator,
     state->receive_ready.record(state->transfer);
     state->receive_ready.synchronize();
     validate_payload(state->verification.data(), payload_bytes, peer, "staged");
+    if (received_digest)
+      *received_digest = payload_digest(state->verification.data(), payload_bytes);
   }
   catch (const std::exception &error) {
     validation_ok = false;
@@ -336,7 +354,8 @@ struct direct_exchange_state {
   event receive_ready;
 };
 
-bool exchange_direct(int device, int rank, int peer, MPI_Comm communicator) {
+bool exchange_direct(int device, int rank, int peer, MPI_Comm communicator,
+                     uint64_t *received_digest) {
   const memory_accounting before = current_memory_accounting();
   std::unique_ptr<direct_exchange_state> state;
   bool preflight_ok = true;
@@ -387,6 +406,8 @@ bool exchange_direct(int device, int rank, int peer, MPI_Comm communicator) {
     state->receive_ready.record(state->transfer);
     state->receive_ready.synchronize();
     validate_payload(state->verification.data(), payload_bytes, peer, "direct");
+    if (received_digest)
+      *received_digest = payload_digest(state->verification.data(), payload_bytes);
   }
   catch (const std::exception &error) {
     validation_ok = false;
@@ -508,8 +529,9 @@ int main(int argc, char **argv) {
                 << selection.device << " " << device_description << "\n";
 
       const int peer = 1 - rank;
+      uint64_t staged_digest = 0;
       if (!exchange_staged(selection.device, rank, peer, MPI_COMM_WORLD,
-                           rank == inject_preflight_failure_rank)) {
+                           rank == inject_preflight_failure_rank, &staged_digest)) {
         exit_code = 1;
       }
       else if (rank == 0) { std::cout << "staged D2H->MPI->H2D bidirectional exchange: PASS\n"; }
@@ -529,8 +551,21 @@ int main(int argc, char **argv) {
         exit_code = 1;
       }
       else if (!exit_code && mode != transport_mode::staged && all_cuda_aware) {
-        if (!exchange_direct(selection.device, rank, peer, MPI_COMM_WORLD)) { exit_code = 1; }
-        else if (rank == 0) { std::cout << "direct device-pointer bidirectional exchange: PASS\n"; }
+        uint64_t direct_digest = 0;
+        if (!exchange_direct(selection.device, rank, peer, MPI_COMM_WORLD, &direct_digest)) {
+          exit_code = 1;
+        }
+        else {
+          const bool same_output = direct_digest == staged_digest;
+          if (!collectively_report(same_output,
+                                   same_output ? std::string()
+                                               : "staged/direct receive digests differ",
+                                   MPI_COMM_WORLD, rank, "staged/direct equivalence"))
+            exit_code = 1;
+          else if (rank == 0)
+            std::cout << "direct device-pointer bidirectional exchange and staged/direct "
+                         "digest equivalence: PASS\n";
+        }
       }
       else if (!exit_code && mode == transport_mode::automatic && rank == 0) {
         std::cout << "direct device-pointer exchange: SKIP "

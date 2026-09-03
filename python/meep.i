@@ -43,6 +43,7 @@
 #undef READONLY
 
 #include <complex>
+#include <cstring>
 #include <string>
 
 #include "config.h"
@@ -1537,6 +1538,12 @@ void _get_gradient(PyObject *grad, double scalegrad,
 %ignore meep::fields::nonfinite_flag;
 %ignore meep::fields::first_bad_step;
 %ignore meep::fields::first_bad_component;
+/* execution_runtime_report deliberately remains a C++ diagnostic type.  The
+   Python API below constructs native dictionaries and lists, avoiding a
+   global std::string typemap change. */
+%ignore meep::execution_runtime_report;
+%ignore meep::fields::get_execution_runtime_report;
+%ignore meep::active_communicator_allgather_json_records;
 %ignore meep::fields_chunk;
 %ignore meep::infinity;
 %ignore meep::timing_scope;
@@ -1583,6 +1590,158 @@ void _get_gradient(PyObject *grad, double scalegrad,
 
 %include "vec.i"
 %include "meep.hpp"
+
+%feature("nothreadallow") _get_execution_runtime_report;
+%feature("nothreadallow") active_communicator_allgather_json;
+%inline %{
+PyObject *_get_execution_runtime_report(meep::fields *f) {
+  if (!f) {
+    PyErr_SetString(PyExc_RuntimeError, "simulation fields are not initialized");
+    return NULL;
+  }
+  meep::execution_runtime_report report;
+  try { report = f->get_execution_runtime_report(); }
+  catch (const std::exception &error) {
+    PyErr_SetString(PyExc_RuntimeError, error.what());
+    return NULL;
+  }
+  PyObject *result = PyDict_New();
+  if (!result) return NULL;
+  const auto put_string = [&](const char *key, const std::string &value) -> bool {
+    PyObject *item = PyUnicode_FromStringAndSize(value.data(), value.size());
+    if (!item) return false;
+    const int status = PyDict_SetItemString(result, key, item);
+    Py_DECREF(item);
+    return status == 0;
+  };
+  const auto put_bool = [&](const char *key, bool value) -> bool {
+    return PyDict_SetItemString(result, key, value ? Py_True : Py_False) == 0;
+  };
+  const auto put_int = [&](const char *key, long long value) -> bool {
+    PyObject *item = PyLong_FromLongLong(value);
+    if (!item) return false;
+    const int status = PyDict_SetItemString(result, key, item);
+    Py_DECREF(item);
+    return status == 0;
+  };
+  const auto put_uint = [&](const char *key, uint64_t value) -> bool {
+    PyObject *item = PyLong_FromUnsignedLongLong(value);
+    if (!item) return false;
+    const int status = PyDict_SetItemString(result, key, item);
+    Py_DECREF(item);
+    return status == 0;
+  };
+#define MEEP_REPORT_STRING(name) put_string(#name, report.name)
+#define MEEP_REPORT_BOOL(name) put_bool(#name, report.name)
+#define MEEP_REPORT_INT(name) put_int(#name, report.name)
+#define MEEP_REPORT_UINT(name) put_uint(#name, static_cast<uint64_t>(report.name))
+  const bool ok =
+      MEEP_REPORT_STRING(requested_backend) && MEEP_REPORT_STRING(resolved_backend) &&
+      MEEP_REPORT_STRING(requested_precision) && MEEP_REPORT_STRING(resolved_precision) &&
+      MEEP_REPORT_STRING(requested_transport) && MEEP_REPORT_STRING(resolved_transport) &&
+      MEEP_REPORT_STRING(requested_overlap) && MEEP_REPORT_STRING(resolved_overlap) &&
+      MEEP_REPORT_STRING(captured_requested_transport) &&
+      MEEP_REPORT_STRING(captured_overlap_policy) &&
+      MEEP_REPORT_STRING(requested_graph) && MEEP_REPORT_STRING(resolved_graph) &&
+      MEEP_REPORT_STRING(mpi_provider) && MEEP_REPORT_STRING(counter_scope) &&
+      MEEP_REPORT_STRING(backend_counter_scope) && MEEP_REPORT_STRING(memory_gauge_scope) &&
+      MEEP_REPORT_STRING(setup_counter_scope) && MEEP_REPORT_STRING(transport_timing_scope) &&
+      MEEP_REPORT_STRING(allocation_counter_scope) &&
+      MEEP_REPORT_STRING(device_uuid) &&
+      MEEP_REPORT_INT(communicator_rank) && MEEP_REPORT_INT(communicator_size) &&
+      MEEP_REPORT_INT(device_id) && MEEP_REPORT_BOOL(mpi_query_available) &&
+      MEEP_REPORT_BOOL(mpi_cuda_aware) && MEEP_REPORT_BOOL(device_owner) &&
+      MEEP_REPORT_BOOL(graph_enabled) &&
+      MEEP_REPORT_BOOL(captured_transport_epoch_active) &&
+      MEEP_REPORT_BOOL(captured_transport_epoch_fresh) && MEEP_REPORT_BOOL(graph_valid) &&
+      MEEP_REPORT_UINT(communicator_generation) &&
+      MEEP_REPORT_UINT(captured_provider_signature) &&
+      MEEP_REPORT_UINT(executable_build_count) && MEEP_REPORT_UINT(messages_sent) &&
+      MEEP_REPORT_UINT(messages_received) && MEEP_REPORT_UINT(bytes_sent) &&
+      MEEP_REPORT_UINT(bytes_received) && MEEP_REPORT_UINT(gather_launches) &&
+      MEEP_REPORT_UINT(scatter_launches) && MEEP_REPORT_UINT(testsome_polls) &&
+      MEEP_REPORT_UINT(waitall_calls) && MEEP_REPORT_UINT(request_completions) &&
+      MEEP_REPORT_UINT(slot_reuses) && MEEP_REPORT_UINT(high_water_requests) &&
+      MEEP_REPORT_UINT(device_to_host_calls) && MEEP_REPORT_UINT(device_to_host_bytes) &&
+      MEEP_REPORT_UINT(host_to_device_calls) && MEEP_REPORT_UINT(host_to_device_bytes) &&
+      MEEP_REPORT_UINT(direct_bytes) && MEEP_REPORT_UINT(overlap_stages) &&
+      MEEP_REPORT_UINT(overlap_interior_launches) &&
+      MEEP_REPORT_UINT(overlap_boundary_launches) &&
+      MEEP_REPORT_UINT(material_recipe_prepare_nanoseconds) &&
+      MEEP_REPORT_UINT(material_initialize_nanoseconds) &&
+      MEEP_REPORT_UINT(graph_build_nanoseconds) &&
+      MEEP_REPORT_UINT(gather_pack_nanoseconds) &&
+      MEEP_REPORT_UINT(device_to_host_nanoseconds) &&
+      MEEP_REPORT_UINT(mpi_progress_nanoseconds) &&
+      MEEP_REPORT_UINT(mpi_wait_nanoseconds) &&
+      MEEP_REPORT_UINT(host_to_device_nanoseconds) &&
+      MEEP_REPORT_UINT(scatter_unpack_nanoseconds) &&
+      MEEP_REPORT_UINT(steady_allocation_count) &&
+      MEEP_REPORT_UINT(graph_recapture_count) && MEEP_REPORT_UINT(full_field_copy_count) &&
+      MEEP_REPORT_UINT(graph_capture_count) && MEEP_REPORT_UINT(graph_launch_count) &&
+      MEEP_REPORT_UINT(graph_boundary_count) && MEEP_REPORT_UINT(host_fallback_count) &&
+      MEEP_REPORT_UINT(host_fallback_device_to_host_bytes) &&
+      MEEP_REPORT_UINT(host_fallback_host_to_device_bytes) &&
+      MEEP_REPORT_UINT(host_fallback_steady_capacity_growths) &&
+      MEEP_REPORT_UINT(material_fallback_warning_count) &&
+      MEEP_REPORT_UINT(process_device_bytes_current) &&
+      MEEP_REPORT_UINT(process_device_bytes_peak) &&
+      MEEP_REPORT_UINT(process_pinned_bytes_current) &&
+      MEEP_REPORT_UINT(process_pinned_bytes_peak) &&
+      MEEP_REPORT_UINT(transport_device_bytes) && MEEP_REPORT_UINT(transport_pinned_bytes);
+#undef MEEP_REPORT_STRING
+#undef MEEP_REPORT_BOOL
+#undef MEEP_REPORT_INT
+#undef MEEP_REPORT_UINT
+  if (!ok) {
+    Py_DECREF(result);
+    return NULL;
+  }
+  return result;
+}
+
+PyObject *active_communicator_allgather_json(PyObject *payload_object) {
+  bool local_valid = PyUnicode_Check(payload_object);
+  std::string local_error;
+  std::string payload;
+  if (!local_valid) {
+    local_error = "active_communicator_allgather_json requires a str on every rank";
+  } else {
+    Py_ssize_t size = 0;
+    const char *data = PyUnicode_AsUTF8AndSize(payload_object, &size);
+    if (!data) {
+      PyErr_Clear();
+      local_valid = false;
+      local_error = "active_communicator_allgather_json requires valid UTF-8";
+    } else if (std::memchr(data, '\0', static_cast<size_t>(size))) {
+      local_valid = false;
+      local_error = "active_communicator_allgather_json rejects embedded NUL bytes";
+    } else {
+      payload.assign(data, static_cast<size_t>(size));
+    }
+  }
+  std::vector<std::string> gathered;
+  try {
+    gathered = meep::active_communicator_allgather_json_records(
+        payload, local_valid, local_error);
+  } catch (const std::exception &error) {
+    PyErr_SetString(PyExc_RuntimeError, error.what());
+    return NULL;
+  }
+  PyObject *result = PyList_New(static_cast<Py_ssize_t>(gathered.size()));
+  if (!result) return NULL;
+  for (size_t i = 0; i < gathered.size(); ++i) {
+    PyObject *item = PyUnicode_FromStringAndSize(
+        gathered[i].data(), static_cast<Py_ssize_t>(gathered[i].size()));
+    if (!item) {
+      Py_DECREF(result);
+      return NULL;
+    }
+    PyList_SET_ITEM(result, static_cast<Py_ssize_t>(i), item);
+  }
+  return result;
+}
+%}
 %include "meep/mympi.hpp"
 %include "meepgeom.hpp"
 %include "meep-python.hpp"

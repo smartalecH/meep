@@ -9,6 +9,8 @@
 /* Backend selection, lifecycle, and the backend-safe access points. */
 
 #include <algorithm>
+#include <climits>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -31,10 +33,18 @@
 #include "backend/initialization_plan.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/material_ir.hpp"
+#include "backend/mpi_context.hpp"
 #include "backend/precision.hpp"
 #include "backend/prepare.hpp"
 #include "backend/random_state.hpp"
 #include "backend/step_plan.hpp"
+#ifdef HAVE_NVIDIA_BACKEND
+#include "backend/dependency_region.hpp"
+#include "backend/graph_plan.hpp"
+#include "backend/nvidia/nvidia_backend.hpp"
+#include "backend/nvidia/runtime.hpp"
+#include "backend/transport_plan.hpp"
+#endif
 
 namespace meep {
 
@@ -57,6 +67,22 @@ static bool host_custom_mpi_override_for_testing = false;
 static int material_candidate_plan_failure_rank_for_testing = -1;
 static int material_candidate_plan_failure_mode_for_testing = 0;
 static bool initialization_only_for_testing = false;
+static int runtime_report_failure_rank_for_testing = -1;
+static int runtime_report_failure_point_for_testing = 0;
+
+void backend_set_runtime_report_failure_for_testing(int rank, int point) {
+  runtime_report_failure_rank_for_testing = rank;
+  runtime_report_failure_point_for_testing = point;
+}
+
+static bool consume_runtime_report_failure(int point) {
+  if (runtime_report_failure_point_for_testing != point ||
+      runtime_report_failure_rank_for_testing != my_rank())
+    return false;
+  runtime_report_failure_point_for_testing = 0;
+  runtime_report_failure_rank_for_testing = -1;
+  return true;
+}
 
 static bool has_live_host_custom_susceptibility(const fields &f) {
   ++host_custom_presence_scan_count_for_testing;
@@ -1760,13 +1786,21 @@ struct ResidentEpochCandidate {
   MaterialRecipeDisposition global_material_route;
   MaterialRecipeDisposition local_material_route;
   LiveIdentitySnapshot entry;
+  uint64_t material_recipe_prepare_nanoseconds;
 
   ResidentEpochCandidate()
       : material_support{MaterialRecipeDisposition::device_native, material_support_none,
                          0, 0, 0, 0, 0, 0},
         global_material_route(MaterialRecipeDisposition::device_native),
-        local_material_route(MaterialRecipeDisposition::device_native) {}
+        local_material_route(MaterialRecipeDisposition::device_native),
+        material_recipe_prepare_nanoseconds(0) {}
 };
+
+static uint64_t elapsed_nanoseconds(const std::chrono::steady_clock::time_point &start) {
+  const std::chrono::nanoseconds elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start);
+  return elapsed.count() > 0 ? uint64_t(elapsed.count()) : uint64_t(0);
+}
 
 struct MaterialFallbackPreflight {
   MaterialSupportDecision local_support;
@@ -1904,6 +1938,8 @@ ResidentCandidateResult build_resident_epoch_candidate(
   ResidentEpochCandidate candidate;
   std::string local_error;
 
+  const std::chrono::steady_clock::time_point recipe_start =
+      std::chrono::steady_clock::now();
   try {
     candidate.catalog.reset(new CpuArrayCatalog);
     candidate.host_storage.reset(new StoragePlan);
@@ -1936,6 +1972,7 @@ ResidentCandidateResult build_resident_epoch_candidate(
     local_error = "unknown resident candidate recipe failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate recipe");
+  candidate.material_recipe_prepare_nanoseconds = elapsed_nanoseconds(recipe_start);
 
   {
     const MaterialRecipe &recipe = candidate.initialization->materials[0];
@@ -1967,6 +2004,8 @@ ResidentCandidateResult build_resident_epoch_candidate(
     f.backend->preflight_initialization(*candidate.initialization);
     candidate.state.reset(f.backend->create_state(candidate.allocation_storage));
     if (!candidate.state) throw std::runtime_error("backend returned no candidate state");
+    candidate.state->material_recipe_prepare_nanoseconds =
+        candidate.material_recipe_prepare_nanoseconds;
     candidate.state->host_custom_local_presence = local_custom;
     candidate.state->host_custom_presence_validated = true;
     candidate.state->host_custom_preflight_required = any_custom;
@@ -2011,6 +2050,8 @@ ResidentCandidateResult build_resident_epoch_candidate(
   backend_reconcile_host_access(local_error, "fields::init_backend candidate create");
 
   bool candidate_promotion = false;
+  const std::chrono::steady_clock::time_point material_initialize_start =
+      std::chrono::steady_clock::now();
   try {
     ScopedArtifactBuildView view(f, candidate);
     f.backend->prepare_initialization(*candidate.initialization, *candidate.state);
@@ -2035,6 +2076,8 @@ ResidentCandidateResult build_resident_epoch_candidate(
     local_error = "unknown resident candidate initialization failure";
   }
   backend_reconcile_host_access(local_error, "fields::init_backend candidate initialize");
+  candidate.state->material_initialize_nanoseconds =
+      elapsed_nanoseconds(material_initialize_start);
 
   try {
     ScopedArtifactBuildView view(f, candidate);
@@ -2314,6 +2357,267 @@ backend_capabilities fields::backend_caps() const {
   c.memory_budget_bytes = 0;
   c.name = "none";
   return c;
+}
+
+execution_runtime_report::execution_runtime_report()
+    : requested_backend("cpu"), resolved_backend("none"), requested_precision("native"),
+      resolved_precision("native"), requested_transport("none"), resolved_transport("none"),
+      requested_overlap("off"), resolved_overlap("off"), captured_requested_transport("none"),
+      captured_overlap_policy("off"), requested_graph("eager"), resolved_graph("eager"),
+      mpi_provider("none"), counter_scope("rank_local_current_epoch"),
+      backend_counter_scope("rank_local_backend_lifetime"),
+      memory_gauge_scope("rank_local_process_lifetime"),
+      setup_counter_scope("rank_local_current_backend_state"),
+      transport_timing_scope("rank_local_current_transport_epoch_host_elapsed"),
+      allocation_counter_scope("rank_local_process_lifetime"), device_uuid(),
+      communicator_rank(0),
+      communicator_size(1), device_id(automatic_device), mpi_query_available(false),
+      mpi_cuda_aware(false), device_owner(false), graph_enabled(false),
+      captured_transport_epoch_active(false), captured_transport_epoch_fresh(false),
+      graph_valid(false), communicator_generation(0),
+      captured_provider_signature(0), executable_build_count(0), messages_sent(0),
+      messages_received(0), bytes_sent(0), bytes_received(0), gather_launches(0),
+      scatter_launches(0), testsome_polls(0), waitall_calls(0), request_completions(0),
+      slot_reuses(0), high_water_requests(0), device_to_host_calls(0), device_to_host_bytes(0),
+      host_to_device_calls(0), host_to_device_bytes(0),
+      direct_bytes(0), overlap_stages(0), overlap_interior_launches(0),
+      overlap_boundary_launches(0), material_recipe_prepare_nanoseconds(0),
+      material_initialize_nanoseconds(0), graph_build_nanoseconds(0),
+      gather_pack_nanoseconds(0), device_to_host_nanoseconds(0),
+      mpi_progress_nanoseconds(0), mpi_wait_nanoseconds(0),
+      host_to_device_nanoseconds(0), scatter_unpack_nanoseconds(0),
+      steady_allocation_count(0), graph_recapture_count(0), full_field_copy_count(0),
+      graph_capture_count(0), graph_launch_count(0),
+      graph_boundary_count(0), host_fallback_count(0),
+      host_fallback_device_to_host_bytes(0), host_fallback_host_to_device_bytes(0),
+      host_fallback_steady_capacity_growths(0), material_fallback_warning_count(0),
+      process_device_bytes_current(0),
+      process_device_bytes_peak(0), process_pinned_bytes_current(0),
+      process_pinned_bytes_peak(0), transport_device_bytes(0),
+      transport_pinned_bytes(0) {}
+
+execution_runtime_report fields::get_execution_runtime_report() const {
+  execution_runtime_report result;
+  result.requested_backend = backend_kind_name(requested_options.backend);
+  result.resolved_backend = backend ? backend->capabilities().name : "none";
+  result.requested_precision = precision_policy_name(requested_options.precision);
+  result.resolved_precision = precision_policy_name(options.precision);
+  result.communicator_rank = my_rank();
+  result.communicator_size = count_processors();
+  result.communicator_generation = current_backend_communicator_generation();
+  if (backend_state) {
+    result.material_recipe_prepare_nanoseconds =
+        backend_state->material_recipe_prepare_nanoseconds;
+    result.material_initialize_nanoseconds = backend_state->material_initialize_nanoseconds;
+  }
+  std::string provider_error;
+  if (!query_gpu_aware_mpi_provider(result.mpi_query_available, result.mpi_cuda_aware,
+                                    result.mpi_provider, provider_error))
+    result.mpi_provider = provider_error;
+  if (result.communicator_size > 1 && result.resolved_backend == "cpu") {
+    result.requested_transport = "host";
+    result.resolved_transport = "host";
+  }
+#ifdef HAVE_NVIDIA_BACKEND
+  const NvidiaBackend *nvidia_backend = dynamic_cast<const NvidiaBackend *>(backend);
+  if (nvidia_backend) {
+    const GpuMpiPolicyParse requested_transport =
+        parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
+    const DependencyOverlapPolicyParse requested_overlap =
+        parse_dependency_overlap_policy(std::getenv("MEEP_NVIDIA_MPI_OVERLAP"));
+    result.requested_transport = requested_transport.valid
+                                     ? gpu_mpi_policy_name(requested_transport.requested)
+                                     : "invalid";
+    result.requested_overlap = requested_overlap.valid
+                                   ? dependency_overlap_policy_name(requested_overlap.requested)
+                                   : "invalid";
+    result.device_owner = true;
+    result.device_id = nvidia_backend->device_ordinal_for_testing();
+    result.device_uuid = nvidia_backend->normalized_device_uuid_for_testing();
+    const NvidiaGraphStatistics graph = nvidia_backend->graph_statistics_for_testing();
+    const NvidiaExecutionTimingStatistics timing =
+        nvidia_backend->execution_timing_statistics_for_testing();
+    result.requested_graph = graph_execution_mode_name(graph.requested);
+    result.graph_enabled = graph.enabled;
+    result.graph_valid = graph.valid;
+    result.resolved_graph = graph.enabled ? "graph" : "eager";
+    result.graph_capture_count = graph.capture_count + graph.magnetic_capture_count;
+    result.graph_launch_count = graph.launch_count + graph.magnetic_launch_count;
+    result.graph_boundary_count = graph.boundary_count + graph.magnetic_boundary_count;
+    result.graph_build_nanoseconds = timing.graph_build_nanoseconds;
+    result.graph_recapture_count =
+        timing.graph_build_count ? timing.graph_build_count - 1 : 0;
+    result.full_field_copy_count = timing.full_field_copy_count;
+    result.executable_build_count =
+        nvidia_backend->executable_cache_statistics_for_testing().executable_build_count;
+    const NvidiaHostFallbackStatistics fallback =
+        nvidia_backend->host_fallback_statistics_for_testing();
+    result.host_fallback_count = fallback.segment_executions;
+    result.host_fallback_device_to_host_bytes = fallback.device_to_host_bytes;
+    result.host_fallback_host_to_device_bytes = fallback.host_to_device_bytes;
+    result.host_fallback_steady_capacity_growths = fallback.steady_capacity_growths;
+    result.material_fallback_warning_count =
+        nvidia_backend->material_fallback_warning_count();
+    const nvidia::memory_accounting memory = nvidia::current_memory_accounting();
+    result.process_device_bytes_current = memory.device_bytes_current;
+    result.process_device_bytes_peak = memory.device_bytes_peak;
+    result.process_pinned_bytes_current = memory.pinned_bytes_current;
+    result.process_pinned_bytes_peak = memory.pinned_bytes_peak;
+    result.steady_allocation_count =
+        memory.device_allocation_count >
+                std::numeric_limits<uint64_t>::max() - memory.pinned_allocation_count
+            ? std::numeric_limits<uint64_t>::max()
+            : memory.device_allocation_count + memory.pinned_allocation_count;
+    const NvidiaMpiTransportStatistics transport =
+        nvidia_backend->mpi_transport_statistics_for_testing();
+    if (transport.active) {
+      result.captured_transport_epoch_active = true;
+      result.captured_requested_transport = gpu_mpi_policy_name(transport.requested_policy);
+      result.captured_overlap_policy =
+          dependency_overlap_policy_name(transport.overlap_policy);
+      result.resolved_transport = gpu_mpi_route_name(transport.resolved_route);
+      result.resolved_overlap =
+          resolved_dependency_overlap_name(transport.dependency_region_count);
+      result.communicator_generation = transport.communicator_generation;
+      result.captured_provider_signature = transport.provider_signature;
+      result.communicator_rank = transport.communicator_rank;
+      result.communicator_size = transport.communicator_size;
+      std::string identity_error;
+      result.captured_transport_epoch_fresh =
+          executable && backend_state &&
+          nvidia_backend->executable_structural_identity_current(
+              *executable, *backend_state, identity_error);
+    }
+    result.messages_sent = transport.messages_sent;
+    result.messages_received = transport.messages_received;
+    result.bytes_sent = transport.bytes_sent;
+    result.bytes_received = transport.bytes_received;
+    result.gather_launches = transport.gather_launches;
+    result.scatter_launches = transport.scatter_launches;
+    result.testsome_polls = transport.testsome_polls;
+    result.waitall_calls = transport.waitall_calls;
+    result.request_completions = transport.request_completions;
+    result.slot_reuses = transport.slot_reuses;
+    result.high_water_requests = transport.high_water_requests;
+    result.device_to_host_calls = transport.device_to_host_calls;
+    result.device_to_host_bytes = transport.device_to_host_bytes;
+    result.host_to_device_calls = transport.host_to_device_calls;
+    result.host_to_device_bytes = transport.host_to_device_bytes;
+    result.direct_bytes = transport.direct_bytes;
+    result.overlap_stages = transport.overlap_stages;
+    result.overlap_interior_launches = transport.overlap_interior_launches;
+    result.overlap_boundary_launches = transport.overlap_boundary_launches;
+    result.gather_pack_nanoseconds = transport.gather_pack_nanoseconds;
+    result.device_to_host_nanoseconds = transport.device_to_host_nanoseconds;
+    result.mpi_progress_nanoseconds = transport.mpi_progress_nanoseconds;
+    result.mpi_wait_nanoseconds = transport.mpi_wait_nanoseconds;
+    result.host_to_device_nanoseconds = transport.host_to_device_nanoseconds;
+    result.scatter_unpack_nanoseconds = transport.scatter_unpack_nanoseconds;
+    result.transport_device_bytes = transport.device_bytes;
+    result.transport_pinned_bytes = transport.pinned_bytes;
+  }
+#endif
+  return result;
+}
+
+std::vector<std::string> active_communicator_allgather_json_records(
+    const std::string &payload, bool local_valid, const std::string &local_error) {
+  static const size_t max_record_bytes = size_t(1) << 20;
+  static const size_t max_aggregate_bytes = size_t(16) << 20;
+  std::vector<std::string> result;
+#ifdef HAVE_MPI
+  std::string thread_error;
+  if (!backend_mpi_thread_ready(thread_error))
+    throw std::runtime_error("runtime-report gather is unavailable: " + thread_error);
+  MPI_Comm communicator = current_backend_communicator();
+  int rank = 0, size = 1;
+  if (MPI_Comm_rank(communicator, &rank) != MPI_SUCCESS ||
+      MPI_Comm_size(communicator, &size) != MPI_SUCCESS)
+    throw std::runtime_error("runtime-report gather cannot query the active communicator");
+  const bool local_size_valid = payload.size() <= max_record_bytes &&
+                                payload.size() <= static_cast<size_t>(INT_MAX);
+  int local_ok = local_valid && local_size_valid ? 1 : 0;
+  int all_ok = 0;
+  if (MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN, communicator) != MPI_SUCCESS)
+    throw std::runtime_error("runtime-report gather validation collective failed");
+  if (!all_ok) {
+    const std::string message = !local_valid ? local_error :
+        (!local_size_valid ? "runtime-report JSON exceeds the per-rank limit" :
+                            "another rank supplied invalid runtime-report JSON");
+    throw std::runtime_error(message);
+  }
+  const int local_size = static_cast<int>(payload.size());
+  std::vector<int> sizes;
+  std::vector<int> displacements;
+  try {
+    if (consume_runtime_report_failure(1)) throw std::bad_alloc();
+    sizes.assign(static_cast<size_t>(size), 0);
+    displacements.assign(static_cast<size_t>(size), 0);
+  }
+  catch (...) { local_ok = 0; }
+  if (MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN, communicator) != MPI_SUCCESS)
+    throw std::runtime_error("runtime-report allocation reconciliation failed");
+  if (!all_ok)
+    throw std::runtime_error("runtime-report rank-layout allocation failed");
+  if (MPI_Allgather(&local_size, 1, MPI_INT, sizes.data(), 1, MPI_INT, communicator) !=
+      MPI_SUCCESS)
+    throw std::runtime_error("runtime-report size allgather failed");
+  size_t total = 0;
+  bool layout_valid = true;
+  for (int i = 0; i < size; ++i) {
+    if (sizes[static_cast<size_t>(i)] < 0 || total > static_cast<size_t>(INT_MAX) -
+                                                      static_cast<size_t>(sizes[static_cast<size_t>(i)])) {
+      layout_valid = false;
+      break;
+    }
+    displacements[static_cast<size_t>(i)] = static_cast<int>(total);
+    total += static_cast<size_t>(sizes[static_cast<size_t>(i)]);
+  }
+  if (total > max_aggregate_bytes) layout_valid = false;
+  local_ok = layout_valid ? 1 : 0;
+  if (MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN, communicator) != MPI_SUCCESS ||
+      !all_ok)
+    throw std::overflow_error("runtime-report gathered JSON exceeds the aggregate limit");
+  std::vector<char> bytes;
+  try {
+    if (consume_runtime_report_failure(2)) throw std::bad_alloc();
+    bytes.resize(total);
+    result.reserve(static_cast<size_t>(size));
+  }
+  catch (...) { local_ok = 0; }
+  if (MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN, communicator) != MPI_SUCCESS)
+    throw std::runtime_error("runtime-report payload allocation reconciliation failed");
+  if (!all_ok)
+    throw std::runtime_error("runtime-report payload allocation failed");
+  if (total && MPI_Allgatherv(const_cast<char *>(payload.data()), local_size, MPI_CHAR,
+                     bytes.data(), sizes.data(), displacements.data(), MPI_CHAR,
+                     communicator) != MPI_SUCCESS)
+    throw std::runtime_error("runtime-report payload allgather failed");
+  try {
+    if (consume_runtime_report_failure(3)) throw std::bad_alloc();
+    for (int i = 0; i < size; ++i) {
+      const size_t record_size = static_cast<size_t>(sizes[static_cast<size_t>(i)]);
+      result.push_back(record_size
+                           ? std::string(bytes.data() + displacements[static_cast<size_t>(i)],
+                                         record_size)
+                           : std::string());
+    }
+  }
+  catch (...) { local_ok = 0; }
+  if (MPI_Allreduce(&local_ok, &all_ok, 1, MPI_INT, MPI_MIN, communicator) != MPI_SUCCESS)
+    throw std::runtime_error("runtime-report materialization reconciliation failed");
+  if (!all_ok)
+    throw std::runtime_error("runtime-report materialization failed");
+#else
+  if (!local_valid) throw std::runtime_error(local_error);
+  if (payload.size() > max_record_bytes)
+    throw std::overflow_error("runtime-report JSON exceeds the per-rank limit");
+  if (consume_runtime_report_failure(1) || consume_runtime_report_failure(2) ||
+      consume_runtime_report_failure(3))
+    throw std::bad_alloc();
+  result.push_back(payload);
+#endif
+  return result;
 }
 
 bool backend_host_refresh_required(const fields &f) {
@@ -2974,6 +3278,7 @@ void backend_prepare_checkpoint_load(fields &f) {
 void fields::select_backend(const execution_options &opts) {
   options = opts;
   apply_execution_environment(options);
+  requested_options = options;
 
   std::string why;
   ExecutionBackend *b = make_backend(*this, options, why);

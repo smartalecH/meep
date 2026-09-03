@@ -1,6 +1,7 @@
 /* Copyright (C) 2005-2026 Massachusetts Institute of Technology */
 
 #include <cstdio>
+#include <cstring>
 #include <limits>
 #include <string>
 
@@ -127,6 +128,17 @@ void test_overlap_policy() {
         "required overlap policy was not parsed");
   CHECK(!parse_dependency_overlap_policy("sometimes").valid,
         "malformed overlap policy was accepted");
+  CHECK(!std::strcmp(resolved_dependency_overlap_name(0), "off"),
+        "off overlap with no admitted regions resolved incorrectly");
+  CHECK(parse_dependency_overlap_policy("auto").requested ==
+            DependencyOverlapPolicy::automatic &&
+            !std::strcmp(resolved_dependency_overlap_name(0), "off") &&
+            !std::strcmp(resolved_dependency_overlap_name(1), "overlap"),
+        "automatic overlap did not reflect admitted dependency regions");
+  CHECK(parse_dependency_overlap_policy("required").requested ==
+            DependencyOverlapPolicy::required &&
+            !std::strcmp(resolved_dependency_overlap_name(1), "overlap"),
+        "required overlap with an admitted region resolved incorrectly");
 }
 
 void test_interior_and_thin_rejection() {

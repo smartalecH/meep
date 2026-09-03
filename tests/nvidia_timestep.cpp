@@ -4689,8 +4689,8 @@ static void run_pr54_strict_rejection_case(precision_policy_kind policy) {
   execution_options options;
   options.backend = backend_kind::nvidia;
   options.precision = policy;
-  options.strict = true;
-  options.fallback = fallback_policy::error;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
   fields f(&s, options);
   f.use_real_fields();
   f.require_component(Ez);
@@ -10170,6 +10170,258 @@ static bool same_resident_values(const resident_value_snapshot &a,
   return true;
 }
 
+struct remote_route_acceptance_result {
+  resident_value_snapshot state;
+  double field_energy;
+  execution_runtime_report report;
+  uint64_t resource_generation_before_checkpoint;
+  uint64_t resource_generation_after_checkpoint;
+};
+
+static remote_route_acceptance_result run_remote_route_acceptance(
+    GpuMpiPolicy policy, precision_policy_kind precision, bool checkpoint_roundtrip) {
+  setenv("MEEP_GPU_AWARE_MPI", policy == GpuMpiPolicy::direct ? "yes" : "no", 1);
+  setenv("MEEP_NVIDIA_MPI_OVERLAP", "off", 1);
+  const grid_volume gv = vol1d(4.0, 10.0);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.device_id = my_rank();
+  options.precision = precision;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&gpu_structure, options);
+  gpu.use_real_fields();
+  gaussian_src_time source(0.35, 0.14);
+  gpu.add_point_source(Ex, source, gv.center(), 0.37);
+  gpu.advance(5);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend && gpu.backend_state && gpu.executable,
+          "remote route acceptance did not publish a NVIDIA executable");
+  const NvidiaExecutableCacheStatistics before =
+      backend->executable_cache_statistics_for_testing();
+  const execution_runtime_report warmup_report = gpu.get_execution_runtime_report();
+
+  if (checkpoint_roundtrip) {
+    const char *filename = sizeof(realnum) == sizeof(float)
+                               ? "/tmp/meep-pr7-5-direct-f32.h5"
+                               : "/tmp/meep-pr7-5-direct-native.h5";
+    if (am_master()) std::remove(filename);
+    all_wait();
+    gpu.dump(filename, true);
+    gpu.advance(1);
+    gpu.load(filename, true);
+    require(and_to_all(!gpu.backend_state && !gpu.executable),
+            "successful direct-route checkpoint load retained a stale resident epoch");
+    gpu.advance(5);
+    if (am_master()) std::remove(filename);
+    all_wait();
+  }
+  else {
+    gpu.advance(5);
+  }
+
+  remote_route_acceptance_result result;
+  result.report = gpu.get_execution_runtime_report();
+  const NvidiaMpiTransportStatistics transport =
+      backend->mpi_transport_statistics_for_testing();
+  require(result.report.captured_overlap_policy == "off" &&
+              result.report.resolved_overlap ==
+                  resolved_dependency_overlap_name(transport.dependency_region_count),
+          "runtime report did not distinguish requested and admitted overlap");
+  require(transport.dependency_region_count == 0 &&
+              result.report.resolved_overlap == "off",
+          "disabled overlap reported an admitted dependency region");
+  require(result.report.gather_pack_nanoseconds > 0 &&
+              result.report.mpi_progress_nanoseconds > 0 &&
+              result.report.mpi_wait_nanoseconds > 0 &&
+              result.report.scatter_unpack_nanoseconds > 0,
+          "production transport timing counters did not advance");
+  require(policy == GpuMpiPolicy::direct
+              ? (result.report.device_to_host_nanoseconds == 0 &&
+                 result.report.host_to_device_nanoseconds == 0)
+              : (result.report.device_to_host_nanoseconds > 0 &&
+                 result.report.host_to_device_nanoseconds > 0),
+          "production copy timing counters differ from the selected route");
+  if (!checkpoint_roundtrip)
+    require(result.report.steady_allocation_count == warmup_report.steady_allocation_count &&
+                result.report.graph_recapture_count == warmup_report.graph_recapture_count &&
+                result.report.full_field_copy_count == warmup_report.full_field_copy_count,
+            "steady production advance allocated, recaptured, or copied full fields");
+  result.state = capture_resident_values(gpu);
+  result.field_energy = gpu.field_energy();
+  result.resource_generation_before_checkpoint = before.ordinary_resource_generation;
+  result.resource_generation_after_checkpoint =
+      backend->executable_cache_statistics_for_testing().ordinary_resource_generation;
+  return result;
+}
+
+static void test_remote_boundary_direct_acceptance() {
+  require(count_processors() == 2,
+          "provider-positive direct acceptance requires two GPU-owning ranks");
+  bool query_available = false, supports_direct = false;
+  std::string provider, why;
+  require(query_gpu_aware_mpi_provider(query_available, supports_direct, provider, why),
+          why.c_str());
+  require(and_to_all(query_available && supports_direct),
+          "provider-positive direct acceptance requires MPIX CUDA support on every rank");
+  const precision_policy_kind policies[] = {precision_policy_kind::native,
+                                             precision_policy_kind::f32};
+  for (precision_policy_kind precision : policies) {
+    const remote_route_acceptance_result staged =
+        run_remote_route_acceptance(GpuMpiPolicy::staged, precision, false);
+    const remote_route_acceptance_result direct =
+        run_remote_route_acceptance(GpuMpiPolicy::direct, precision, true);
+    require(same_resident_values(staged.state, direct.state),
+            "staged and direct production routes produced different resident state");
+    const double tolerance = precision == precision_policy_kind::f32 ? 2e-6 : 0.0;
+    require(std::abs(staged.field_energy - direct.field_energy) <= tolerance,
+            "staged and direct production routes produced different field energy");
+    require(staged.report.captured_transport_epoch_active &&
+                staged.report.captured_transport_epoch_fresh &&
+                staged.report.captured_requested_transport == "staged" &&
+                staged.report.resolved_transport == "staged" &&
+                staged.report.direct_bytes == 0 && staged.report.device_to_host_bytes > 0 &&
+                staged.report.host_to_device_bytes > 0 &&
+                staged.report.transport_pinned_bytes > 0 &&
+                staged.report.gather_launches > 0 && staged.report.scatter_launches > 0,
+            "staged production report does not describe staged transport");
+    require(direct.report.captured_transport_epoch_active &&
+                direct.report.captured_transport_epoch_fresh &&
+                direct.report.captured_requested_transport == "direct" &&
+                direct.report.resolved_transport == "direct" &&
+                direct.report.direct_bytes ==
+                    direct.report.bytes_sent + direct.report.bytes_received &&
+                direct.report.direct_bytes > 0 && direct.report.device_to_host_calls == 0 &&
+                direct.report.device_to_host_bytes == 0 &&
+                direct.report.host_to_device_calls == 0 &&
+                direct.report.host_to_device_bytes == 0 &&
+                direct.report.transport_pinned_bytes == 0 &&
+                direct.report.gather_launches > 0 && direct.report.scatter_launches > 0 &&
+                direct.report.request_completions > 0 &&
+                direct.report.high_water_requests > 0 &&
+                direct.report.captured_provider_signature != 0,
+            "direct production report contains staged transfers or lacks direct traffic");
+    require(direct.resource_generation_after_checkpoint >
+                direct.resource_generation_before_checkpoint &&
+                direct.report.executable_build_count == 1,
+            "checkpoint did not retire and rebuild the direct transport executable");
+    require(staged.report.communicator_generation == direct.report.communicator_generation &&
+                staged.report.communicator_rank == direct.report.communicator_rank &&
+                staged.report.communicator_size == direct.report.communicator_size &&
+                staged.report.captured_provider_signature ==
+                    direct.report.captured_provider_signature &&
+                staged.report.device_uuid == direct.report.device_uuid,
+            "route replacement changed communicator/provider/device identity");
+    if (const char *graph_mode = std::getenv("MEEP_NVIDIA_GRAPH_MODE"))
+      if (!::strcmp(graph_mode, "required"))
+        require(staged.report.graph_enabled && direct.report.graph_enabled &&
+                    staged.report.graph_launch_count > 0 && direct.report.graph_launch_count > 0,
+                "required graph mode did not execute on staged/direct production routes");
+  }
+  unsetenv("MEEP_GPU_AWARE_MPI");
+  unsetenv("MEEP_NVIDIA_MPI_OVERLAP");
+  master_printf("nvidia_timestep: provider-positive direct acceptance PASS\n");
+}
+
+static void test_remote_direct_policy_and_communicator_rebuild() {
+  require(count_processors() == 2,
+          "direct lifecycle acceptance requires two GPU-owning ranks");
+  setenv("MEEP_GPU_AWARE_MPI", "yes", 1);
+  setenv("MEEP_NVIDIA_MPI_OVERLAP", "off", 1);
+  const grid_volume gv = vol1d(4.0, 10.0);
+  structure cpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
+  fields cpu(&cpu_structure);
+  execution_options options;
+  options.backend = backend_kind::nvidia;
+  options.device_id = my_rank();
+  options.precision = precision_policy_kind::native;
+  options.strict = false;
+  options.fallback = fallback_policy::warn;
+  fields gpu(&gpu_structure, options);
+  cpu.use_real_fields();
+  gpu.use_real_fields();
+  gaussian_src_time cpu_source(0.35, 0.14), gpu_source(0.35, 0.14);
+  cpu.add_point_source(Ex, cpu_source, gv.center(), 0.37);
+  gpu.add_point_source(Ex, gpu_source, gv.center(), 0.37);
+  cpu.advance(2);
+  gpu.advance(2);
+  NvidiaBackend *backend = dynamic_cast<NvidiaBackend *>(gpu.backend);
+  require(backend, "direct lifecycle acceptance has no NVIDIA backend");
+  const NvidiaExecutableCacheStatistics direct_before =
+      backend->executable_cache_statistics_for_testing();
+  const execution_runtime_report direct_report = gpu.get_execution_runtime_report();
+  require(direct_report.resolved_transport == "direct" &&
+              direct_report.captured_transport_epoch_fresh,
+          "direct lifecycle fixture did not start with a fresh direct epoch");
+
+  setenv("MEEP_GPU_AWARE_MPI", "no", 1);
+  const execution_runtime_report changed_policy_report =
+      gpu.get_execution_runtime_report();
+  require(changed_policy_report.requested_transport == "staged" &&
+              changed_policy_report.captured_requested_transport == "direct" &&
+              !changed_policy_report.captured_transport_epoch_fresh,
+          "runtime report treated a changed transport policy as fresh");
+  cpu.advance(1);
+  gpu.advance(1);
+  const NvidiaExecutableCacheStatistics staged_cache =
+      backend->executable_cache_statistics_for_testing();
+  const execution_runtime_report staged_report = gpu.get_execution_runtime_report();
+  require(staged_cache.ordinary_resource_generation >
+              direct_before.ordinary_resource_generation &&
+              staged_report.resolved_transport == "staged" &&
+              staged_report.captured_requested_transport == "staged" &&
+              staged_report.captured_transport_epoch_fresh,
+          "direct-to-staged policy change did not rebuild transport identity");
+  compare_live_fields_by_key(cpu, gpu, 8e-13);
+
+  setenv("MEEP_NVIDIA_MPI_OVERLAP", "auto", 1);
+  const execution_runtime_report changed_overlap_report =
+      gpu.get_execution_runtime_report();
+  require(changed_overlap_report.requested_overlap == "auto" &&
+              changed_overlap_report.captured_overlap_policy == "off" &&
+              !changed_overlap_report.captured_transport_epoch_fresh,
+          "runtime report treated a changed overlap policy as fresh");
+  setenv("MEEP_NVIDIA_MPI_OVERLAP", "off", 1);
+
+  setenv("MEEP_GPU_AWARE_MPI", "yes", 1);
+  cpu.advance(1);
+  gpu.advance(1);
+  const NvidiaExecutableCacheStatistics direct_again =
+      backend->executable_cache_statistics_for_testing();
+  const execution_runtime_report direct_again_report = gpu.get_execution_runtime_report();
+  require(direct_again.ordinary_resource_generation > staged_cache.ordinary_resource_generation &&
+              direct_again_report.resolved_transport == "direct" &&
+              direct_again_report.captured_transport_epoch_fresh,
+          "staged-to-direct policy change did not rebuild transport identity");
+  compare_live_fields_by_key(cpu, gpu, 8e-13);
+
+  const uint64_t world_generation = direct_again_report.communicator_generation;
+  divide_parallel_processes(2);
+  require(count_processors() == 1, "direct lifecycle split did not create singleton groups");
+  begin_global_communications();
+  require(count_processors() == 2, "direct lifecycle could not restore world communications");
+  cpu.advance(1);
+  gpu.advance(1);
+  const NvidiaExecutableCacheStatistics after_communicator =
+      backend->executable_cache_statistics_for_testing();
+  const execution_runtime_report communicator_report = gpu.get_execution_runtime_report();
+  require(after_communicator.ordinary_resource_generation >
+              direct_again.ordinary_resource_generation &&
+              communicator_report.communicator_generation > world_generation &&
+              communicator_report.communicator_size == 2 &&
+              communicator_report.resolved_transport == "direct" &&
+              communicator_report.captured_transport_epoch_fresh,
+          "active-communicator transition did not rebuild direct transport identity");
+  compare_live_fields_by_key(cpu, gpu, 8e-13);
+  end_global_communications();
+  end_divide_parallel();
+  unsetenv("MEEP_GPU_AWARE_MPI");
+  unsetenv("MEEP_NVIDIA_MPI_OVERLAP");
+  master_printf("nvidia_timestep: direct policy/communicator lifecycle PASS\n");
+}
+
 static void test_noisy_lifecycle() {
   const grid_volume gv = vol2d(2.0, 2.0, 6.0);
   structure s(gv, isotropic_eps, no_pml(), identity(), 2);
@@ -10583,15 +10835,8 @@ static void test_rejections() {
 }
 
 static void test_remote_boundary_staged_path() {
-  require(count_processors() == 2 || count_processors() == 4,
-          "remote boundary staged validation requires two or four ranks");
-  if (count_processors() == 4) {
-    char synthetic_uuid[40];
-    std::snprintf(synthetic_uuid, sizeof(synthetic_uuid),
-                  "000000000000000000000000000000%02x", my_rank());
-    device_uuid_testing::set_overrides(synthetic_uuid, NULL);
-    setenv("MEEP_ALLOW_GPU_SHARING", "1", 1);
-  }
+  require(count_processors() == 2,
+          "production remote boundary validation requires two GPU-owning ranks");
   const precision_policy_kind policies[] = {precision_policy_kind::native,
                                              precision_policy_kind::f32};
   const GpuMpiPolicyParse requested = parse_gpu_mpi_policy(std::getenv("MEEP_GPU_AWARE_MPI"));
@@ -10639,6 +10884,7 @@ static void test_remote_boundary_staged_path() {
     const NvidiaMpiTransportStatistics transport =
         backend ? backend->mpi_transport_statistics_for_testing()
                 : NvidiaMpiTransportStatistics();
+    const execution_runtime_report report = gpu.get_execution_runtime_report();
     const bool owns_remote_descriptors = statistics.receives + statistics.sends != 0;
     const bool exercised_remote_transport =
         transport.messages_sent != 0 || transport.messages_received != 0;
@@ -10656,23 +10902,59 @@ static void test_remote_boundary_staged_path() {
     require(and_to_all(local_authority_valid) && descriptor_owners == 2,
             "production staged transport did not retain the expected active/idle "
             "real-HaloPlan descriptor authority");
-    const bool local_transport_valid =
+    const bool zero_idle_transport =
+        transport.messages_sent == 0 && transport.messages_received == 0 && transport.bytes_sent == 0 &&
+        transport.bytes_received == 0 && transport.testsome_polls == 0 &&
+        transport.waitall_calls == 0 && transport.slot_reuses == 0 &&
+        transport.device_to_host_calls == 0 && transport.device_to_host_bytes == 0 &&
+        transport.host_to_device_calls == 0 && transport.host_to_device_bytes == 0 &&
+        transport.direct_bytes == 0 && transport.overlap_stages == 0 &&
+        transport.overlap_interior_launches == 0 &&
+        transport.overlap_boundary_launches == 0 &&
+        transport.gather_pack_nanoseconds == 0 &&
+        transport.device_to_host_nanoseconds == 0 &&
+        transport.mpi_progress_nanoseconds == 0 && transport.mpi_wait_nanoseconds == 0 &&
+        transport.host_to_device_nanoseconds == 0 &&
+        transport.scatter_unpack_nanoseconds == 0 && transport.device_bytes == 0 &&
+        transport.pinned_bytes == 0;
+    const bool active_route_valid =
+        transport.active && transport.device_bytes > 0 && transport.messages_sent > 0 &&
+        transport.messages_received > 0 && transport.bytes_sent > 0 &&
+        transport.bytes_received > 0 && transport.testsome_polls > 0 &&
+        transport.waitall_calls > 0 && transport.slot_reuses > 0 &&
         (expected_route == GpuMpiRoute::direct
-             ? transport.direct_bytes == transport.bytes_sent + transport.bytes_received
-             : transport.direct_bytes == 0) &&
-        (!exercised_remote_transport ||
-         (transport.messages_sent > 0 && transport.messages_received > 0 &&
-          transport.bytes_sent > 0 && transport.bytes_received > 0 &&
-          transport.testsome_polls > 0 && transport.waitall_calls > 0 &&
-          transport.slot_reuses > 0));
+             ? transport.direct_bytes == transport.bytes_sent + transport.bytes_received &&
+                   transport.direct_bytes > 0 && transport.device_to_host_calls == 0 &&
+                   transport.device_to_host_bytes == 0 &&
+                   transport.host_to_device_calls == 0 &&
+                   transport.host_to_device_bytes == 0 && transport.pinned_bytes == 0
+             : transport.direct_bytes == 0 && transport.device_to_host_calls > 0 &&
+                   transport.device_to_host_bytes > 0 &&
+                   transport.host_to_device_calls > 0 &&
+                   transport.host_to_device_bytes > 0 && transport.pinned_bytes > 0);
+    const bool local_transport_valid = exercised_remote_transport ? active_route_valid
+                                                                   : zero_idle_transport;
     require(and_to_all(local_transport_valid) &&
                 sum_to_all(int(exercised_remote_transport)) == 2,
             "production transport execution/accounting did not distinguish "
             "active and idle ranks");
-  }
-  if (count_processors() == 4) {
-    unsetenv("MEEP_ALLOW_GPU_SHARING");
-    device_uuid_testing::set_overrides(NULL, NULL);
+    require(report.captured_transport_epoch_active == transport.active &&
+                report.communicator_rank == my_rank() &&
+                report.communicator_size == count_processors() &&
+                report.captured_provider_signature == transport.provider_signature &&
+                report.captured_requested_transport ==
+                    gpu_mpi_policy_name(transport.requested_policy) &&
+                report.captured_overlap_policy ==
+                    dependency_overlap_policy_name(transport.overlap_policy) &&
+                report.resolved_transport == gpu_mpi_route_name(expected_route) &&
+                report.resolved_overlap ==
+                    (transport.dependency_region_count ? "overlap" : "off") &&
+                report.captured_transport_epoch_fresh &&
+                report.direct_bytes == transport.direct_bytes &&
+                report.transport_device_bytes == transport.device_bytes &&
+                report.transport_pinned_bytes == transport.pinned_bytes &&
+                report.device_owner && !report.device_uuid.empty(),
+            "backend-neutral runtime report does not match the captured transport epoch");
   }
   master_printf("nvidia_timestep: remote boundary %s path PASS\n",
                 gpu_mpi_route_name(expected_route));
@@ -10781,6 +11063,11 @@ int main(int argc, char **argv) {
   }
   if (getenv("MEEP_NVIDIA_REMOTE_COMPILE_ONLY")) {
     test_remote_boundary_staged_path();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_REMOTE_DIRECT_ACCEPTANCE_ONLY")) {
+    test_remote_boundary_direct_acceptance();
+    test_remote_direct_policy_and_communicator_rebuild();
     return 0;
   }
   if (getenv("MEEP_NVIDIA_REMOTE_DIRECT_REJECT_ONLY")) {

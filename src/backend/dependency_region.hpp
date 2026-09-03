@@ -26,6 +26,7 @@ struct DependencyOverlapPolicyParse {
 
 DependencyOverlapPolicyParse parse_dependency_overlap_policy(const char *value);
 const char *dependency_overlap_policy_name(DependencyOverlapPolicy policy);
+const char *resolved_dependency_overlap_name(size_t admitted_region_count);
 
 struct DependencyBox {
   size_t base;

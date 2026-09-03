@@ -297,7 +297,8 @@ nvidia_adjoint_smoke: $(srcdir)/nvidia_adjoint_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
 
 if WITH_MPI
 nvidia_mpi_runtime_smoke: $(srcdir)/nvidia_mpi_runtime_smoke.cu $(NVIDIA_CUDA_ARCHIVE)
-	$(AM_V_GEN)$(CXX) $(CPPFLAGS) $(AM_CPPFLAGS) $(CXXFLAGS) -x c++ $< -x none \
+	$(AM_V_GEN)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(CPPFLAGS) $(AM_CPPFLAGS) \
+	  $(CXXFLAGS) -x c++ $< -x none \
 	  $(NVIDIA_CUDA_ARCHIVE) $(CUDA_LDFLAGS) $(CUDA_LIBS) $(LIBS) -o $@
 endif
 endif

@@ -1879,6 +1879,55 @@ struct backend_capabilities {
   const char *name;
 };
 
+/* Backend-neutral C++ execution telemetry. Frontends expose this through
+   native scalar dictionaries, not by wrapping this std::string-bearing type.
+   Transport values are rank-local counters for the currently published epoch;
+   CPU and uninitialized fields report explicit zero values. */
+struct execution_runtime_report {
+  std::string requested_backend, resolved_backend;
+  std::string requested_precision, resolved_precision;
+  std::string requested_transport, resolved_transport;
+  std::string requested_overlap, resolved_overlap;
+  std::string captured_requested_transport, captured_overlap_policy;
+  std::string requested_graph, resolved_graph;
+  std::string mpi_provider;
+  std::string counter_scope, backend_counter_scope, memory_gauge_scope;
+  std::string setup_counter_scope, transport_timing_scope, allocation_counter_scope;
+  std::string device_uuid;
+  int communicator_rank, communicator_size, device_id;
+  bool mpi_query_available, mpi_cuda_aware, device_owner, graph_enabled;
+  bool captured_transport_epoch_active, captured_transport_epoch_fresh, graph_valid;
+  uint64_t communicator_generation, captured_provider_signature;
+  uint64_t executable_build_count;
+  uint64_t messages_sent, messages_received, bytes_sent, bytes_received;
+  uint64_t gather_launches, scatter_launches, testsome_polls, waitall_calls;
+  uint64_t request_completions, slot_reuses, high_water_requests;
+  uint64_t device_to_host_calls, device_to_host_bytes;
+  uint64_t host_to_device_calls, host_to_device_bytes, direct_bytes;
+  uint64_t overlap_stages, overlap_interior_launches, overlap_boundary_launches;
+  uint64_t material_recipe_prepare_nanoseconds, material_initialize_nanoseconds;
+  uint64_t graph_build_nanoseconds, gather_pack_nanoseconds;
+  uint64_t device_to_host_nanoseconds, mpi_progress_nanoseconds, mpi_wait_nanoseconds;
+  uint64_t host_to_device_nanoseconds, scatter_unpack_nanoseconds;
+  uint64_t steady_allocation_count, graph_recapture_count, full_field_copy_count;
+  uint64_t graph_capture_count, graph_launch_count, graph_boundary_count;
+  uint64_t host_fallback_count, host_fallback_device_to_host_bytes;
+  uint64_t host_fallback_host_to_device_bytes, host_fallback_steady_capacity_growths;
+  uint64_t material_fallback_warning_count;
+  uint64_t process_device_bytes_current, process_device_bytes_peak;
+  uint64_t process_pinned_bytes_current, process_pinned_bytes_peak;
+  size_t transport_device_bytes, transport_pinned_bytes;
+
+  execution_runtime_report();
+};
+
+/* Frontend-only active-communicator exchange.  The input is treated as opaque
+   UTF-8 JSON bytes; every rank receives the same rank-ordered byte strings.
+   Local validation failures are reconciled before payload exchange. */
+std::vector<std::string> active_communicator_allgather_json_records(
+    const std::string &payload, bool local_valid = true,
+    const std::string &local_error = std::string());
+
 /* Reads MEEP_BACKEND, MEEP_DEVICE_ID, MEEP_PRECISION and
    MEEP_ACCELERATOR_STRICT over the top of `opts`. An unrecognized value warns
    and leaves the field alone. */
@@ -2123,7 +2172,9 @@ public:
   Executable *executable;
   InitializationPlan *initialization_plan;
   execution_options options;
+  execution_options requested_options;
   backend_capabilities backend_caps() const;
+  execution_runtime_report get_execution_runtime_report() const;
 
   static const int num_mutation_kinds = 14;
   uint32_t dirty_mask;

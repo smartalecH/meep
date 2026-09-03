@@ -221,6 +221,8 @@ fields::fields(const fields &thef)
   // Time stuff:
   reset_timers();
   last_step_output_wall_time = -1;
+  options = thef.options;
+  requested_options = thef.requested_options;
 
   num_chunks = thef.num_chunks;
   typedef fields_chunk *fields_chunk_ptr;

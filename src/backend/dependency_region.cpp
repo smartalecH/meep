@@ -261,6 +261,10 @@ const char *dependency_overlap_policy_name(DependencyOverlapPolicy policy) {
   return "invalid";
 }
 
+const char *resolved_dependency_overlap_name(size_t admitted_region_count) {
+  return admitted_region_count ? "overlap" : "off";
+}
+
 uint64_t compute_dependency_region_signature(const DependencyRegionPlan &plan) {
   uint64_t h = UINT64_C(1469598103934665603);
   h = mix(h, plan.halo_operation_index);

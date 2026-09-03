@@ -5,6 +5,7 @@
 #include "backend/mpi_context.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -17,6 +18,14 @@
 namespace meep {
 namespace nvidia {
 namespace {
+
+typedef std::chrono::steady_clock transport_clock;
+
+uint64_t elapsed_nanoseconds(const transport_clock::time_point &start) {
+  const std::chrono::nanoseconds elapsed =
+      std::chrono::duration_cast<std::chrono::nanoseconds>(transport_clock::now() - start);
+  return elapsed.count() > 0 ? uint64_t(elapsed.count()) : uint64_t(0);
+}
 
 testing::staged_transport_failure_point injected_failure =
     testing::staged_transport_failure_point::none;
@@ -168,7 +177,9 @@ staged_transport_statistics::staged_transport_statistics()
       host_to_device_bytes(0), direct_bytes(0), gather_launches(0), scatter_launches(0),
       testsome_polls(0), waitall_calls(0), request_completions(0), slot_reuses(0),
       overlap_stages(0), overlap_interior_launches(0), overlap_boundary_launches(0),
-      high_water_requests(0), device_bytes(0), pinned_bytes(0) {}
+      high_water_requests(0), gather_pack_nanoseconds(0), device_to_host_nanoseconds(0),
+      mpi_progress_nanoseconds(0), mpi_wait_nanoseconds(0), host_to_device_nanoseconds(0),
+      scatter_unpack_nanoseconds(0), device_bytes(0), pinned_bytes(0) {}
 
 transport_structural_identity::transport_structural_identity()
     : version(schema_version), slot_layout_version(1), slot_count(2),
@@ -401,6 +412,7 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
   if (consume_failure(testing::staged_transport_failure_point::after_receive_post))
     fatal_transport(communicator, "injected failure after MPI_Irecv publication", 1);
   try {
+    const transport_clock::time_point gather_start = transport_clock::now();
     if (consume_failure(testing::staged_transport_failure_point::gather))
       throw std::runtime_error("injected NVIDIA staged transport gather failure");
     slot.compute_ready.record(compute);
@@ -415,6 +427,10 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
     }
     slot.gather_ready.record(*impl_->communication);
     slot.gather_ready.wait(compute);
+    if (!stage->plan.sends.empty())
+      impl_->stats.gather_pack_nanoseconds = checked_counter_add(
+          impl_->stats.gather_pack_nanoseconds, elapsed_nanoseconds(gather_start),
+          "gather/pack elapsed nanoseconds");
   }
   catch (...) {
     fatal_transport(communicator, "CUDA gather after request publication", 1);
@@ -461,6 +477,7 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
   bool copies_enqueued = direct || stage->plan.sends.empty();
   bool all_sends_posted = stage->plan.sends.empty();
   size_t presend_polls = 0;
+  const transport_clock::time_point progress_start = transport_clock::now();
   while (!all_sends_posted) {
     int count = 0;
     mpi_require(transport_testsome(slot.requests, count, slot.completed.data(),
@@ -480,6 +497,7 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
                          !direct && copies_enqueued && slot.device_to_host_ready.ready(),
                          copies_enqueued);
       if (action == testing::transport_presend_action::enqueue_device_to_host) {
+        const transport_clock::time_point copy_start = transport_clock::now();
         if (consume_failure(testing::staged_transport_failure_point::device_to_host))
           throw std::runtime_error("injected NVIDIA staged transport D2H failure");
         for (const bound_boundary_message &message : stage->plan.sends) {
@@ -494,6 +512,9 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
                                                                   message.wire_bytes, "D2H bytes");
         }
         slot.device_to_host_ready.record(*impl_->communication);
+        impl_->stats.device_to_host_nanoseconds = checked_counter_add(
+            impl_->stats.device_to_host_nanoseconds, elapsed_nanoseconds(copy_start),
+            "D2H elapsed nanoseconds");
         copies_enqueued = true;
       }
       const bool staging_ready =
@@ -526,13 +547,21 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
       fatal_transport(communicator, "CUDA staging before all sends are posted", 1);
     }
   }
+  if (!stage->plan.sends.empty())
+    impl_->stats.mpi_progress_nanoseconds = checked_counter_add(
+        impl_->stats.mpi_progress_nanoseconds, elapsed_nanoseconds(progress_start),
+        "MPI progress elapsed nanoseconds");
 
   size_t waited_requests = 0;
   for (MPI_Request &request : slot.requests)
     if (!transport_request_is_null(&request)) ++waited_requests;
   if (!slot.requests.empty()) {
+    const transport_clock::time_point wait_start = transport_clock::now();
     mpi_require(transport_waitall(slot.requests, slot.statuses.data()),
                 communicator, "MPI_Waitall after all sends are posted");
+    impl_->stats.mpi_wait_nanoseconds = checked_counter_add(
+        impl_->stats.mpi_wait_nanoseconds, elapsed_nanoseconds(wait_start),
+        "MPI wait elapsed nanoseconds");
   }
   for (MPI_Request &request : slot.requests)
     transport_clear_request(&request);
@@ -556,6 +585,7 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
           checked_counter_add(impl_->stats.bytes_sent, message.wire_bytes, "sent bytes");
     if (!direct && consume_failure(testing::staged_transport_failure_point::host_to_device))
       throw std::runtime_error("injected NVIDIA staged transport H2D failure");
+    const transport_clock::time_point host_to_device_start = transport_clock::now();
     for (const bound_boundary_message &message : stage->plan.receives)
       if (direct)
         impl_->stats.direct_bytes =
@@ -570,10 +600,15 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
         impl_->stats.host_to_device_bytes = checked_counter_add(
             impl_->stats.host_to_device_bytes, message.wire_bytes, "H2D bytes");
       }
+    if (!direct && !stage->plan.receives.empty())
+      impl_->stats.host_to_device_nanoseconds = checked_counter_add(
+          impl_->stats.host_to_device_nanoseconds,
+          elapsed_nanoseconds(host_to_device_start), "H2D elapsed nanoseconds");
     if (direct)
       for (const bound_boundary_message &message : stage->plan.sends)
         impl_->stats.direct_bytes =
             checked_counter_add(impl_->stats.direct_bytes, message.wire_bytes, "direct bytes");
+    const transport_clock::time_point scatter_start = transport_clock::now();
     slot.local_scatter_ready.wait(*impl_->communication);
     if (consume_failure(testing::staged_transport_failure_point::scatter))
       throw std::runtime_error("injected NVIDIA staged transport scatter failure");
@@ -594,6 +629,10 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
           checked_counter_add(impl_->stats.scatter_launches, 1, "scatter launch");
     }
     impl_->communication->synchronize();
+    if (!stage->plan.receives.empty())
+      impl_->stats.scatter_unpack_nanoseconds = checked_counter_add(
+          impl_->stats.scatter_unpack_nanoseconds, elapsed_nanoseconds(scatter_start),
+          "scatter/unpack elapsed nanoseconds");
   }
   catch (const std::exception &error) {
     local_error = error.what();

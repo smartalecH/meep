@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <complex>
@@ -61,6 +62,20 @@
 #include "meep_internals.hpp"
 
 namespace meep {
+
+static uint64_t nvidia_elapsed_nanoseconds(
+    const std::chrono::steady_clock::time_point &start) {
+  const std::chrono::nanoseconds elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now() - start);
+  return elapsed.count() > 0 ? uint64_t(elapsed.count()) : uint64_t(0);
+}
+
+static uint64_t nvidia_checked_counter_add(uint64_t current, uint64_t increment,
+                                           const char *what) {
+  if (increment > std::numeric_limits<uint64_t>::max() - current)
+    throw std::overflow_error(std::string("NVIDIA counter overflow while accounting ") + what);
+  return current + increment;
+}
 
 namespace nvidia {
 
@@ -876,6 +891,32 @@ struct NvidiaCompiledDependencyStage {
 nvidia::flat_region flat_region_for(const DependencyBox &source);
 void shift_profile_for_dependency(nvidia::pml_profile_launch &profile,
                                   const DependencyBox &box);
+
+nvidia::flat_region flat_region_for(const DependencyBox &source) {
+  nvidia::flat_region result = {};
+  result.base = source.base;
+  for (int axis = 0; axis < 3; ++axis) {
+    if (!source.counts[axis])
+      throw std::invalid_argument("dependency region has an empty axis");
+    if (source.strides[axis] < 0)
+      throw std::invalid_argument("dependency region has a negative storage stride");
+    result.counts[axis] = source.counts[axis];
+    result.strides[axis] = source.strides[axis];
+  }
+  return result;
+}
+
+void shift_profile_for_dependency(nvidia::pml_profile_launch &profile,
+                                  const DependencyBox &box) {
+  if (!profile.sigma) return;
+  for (int axis = 0; axis < 3; ++axis) {
+    ptrdiff_t delta = 0;
+    if (box.origin[axis] > size_t(std::numeric_limits<ptrdiff_t>::max()) ||
+        __builtin_mul_overflow(ptrdiff_t(box.origin[axis]), profile.strides[axis], &delta) ||
+        __builtin_add_overflow(profile.base, delta, &profile.base))
+      throw std::overflow_error("dependency-region PML offset overflows");
+  }
+}
 
 struct NvidiaCapturedGraph {
   nvidia::graph definition;
@@ -1930,32 +1971,6 @@ nvidia::flat_region flat_region_for(const UpdateRegion &source) {
     result.strides[axis] = source.strides[axis];
   }
   return result;
-}
-
-nvidia::flat_region flat_region_for(const DependencyBox &source) {
-  nvidia::flat_region result = {};
-  result.base = source.base;
-  for (int axis = 0; axis < 3; ++axis) {
-    if (!source.counts[axis])
-      throw std::invalid_argument("dependency region has an empty axis");
-    if (source.strides[axis] < 0)
-      throw std::invalid_argument("dependency region has a negative storage stride");
-    result.counts[axis] = source.counts[axis];
-    result.strides[axis] = source.strides[axis];
-  }
-  return result;
-}
-
-void shift_profile_for_dependency(nvidia::pml_profile_launch &profile,
-                                  const DependencyBox &box) {
-  if (!profile.sigma) return;
-  for (int axis = 0; axis < 3; ++axis) {
-    ptrdiff_t delta = 0;
-    if (box.origin[axis] > size_t(std::numeric_limits<ptrdiff_t>::max()) ||
-        __builtin_mul_overflow(ptrdiff_t(box.origin[axis]), profile.strides[axis], &delta) ||
-        __builtin_add_overflow(profile.base, delta, &profile.base))
-      throw std::overflow_error("dependency-region PML offset overflows");
-  }
 }
 
 ptrdiff_t checked_region_max(const nvidia::flat_region &region) {
@@ -4199,18 +4214,50 @@ NvidiaMpiTransportStatistics NvidiaBackend::mpi_transport_statistics_for_testing
   const NvidiaExecutable *executable = dynamic_cast<const NvidiaExecutable *>(f_.executable);
   if (!executable || !executable->transport_) return result;
   const nvidia::staged_transport_statistics &stats = executable->transport_->statistics();
+  const nvidia::transport_structural_identity &identity =
+      executable->transport_->structural_identity();
+  result.active = true;
+  result.requested_policy = identity.requested_policy;
+  result.resolved_route = identity.resolved_route;
+  result.overlap_policy = identity.overlap_policy;
+  result.communicator_generation = identity.communicator_generation;
+  result.provider_signature = identity.provider_signature;
+  result.dependency_signature = identity.dependency_signature;
+  result.dependency_region_count = executable->dependency_regions_.size();
+  result.communicator_rank = identity.communicator_rank;
+  result.communicator_size = identity.communicator_size;
   result.messages_sent = stats.messages_sent;
   result.messages_received = stats.messages_received;
   result.bytes_sent = stats.bytes_sent;
   result.bytes_received = stats.bytes_received;
+  result.gather_launches = stats.gather_launches;
+  result.scatter_launches = stats.scatter_launches;
   result.testsome_polls = stats.testsome_polls;
   result.waitall_calls = stats.waitall_calls;
+  result.request_completions = stats.request_completions;
   result.slot_reuses = stats.slot_reuses;
+  result.device_to_host_calls = stats.device_to_host_calls;
+  result.device_to_host_bytes = stats.device_to_host_bytes;
+  result.host_to_device_calls = stats.host_to_device_calls;
+  result.host_to_device_bytes = stats.host_to_device_bytes;
   result.direct_bytes = stats.direct_bytes;
   result.overlap_stages = stats.overlap_stages;
   result.overlap_interior_launches = stats.overlap_interior_launches;
   result.overlap_boundary_launches = stats.overlap_boundary_launches;
+  result.high_water_requests = stats.high_water_requests;
+  result.gather_pack_nanoseconds = stats.gather_pack_nanoseconds;
+  result.device_to_host_nanoseconds = stats.device_to_host_nanoseconds;
+  result.mpi_progress_nanoseconds = stats.mpi_progress_nanoseconds;
+  result.mpi_wait_nanoseconds = stats.mpi_wait_nanoseconds;
+  result.host_to_device_nanoseconds = stats.host_to_device_nanoseconds;
+  result.scatter_unpack_nanoseconds = stats.scatter_unpack_nanoseconds;
+  result.device_bytes = stats.device_bytes;
+  result.pinned_bytes = stats.pinned_bytes;
   return result;
+}
+
+NvidiaExecutionTimingStatistics NvidiaBackend::execution_timing_statistics_for_testing() const {
+  return execution_timing_statistics_;
 }
 
 uint64_t NvidiaBackend::claim_executable_generation() {
@@ -10101,6 +10148,8 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
                                    : transport_error);
   }
   local_error.clear();
+  const std::chrono::steady_clock::time_point graph_build_start =
+      std::chrono::steady_clock::now();
   try {
     nvidia::device_scope scope(state.device_);
     configure_graph_execution(plan, *executable, state);
@@ -10116,6 +10165,14 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
     if (local_error.empty())
       local_error = "NVIDIA graph configuration was rejected on another rank";
     throw std::runtime_error(local_error);
+  }
+  if (executable->graph_enabled_) {
+    execution_timing_statistics_.graph_build_nanoseconds = nvidia_checked_counter_add(
+        execution_timing_statistics_.graph_build_nanoseconds,
+        nvidia_elapsed_nanoseconds(graph_build_start),
+        "graph build elapsed nanoseconds");
+    execution_timing_statistics_.graph_build_count = nvidia_checked_counter_add(
+        execution_timing_statistics_.graph_build_count, 1, "graph build count");
   }
   if (plan.program == StepProgram::ordinary)
     state.graph_statistics_ = executable->graph_statistics_;
@@ -13742,6 +13799,8 @@ void NvidiaBackend::prepare_state_rebuild(BackendState &raw_state, DirtyMask) {
   for (const MigrationRow &row : rows)
     storage_to_host(row.destination, static_cast<const char *>(staged.data()) + row.offset,
                     row.spec, row.spec.elements);
+  execution_timing_statistics_.full_field_copy_count = nvidia_checked_counter_add(
+      execution_timing_statistics_.full_field_copy_count, 1, "full-field copy count");
   state.device_authoritative_ = false;
 }
 

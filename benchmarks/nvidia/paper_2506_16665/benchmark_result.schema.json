@@ -12,13 +12,15 @@
     "execution": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["mode", "backend", "precision", "ranks", "mpi_transport"],
+      "required": ["mode", "backend", "precision", "ranks", "mpi_transport", "overlap", "graph"],
       "properties": {
         "mode": {"enum": ["smoke", "fixed-step", "end-to-end"]},
         "backend": {"enum": ["auto", "cpu", "nvidia"]},
         "precision": {"enum": ["native", "f32", "mixed"]},
         "ranks": {"type": "integer", "minimum": 1},
-        "mpi_transport": {"enum": ["none", "host", "staged", "direct", "auto"]}
+        "mpi_transport": {"enum": ["none", "host", "staged", "direct", "auto"]},
+        "overlap": {"enum": ["off", "auto", "required"]},
+        "graph": {"enum": ["eager", "auto", "required"]}
       }
     }
   },

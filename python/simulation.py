@@ -2102,6 +2102,12 @@ class Simulation:
         )
         return opts
 
+    def get_execution_runtime_report(self):
+        """Return rank-local telemetry for the currently published execution epoch."""
+        if self.fields is None:
+            raise RuntimeError("simulation fields are not initialized")
+        return mp._get_execution_runtime_report(self.fields)
+
     def _init_structure(self, k=False):
         if verbosity.meep > 0:
             print("-" * 11)

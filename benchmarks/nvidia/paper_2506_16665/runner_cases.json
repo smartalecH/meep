@@ -136,8 +136,8 @@
         {"name": "cross_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "transmission", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
       ],
       "required_observables": [
-        {"name": "target_mode_transmission", "monitor": "cross_te0", "unit": "1"},
-        {"name": "excess_loss_db", "monitor": "cross_te0", "unit": "dB"}
+        {"name": "target_mode_transmission", "monitor": "cross_te0", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"},
+        {"name": "excess_loss_db", "monitor": "cross_te0", "unit": "dB", "evaluation": "negative_ten_log10_linear_center_wavelength_mode_power_ratio"}
       ]
     },
     "crossing": {
@@ -157,8 +157,8 @@
         {"name": "through_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "transmission", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
       ],
       "required_observables": [
-        {"name": "target_mode_transmission", "monitor": "through_te0", "unit": "1"},
-        {"name": "excess_loss_db", "monitor": "through_te0", "unit": "dB"}
+        {"name": "target_mode_transmission", "monitor": "through_te0", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"},
+        {"name": "excess_loss_db", "monitor": "through_te0", "unit": "dB", "evaluation": "negative_ten_log10_linear_center_wavelength_mode_power_ratio"}
       ]
     },
     "mmi2x2": {
@@ -178,8 +178,8 @@
         {"name": "cross_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "transmission", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
       ],
       "required_observables": [
-        {"name": "target_mode_transmission", "monitor": "cross_te0", "unit": "1"},
-        {"name": "excess_loss_db", "monitor": "cross_te0", "unit": "dB"}
+        {"name": "target_mode_transmission", "monitor": "cross_te0", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"},
+        {"name": "excess_loss_db", "monitor": "cross_te0", "unit": "dB", "evaluation": "negative_ten_log10_linear_center_wavelength_mode_power_ratio"}
       ]
     },
     "mode_converter": {
@@ -200,8 +200,8 @@
         {"name": "residual_te0", "kind": "mode", "port": "o3", "polarization": "TE", "mode_order": 0, "observable": "crosstalk", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
       ],
       "required_observables": [
-        {"name": "te1_conversion_efficiency", "monitor": "converted_te1", "unit": "1"},
-        {"name": "te0_crosstalk", "monitor": "residual_te0", "unit": "1"}
+        {"name": "te1_conversion_efficiency", "monitor": "converted_te1", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"},
+        {"name": "te0_crosstalk", "monitor": "residual_te0", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"}
       ]
     },
     "psr": {
@@ -221,8 +221,8 @@
         {"name": "residual_tm0", "kind": "mode", "port": "o2", "polarization": "TM", "mode_order": 0, "observable": "crosstalk", "normalization": {"kind": "mode_power_ratio", "numerator_quantity": "forward_mode_power", "denominator_monitor": "input_incident", "denominator_quantity": "forward_mode_power"}}
       ],
       "required_observables": [
-        {"name": "te0_conversion_efficiency", "monitor": "rotated_te0", "unit": "1"},
-        {"name": "tm0_crosstalk", "monitor": "residual_tm0", "unit": "1"}
+        {"name": "te0_conversion_efficiency", "monitor": "rotated_te0", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"},
+        {"name": "tm0_crosstalk", "monitor": "residual_tm0", "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio"}
       ],
       "top_cladding": {"material": "Si3N4", "refractive_index": 2.0},
       "runner_support": {
@@ -246,9 +246,9 @@
         {"name": "ring_resonance", "kind": "derived_resonance", "input_monitor": "through_te0", "input_quantity": "normalized_mode_power", "normalization": "divide by maximum over sampled band", "interpolation": {"kind": "cubic_spline", "sample_count": 1000}, "half_depth_definition": "0.5 * (1 + minimum_normalized_transmission)", "resonance_wavelength_rule": "midpoint of the two half-depth crossings", "fwhm_rule": "wavelength difference between the two half-depth crossings", "quality_factor_rule": "resonance_wavelength_um / fwhm_um", "outputs": ["resonance_wavelength_um", "fwhm_um", "quality_factor"]}
       ],
       "required_observables": [
-        {"name": "resonance_wavelength_um", "monitor": "ring_resonance", "unit": "um"},
-        {"name": "fwhm_um", "monitor": "ring_resonance", "unit": "um"},
-        {"name": "quality_factor", "monitor": "ring_resonance", "unit": "1"}
+        {"name": "resonance_wavelength_um", "monitor": "ring_resonance", "unit": "um", "evaluation": "not_a_knot_cubic_spline_1000_half_depth"},
+        {"name": "fwhm_um", "monitor": "ring_resonance", "unit": "um", "evaluation": "not_a_knot_cubic_spline_1000_half_depth"},
+        {"name": "quality_factor", "monitor": "ring_resonance", "unit": "1", "evaluation": "not_a_knot_cubic_spline_1000_half_depth"}
       ]
     }
   }

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meep.readthedocs.io/schemas/nvidia-paper-mpi-route-comparison-v1.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "generated_at_utc", "manifest_sha256", "physics_reference_sha256", "staged", "direct", "bitwise_monitor_match", "physics_match", "wire_totals_match"],
+  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}},
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "paper_2506_16665_staged_direct_comparison"},
+    "generated_at_utc": {"type": "string", "minLength": 1},
+    "manifest_sha256": {"$ref": "#/$defs/sha256"},
+    "physics_reference_sha256": {"$ref": "#/$defs/sha256"},
+    "staged": {"$ref": "#/$defs/artifact"},
+    "direct": {"$ref": "#/$defs/artifact"},
+    "bitwise_monitor_match": {"const": true},
+    "physics_match": {"const": true},
+    "wire_totals_match": {"const": true}
+  }
+}

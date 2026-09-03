@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meep.readthedocs.io/schemas/nvidia-paper-mpi-benchmark-result-v2.json",
+  "title": "Meep NVIDIA multi-rank benchmark result",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "generated_at_utc", "run_manifest", "physics_reference", "status", "launch", "provenance", "requested_execution", "resolved_execution", "communicator", "rank_records", "timing", "counter_aggregates", "simulation", "performance", "physics_observables"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonnegativeInteger": {"type": "integer", "minimum": 0},
+    "nonnegativeNumber": {"type": "number", "minimum": 0},
+    "execution": {
+      "type": "object", "additionalProperties": false,
+      "required": ["backend", "precision", "route", "overlap", "graph"],
+      "properties": {
+        "backend": {"enum": ["auto", "cpu", "nvidia"]},
+        "precision": {"enum": ["native", "f32", "mixed"]},
+        "route": {"enum": ["host", "staged", "direct", "auto"]},
+        "overlap": {"enum": ["off", "auto", "required", "overlap"]},
+        "graph": {"enum": ["eager", "auto", "required", "graph"]}
+        ,"ranks": {"type": "integer", "minimum": 2}
+      }
+    },
+    "runtime": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requested_backend", "resolved_backend", "requested_precision", "resolved_precision", "requested_transport", "resolved_transport", "requested_overlap", "resolved_overlap", "captured_requested_transport", "captured_overlap_policy", "requested_graph", "resolved_graph", "mpi_provider", "counter_scope", "backend_counter_scope", "memory_gauge_scope", "setup_counter_scope", "transport_timing_scope", "allocation_counter_scope", "device_uuid", "communicator_rank", "communicator_size", "communicator_generation", "captured_provider_signature", "mpi_query_available", "mpi_cuda_aware", "device_owner", "device_id", "captured_transport_epoch_active", "captured_transport_epoch_fresh", "graph_enabled", "graph_valid", "messages_sent", "messages_received", "bytes_sent", "bytes_received", "device_to_host_calls", "device_to_host_bytes", "host_to_device_calls", "host_to_device_bytes", "direct_bytes", "testsome_polls", "waitall_calls", "slot_reuses", "gather_launches", "scatter_launches", "request_completions", "high_water_requests", "overlap_stages", "overlap_interior_launches", "overlap_boundary_launches", "graph_capture_count", "graph_launch_count", "graph_boundary_count", "host_fallback_count", "host_fallback_device_to_host_bytes", "host_fallback_host_to_device_bytes", "host_fallback_steady_capacity_growths", "material_fallback_warning_count", "material_recipe_prepare_nanoseconds", "material_initialize_nanoseconds", "graph_build_nanoseconds", "gather_pack_nanoseconds", "device_to_host_nanoseconds", "mpi_progress_nanoseconds", "mpi_wait_nanoseconds", "host_to_device_nanoseconds", "scatter_unpack_nanoseconds", "steady_allocation_count", "graph_recapture_count", "full_field_copy_count", "executable_build_count", "process_device_bytes_current", "process_device_bytes_peak", "process_pinned_bytes_current", "process_pinned_bytes_peak", "transport_device_bytes", "transport_pinned_bytes"],
+      "properties": {
+        "requested_backend": {"type": "string"}, "resolved_backend": {"type": "string"},
+        "requested_precision": {"type": "string"}, "resolved_precision": {"type": "string"},
+        "requested_transport": {"type": "string"}, "resolved_transport": {"type": "string"},
+        "requested_overlap": {"type": "string"}, "resolved_overlap": {"type": "string"},
+        "requested_graph": {"type": "string"}, "resolved_graph": {"type": "string"},
+        "captured_requested_transport": {"type": "string"}, "captured_overlap_policy": {"type": "string"},
+        "mpi_provider": {"type": "string"}, "counter_scope": {"const": "rank_local_current_epoch"}, "backend_counter_scope": {"const": "rank_local_backend_lifetime"}, "memory_gauge_scope": {"const": "rank_local_process_lifetime"}, "setup_counter_scope": {"const": "rank_local_current_backend_state"}, "transport_timing_scope": {"const": "rank_local_current_transport_epoch_host_elapsed"}, "allocation_counter_scope": {"const": "rank_local_process_lifetime"}, "communicator_rank": {"$ref": "#/$defs/nonnegativeInteger"},
+        "communicator_size": {"type": "integer", "minimum": 1}, "communicator_generation": {"$ref": "#/$defs/nonnegativeInteger"},
+        "mpi_query_available": {"type": "boolean"}, "mpi_cuda_aware": {"type": "boolean"},
+        "device_owner": {"type": "boolean"}, "device_id": {"type": "integer"}, "device_uuid": {"type": "string"},
+        "captured_transport_epoch_active": {"type": "boolean"}, "captured_transport_epoch_fresh": {"type": "boolean"},
+        "graph_enabled": {"type": "boolean"}, "graph_valid": {"type": "boolean"},
+        "captured_provider_signature": {"$ref": "#/$defs/nonnegativeInteger"},
+        "messages_sent": {"$ref": "#/$defs/nonnegativeInteger"}, "messages_received": {"$ref": "#/$defs/nonnegativeInteger"}, "bytes_sent": {"$ref": "#/$defs/nonnegativeInteger"}, "bytes_received": {"$ref": "#/$defs/nonnegativeInteger"},
+        "device_to_host_calls": {"$ref": "#/$defs/nonnegativeInteger"}, "device_to_host_bytes": {"$ref": "#/$defs/nonnegativeInteger"}, "host_to_device_calls": {"$ref": "#/$defs/nonnegativeInteger"}, "host_to_device_bytes": {"$ref": "#/$defs/nonnegativeInteger"}, "direct_bytes": {"$ref": "#/$defs/nonnegativeInteger"},
+        "testsome_polls": {"$ref": "#/$defs/nonnegativeInteger"}, "waitall_calls": {"$ref": "#/$defs/nonnegativeInteger"}, "slot_reuses": {"$ref": "#/$defs/nonnegativeInteger"}, "gather_launches": {"$ref": "#/$defs/nonnegativeInteger"}, "scatter_launches": {"$ref": "#/$defs/nonnegativeInteger"}, "request_completions": {"$ref": "#/$defs/nonnegativeInteger"}, "high_water_requests": {"$ref": "#/$defs/nonnegativeInteger"}, "overlap_stages": {"$ref": "#/$defs/nonnegativeInteger"}, "overlap_interior_launches": {"$ref": "#/$defs/nonnegativeInteger"}, "overlap_boundary_launches": {"$ref": "#/$defs/nonnegativeInteger"},
+        "graph_capture_count": {"$ref": "#/$defs/nonnegativeInteger"}, "graph_launch_count": {"$ref": "#/$defs/nonnegativeInteger"}, "graph_boundary_count": {"$ref": "#/$defs/nonnegativeInteger"}, "host_fallback_count": {"$ref": "#/$defs/nonnegativeInteger"}, "host_fallback_device_to_host_bytes": {"$ref": "#/$defs/nonnegativeInteger"}, "host_fallback_host_to_device_bytes": {"$ref": "#/$defs/nonnegativeInteger"}, "host_fallback_steady_capacity_growths": {"$ref": "#/$defs/nonnegativeInteger"}, "material_fallback_warning_count": {"$ref": "#/$defs/nonnegativeInteger"},
+        "material_recipe_prepare_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "material_initialize_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "graph_build_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "gather_pack_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "device_to_host_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "mpi_progress_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "mpi_wait_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "host_to_device_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "scatter_unpack_nanoseconds": {"$ref": "#/$defs/nonnegativeInteger"}, "steady_allocation_count": {"$ref": "#/$defs/nonnegativeInteger"}, "graph_recapture_count": {"$ref": "#/$defs/nonnegativeInteger"}, "full_field_copy_count": {"$ref": "#/$defs/nonnegativeInteger"},
+        "executable_build_count": {"$ref": "#/$defs/nonnegativeInteger"}, "process_device_bytes_current": {"$ref": "#/$defs/nonnegativeInteger"}, "process_device_bytes_peak": {"$ref": "#/$defs/nonnegativeInteger"}, "process_pinned_bytes_current": {"$ref": "#/$defs/nonnegativeInteger"}, "process_pinned_bytes_peak": {"$ref": "#/$defs/nonnegativeInteger"}, "transport_device_bytes": {"$ref": "#/$defs/nonnegativeInteger"}, "transport_pinned_bytes": {"$ref": "#/$defs/nonnegativeInteger"}
+      }
+    }
+  },
+  "properties": {
+    "schema_version": {"const": 2},
+    "kind": {"const": "paper_2506_16665_multi_rank_benchmark"},
+    "generated_at_utc": {"type": "string", "minLength": 1},
+    "run_manifest": {"type": "object", "additionalProperties": false, "required": ["path", "sha256", "case_id"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}, "case_id": {"type": "string", "minLength": 1}}},
+    "physics_reference": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}},
+    "status": {"type": "object", "additionalProperties": false, "required": ["succeeded", "errors"], "properties": {"succeeded": {"const": true}, "errors": {"type": "array", "maxItems": 0}}},
+    "launch": {"type": "object", "additionalProperties": false, "required": ["argv", "cwd", "environment", "timeout_seconds", "mpiexec", "python", "mpi_version", "ucx_version"], "properties": {
+      "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}}, "cwd": {"type": "string", "minLength": 1},
+      "environment": {"type": "object", "additionalProperties": {"type": "string"}, "required": ["OMPI_MCA_opal_cuda_support", "OMPI_MCA_pml", "UCX_TLS", "MEEP_GPU_AWARE_MPI", "MEEP_NVIDIA_MPI_OVERLAP", "MEEP_NVIDIA_GRAPH_MODE", "MEEP_PRECISION", "CUDA_VISIBLE_DEVICES", "PYTHONPATH", "LD_LIBRARY_PATH"]},
+      "timeout_seconds": {"type": "number", "exclusiveMinimum": 0}, "mpiexec": {"type": "string", "minLength": 1}, "python": {"type": "string", "minLength": 1},
+      "mpi_version": {"type": "string", "minLength": 1}, "ucx_version": {"type": "string", "minLength": 1}
+    }},
+    "provenance": {"type": "object", "additionalProperties": false, "required": ["meep_source", "meep_commit", "meep_dirty", "runner_commit", "runner_dirty", "build_directory", "cuda_toolkit", "configure_arguments", "compiler", "compiler_flags", "executable_sha256"], "properties": {
+      "meep_source": {"type": "string", "minLength": 1}, "meep_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "meep_dirty": {"type": "boolean"},
+      "runner_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "runner_dirty": {"type": "boolean"},
+      "build_directory": {"type": "string", "minLength": 1}, "cuda_toolkit": {"type": ["string", "null"]},
+      "configure_arguments": {"type": "string", "minLength": 1}, "compiler": {"type": "string", "minLength": 1},
+      "compiler_flags": {"type": "object", "additionalProperties": {"type": "string"}},
+      "executable_sha256": {"type": "object", "additionalProperties": false, "required": ["mpiexec", "python"], "properties": {"mpiexec": {"$ref": "#/$defs/sha256"}, "python": {"$ref": "#/$defs/sha256"}}}
+    }},
+    "requested_execution": {"type": "object", "additionalProperties": false, "required": ["backend", "precision", "route", "overlap", "graph", "ranks"], "properties": {"backend": {"enum": ["auto", "cpu", "nvidia"]}, "precision": {"enum": ["native", "f32", "mixed"]}, "route": {"enum": ["staged", "direct", "auto"]}, "overlap": {"enum": ["off", "auto", "required"]}, "graph": {"enum": ["eager", "auto", "required"]}, "ranks": {"const": 2}}},
+    "resolved_execution": {"$ref": "#/$defs/execution"},
+    "communicator": {"type": "object", "additionalProperties": false, "required": ["size", "generation"], "properties": {"size": {"type": "integer", "minimum": 2}, "generation": {"$ref": "#/$defs/nonnegativeInteger"}}},
+    "rank_records": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"type": "object", "additionalProperties": false, "required": ["rank", "communicator_size", "communicator_generation", "manifest_sha256", "launch_sha256", "provenance_sha256", "hostname", "local_rank", "role", "device", "runtime", "repetitions", "module_paths", "module_sha256", "cpu_affinity"], "properties": {
+      "rank": {"$ref": "#/$defs/nonnegativeInteger"}, "communicator_size": {"type": "integer", "minimum": 2}, "communicator_generation": {"$ref": "#/$defs/nonnegativeInteger"}, "manifest_sha256": {"$ref": "#/$defs/sha256"}, "launch_sha256": {"$ref": "#/$defs/sha256"}, "provenance_sha256": {"$ref": "#/$defs/sha256"},
+      "hostname": {"type": "string", "minLength": 1}, "local_rank": {"$ref": "#/$defs/nonnegativeInteger"}, "role": {"enum": ["owner", "idle"]},
+      "device": {"type": ["object", "null"]}, "runtime": {"$ref": "#/$defs/runtime"},
+      "module_paths": {"type": "object", "additionalProperties": false, "required": ["meep", "extension"], "properties": {"meep": {"type": "string", "minLength": 1}, "extension": {"type": "string"}}},
+      "module_sha256": {"type": "object", "additionalProperties": false, "required": ["meep", "extension"], "properties": {"meep": {"$ref": "#/$defs/sha256"}, "extension": {"$ref": "#/$defs/sha256"}}},
+      "cpu_affinity": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonnegativeInteger"}},
+      "repetitions": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["initialization_seconds", "warmup_seconds", "steady_seconds", "monitor_seconds", "steps", "dt_meep", "grid_shape", "stop_reason", "counter_start", "counter_end", "counter_deltas", "monitors"], "properties": {"initialization_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "warmup_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "steady_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "monitor_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "steps": {"type": "integer", "minimum": 1}, "dt_meep": {"type": "number", "exclusiveMinimum": 0}, "grid_shape": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 1}}, "stop_reason": {"enum": ["fixed_steps", "field_energy_decay", "max_steps"]}, "counter_start": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nonnegativeInteger"}}, "counter_end": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nonnegativeInteger"}}, "counter_deltas": {"type": "object", "additionalProperties": {"$ref": "#/$defs/nonnegativeInteger"}}, "monitors": {"type": "array", "items": {"type": "object"}}}}
+    }}}},
+    "timing": {"type": "object", "additionalProperties": false, "required": ["repetitions", "critical_path_samples_seconds", "minimum_seconds", "median_seconds", "maximum_seconds"], "properties": {
+      "repetitions": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["index", "per_rank_seconds", "global_max_seconds", "rank_median_seconds", "imbalance_ratio"], "properties": {"index": {"$ref": "#/$defs/nonnegativeInteger"}, "per_rank_seconds": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/nonnegativeNumber"}}, "global_max_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "rank_median_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "imbalance_ratio": {"type": ["number", "null"], "minimum": 1}}}},
+      "critical_path_samples_seconds": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonnegativeNumber"}}, "minimum_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "median_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "maximum_seconds": {"$ref": "#/$defs/nonnegativeNumber"}
+    }},
+    "counter_aggregates": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["name", "aggregation", "per_rank", "value"], "properties": {"name": {"type": "string", "minLength": 1}, "aggregation": {"enum": ["sum", "max"]}, "per_rank": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/nonnegativeInteger"}}, "value": {"$ref": "#/$defs/nonnegativeInteger"}}}},
+    "simulation": {"type": "object", "additionalProperties": false, "required": ["grid_shape", "grid_points_exact", "steps", "dt_meep", "physical_time_meep"], "properties": {"grid_shape": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "integer", "minimum": 1}}, "grid_points_exact": {"type": "integer", "minimum": 1}, "steps": {"type": "integer", "minimum": 1}, "dt_meep": {"type": "number", "exclusiveMinimum": 0}, "physical_time_meep": {"$ref": "#/$defs/nonnegativeNumber"}}},
+    "performance": {"type": "object", "additionalProperties": false, "required": ["grid_timesteps_per_second", "rate_basis"], "properties": {"grid_timesteps_per_second": {"$ref": "#/$defs/nonnegativeNumber"}, "rate_basis": {"const": "critical_path_median_seconds"}}},
+    "physics_observables": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["name", "monitor", "unit", "evaluation", "value", "values_by_repetition", "reference_value", "absolute_tolerance", "relative_tolerance", "passed"], "properties": {"name": {"type": "string", "minLength": 1}, "monitor": {"type": "object"}, "unit": {"type": "string", "minLength": 1}, "evaluation": {"enum": ["linear_center_wavelength_mode_power_ratio", "negative_ten_log10_linear_center_wavelength_mode_power_ratio", "not_a_knot_cubic_spline_1000_half_depth"]}, "value": {"type": "number"}, "values_by_repetition": {"type": "array", "minItems": 1, "items": {"type": "number"}}, "reference_value": {"type": "number"}, "absolute_tolerance": {"$ref": "#/$defs/nonnegativeNumber"}, "relative_tolerance": {"$ref": "#/$defs/nonnegativeNumber"}, "passed": {"type": "boolean"}}}}
+  }
+}

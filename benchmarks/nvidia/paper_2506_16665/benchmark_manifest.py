@@ -20,12 +20,15 @@ DEFAULT_REFERENCE = HERE / "paper_reference.json"
 DEFAULT_CASES = HERE / "runner_cases.json"
 DEFAULT_MANIFEST_SCHEMA = HERE / "benchmark_manifest.schema.json"
 DEFAULT_RESULT_SCHEMA = HERE / "benchmark_result.schema.json"
-GENERATOR_VERSION = 3
-MANIFEST_SCHEMA_VERSION = 3
+DEFAULT_MPI_RESULT_SCHEMA = HERE / "mpi_benchmark_result.schema.json"
+GENERATOR_VERSION = 4
+MANIFEST_SCHEMA_VERSION = 4
 RESULT_SCHEMA_VERSION = 1
 BACKENDS = {"auto", "cpu", "nvidia"}
 PRECISIONS = {"native", "f32", "mixed"}
 TRANSPORTS = {"none", "host", "staged", "direct", "auto"}
+OVERLAPS = {"off", "auto", "required"}
+GRAPHS = {"eager", "auto", "required"}
 MODES = {"smoke", "fixed-step", "end-to-end"}
 POWER_OBSERVABLES = {"transmission", "conversion_efficiency", "transmission_spectrum"}
 SPECTRAL_ENVELOPE_POLICY = {
@@ -567,7 +570,7 @@ def validate_case_definitions(definitions: Mapping[str, Any]) -> None:
             observable = _mapping(
                 raw_observable, f"case {name}.required_observables[{index}]"
             )
-            for key in ("name", "monitor", "unit"):
+            for key in ("name", "monitor", "unit", "evaluation"):
                 if not isinstance(observable.get(key), str) or not observable[key]:
                     raise ValidationError(
                         f"case {name}.required_observables[{index}].{key} is required"
@@ -1017,7 +1020,11 @@ def build_manifest(
     max_steps: Optional[int],
     auto_shutoff_threshold: float,
     decay_check_interval_meep: float,
+    overlap: str = "off",
+    graph: str = "eager",
 ) -> Dict[str, Any]:
+    if ranks > 1 and pathlib.Path(result_schema_path) == DEFAULT_RESULT_SCHEMA:
+        result_schema_path = DEFAULT_MPI_RESULT_SCHEMA
     validate_reference(reference)
     validate_case_definitions(case_definitions)
     if device_name not in reference["devices"]:
@@ -1037,6 +1044,10 @@ def build_manifest(
             "cells per material wavelength must be one of the paper's 6, 10, 15, 20, or 25 settings"
         )
     validate_execution(backend, precision, ranks, mpi_transport)
+    if overlap not in OVERLAPS:
+        raise ValidationError(f"overlap must be one of {sorted(OVERLAPS)}")
+    if graph not in GRAPHS:
+        raise ValidationError(f"graph must be one of {sorted(GRAPHS)}")
     if material_mode not in {"paper", "performance-adaptation"}:
         raise ValidationError("unknown material mode")
     if device_name not in checkout_validation.get("validated_cases", []):
@@ -1133,6 +1144,7 @@ def build_manifest(
             "name": observable["name"],
             "monitor": dict(monitor_by_name[observable["monitor"]]),
             "unit": observable["unit"],
+            "evaluation": observable["evaluation"],
             "absolute_tolerance": tolerance["absolute"],
             "relative_tolerance": tolerance["relative"],
         }
@@ -1163,7 +1175,7 @@ def build_manifest(
         "result_schema": {
             "path": str(result_schema_path.resolve()),
             "sha256": sha256_file(result_schema_path.resolve()),
-            "schema_version": RESULT_SCHEMA_VERSION,
+            "schema_version": load_json_object(result_schema_path, "result schema")["properties"]["schema_version"]["const"],
         },
         "input_checkout": {
             "path": checkout_validation["checkout"],
@@ -1205,6 +1217,8 @@ def build_manifest(
                 "precision": precision,
                 "ranks": ranks,
                 "mpi_transport": mpi_transport,
+                "overlap": overlap,
+                "graph": graph,
             },
             "resolution_required_at_runtime": backend == "auto"
             or (ranks > 1 and mpi_transport == "auto"),
@@ -1311,12 +1325,18 @@ def _validate_run_manifest_for_result(
     runner_case = bundled_cases["cases"][case_id]
     monitors = _sequence(case.get("monitors"), f"{label}.case.monitors")
     result_schema = _mapping(manifest.get("result_schema"), f"{label}.result_schema")
+    recorded_result_schema_version = result_schema.get("schema_version")
+    expected_result_schema_path = (
+        DEFAULT_MPI_RESULT_SCHEMA
+        if recorded_result_schema_version == 2
+        else DEFAULT_RESULT_SCHEMA
+    )
     _require_schema_version(
-        result_schema.get("schema_version"),
-        RESULT_SCHEMA_VERSION,
+        recorded_result_schema_version,
+        2 if expected_result_schema_path == DEFAULT_MPI_RESULT_SCHEMA else RESULT_SCHEMA_VERSION,
         f"{label}.result_schema schema_version",
     )
-    expected_result_schema_hash = sha256_file(DEFAULT_RESULT_SCHEMA)
+    expected_result_schema_hash = sha256_file(expected_result_schema_path)
     if result_schema.get("sha256") != expected_result_schema_hash:
         raise ValidationError(
             f"{label}.result_schema hash does not match the validator"
@@ -1375,6 +1395,10 @@ def _validate_run_manifest_for_result(
         requested.get("ranks"),
         requested.get("mpi_transport"),
     )
+    if requested.get("overlap") not in OVERLAPS:
+        raise ValidationError(f"{label} execution overlap policy is invalid")
+    if requested.get("graph") not in GRAPHS:
+        raise ValidationError(f"{label} execution graph policy is invalid")
     _positive_int(
         execution.get("measured_repetitions"),
         f"{label}.execution.measured_repetitions",
@@ -1541,6 +1565,7 @@ def _validate_run_manifest_for_result(
             "name": observable["name"],
             "monitor": monitor_by_name[observable["monitor"]],
             "unit": observable["unit"],
+            "evaluation": observable["evaluation"],
             "absolute_tolerance": tolerance["absolute"],
             "relative_tolerance": tolerance["relative"],
         }
@@ -2281,6 +2306,8 @@ def make_parser() -> argparse.ArgumentParser:
     manifest.add_argument("--backend", choices=sorted(BACKENDS), default="nvidia")
     manifest.add_argument("--ranks", type=int, default=1)
     manifest.add_argument("--mpi-transport", choices=sorted(TRANSPORTS), default="none")
+    manifest.add_argument("--overlap", choices=sorted(OVERLAPS), default="off")
+    manifest.add_argument("--graph", choices=sorted(GRAPHS), default="eager")
     manifest.add_argument("--steps", type=int)
     manifest.add_argument("--max-steps", type=int)
     manifest.add_argument("--auto-shutoff-threshold", type=float, default=1e-5)
@@ -2345,7 +2372,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reference_path=args.reference,
             case_definitions=case_definitions,
             cases_path=args.cases,
-            result_schema_path=DEFAULT_RESULT_SCHEMA,
+            result_schema_path=(DEFAULT_MPI_RESULT_SCHEMA if args.ranks > 1 else DEFAULT_RESULT_SCHEMA),
             checkout_validation=checkout,
             device_name=args.device,
             mode=args.mode,
@@ -2360,6 +2387,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             backend=args.backend,
             ranks=args.ranks,
             mpi_transport=args.mpi_transport,
+            overlap=args.overlap,
+            graph=args.graph,
             steps=args.steps,
             max_steps=args.max_steps,
             auto_shutoff_threshold=args.auto_shutoff_threshold,

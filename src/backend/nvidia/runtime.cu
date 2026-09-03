@@ -29,6 +29,8 @@ std::atomic<size_t> device_current(0);
 std::atomic<size_t> device_peak(0);
 std::atomic<size_t> pinned_current(0);
 std::atomic<size_t> pinned_peak(0);
+std::atomic<uint64_t> device_allocation_count(0);
+std::atomic<uint64_t> pinned_allocation_count(0);
 std::atomic<size_t> host_to_device_calls(0), host_to_device_bytes(0);
 std::atomic<size_t> device_to_host_calls(0), device_to_host_bytes(0);
 std::atomic<size_t> device_to_device_calls(0), device_to_device_bytes(0);
@@ -43,6 +45,14 @@ void update_peak(std::atomic<size_t> &peak, size_t value) {
   while (observed < value &&
          !peak.compare_exchange_weak(observed, value, std::memory_order_relaxed,
                                      std::memory_order_relaxed)) {}
+}
+
+void account_event(std::atomic<uint64_t> &counter) {
+  uint64_t observed = counter.load(std::memory_order_relaxed);
+  while (observed != std::numeric_limits<uint64_t>::max() &&
+         !counter.compare_exchange_weak(observed, observed + 1,
+                                        std::memory_order_relaxed,
+                                        std::memory_order_relaxed)) {}
 }
 
 void account_allocate(std::atomic<size_t> &current, std::atomic<size_t> &peak, size_t bytes) {
@@ -491,6 +501,7 @@ void device_buffer::allocate(size_t bytes, int device) {
   impl_->bytes = bytes;
   impl_->device = allocation_device;
   account_allocate(device_current, device_peak, bytes);
+  account_event(device_allocation_count);
 }
 
 void device_buffer::reset() {
@@ -566,6 +577,7 @@ void pinned_buffer::allocate(size_t bytes) {
   impl_->address = address;
   impl_->bytes = bytes;
   account_allocate(pinned_current, pinned_peak, bytes);
+  account_event(pinned_allocation_count);
 }
 
 void pinned_buffer::reset() {
@@ -679,6 +691,8 @@ memory_accounting current_memory_accounting() {
   result.device_bytes_peak = device_peak.load(std::memory_order_relaxed);
   result.pinned_bytes_current = pinned_current.load(std::memory_order_relaxed);
   result.pinned_bytes_peak = pinned_peak.load(std::memory_order_relaxed);
+  result.device_allocation_count = device_allocation_count.load(std::memory_order_relaxed);
+  result.pinned_allocation_count = pinned_allocation_count.load(std::memory_order_relaxed);
   return result;
 }
 

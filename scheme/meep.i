@@ -321,6 +321,9 @@ static meep::vec my_kpoint_func(double freq, int mode, void *user_data) {
 %ignore meep::fields::nonfinite_flag;
 %ignore meep::fields::first_bad_step;
 %ignore meep::fields::first_bad_component;
+%ignore meep::execution_runtime_report;
+%ignore meep::fields::get_execution_runtime_report;
+%ignore meep::active_communicator_allgather_json_records;
 %ignore meep::fields_chunk;
 %ignore meep_geom::fragment_stats;
 

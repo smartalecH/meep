@@ -214,6 +214,8 @@ struct memory_accounting {
   size_t device_bytes_peak;
   size_t pinned_bytes_current;
   size_t pinned_bytes_peak;
+  uint64_t device_allocation_count;
+  uint64_t pinned_allocation_count;
 };
 
 memory_accounting current_memory_accounting();
