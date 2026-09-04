@@ -427,6 +427,15 @@ def validate_executable_manifest(manifest: Mapping[str, Any]) -> Dict[str, Any]:
         )
     if manifest["materials"]["mode"] != "performance-adaptation":
         raise RunnerError("PR3 cannot execute the paper's dispersive material model")
+    cell = manifest["case"]["cell"]
+    if (
+        cell.get("epsilon_averaging") is not False
+        or cell.get("material_discretization") != "yee_grid_point_staircased"
+    ):
+        raise RunnerError(
+            "the executable runner requires manifest-bound staircased "
+            "Yee-grid-point material assignment"
+        )
     return details
 
 
@@ -663,6 +672,7 @@ def _build_simulation(
         "backend": requested["backend"],
         "precision": requested["precision"],
         "accelerator_strict": True,
+        "eps_averaging": bool(case["cell"]["epsilon_averaging"]),
     }
     if requested["backend"] == "nvidia":
         kwargs["device_id"] = device_id
@@ -2085,8 +2095,41 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _begin_singleton_accelerator_context(mp: Any, backend: str) -> bool:
+    if backend != "nvidia":
+        return False
+    begun = False
+    try:
+        mp.begin_global_communications()
+        begun = True
+        mp.divide_parallel_processes(1)
+    except Exception as error:
+        if begun:
+            try:
+                mp.end_divide_parallel()
+            except Exception:
+                pass
+        raise RunnerError(
+            f"cannot initialize singleton accelerator communicator: {error}"
+        ) from error
+    return True
+
+
+def _end_singleton_accelerator_context(mp: Any, active: bool) -> None:
+    if not active:
+        return
+    try:
+        mp.end_divide_parallel()
+    except Exception as error:
+        raise RunnerError(
+            f"cannot finalize singleton accelerator communicator: {error}"
+        ) from error
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = make_parser().parse_args(argv)
+    mp = None
+    accelerator_context_active = False
     try:
         manifest, manifest_sha256 = _manifest_snapshot(args.manifest)
         validate_executable_manifest(manifest)
@@ -2142,6 +2185,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             os.environ["MEEP_NVIDIA_MPI_OVERLAP"] = requested["overlap"]
             os.environ["MEEP_NVIDIA_GRAPH_MODE"] = requested["graph"]
         mp, gdstk = _load_runtime_modules()
+        accelerator_context_active = _begin_singleton_accelerator_context(
+            mp, requested["backend"]
+        )
         records, translation = _geometry_records(manifest, gdstk)
         ports = transformed_ports(manifest, translation)
         planes = validate_planes(manifest, ports)
@@ -2196,6 +2242,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ) as error:
         print(f"run_benchmark.py: error: {error}", file=sys.stderr)
         return 2
+    finally:
+        if mp is not None:
+            _end_singleton_accelerator_context(mp, accelerator_context_active)
 
 
 if __name__ == "__main__":

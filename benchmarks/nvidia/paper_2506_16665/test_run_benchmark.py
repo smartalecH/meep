@@ -41,6 +41,62 @@ class RunnerManifestTests(unittest.TestCase):
             sampling["frequencies_meep"],
             [1.0 / 1.54, 1.0 / 1.55, 1.0 / 1.56],
         )
+        self.assertIs(manifest["case"]["cell"]["epsilon_averaging"], False)
+        self.assertEqual(
+            manifest["case"]["cell"]["material_discretization"],
+            "yee_grid_point_staircased",
+        )
+
+    def test_simulation_receives_manifest_bound_staircased_material_policy(self):
+        manifest = self.manifest(backend="nvidia")
+        planes = runner.validate_planes(
+            manifest, runner.transformed_ports(manifest, {"x_um": 0.0, "y_um": 0.0})
+        )
+        mp = mock.MagicMock()
+        mp.NO_DIRECTION = "NO_DIRECTION"
+        mp.NO_PARITY = "NO_PARITY"
+        mp.X = "X"
+        mp.Y = "Y"
+        simulation = mp.Simulation.return_value
+
+        runner._build_simulation(mp, manifest, [], planes, device_id=0)
+
+        kwargs = mp.Simulation.call_args.kwargs
+        self.assertIs(kwargs["eps_averaging"], False)
+        self.assertIs(kwargs["accelerator_strict"], True)
+        self.assertEqual(kwargs["backend"], "nvidia")
+
+    def test_singleton_accelerator_communicator_lifecycle(self):
+        mp = mock.Mock()
+        active = runner._begin_singleton_accelerator_context(mp, "nvidia")
+        runner._end_singleton_accelerator_context(mp, active)
+        self.assertEqual(
+            mp.mock_calls,
+            [
+                mock.call.begin_global_communications(),
+                mock.call.divide_parallel_processes(1),
+                mock.call.end_divide_parallel(),
+            ],
+        )
+
+        cpu_mp = mock.Mock()
+        active = runner._begin_singleton_accelerator_context(cpu_mp, "cpu")
+        runner._end_singleton_accelerator_context(cpu_mp, active)
+        self.assertEqual(cpu_mp.mock_calls, [])
+
+    def test_singleton_accelerator_divide_failure_cleans_up(self):
+        mp = mock.Mock()
+        mp.divide_parallel_processes.side_effect = RuntimeError("divide failed")
+        with self.assertRaisesRegex(runner.RunnerError, "communicator"):
+            runner._begin_singleton_accelerator_context(mp, "nvidia")
+        self.assertEqual(
+            mp.mock_calls,
+            [
+                mock.call.begin_global_communications(),
+                mock.call.divide_parallel_processes(1),
+                mock.call.end_divide_parallel(),
+            ],
+        )
 
     def test_psr_is_explicitly_unsupported(self):
         manifest = self.manifest(device="psr")

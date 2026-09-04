@@ -21,8 +21,8 @@ DEFAULT_CASES = HERE / "runner_cases.json"
 DEFAULT_MANIFEST_SCHEMA = HERE / "benchmark_manifest.schema.json"
 DEFAULT_RESULT_SCHEMA = HERE / "benchmark_result.schema.json"
 DEFAULT_MPI_RESULT_SCHEMA = HERE / "mpi_benchmark_result.schema.json"
-GENERATOR_VERSION = 4
-MANIFEST_SCHEMA_VERSION = 4
+GENERATOR_VERSION = 5
+MANIFEST_SCHEMA_VERSION = 5
 RESULT_SCHEMA_VERSION = 1
 BACKENDS = {"auto", "cpu", "nvidia"}
 PRECISIONS = {"native", "f32", "mixed"}
@@ -42,6 +42,12 @@ PERFORMANCE_ADAPTATION_MATERIALS = {
     "SiO2": {"model": "nondispersive", "epsilon": 2.09},
     "Si3N4": {"model": "nondispersive", "refractive_index": 2.0, "epsilon": 4.0},
 }
+MATERIAL_DISCRETIZATION_ADAPTATION = (
+    "Meep uses per-component scalar-permittivity sampling at staggered Yee-grid "
+    "locations (epsilon_averaging=false), producing a staircased material "
+    "assignment that remains backend-independent and does not require host "
+    "material fallback."
+)
 
 
 class ValidationError(ValueError):
@@ -356,6 +362,12 @@ def validate_case_definitions(definitions: Mapping[str, Any]) -> None:
     ):
         raise ValidationError("cell z extent must be positive")
     _finite(cell.get("in_plane_padding_um"), "cell.in_plane_padding_um", positive=True)
+    if cell.get("epsilon_averaging") is not False:
+        raise ValidationError("cell.epsilon_averaging must be false")
+    if cell.get("material_discretization") != "yee_grid_point_staircased":
+        raise ValidationError(
+            "cell.material_discretization must be yee_grid_point_staircased"
+        )
     adaptation_materials = _mapping(
         definitions.get("performance_adaptation_materials"),
         "performance_adaptation_materials",
@@ -1175,7 +1187,9 @@ def build_manifest(
         "result_schema": {
             "path": str(result_schema_path.resolve()),
             "sha256": sha256_file(result_schema_path.resolve()),
-            "schema_version": load_json_object(result_schema_path, "result schema")["properties"]["schema_version"]["const"],
+            "schema_version": load_json_object(result_schema_path, "result schema")[
+                "properties"
+            ]["schema_version"]["const"],
         },
         "input_checkout": {
             "path": checkout_validation["checkout"],
@@ -1223,7 +1237,7 @@ def build_manifest(
             "resolution_required_at_runtime": backend == "auto"
             or (ranks > 1 and mpi_transport == "auto"),
             "requested_gpus": ranks if backend == "nvidia" else 0,
-            "warmup_steps": 0 if mode == "smoke" else 100,
+            "warmup_steps": 1 if mode == "smoke" else 100,
             "measured_repetitions": 1 if mode == "smoke" else 5,
         },
         "stopping": stopping,
@@ -1255,6 +1269,7 @@ def build_manifest(
             reference["common"]["mesh_caveat"],
             reference["common"]["material_mode_caveat"],
             reference["common"]["boundary_caveat"],
+            MATERIAL_DISCRETIZATION_ADAPTATION,
         ],
     }
     manifest["validation_policy"]["reference"]["physics_configuration_sha256"] = (
@@ -1333,7 +1348,11 @@ def _validate_run_manifest_for_result(
     )
     _require_schema_version(
         recorded_result_schema_version,
-        2 if expected_result_schema_path == DEFAULT_MPI_RESULT_SCHEMA else RESULT_SCHEMA_VERSION,
+        (
+            2
+            if expected_result_schema_path == DEFAULT_MPI_RESULT_SCHEMA
+            else RESULT_SCHEMA_VERSION
+        ),
         f"{label}.result_schema schema_version",
     )
     expected_result_schema_hash = sha256_file(expected_result_schema_path)
@@ -1408,7 +1427,7 @@ def _validate_run_manifest_for_result(
         f"{label}.execution.warmup_steps",
         allow_zero=True,
     )
-    expected_warmup = 0 if requested["mode"] == "smoke" else 100
+    expected_warmup = 1 if requested["mode"] == "smoke" else 100
     expected_repetitions = 1 if requested["mode"] == "smoke" else 5
     if execution["warmup_steps"] != expected_warmup:
         raise ValidationError(f"{label}.execution.warmup_steps is not canonical")
@@ -1609,6 +1628,7 @@ def _validate_run_manifest_for_result(
         bundled_reference["common"]["mesh_caveat"],
         bundled_reference["common"]["material_mode_caveat"],
         bundled_reference["common"]["boundary_caveat"],
+        MATERIAL_DISCRETIZATION_ADAPTATION,
     ]
     if not _json_equal(manifest.get("adaptations"), expected_adaptations):
         raise ValidationError(f"{label}.adaptations are not canonical")
@@ -2372,7 +2392,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             reference_path=args.reference,
             case_definitions=case_definitions,
             cases_path=args.cases,
-            result_schema_path=(DEFAULT_MPI_RESULT_SCHEMA if args.ranks > 1 else DEFAULT_RESULT_SCHEMA),
+            result_schema_path=(
+                DEFAULT_MPI_RESULT_SCHEMA if args.ranks > 1 else DEFAULT_RESULT_SCHEMA
+            ),
             checkout_validation=checkout,
             device_name=args.device,
             mode=args.mode,

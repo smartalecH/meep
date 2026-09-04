@@ -262,6 +262,13 @@ shared layer stack; `validate` audits the entire six-case corpus.
 to the Meep runner. It fixes the GDS transform, layer/datatype and z-range
 mappings, ports, source and monitor definitions, padding, all six PML faces,
 the exact nondispersive material constants, and the field-energy decay region.
+It also explicitly fixes `epsilon_averaging=false`, a backend-independent
+staircased material assignment used by this performance adaptation. Meep then
+samples scalar permittivity separately at each staggered Yee-grid component
+location; it does not assign one value at the cell center. That choice avoids
+host material fallback for the imported GDS prisms, is part of the manifest's
+physics hash, and is not claimed to reproduce the paper's unavailable exact
+solver snapshot.
 The 0.25 um transverse padding is total added span (0.125 um per side); the
 earlier 4 um value could not fit several source planes inside the paper cells'
 non-PML regions. The ring case separately identifies its
@@ -273,7 +280,7 @@ Gaussian center frequency and `fwidth`. These values are versioned benchmark
 inputs rather than hidden runner defaults. Each manifest also contains the
 expanded wavelength/frequency arrays and the resolved DFT decimation factor.
 
-`benchmark_manifest.schema.json` defines the complete version-4 run document,
+`benchmark_manifest.schema.json` defines the complete version-5 run document,
 including the requested overlap and graph policies.
 Result validation rechecks that schema and the bundled manifest-schema,
 paper-reference, case-definition, result-schema, pinned-commit, GDS, YAML, and
@@ -373,7 +380,8 @@ the paper alone.
 
 ## Benchmark modes
 
-- `smoke`: fixed 10 steps by default, no warmup or repetition requirement.
+- `smoke`: one untimed setup step followed by one measured 10-step window. The
+  setup step materializes lazy backend state before the measured diagnostic.
 - `fixed-step`: requires `--steps`; records 100 warmup steps and five measured
   repetitions for steady-state throughput.
 - `end-to-end`: field-energy decay threshold `1e-5`, explicit check interval,
@@ -383,7 +391,8 @@ the paper alone.
 `run_benchmark.py` currently accepts `smoke` and `fixed-step`. A fixed-step run
 constructs one simulation, performs the manifest's 100 untimed warmup steps
 once, and then records five sequential windows of exactly the requested step
-count. Smoke mode runs ten steps once with no warmup. Ten steps occur well
+count. Smoke mode runs one untimed setup step and then ten measured steps once.
+The ten measured steps occur well
 before the 20 nm Gaussian pulse peak and prove only construction, stepping, and
 finite monitor access.
 

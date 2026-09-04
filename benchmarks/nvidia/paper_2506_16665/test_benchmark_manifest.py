@@ -156,6 +156,16 @@ class ReferenceAndCaseTests(unittest.TestCase):
         with self.assertRaisesRegex(bm.ValidationError, "spectral_envelope"):
             bm.validate_case_definitions(cases)
 
+    def test_case_validation_requires_staircased_material_assignment(self):
+        cases = bm.load_case_definitions()
+        cases["cell"]["epsilon_averaging"] = True
+        with self.assertRaisesRegex(bm.ValidationError, "epsilon_averaging"):
+            bm.validate_case_definitions(cases)
+        cases = bm.load_case_definitions()
+        cases["cell"]["material_discretization"] = "subpixel_averaged"
+        with self.assertRaisesRegex(bm.ValidationError, "material_discretization"):
+            bm.validate_case_definitions(cases)
+
     def test_malformed_json_is_a_validation_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "bad.json"
@@ -359,7 +369,16 @@ class ManifestTests(unittest.TestCase):
                 self.assertEqual(
                     manifest["execution"]["requested"]["precision"], "native"
                 )
+                self.assertEqual(manifest["execution"]["warmup_steps"], 1)
                 self.assertTrue(manifest["validation_policy"]["required_observables"])
+                self.assertIs(manifest["case"]["cell"]["epsilon_averaging"], False)
+                self.assertEqual(
+                    manifest["case"]["cell"]["material_discretization"],
+                    "yee_grid_point_staircased",
+                )
+                self.assertIn(
+                    bm.MATERIAL_DISCRETIZATION_ADAPTATION, manifest["adaptations"]
+                )
                 self.assertEqual(
                     manifest["manifest_schema"]["sha256"],
                     bm.sha256_file(bm.DEFAULT_MANIFEST_SCHEMA),
@@ -598,6 +617,7 @@ class ResultTests(unittest.TestCase):
         manifest = json.loads(
             pathlib.Path(result["run_manifest"]["path"]).read_text(encoding="utf-8")
         )
+        result["timing"]["warmup_steps"] = manifest["execution"]["warmup_steps"]
         reference = json.loads(
             pathlib.Path(result["physics_reference"]["path"]).read_text(
                 encoding="utf-8"
@@ -632,7 +652,7 @@ class ResultTests(unittest.TestCase):
         manifest_schema = bm.load_json_object(
             bm.DEFAULT_MANIFEST_SCHEMA, "run manifest schema"
         )
-        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 4)
+        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 5)
 
     def test_result_rejects_nonfinite_and_grid_mismatch(self):
         temporary, result, _manifest = self.template()
@@ -855,6 +875,7 @@ class ResultTests(unittest.TestCase):
             lambda value: value["excitation"].update(bandwidth_nm=50.0),
             lambda value: value["materials"].update(validation={"sha256": "1" * 64}),
             lambda value: value["case"]["boundaries"].update(thickness_um=2.0),
+            lambda value: value["case"]["cell"].update(epsilon_averaging=True),
             lambda value: value["case"]["monitors"][1].update(mode_order=1),
             lambda value: value["stopping"].update(steps=11),
         )

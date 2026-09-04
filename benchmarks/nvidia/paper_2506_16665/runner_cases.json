@@ -43,7 +43,9 @@
     "z_min_um": -2.0,
     "z_max_um": 2.0,
     "in_plane_padding_um": 1.0,
-    "background_material": "SiO2"
+    "background_material": "SiO2",
+    "epsilon_averaging": false,
+    "material_discretization": "yee_grid_point_staircased"
   },
   "performance_adaptation_materials": {
     "Si": {
