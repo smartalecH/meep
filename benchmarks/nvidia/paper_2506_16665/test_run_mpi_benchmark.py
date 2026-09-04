@@ -3,6 +3,7 @@
 import copy
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -11,92 +12,220 @@ import run_mpi_benchmark as runner
 
 
 HASH = "a" * 64
-REQUESTED = {"backend": "nvidia", "precision": "native", "route": "direct",
-             "overlap": "required", "graph": "required", "ranks": 2}
+REQUESTED = {
+    "backend": "nvidia",
+    "precision": "native",
+    "route": "direct",
+    "overlap": "required",
+    "graph": "required",
+    "ranks": 2,
+}
 
 
 def rank_record(rank, samples=(2.0, 4.0)):
     normalized_uuid = f"{rank + 1:032x}"
     runtime = {
-        "requested_backend": "nvidia", "resolved_backend": "nvidia",
-        "requested_precision": "native", "resolved_precision": "native",
-        "requested_transport": "direct", "resolved_transport": "direct",
-        "requested_overlap": "required", "resolved_overlap": "overlap",
-        "captured_requested_transport": "direct", "captured_overlap_policy": "required",
-        "requested_graph": "required", "resolved_graph": "graph",
-        "mpi_provider": "Open MPI/UCX", "counter_scope": "rank_local_current_epoch",
+        "requested_backend": "nvidia",
+        "resolved_backend": "nvidia",
+        "requested_precision": "native",
+        "resolved_precision": "native",
+        "requested_transport": "direct",
+        "resolved_transport": "direct",
+        "requested_overlap": "required",
+        "resolved_overlap": "overlap",
+        "captured_requested_transport": "direct",
+        "captured_overlap_policy": "required",
+        "requested_graph": "required",
+        "resolved_graph": "graph",
+        "mpi_provider": "Open MPI/UCX",
+        "counter_scope": "rank_local_current_epoch",
         "backend_counter_scope": "rank_local_backend_lifetime",
         "memory_gauge_scope": "rank_local_process_lifetime",
         "setup_counter_scope": "rank_local_current_backend_state",
         "transport_timing_scope": "rank_local_current_transport_epoch_host_elapsed",
         "allocation_counter_scope": "rank_local_process_lifetime",
         "communicator_rank": rank,
-        "communicator_size": 2, "communicator_generation": 7,
+        "communicator_size": 2,
+        "communicator_generation": 7,
         "captured_provider_signature": 9,
-        "mpi_query_available": True, "mpi_cuda_aware": True,
-        "device_owner": True, "device_id": rank, "device_uuid": normalized_uuid,
-        "captured_transport_epoch_active": True, "captured_transport_epoch_fresh": True,
-        "graph_enabled": True, "graph_valid": True,
+        "mpi_query_available": True,
+        "mpi_cuda_aware": True,
+        "device_owner": True,
+        "device_id": rank,
+        "device_uuid": normalized_uuid,
+        "captured_transport_epoch_active": True,
+        "captured_transport_epoch_fresh": True,
+        "graph_enabled": True,
+        "graph_valid": True,
     }
     runtime.update({name: rank + 1 for name in runner.COUNTER_AGGREGATIONS})
     runtime.update({name: 100 + rank for name in runner.GAUGE_AGGREGATIONS})
     runtime["transport_pinned_bytes"] = 0
     runtime["device_to_host_calls"] = runtime["device_to_host_bytes"] = 0
     runtime["host_to_device_calls"] = runtime["host_to_device_bytes"] = 0
-    return {"rank": rank, "communicator_size": 2, "communicator_generation": 7,
-            "manifest_sha256": HASH, "launch_sha256": "b" * 64,
-            "provenance_sha256": "c" * 64, "hostname": "node", "local_rank": rank,
-            "role": "owner", "device": {"visible_device": rank, "process_device_id": rank,
-                "physical_selector": str(rank), "uuid": f"GPU-{normalized_uuid}", "name": "GB200",
-                "memory_bytes": 1000, "sm_clock_hz": 1.0, "memory_clock_hz": 1.0,
-                "driver_version": "1"}, "runtime": runtime,
-            "module_paths": {"meep": "/tmp/meep/__init__.py", "extension": "/tmp/_meep.so"},
-            "module_sha256": {"meep": "e" * 64, "extension": "f" * 64},
-            "cpu_affinity": [rank],
-            "repetitions": [{"initialization_seconds": 0.1, "warmup_seconds": 0.2,
-                             "steady_seconds": value + rank, "monitor_seconds": 0.3,
-                             "steps": 100, "dt_meep": 0.1, "grid_shape": [2, 3, 4],
-                             "stop_reason": "fixed_steps",
-                             "counter_start": {name: 0 for name in runner.COUNTER_AGGREGATIONS},
-                             "counter_end": {name: (2 * (rank + 1) if name == "direct_bytes" else
-                                                    0 if name in {"device_to_host_calls", "device_to_host_bytes", "host_to_device_calls", "host_to_device_bytes"}
-                                                    else rank + 1) for name in runner.COUNTER_AGGREGATIONS},
-                             "counter_deltas": {name: (2 * (rank + 1) if name == "direct_bytes" else
-                                                         0 if name in {"device_to_host_calls", "device_to_host_bytes", "host_to_device_calls", "host_to_device_bytes"}
-                                                         else rank + 1) for name in runner.COUNTER_AGGREGATIONS},
-                             "monitors": []} for value in samples]}
+    forbidden_steady_counters = {
+        "steady_allocation_count",
+        "graph_recapture_count",
+        "full_field_copy_count",
+        "host_fallback_count",
+        "host_fallback_device_to_host_bytes",
+        "host_fallback_host_to_device_bytes",
+        "host_fallback_steady_capacity_growths",
+        "material_fallback_warning_count",
+    }
+    return {
+        "rank": rank,
+        "communicator_size": 2,
+        "communicator_generation": 7,
+        "manifest_sha256": HASH,
+        "launch_sha256": "b" * 64,
+        "provenance_sha256": "c" * 64,
+        "hostname": "node",
+        "local_rank": rank,
+        "role": "owner",
+        "device": {
+            "visible_device": rank,
+            "process_device_id": rank,
+            "physical_selector": str(rank),
+            "uuid": f"GPU-{normalized_uuid}",
+            "name": "GB200",
+            "memory_bytes": 1000,
+            "sm_clock_hz": 1.0,
+            "memory_clock_hz": 1.0,
+            "driver_version": "1",
+        },
+        "runtime": runtime,
+        "module_paths": {"meep": "/tmp/meep/__init__.py", "extension": "/tmp/_meep.so"},
+        "module_sha256": {"meep": "e" * 64, "extension": "f" * 64},
+        "cpu_affinity": [rank],
+        "repetitions": [
+            {
+                "initialization_seconds": 0.1,
+                "warmup_seconds": 0.2,
+                "steady_seconds": value + rank,
+                "monitor_seconds": 0.3,
+                "steps": 100,
+                "dt_meep": 0.1,
+                "grid_shape": [2, 3, 4],
+                "stop_reason": "fixed_steps",
+                "counter_start": {name: 0 for name in runner.COUNTER_AGGREGATIONS},
+                "counter_end": {
+                    name: (
+                        2 * (rank + 1)
+                        if name == "direct_bytes"
+                        else 0
+                        if name
+                        in {
+                            "device_to_host_calls",
+                            "device_to_host_bytes",
+                            "host_to_device_calls",
+                            "host_to_device_bytes",
+                        }
+                        | forbidden_steady_counters
+                        else rank + 1
+                    )
+                    for name in runner.COUNTER_AGGREGATIONS
+                },
+                "counter_deltas": {
+                    name: (
+                        2 * (rank + 1)
+                        if name == "direct_bytes"
+                        else 0
+                        if name
+                        in {
+                            "device_to_host_calls",
+                            "device_to_host_bytes",
+                            "host_to_device_calls",
+                            "host_to_device_bytes",
+                        }
+                        | forbidden_steady_counters
+                        else rank + 1
+                    )
+                    for name in runner.COUNTER_AGGREGATIONS
+                },
+                "monitors": [],
+            }
+            for value in samples
+        ],
+    }
 
 
 def result_document():
-    reconciled = runner.reconcile_rank_records([rank_record(0), rank_record(1)], HASH, REQUESTED)
-    result = {"schema_version": 2, "kind": "paper_2506_16665_multi_rank_benchmark",
-            "generated_at_utc": "2026-09-02T00:00:00+00:00",
-            "run_manifest": {"path": "/tmp/manifest.json", "sha256": HASH, "case_id": "coupler"},
-            "physics_reference": {"path": "/tmp/reference.json", "sha256": "d" * 64},
-            "status": {"succeeded": True, "errors": []},
-            "launch": {"argv": [str(runner.MPIEXEC), "-np", "2", str(runner.PYTHON)], "cwd": "/tmp",
-                       "environment": {"OMPI_MCA_opal_cuda_support": "true", "OMPI_MCA_pml": "ucx",
-                           "UCX_TLS": runner.UCX_TLS, "MEEP_GPU_AWARE_MPI": "yes",
-                           "MEEP_NVIDIA_MPI_OVERLAP": "required", "MEEP_NVIDIA_GRAPH_MODE": "required",
-                           "MEEP_PRECISION": "native", "CUDA_VISIBLE_DEVICES": "0,1",
-                           "PYTHONPATH": "/tmp/python", "LD_LIBRARY_PATH": "/tmp/lib"}, "timeout_seconds": 30,
-                       "mpiexec": str(runner.MPIEXEC), "python": str(runner.PYTHON),
-                       "mpi_version": "Open MPI", "ucx_version": "UCX"},
-            "provenance": {"meep_source": "/tmp/meep", "meep_commit": "1" * 40,
-                           "meep_dirty": False, "runner_commit": "2" * 40,
-                           "runner_dirty": True, "build_directory": "/tmp/build",
-                           "cuda_toolkit": "CUDA 13", "configure_arguments": "--with-cuda",
-                           "compiler": "mpic++ 15", "compiler_flags": {"CXXFLAGS": "-O3"},
-                           "executable_sha256": {"mpiexec": "3" * 64,
-                                                 "python": "4" * 64}},
-            "requested_execution": REQUESTED,
-            "physics_observables": [{"name": "x", "monitor": {}, "unit": "1", "evaluation": "linear_center_wavelength_mode_power_ratio",
-                                     "value": 1.0, "values_by_repetition": [1.0, 1.0],
-                                     "reference_value": 1.0, "absolute_tolerance": 0.0,
-                                     "relative_tolerance": 0.0, "passed": True}],
-            **reconciled}
-    launch_hash = __import__("hashlib").sha256(json.dumps(result["launch"], sort_keys=True).encode()).hexdigest()
-    provenance_hash = __import__("hashlib").sha256(json.dumps(result["provenance"], sort_keys=True).encode()).hexdigest()
+    reconciled = runner.reconcile_rank_records(
+        [rank_record(0), rank_record(1)], HASH, REQUESTED
+    )
+    result = {
+        "schema_version": 2,
+        "kind": "paper_2506_16665_multi_rank_benchmark",
+        "generated_at_utc": "2026-09-02T00:00:00+00:00",
+        "run_manifest": {
+            "path": "/tmp/manifest.json",
+            "sha256": HASH,
+            "case_id": "coupler",
+        },
+        "physics_reference": {"path": "/tmp/reference.json", "sha256": "d" * 64},
+        "status": {"succeeded": True, "errors": []},
+        "launch": {
+            "argv": [str(runner.MPIEXEC), "-np", "2", str(runner.PYTHON)],
+            "cwd": "/tmp",
+            "environment": {
+                "OMPI_MCA_opal_cuda_support": "true",
+                "OMPI_MCA_pml": "ucx",
+                "UCX_TLS": runner.UCX_TLS,
+                "MEEP_GPU_AWARE_MPI": "yes",
+                "MEEP_NVIDIA_MPI_OVERLAP": "required",
+                "MEEP_NVIDIA_GRAPH_MODE": "required",
+                "MEEP_PRECISION": "native",
+                "CUDA_VISIBLE_DEVICES": "0,1",
+                "PYTHONPATH": "/tmp/python",
+                "LD_LIBRARY_PATH": "/tmp/lib",
+            },
+            "timeout_seconds": 30,
+            "mpiexec": str(runner.MPIEXEC),
+            "python": str(runner.PYTHON),
+            "mpi_version": "Open MPI",
+            "ucx_version": "UCX",
+        },
+        "provenance": {
+            "meep_source": "/tmp/meep",
+            "meep_commit": "1" * 40,
+            "meep_dirty": False,
+            "runner_commit": "2" * 40,
+            "runner_dirty": True,
+            "build_directory": "/tmp/build",
+            "cuda_toolkit": "CUDA 13",
+            "configure_arguments": "--with-cuda",
+            "compiler": "mpic++ 15",
+            "compiler_flags": {"CXXFLAGS": "-O3"},
+            "executable_sha256": {"mpiexec": "3" * 64, "python": "4" * 64},
+        },
+        "requested_execution": REQUESTED,
+        "physics_observables": [
+            {
+                "name": "x",
+                "monitor": {},
+                "unit": "1",
+                "evaluation": "linear_center_wavelength_mode_power_ratio",
+                "value": 1.0,
+                "values_by_repetition": [1.0, 1.0],
+                "reference_value": 1.0,
+                "absolute_tolerance": 0.0,
+                "relative_tolerance": 0.0,
+                "passed": True,
+            }
+        ],
+        **reconciled,
+    }
+    launch_hash = (
+        __import__("hashlib")
+        .sha256(json.dumps(result["launch"], sort_keys=True).encode())
+        .hexdigest()
+    )
+    provenance_hash = (
+        __import__("hashlib")
+        .sha256(json.dumps(result["provenance"], sort_keys=True).encode())
+        .hexdigest()
+    )
     for record in result["rank_records"]:
         record["launch_sha256"] = launch_hash
         record["provenance_sha256"] = provenance_hash
@@ -105,7 +234,9 @@ def result_document():
 
 class LaunchEnvironmentTest(unittest.TestCase):
     def test_provider_positive_ucx_is_forced(self):
-        env = runner.launch_environment({"OMPI_MCA_btl": "stale"}, "direct", "required", "required", "native")
+        env = runner.launch_environment(
+            {"OMPI_MCA_btl": "stale"}, "direct", "required", "required", "native"
+        )
         self.assertEqual(env["OMPI_MCA_opal_cuda_support"], "true")
         self.assertEqual(env["OMPI_MCA_pml"], "ucx")
         self.assertEqual(env["UCX_TLS"], "self,sm,cuda_copy,cuda_ipc")
@@ -118,8 +249,53 @@ class LaunchEnvironmentTest(unittest.TestCase):
             "51b2c4ce123456789abcdef012345678",
         )
 
+    def test_rocm_provider_environment_is_explicit_and_cuda_free(self):
+        env = runner.launch_environment(
+            {"OMPI_MCA_opal_cuda_support": "stale"},
+            "direct",
+            "off",
+            "eager",
+            "native",
+            "hip",
+        )
+        self.assertEqual(env["OMPI_MCA_pml"], "ucx")
+        self.assertEqual(env["UCX_TLS"], "self,sm,rocm_copy,rocm_ipc")
+        self.assertEqual(env["MEEP_GPU_AWARE_MPI"], "yes")
+        self.assertEqual(env["MEEP_ACCELERATOR_RUNTIME"], "hip")
+        self.assertNotIn("OMPI_MCA_opal_cuda_support", env)
+
+    def test_singleton_none_route_disables_device_mpi(self):
+        env = runner.launch_environment({}, "none", "off", "eager", "native", "hip")
+        self.assertEqual(env["MEEP_GPU_AWARE_MPI"], "no")
+
+    def test_rocm_provenance_binds_launch_selector_to_runtime_bdf(self):
+        inventory = {
+            "card0": {
+                "PCI Bus": "0000:08:00.0",
+                "Unique ID": "0x1234",
+                "(Topology) Numa Node": "0",
+                "Card Series": "MI350X",
+                "GFX Version": "gfx950",
+                "VRAM Total Memory (B)": "309220868096",
+                "sclk clock speed:": "(2200Mhz)",
+                "mclk clock speed:": "(2000Mhz)",
+            },
+            "system": {"Driver version": "6.16.6"},
+        }
+        completed = mock.Mock(stdout=json.dumps(inventory), stderr="")
+        with mock.patch.object(
+            runner, "_hip_pci_bus_id", return_value="0000:08:00.0"
+        ), mock.patch.object(runner.subprocess, "run", return_value=completed):
+            device = runner._rocm_device_provenance(
+                0, "1234567890abcdef1234567890abcdef", ["1"], pathlib.Path("/rocm-smi")
+            )
+        self.assertEqual(device["physical_selector"], "1")
+        self.assertEqual(device["inventory_card"], "card0")
+        self.assertEqual(device["pci_bus_id"], "0000:08:00.0")
+        self.assertEqual(device["numa_node"], 0)
+
     def test_python_purelib_is_queried_from_selected_interpreter(self):
-        path = runner.python_purelib(runner.PYTHON)
+        path = runner.python_purelib(pathlib.Path(sys.executable))
         self.assertTrue(path.is_absolute())
         self.assertIn("site-packages", str(path))
 
@@ -128,19 +304,31 @@ class CollectiveStopTest(unittest.TestCase):
     def test_fixed_step_uses_exact_count(self):
         class Fields:
             t = 4
-            def advance(self, steps): self.t += steps
+
+            def advance(self, steps):
+                self.t += steps
+
         class Simulation:
             fields = Fields()
-        steps, reason = runner.advance_with_collective_stop(None, Simulation(),
-                                                            {"kind": "fixed_steps", "steps": 7})
+
+        steps, reason = runner.advance_with_collective_stop(
+            None, Simulation(), {"kind": "fixed_steps", "steps": 7}
+        )
         self.assertEqual((steps, reason), (7, "fixed_steps"))
 
     def test_total_energy_mode_is_rejected_instead_of_risking_rank_divergence(self):
-        class Fields: t = 0
-        class Simulation: fields = Fields()
+        class Fields:
+            t = 0
+
+        class Simulation:
+            fields = Fields()
+
         with self.assertRaisesRegex(runner.RunnerError, "total_field_energy"):
-            runner.advance_with_collective_stop(None, Simulation(),
-                {"kind": "field_energy_decay", "observable": "total_field_energy"})
+            runner.advance_with_collective_stop(
+                None,
+                Simulation(),
+                {"kind": "field_energy_decay", "observable": "total_field_energy"},
+            )
 
     def test_timed_interval_is_bracketed_by_active_communicator_barriers(self):
         events = []
@@ -166,7 +354,13 @@ class CollectiveStopTest(unittest.TestCase):
                 return {"counter": len(events)}
 
         with mock.patch.object(runner.time, "perf_counter", side_effect=(10.0, 13.5)):
-            steps, reason, elapsed, before, after = runner.timed_advance_with_collective_stop(
+            (
+                steps,
+                reason,
+                elapsed,
+                before,
+                after,
+            ) = runner.timed_advance_with_collective_stop(
                 MP(), Simulation(), {"kind": "fixed_steps", "steps": 7}
             )
         self.assertEqual(events, ["barrier", "report", "advance", "barrier", "report"])
@@ -176,7 +370,9 @@ class CollectiveStopTest(unittest.TestCase):
 
 class ReconciliationTest(unittest.TestCase):
     def test_global_timing_and_declared_counter_aggregation(self):
-        result = runner.reconcile_rank_records([rank_record(0), rank_record(1)], HASH, REQUESTED)
+        result = runner.reconcile_rank_records(
+            [rank_record(0), rank_record(1)], HASH, REQUESTED
+        )
         self.assertEqual(result["timing"]["critical_path_samples_seconds"], [3.0, 5.0])
         self.assertEqual(result["timing"]["median_seconds"], 4.0)
         self.assertEqual(result["timing"]["repetitions"][0]["rank_median_seconds"], 2.5)
@@ -184,6 +380,31 @@ class ReconciliationTest(unittest.TestCase):
         counters = {item["name"]: item for item in result["counter_aggregates"]}
         self.assertEqual(counters["direct_bytes"]["aggregation"], "sum")
         self.assertEqual(counters["direct_bytes"]["value"], 12)
+
+    def test_singleton_none_route_has_no_transport_epoch(self):
+        requested = dict(REQUESTED, route="none", overlap="off", graph="eager", ranks=1)
+        record = rank_record(0)
+        record["communicator_size"] = 1
+        runtime = record["runtime"]
+        runtime.update(
+            {
+                "communicator_size": 1,
+                "requested_transport": "staged",
+                "resolved_transport": "none",
+                "captured_requested_transport": "none",
+                "requested_overlap": "off",
+                "resolved_overlap": "off",
+                "captured_overlap_policy": "off",
+                "requested_graph": "eager",
+                "resolved_graph": "eager",
+                "graph_enabled": False,
+                "graph_valid": False,
+                "captured_transport_epoch_active": False,
+                "captured_transport_epoch_fresh": False,
+            }
+        )
+        result = runner.reconcile_rank_records([record], HASH, requested)
+        self.assertEqual(result["resolved_execution"]["route"], "none")
 
     def test_manifest_disagreement_is_rejected(self):
         records = [rank_record(0), rank_record(1)]
@@ -216,6 +437,28 @@ class ReconciliationTest(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerError, "required graph"):
             runner.reconcile_rank_records(records, HASH, REQUESTED)
 
+    def test_measured_steady_state_work_must_not_fallback_or_allocate(self):
+        for counter in (
+            "steady_allocation_count",
+            "graph_recapture_count",
+            "full_field_copy_count",
+            "host_fallback_count",
+            "host_fallback_device_to_host_bytes",
+            "host_fallback_host_to_device_bytes",
+            "host_fallback_steady_capacity_growths",
+            "material_fallback_warning_count",
+        ):
+            result = result_document()
+            result["rank_records"][0]["repetitions"][0]["counter_end"][counter] = 1
+            result["rank_records"][0]["repetitions"][0]["counter_deltas"][counter] = 1
+            aggregate = next(
+                item for item in result["counter_aggregates"] if item["name"] == counter
+            )
+            aggregate["per_rank"][0] = 1
+            aggregate["value"] = 1
+            with self.assertRaisesRegex(runner.RunnerError, "measured interval"):
+                runner.validate_result(result)
+
 
 class PublicationTest(unittest.TestCase):
     @staticmethod
@@ -223,15 +466,24 @@ class PublicationTest(unittest.TestCase):
         manifest = {
             "execution": {
                 "requested": {
-                    "backend": "nvidia", "precision": "native",
-                    "mpi_transport": "direct", "overlap": "required",
-                    "graph": "required", "ranks": 2,
+                    "backend": "nvidia",
+                    "precision": "native",
+                    "mpi_transport": "direct",
+                    "overlap": "required",
+                    "graph": "required",
+                    "ranks": 2,
                 },
                 "measured_repetitions": 2,
             },
-            "validation_policy": {"required_observables": [{
-                "name": "x", "monitor": {"name": "out"}, "unit": "1",
-            }]},
+            "validation_policy": {
+                "required_observables": [
+                    {
+                        "name": "x",
+                        "monitor": {"name": "out"},
+                        "unit": "1",
+                    }
+                ]
+            },
         }
         references = {"x": {"monitor": "out", "unit": "1", "value": 1.0}}
         derived = copy.deepcopy(result["physics_observables"][0])
@@ -278,8 +530,10 @@ class PublicationTest(unittest.TestCase):
             runner.validate_result(result)
 
     def test_simulation_and_performance_tampering_are_rejected(self):
-        for section, key in (("simulation", "steps"),
-                             ("performance", "grid_timesteps_per_second")):
+        for section, key in (
+            ("simulation", "steps"),
+            ("performance", "grid_timesteps_per_second"),
+        ):
             with self.subTest(section=section):
                 result = result_document()
                 result[section][key] += 1
@@ -307,13 +561,15 @@ class PublicationTest(unittest.TestCase):
             changed_references = copy.deepcopy(references)
             changed_references["x"]["monitor"] = "other"
             with self.assertRaisesRegex(runner.RunnerError, "monitor/unit"):
-                runner.validate_result(result, manifest=manifest,
-                                       references=changed_references)
+                runner.validate_result(
+                    result, manifest=manifest, references=changed_references
+                )
             changed_result = copy.deepcopy(result)
             changed_result["physics_observables"][0]["value"] = 2.0
             with self.assertRaisesRegex(runner.RunnerError, "not derived"):
-                runner.validate_result(changed_result, manifest=manifest,
-                                       references=references)
+                runner.validate_result(
+                    changed_result, manifest=manifest, references=references
+                )
 
     def test_per_rank_route_accounting_cannot_cancel_across_ranks(self):
         result = result_document()

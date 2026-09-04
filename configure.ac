@@ -66,8 +66,8 @@ AC_PROG_CC
 AC_PROG_CXX
 AC_LANG([C++])
 
-# Parse accelerator selection before MPI provider checks so AMD builds can keep
-# the existing CUDA-awareness query disabled until ROCm-aware MPI is added.
+# Parse accelerator selection before MPI provider checks so each accelerator
+# build probes only its matching provider-awareness extension.
 AC_ARG_WITH([accelerator],
             [AS_HELP_STRING([--with-accelerator=no|nvidia|amd],
                             [build an accelerator backend (default: no)])],
@@ -82,8 +82,14 @@ AC_ARG_VAR([MPIRUN], [MPI launcher used by the test suite])
 if test "x$with_mpi" = "xyes"; then
   AX_MPI([],[AC_MSG_ERROR([could not find mpi library for --with-mpi])])
   CXX=$MPICXX
-  if test "x$with_accelerator" != "xamd"; then
-    AC_CHECK_HEADERS([mpi-ext.h], [
+  AC_CHECK_HEADERS([mpi-ext.h], [
+    if test "x$with_accelerator" = "xamd"; then
+      AC_LINK_IFELSE(
+        [AC_LANG_PROGRAM([[#include <mpi.h>
+#include <mpi-ext.h>]], [[return MPIX_Query_rocm_support() < 0;]])],
+        [AC_DEFINE([HAVE_MPIX_QUERY_ROCM_SUPPORT], [1],
+                   [Define when MPIX_Query_rocm_support is available])])
+    else
       AC_LINK_IFELSE(
         [AC_LANG_PROGRAM([[#include <mpi.h>
 #include <mpi-ext.h>]], [[return MPIX_Query_cuda_support() < 0;]])],
@@ -97,8 +103,8 @@ if test "x$with_mpi" = "xyes"; then
 #endif]], [[]])],
         [AC_DEFINE([HAVE_OPEN_MPI_CUDA_AWARE_SUPPORT_MACRO], [1],
                    [Define when Open MPI publishes a CUDA-awareness support macro])])
-    ], [], [[#include <mpi.h>]])
-  fi
+    fi
+  ], [], [[#include <mpi.h>]])
 fi
 
 # Require C++11 support
@@ -177,10 +183,6 @@ case "$with_accelerator" in
     ;;
   *) AC_MSG_ERROR([--with-accelerator must be no, nvidia, or amd]) ;;
 esac
-
-if test "x$use_hip_device_compiler" = "xyes" -a "x$with_mpi" = "xyes"; then
-  AC_MSG_NOTICE([AMD/HIP MPI transport is staged-only; provider-direct support is disabled])
-fi
 
 if test "x$use_hip_device_compiler" = "xyes"; then
   if test -n "$cuda_prefix" -o -n "$cuda_architectures" -o \

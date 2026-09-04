@@ -1,4 +1,4 @@
-# arXiv 2506.16665 benchmark runner
+# Accelerator benchmark runners and arXiv 2506.16665 corpus adapter
 
 ## Normative multi-rank runner (PR7.5)
 
@@ -7,15 +7,19 @@ multi-GPU evidence producer. `run_mpi_benchmark.py` is the version-2 normative
 MPI result producer and validates `mpi_benchmark_result.schema.json` before
 communicator rank 0 atomically publishes the final JSON file.
 
-The launcher intentionally uses the branch-matched environment at
-`/home/alechammond/meep-env`: both `mpirun` and Python are absolute paths. For
-same-node provider-positive runs it sets these variables before `MPI_Init`:
+The launcher accepts independent `--python`, `--mpiexec`, `--pythonpath`, and
+repeatable `--runtime-library-path` arguments. This is required when Python,
+Meep, Open MPI, UCX, and ROCm come from different private prefixes. For
+same-node provider-positive HIP runs it sets these variables before `MPI_Init`:
 
 ```text
-OMPI_MCA_opal_cuda_support=true
 OMPI_MCA_pml=ucx
-UCX_TLS=self,sm,cuda_copy,cuda_ipc
+UCX_TLS=self,sm,rocm_copy,rocm_ipc
+ROCR_VISIBLE_DEVICES=<one explicit physical selector per rank>
 ```
+
+CUDA runs retain `OMPI_MCA_opal_cuda_support=true`,
+`UCX_TLS=self,sm,cuda_copy,cuda_ipc`, and `CUDA_VISIBLE_DEVICES`.
 
 Route, overlap, graph mode, and precision are mandatory arguments and must
 match the immutable manifest. The result records the exact launcher argv,
@@ -24,31 +28,42 @@ host/local rank, GPU identity, provider query, requested/resolved policies,
 per-rank repetitions, and rank-local transport counters. Each repetition uses
 the maximum rank duration as its critical path and records rank median and
 imbalance. Every aggregate counter carries an explicit `sum` or `max` rule.
-The real benchmark path is intentionally restricted to two ranks/GPUs until
-the planned two-owner plus two-idle decomposition is available. The built-in
-acceptance path below uses a collective point-field decay decision. Paper
-end-to-end manifests currently request `total_field_energy`; the runner rejects
-that mode explicitly because the resident multi-rank host-energy query remains
-a known crash, instead of publishing a misleading fixed-step substitute.
+The runner accepts exactly 1, 2, 4, or 8 owning ranks and requires an explicit,
+distinct device selector for every rank. The built-in acceptance path below
+uses a collective point-field decay decision. Paper end-to-end manifests
+currently request `total_field_energy`; the runner rejects that mode explicitly
+because the resident multi-rank host-energy query remains a known crash,
+instead of publishing a misleading fixed-step substitute.
 
-Example two-rank provider-positive run:
+Example two-rank provider-positive HIP run:
 
 ```sh
-/home/alechammond/meep-env/bin/python run_mpi_benchmark.py \
+/home/alechammond/rocm-mpi/python/bin/python run_mpi_benchmark.py \
   --manifest /absolute/path/run-manifest.json \
   --physics-reference /absolute/path/cpu-native-baseline.json \
   --output /absolute/path/raw-result.json \
   --build-directory /absolute/path/meep-build \
+  --accelerator hip --visible-devices 1,5 \
+  --python /home/alechammond/rocm-mpi/python/bin/python \
+  --mpiexec /home/alechammond/rocm-mpi/openmpi/bin/mpirun \
+  --pythonpath /absolute/path/meep-build/python \
+  --library-path /absolute/path/meep-build/src/.libs \
+  --runtime-library-path /home/alechammond/rocm-mpi/openmpi/lib \
+  --runtime-library-path /home/alechammond/rocm-mpi/ucx/lib \
+  --runtime-library-path /absolute/path/rocm/lib \
+  --toolkit-compiler /absolute/path/rocm/bin/hipcc \
+  --rocm-smi /absolute/path/rocm/bin/rocm-smi \
+  --ucx-info /home/alechammond/rocm-mpi/ucx/bin/ucx_info \
   --route direct --overlap required --graph required --precision native \
   --timeout 1800
 ```
 
-`--prefix` is configurable for reproducibility, with
-`/home/alechammond/meep-env` as the local default. The launcher explicitly
-records `CUDA_VISIBLE_DEVICES`, `PYTHONPATH`, and `LD_LIBRARY_PATH` as well as
-the configured build flags, compiler, executable and loaded-module hashes,
-observed CPU affinity, and GPU mapping. `--build-directory` is required and
-must identify the configured build used for the run.
+`--prefix` remains the CUDA-compatible default. Explicit tool and path options
+override it without resolving a virtual-environment Python symlink to the
+system interpreter. The launcher records CUDA or ROCr visibility, all runtime
+library paths, map/rank/bind policy, HIPCC or NVCC version, `rocm-smi` inventory
+for HIP, build flags, executable/module hashes, CPU affinity/NUMA, GPU UUID,
+physical selector, PCI BDF, and device NUMA node.
 
 The CPU reference must be a hash-authenticated `cpu_native_baseline` bound to
 the same paper corpus, case definitions, case ID, and physics-configuration
@@ -109,11 +124,90 @@ device-buffer result must be present together. Provider zero-copy is a separate
 optional object that requires a hash-addressed provider log plus its memory type
 and selected IPC transport; the staged-only AMD gate emits neither claim.
 
+For PR5 ROCm-aware direct validation, first run the native target. It preserves
+the PR4 staged-only target separately, exercises both forced-direct and
+automatic selection on two owners, and uses larger all-owner rings to validate
+device identity and NUMA locality:
+
+```sh
+env -u LD_LIBRARY_PATH \
+  OMPI_MCA_pml=ucx UCX_TLS=self,sm,rocm_copy,rocm_ipc \
+  make -C /tmp/meep-rocm-build/tests -j1 amd-direct-mpi-check \
+    AMD_MPIEXEC=/home/alechammond/rocm-mpi/openmpi/bin/mpirun
+```
+
+The target retains `nvidia-mpi-rocm-provider.log`, requires protocol lines for
+both ROCm devices and selected `rocm_ipc/rocm_ipc` zero-copy, and rejects a
+positive device-buffer result without that provider evidence. Its np4 mapping
+uses ROCr selectors `1,3,5,7` for physical BDFs `08,18,88,98`; its np8 mapping
+uses selectors `0..7` and asserts the runtime's validated BDF order. These are
+host-specific defaults and must be overridden together on another system.
+
 An AMD+MPI build also exposes `make -C tests amd-staged-transport-acceptance`.
 Set `AMD_ACCEPTANCE_PREFIX` to the MPI installation used to build Meep and set
 `AMD_ACCEPTANCE_PYTHON_CMD` and `AMD_ACCEPTANCE_PYTHONPATH` to the executable
 and package from that same build; the MPI launcher, visible devices, output,
 and library path are independently overridable make variables.
+
+The corresponding PR5 `amd-direct-transport-acceptance` target first runs the
+native direct/provider gates and then invokes the runner with
+`--routes cpu,staged,direct` and the hash-addressed UCX provider log. It requires
+the same explicit prefix, Python, and Python-package variables. A unit-tested
+schema or dry-run is not a substitute for this Python end-to-end result.
+
+Neither native target is a performance benchmark. Do not report an AMD
+speedup from it. The pinned external paper corpus remains a separate,
+hash-authenticated prerequisite for paper comparisons.
+
+`run_self_contained_benchmark.py` supplies a corpus-independent performance
+experiment for bring-up. It uses one fixed 3D vacuum case, initializes once,
+warms up exactly 100 steps, and retains five sequential raw 100-step windows.
+It publishes the slowest rank for every window. The validator fails closed on
+steady allocation, graph recapture, full-field copy, host fallback, wrong
+transport byte accounting, duplicate GPU identities, nonlocal CPU/GPU NUMA
+placement, CPU field tolerance, or non-bitwise staged/direct fields. Direct
+results require the matching staged artifact, so route comparisons cannot use
+different devices or work.
+
+Use a pinned one-thread CPU artifact and a disclosed CPU thread sweep before
+launching GPU cases. The following illustrates the private-stack arguments;
+repeat `--runtime-library-path` in exact loader order and use `ppr:1:package`,
+`ppr:2:package`, or `ppr:4:package` for 2, 4, or 8 GPUs across this two-socket
+host:
+
+```sh
+python=/home/alechammond/rocm-mpi/python/bin/python
+$python run_self_contained_benchmark.py \
+  --output /tmp/hip-staged-np2.json \
+  --backend nvidia --accelerator hip --route staged --ranks 2 \
+  --visible-devices 1,5 --omp-threads 1 \
+  --python "$python" \
+  --mpiexec /home/alechammond/rocm-mpi/openmpi/bin/mpirun \
+  --build-directory /absolute/path/meep-build \
+  --library-path /absolute/path/meep-build/python \
+  --runtime-library-path /absolute/path/meep-build/src/.libs \
+  --runtime-library-path /home/alechammond/rocm-mpi/openmpi/lib \
+  --runtime-library-path /home/alechammond/rocm-mpi/ucx/lib \
+  --runtime-library-path /absolute/path/rocm/lib \
+  --runtime-library-path /absolute/path/numerical-dependencies/lib \
+  --toolkit-compiler /absolute/path/rocm/bin/hipcc \
+  --rocm-smi /absolute/path/rocm/bin/rocm-smi \
+  --ucx-info /home/alechammond/rocm-mpi/ucx/bin/ucx_info \
+  --map-by ppr:1:package --rank-by fill --bind-to core \
+  --reference /tmp/cpu-best.json
+```
+
+Run the same command with `--route direct`, a distinct output, and
+`--peer-route-result /tmp/hip-staged-np2.json`. Single-rank HIP uses one
+explicit selector; 4/8-rank launches must similarly enumerate all devices.
+The tiny built-in case is a portability and route-overhead measurement, not a
+representative accelerator throughput claim; report slowdowns as readily as
+speedups.
+
+`run_amd_fixed_step_matrix.sh OUTPUT_DIRECTORY` reproduces the disclosed local
+CPU sweep and HIP 1/2/4/8 matrix. Its private-stack paths are explicit defaults
+and can be overridden with `PYTHON`, `MPIEXEC`, `UCX_PREFIX`, `ROCM_PREFIX`,
+`MEEP_DEPS`, `MEEP_BUILD`, and `MEEP_PYTHONPATH`.
 
 Workers never parse stdout. They call
 `meep.active_communicator_allgather_json(payload)`, which must collectively

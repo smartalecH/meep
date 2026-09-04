@@ -104,8 +104,7 @@ bool mpi_initialized_by_meep = false;
 int mpi_thread_level = MPI_THREAD_SINGLE;
 std::thread::id mpi_main_thread;
 std::string backend_communicator_failure_point;
-bool install_backend_communicator_context(MPI_Comm source, uint64_t generation,
-                                          std::string &why);
+bool install_backend_communicator_context(MPI_Comm source, uint64_t generation, std::string &why);
 bool retire_active_backend_communicator_context(std::string &why) noexcept;
 void discard_active_backend_communicator_context() noexcept;
 
@@ -142,8 +141,7 @@ void retire_divided_communicators_without_generation() {
 
 void require_backend_communicator_mutation_thread(const char *operation) {
   std::string why;
-  if (!backend_mpi_thread_ready(why))
-    throw std::runtime_error(std::string(operation) + ": " + why);
+  if (!backend_mpi_thread_ready(why)) throw std::runtime_error(std::string(operation) + ": " + why);
 }
 #endif
 
@@ -293,8 +291,7 @@ initialize::initialize(int &argc, char **&argv) {
   }
   else if (MPI_Query_thread(&mpi_thread_level) != MPI_SUCCESS)
     abort("MPI_Query_thread failed");
-  if (mpi_thread_level < MPI_THREAD_FUNNELED)
-    abort("MPI does not provide MPI_THREAD_FUNNELED");
+  if (mpi_thread_level < MPI_THREAD_FUNNELED) abort("MPI does not provide MPI_THREAD_FUNNELED");
   int is_main = 0;
   if (MPI_Is_thread_main(&is_main) != MPI_SUCCESS) abort("MPI_Is_thread_main failed");
   if (!is_main) abort("Meep MPI initialization must run on the MPI main thread");
@@ -1042,7 +1039,8 @@ BackendCommunicatorLease::BackendCommunicatorLease() : context_(), info_() {}
 BackendCommunicatorLease::~BackendCommunicatorLease() {}
 
 BackendCommunicatorLease::BackendCommunicatorLease(BackendCommunicatorLease &&other) noexcept
-    : context_(std::move(other.context_)), info_(std::move(other.info_)) {
+    : context_(std::move(other.context_)),
+      info_(std::move(other.info_)) {
   other.info_ = BackendCommunicatorInfo();
 }
 
@@ -1151,8 +1149,12 @@ bool query_gpu_aware_mpi_provider(bool &query_available, bool &supports_direct,
     return false;
   }
   provider.assign(text, size_t(std::max(0, length)));
-  while (!provider.empty() && provider.back() == '\0') provider.pop_back();
-#ifdef HAVE_MPIX_QUERY_CUDA_SUPPORT
+  while (!provider.empty() && provider.back() == '\0')
+    provider.pop_back();
+#if defined(HAVE_MPIX_QUERY_ROCM_SUPPORT)
+  query_available = true;
+  supports_direct = MPIX_Query_rocm_support() > 0;
+#elif defined(HAVE_MPIX_QUERY_CUDA_SUPPORT)
   query_available = true;
   supports_direct = MPIX_Query_cuda_support() > 0;
 #endif
@@ -1169,8 +1171,8 @@ bool collective_resolve_gpu_mpi_policy(bool local_parse_valid, GpuMpiPolicy loca
   why.clear();
 #ifdef HAVE_MPI
   if (!backend_mpi_thread_ready(why)) return false;
-  int values[3] = {local_parse_valid ? int(local_policy) : -1,
-                   local_query_available ? 1 : 0, local_direct_support ? 1 : 0};
+  int values[3] = {local_parse_valid ? int(local_policy) : -1, local_query_available ? 1 : 0,
+                   local_direct_support ? 1 : 0};
   int minima[3] = {}, maxima[3] = {};
   if (MPI_Allreduce(values, minima, 3, MPI_INT, MPI_MIN, mycomm) != MPI_SUCCESS)
     fatal_backend_communicator(mycomm, "MPI policy minimum reconciliation failed");
@@ -1199,9 +1201,9 @@ bool collective_resolve_gpu_mpi_policy(bool local_parse_valid, GpuMpiPolicy loca
 namespace {
 
 #ifdef HAVE_MPI
-bool build_backend_communicator_context(
-    MPI_Comm source, uint64_t generation,
-    std::shared_ptr<BackendCommunicatorContext> &candidate, std::string &why) {
+bool build_backend_communicator_context(MPI_Comm source, uint64_t generation,
+                                        std::shared_ptr<BackendCommunicatorContext> &candidate,
+                                        std::string &why) {
   why.clear();
   if (!backend_mpi_thread_ready(why)) return false;
   BackendCommunicatorInfo info{};
@@ -1213,8 +1215,7 @@ bool build_backend_communicator_context(
     local_failed = 1;
   }
   int *tag_ub = NULL, present = 0;
-  if (!local_failed &&
-      MPI_Comm_get_attr(source, MPI_TAG_UB, &tag_ub, &present) != MPI_SUCCESS) {
+  if (!local_failed && MPI_Comm_get_attr(source, MPI_TAG_UB, &tag_ub, &present) != MPI_SUCCESS) {
     why = "MPI_TAG_UB query failed";
     local_failed = 1;
   }
@@ -1246,14 +1247,12 @@ bool build_backend_communicator_context(
   }
   const unsigned long long local_generation = static_cast<unsigned long long>(generation);
   unsigned long long minimum_generation = 0, maximum_generation = 0;
-  if (MPI_Allreduce(&local_generation, &minimum_generation, 1, MPI_UNSIGNED_LONG_LONG,
-                    MPI_MIN, source) != MPI_SUCCESS)
-    fatal_backend_communicator(source,
-                               "communicator generation minimum reconciliation failed");
-  if (MPI_Allreduce(&local_generation, &maximum_generation, 1, MPI_UNSIGNED_LONG_LONG,
-                    MPI_MAX, source) != MPI_SUCCESS)
-    fatal_backend_communicator(source,
-                               "communicator generation maximum reconciliation failed");
+  if (MPI_Allreduce(&local_generation, &minimum_generation, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN,
+                    source) != MPI_SUCCESS)
+    fatal_backend_communicator(source, "communicator generation minimum reconciliation failed");
+  if (MPI_Allreduce(&local_generation, &maximum_generation, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX,
+                    source) != MPI_SUCCESS)
+    fatal_backend_communicator(source, "communicator generation maximum reconciliation failed");
   if (minimum_generation != maximum_generation) {
     why = "active communicator generation differs across ranks";
     local_failed = 1;
@@ -1266,8 +1265,12 @@ bool build_backend_communicator_context(
     return false;
   }
 
-  try { candidate.reset(new BackendCommunicatorContext()); }
-  catch (...) { candidate.reset(); }
+  try {
+    candidate.reset(new BackendCommunicatorContext());
+  }
+  catch (...) {
+    candidate.reset();
+  }
   local_failed = candidate ? 0 : 1;
   if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, source) != MPI_SUCCESS)
     fatal_backend_communicator(source, "communicator allocation reconciliation failed");
@@ -1286,8 +1289,7 @@ bool build_backend_communicator_context(
   any_failed = 0;
   if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, candidate->comm) !=
       MPI_SUCCESS)
-    fatal_backend_communicator(candidate->comm,
-                               "communicator creation reconciliation failed");
+    fatal_backend_communicator(candidate->comm, "communicator creation reconciliation failed");
   if (any_failed) {
     if (MPI_Comm_free(&candidate->comm) != MPI_SUCCESS)
       fatal_backend_communicator(source, "communicator creation rollback failed");
@@ -1299,8 +1301,8 @@ bool build_backend_communicator_context(
   return true;
 }
 
-bool retire_backend_communicator_context(
-    const std::shared_ptr<BackendCommunicatorContext> &context, std::string &why) noexcept {
+bool retire_backend_communicator_context(const std::shared_ptr<BackendCommunicatorContext> &context,
+                                         std::string &why) noexcept {
   why.clear();
   if (!context || context->comm == MPI_COMM_NULL) return true;
   int finalized = 0;
@@ -1326,13 +1328,11 @@ bool retire_backend_communicator_context(
   return true;
 }
 
-bool install_backend_communicator_context(MPI_Comm source, uint64_t generation,
-                                          std::string &why) {
+bool install_backend_communicator_context(MPI_Comm source, uint64_t generation, std::string &why) {
   std::shared_ptr<BackendCommunicatorContext> candidate;
   const bool built = build_backend_communicator_context(source, generation, candidate, why);
   int local_failed = built ? 0 : 1, any_failed = 0;
-  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD) !=
-      MPI_SUCCESS)
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD) != MPI_SUCCESS)
     fatal_backend_communicator(MPI_COMM_WORLD,
                                "communicator transition candidate reconciliation failed");
   if (any_failed) {
@@ -1345,8 +1345,7 @@ bool install_backend_communicator_context(MPI_Comm source, uint64_t generation,
     return false;
   }
   local_failed = consume_backend_communicator_failure("before_retire") ? 1 : 0;
-  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD) !=
-      MPI_SUCCESS)
+  if (MPI_Allreduce(&local_failed, &any_failed, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD) != MPI_SUCCESS)
     fatal_backend_communicator(MPI_COMM_WORLD,
                                "communicator transition retirement reconciliation failed");
   if (any_failed) {
@@ -1412,8 +1411,7 @@ size_t backend_communicator_context_use_count_for_testing() {
 }
 
 bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &lease,
-                                               const RemoteHaloProgram &program,
-                                               std::string &why) {
+                                               const RemoteHaloProgram &program, std::string &why) {
   why.clear();
   if (!lease.valid()) {
     why = "remote halo agreement requires a communicator lease";
@@ -1436,8 +1434,7 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   int any_invalid = 0;
   if (MPI_Allreduce(&local_invalid, &any_invalid, 1, MPI_INT, MPI_LOR, lease.context_->comm) !=
       MPI_SUCCESS)
-    fatal_backend_communicator(lease.context_->comm,
-                               "remote halo preflight reconciliation failed");
+    fatal_backend_communicator(lease.context_->comm, "remote halo preflight reconciliation failed");
   if (any_invalid) {
     why = local_invalid ? local_why : "remote halo program is invalid on another rank";
     return false;
@@ -1487,8 +1484,7 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   }
   if (MPI_Allgather(&local_bytes, 1, MPI_INT, counts.data(), 1, MPI_INT, lease.context_->comm) !=
       MPI_SUCCESS)
-    fatal_backend_communicator(lease.context_->comm,
-                               "remote halo agreement count exchange failed");
+    fatal_backend_communicator(lease.context_->comm, "remote halo agreement count exchange failed");
   int total = 0;
   for (int i = 0; i < lease.info().size; ++i) {
     if (counts[i] < 0 || counts[i] % int(sizeof(Packed)) || counts[i] > INT_MAX - total) {
@@ -1500,7 +1496,9 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
   }
   std::vector<unsigned char> gathered;
   local_prepare_failed = 0;
-  try { gathered.resize(static_cast<size_t>(total), 0); }
+  try {
+    gathered.resize(static_cast<size_t>(total), 0);
+  }
   catch (...) {
     local_why = "remote halo agreement receive allocation failed";
     local_prepare_failed = 1;
@@ -1511,8 +1509,8 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
     fatal_backend_communicator(lease.context_->comm,
                                "remote halo receive allocation reconciliation failed");
   if (any_prepare_failed) {
-    why = local_prepare_failed ? local_why
-                               : "remote halo receive allocation failed on another rank";
+    why =
+        local_prepare_failed ? local_why : "remote halo receive allocation failed on another rank";
     return false;
   }
   if (MPI_Allgatherv(local.empty() ? NULL : static_cast<void *>(local.data()), local_bytes,
@@ -1533,8 +1531,8 @@ bool collective_validate_remote_halo_agreement(const BackendCommunicatorLease &l
         break;
       }
       RemoteHaloAgreementRecord record;
-      record.key = RemoteHaloWireKey{packed.source_rank, packed.destination_rank,
-                                     field_type(packed.ft), packed.source_chunk,
+      record.key = RemoteHaloWireKey{packed.source_rank,       packed.destination_rank,
+                                     field_type(packed.ft),    packed.source_chunk,
                                      packed.destination_chunk, packed.tag,
                                      packed.canonical_ordinal};
       record.direction = RemoteHaloDirection(packed.direction);

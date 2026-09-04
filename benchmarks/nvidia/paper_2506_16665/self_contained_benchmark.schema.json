@@ -1,0 +1,89 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://meep.readthedocs.io/schemas/self-contained-fixed-step-benchmark-v1.json",
+  "title": "Meep self-contained fixed-step benchmark",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "generated_at_utc", "case", "case_sha256", "launch", "provenance", "rank_records", "timing", "validation"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "nonnegativeInteger": {"type": "integer", "minimum": 0},
+    "nonnegativeNumber": {"type": "number", "minimum": 0},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}
+  },
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "meep_self_contained_fixed_step_benchmark"},
+    "generated_at_utc": {"type": "string", "minLength": 1},
+    "case": {"type": "object"},
+    "case_sha256": {"$ref": "#/$defs/sha256"},
+    "launch": {
+      "type": "object", "additionalProperties": false,
+      "required": ["argv", "cwd", "environment", "timeout_seconds", "mpiexec", "python", "backend", "accelerator", "route", "ranks", "omp_threads", "visible_devices", "map_by", "rank_by", "bind_to", "mpi_version", "ucx_version"],
+      "properties": {
+        "argv": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+        "cwd": {"type": "string", "minLength": 1}, "environment": {"type": "object", "additionalProperties": {"type": "string"}},
+        "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
+        "mpiexec": {"type": "string", "minLength": 1}, "python": {"type": "string", "minLength": 1},
+        "backend": {"enum": ["cpu", "nvidia"]}, "accelerator": {"enum": ["cuda", "hip"]},
+        "route": {"enum": ["host", "staged", "direct"]}, "ranks": {"enum": [1, 2, 4, 8]},
+        "omp_threads": {"type": "integer", "minimum": 1},
+        "visible_devices": {"type": "array", "maxItems": 8, "items": {"type": "string", "minLength": 1}},
+        "map_by": {"type": "string", "minLength": 1}, "rank_by": {"type": ["string", "null"]},
+        "bind_to": {"type": "string", "minLength": 1}, "mpi_version": {"type": "string", "minLength": 1},
+        "ucx_version": {"type": "string", "minLength": 1}
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "required": ["source", "commit", "dirty", "source_clean", "source_diff_sha256", "runner_source"],
+      "properties": {
+        "source": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+        "dirty": {"type": "boolean"},
+        "source_clean": {"type": "boolean"},
+        "source_diff_sha256": {"oneOf": [{"$ref": "#/$defs/sha256"}, {"type": "null"}]},
+        "runner_source": {"$ref": "#/$defs/artifact"}
+      }
+    },
+    "rank_records": {
+      "type": "array", "minItems": 1, "maxItems": 8,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["rank", "communicator_size", "local_rank", "hostname", "role", "device", "cpu_affinity", "cpu_numa_nodes", "runtime", "repetitions", "module_paths", "module_sha256", "launch_sha256", "provenance_sha256"],
+        "properties": {
+          "rank": {"$ref": "#/$defs/nonnegativeInteger"}, "communicator_size": {"type": "integer", "minimum": 1, "maximum": 8},
+          "local_rank": {"$ref": "#/$defs/nonnegativeInteger"}, "hostname": {"type": "string", "minLength": 1},
+          "role": {"enum": ["cpu", "owner"]}, "device": {"type": ["object", "null"]},
+          "cpu_affinity": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonnegativeInteger"}},
+          "cpu_numa_nodes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/nonnegativeInteger"}},
+          "runtime": {"type": "object"},
+          "repetitions": {"type": "array", "minItems": 5, "items": {"type": "object"}},
+          "module_paths": {"type": "object"}, "module_sha256": {"type": "object"},
+          "launch_sha256": {"$ref": "#/$defs/sha256"}, "provenance_sha256": {"$ref": "#/$defs/sha256"}
+        }
+      }
+    },
+    "timing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["critical_path_samples_seconds", "minimum_seconds", "median_seconds", "maximum_seconds", "grid_timesteps_per_second"],
+      "properties": {
+        "critical_path_samples_seconds": {"type": "array", "minItems": 5, "items": {"$ref": "#/$defs/nonnegativeNumber"}},
+        "minimum_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "median_seconds": {"$ref": "#/$defs/nonnegativeNumber"},
+        "maximum_seconds": {"$ref": "#/$defs/nonnegativeNumber"}, "grid_timesteps_per_second": {"$ref": "#/$defs/nonnegativeNumber"}
+      }
+    },
+    "validation": {
+      "type": "object", "additionalProperties": false,
+      "required": ["fixed_step_protocol", "steady_state_clean", "transport_accounting", "topology_attested", "cpu_reference", "cpu_tolerance_passed", "peer_route", "peer_route_bitwise"],
+      "properties": {
+        "fixed_step_protocol": {"const": true}, "steady_state_clean": {"const": true},
+        "transport_accounting": {"const": true}, "topology_attested": {"const": true},
+        "cpu_reference": {"oneOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]},
+        "cpu_tolerance_passed": {"type": ["boolean", "null"]},
+        "peer_route": {"oneOf": [{"$ref": "#/$defs/artifact"}, {"type": "null"}]},
+        "peer_route_bitwise": {"type": ["boolean", "null"]}
+      }
+    }
+  }
+}

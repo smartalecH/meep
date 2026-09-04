@@ -390,6 +390,37 @@ class AcceptanceArtifactValidationTest(unittest.TestCase):
         ):
             acceptance.validate_comparison_artifact(inconsistent)
 
+    def test_provider_log_requires_two_devices_and_selected_zero_copy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "ucx.log"
+            path.write_text(
+                "tagged message from rocm/GPU0\n"
+                "891..inf rendezvous zero-copy read from remote rocm_ipc/rocm_ipc\n"
+                "tagged message from rocm/GPU1\n"
+                "891..inf rendezvous zero-copy read from remote rocm_ipc/rocm_ipc\n",
+                encoding="utf-8",
+            )
+            evidence = acceptance.provider_zero_copy_evidence(path, "rocm")
+            self.assertEqual(evidence["provider"], "ucx")
+            self.assertEqual(evidence["memory_type"], "rocm")
+            self.assertEqual(evidence["transport"], "rocm_ipc")
+            self.assertEqual(evidence["evidence"]["path"], str(path.resolve()))
+            self.assertEqual(
+                evidence["evidence"]["sha256"], acceptance.bm.sha256_file(path)
+            )
+
+            for contents in (
+                "tagged message from rocm/GPU0\nrocm_ipc/rocm_ipc\n",
+                "from rocm/GPU0\ninto rocm/GPU1\nzero-copy sysv/memory\n",
+                "from rocm/GPU0\nzero-copy rocm_ipc/rocm_ipc\n"
+                "from rocm/GPU1\neager copy-in copy-out rocm_copy/rocm\n",
+            ):
+                path.write_text(contents, encoding="utf-8")
+                with self.assertRaisesRegex(
+                    acceptance.mpi_runner.RunnerError, "does not prove"
+                ):
+                    acceptance.provider_zero_copy_evidence(path, "rocm")
+
     def test_staged_wire_balance_reuse_and_direct_zero_are_enforced(self):
         for name, value, message in (
             ("bytes_received", 8, "host-staged"),
@@ -546,6 +577,69 @@ class AcceptanceArtifactValidationTest(unittest.TestCase):
             self.assertNotIn("HIP_VISIBLE_DEVICES", calls[1][1])
             self.assertNotIn("OMPI_MCA_opal_cuda_support", calls[1][1])
             self.assertFalse((root / "out" / "direct.json").exists())
+
+    def test_rocm_direct_cli_requires_and_records_provider_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            calls = []
+
+            def fake_run(command, env, timeout):
+                calls.append((command, env, timeout))
+                route = command[command.index("--worker") + 1]
+                output = pathlib.Path(command[command.index("--output") + 1])
+                output.write_text(json.dumps(artifact(route)), encoding="utf-8")
+
+            common = [
+                "--output-dir",
+                str(root / "out"),
+                "--routes",
+                "cpu,staged,direct",
+                "--prefix",
+                str(root / "private-mpi"),
+                "--python",
+                str(root / "python"),
+                "--mpiexec",
+                str(root / "mpiexec"),
+                "--visible-devices",
+                "0,1",
+                "--rocm-smi",
+                str(root / "rocm-smi"),
+                "--pythonpath",
+                str(root / "pythonpath"),
+                "--library-path",
+                str(root / "lib"),
+            ]
+            with mock.patch.object(acceptance, "_run", side_effect=fake_run):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(acceptance.main(common), 2)
+            calls.clear()
+
+            provider_log = root / "ucx.log"
+            provider_log.write_text(
+                "from rocm/GPU0\n"
+                "rendezvous zero-copy read from remote rocm_ipc/rocm_ipc\n"
+                "from rocm/GPU1\n"
+                "rendezvous zero-copy read from remote rocm_ipc/rocm_ipc\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(acceptance, "_run", side_effect=fake_run):
+                self.assertEqual(
+                    acceptance.main(
+                        common + ["--provider-zero-copy-log", str(provider_log)]
+                    ),
+                    0,
+                )
+            self.assertEqual(len(calls), 3)
+            direct_env = calls[2][1]
+            self.assertEqual(direct_env["OMPI_MCA_pml"], "ucx")
+            self.assertEqual(direct_env["UCX_TLS"], "self,sm,rocm_copy,rocm_ipc")
+            comparison_value = json.loads(
+                (root / "out" / "comparison.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                comparison_value["provider_zero_copy"],
+                acceptance.provider_zero_copy_evidence(provider_log, "rocm"),
+            )
 
 
 if __name__ == "__main__":

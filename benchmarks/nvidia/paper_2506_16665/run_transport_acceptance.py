@@ -49,6 +49,40 @@ def canonical_hash(value: Any) -> str:
     ).hexdigest()
 
 
+def provider_zero_copy_evidence(path: pathlib.Path, memory_type: str) -> dict[str, Any]:
+    if memory_type not in {"cuda", "rocm"}:
+        raise mpi_runner.RunnerError("provider memory type must be cuda or rocm")
+    resolved = path.resolve()
+    try:
+        payload = resolved.read_bytes()
+    except OSError as error:
+        raise mpi_runner.RunnerError(
+            f"cannot read provider zero-copy log {resolved}: {error}"
+        ) from error
+    text = payload.decode("utf-8", errors="replace")
+    transport = f"{memory_type}_ipc"
+    device_protocol = re.compile(
+        rf"from {memory_type}/GPU([0-9]+)"
+        rf"(?:(?!from {memory_type}/GPU).)*?"
+        rf"zero-copy[^\n]*{transport}/{transport}",
+        re.DOTALL,
+    )
+    devices = set(device_protocol.findall(text))
+    if len(devices) < 2:
+        raise mpi_runner.RunnerError(
+            f"provider log does not prove two-device {transport} zero-copy"
+        )
+    return {
+        "provider": "ucx",
+        "memory_type": memory_type,
+        "transport": transport,
+        "evidence": {
+            "path": str(resolved),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    }
+
+
 def _cpu_placement() -> tuple[list[int], list[int]]:
     affinity = sorted(os.sched_getaffinity(0))
     nodes: set[int] = set()
@@ -759,6 +793,11 @@ def main(argv=None) -> int:
     parser.add_argument("--pythonpath")
     parser.add_argument("--library-path")
     parser.add_argument(
+        "--provider-zero-copy-log",
+        type=pathlib.Path,
+        help="UCX protocol log from a separate fail-closed device-buffer MPI probe",
+    )
+    parser.add_argument(
         "--worker", choices=("cpu", "staged", "direct"), help=argparse.SUPPRESS
     )
     parser.add_argument("--output", type=pathlib.Path, help=argparse.SUPPRESS)
@@ -770,6 +809,18 @@ def main(argv=None) -> int:
             raise mpi_runner.RunnerError("--output-dir is required")
         if not args.pythonpath or not args.library_path:
             raise mpi_runner.RunnerError("--pythonpath and --library-path are required")
+        if args.provider_zero_copy_log is not None and "direct" not in args.routes:
+            raise mpi_runner.RunnerError(
+                "--provider-zero-copy-log requires the direct acceptance route"
+            )
+        if (
+            args.rocm_smi is not None
+            and "direct" in args.routes
+            and args.provider_zero_copy_log is None
+        ):
+            raise mpi_runner.RunnerError(
+                "ROCm direct acceptance requires --provider-zero-copy-log"
+            )
         prefix = args.prefix.resolve()
         python = args.python.resolve() if args.python else prefix / "bin/python"
         mpiexec = args.mpiexec.resolve() if args.mpiexec else prefix / "bin/mpirun"
@@ -820,8 +871,12 @@ def main(argv=None) -> int:
                 env.pop("CUDA_VISIBLE_DEVICES", None)
                 env.pop("HIP_VISIBLE_DEVICES", None)
                 env.pop("OMPI_MCA_opal_cuda_support", None)
-                env.pop("OMPI_MCA_pml", None)
-                env.pop("UCX_TLS", None)
+                if route == "direct":
+                    env["OMPI_MCA_pml"] = "ucx"
+                    env["UCX_TLS"] = "self,sm,rocm_copy,rocm_ipc"
+                else:
+                    env.pop("OMPI_MCA_pml", None)
+                    env.pop("UCX_TLS", None)
             else:
                 env["CUDA_VISIBLE_DEVICES"] = ",".join(selectors)
             _run(
@@ -941,6 +996,10 @@ def main(argv=None) -> int:
                     "staged_direct_bitwise": True,
                     "device_buffer_mpi_positive": True,
                 }
+            )
+        if args.provider_zero_copy_log is not None:
+            comparison["provider_zero_copy"] = provider_zero_copy_evidence(
+                args.provider_zero_copy_log, "rocm" if args.rocm_smi else "cuda"
             )
         _atomic(comparison, args.output_dir / "comparison.json", COMPARISON_SCHEMA)
         return 0

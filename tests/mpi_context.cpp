@@ -16,13 +16,12 @@ using namespace meep;
 namespace {
 int failures = 0;
 
-#define CHECK(condition, message)                                                                 \
-  do {                                                                                            \
-    if (!(condition)) {                                                                           \
-      std::fprintf(stderr, "[rank %d] FAIL %s:%d: %s\n", my_rank(), __FILE__, __LINE__,         \
-                   message);                                                                      \
-      ++failures;                                                                                 \
-    }                                                                                             \
+#define CHECK(condition, message)                                                                  \
+  do {                                                                                             \
+    if (!(condition)) {                                                                            \
+      std::fprintf(stderr, "[rank %d] FAIL %s:%d: %s\n", my_rank(), __FILE__, __LINE__, message);  \
+      ++failures;                                                                                  \
+    }                                                                                              \
   } while (0)
 
 RemoteHaloMessage message(bool outgoing, int rank) {
@@ -75,9 +74,8 @@ void test_lease_and_agreement() {
   program.requested_policy = GpuMpiPolicy::staged;
   program.resolved_route = GpuMpiRoute::staged;
   const bool owner = lease.info().size < 2 || lease.info().rank < 2;
-  program.participation = RemoteHaloParticipation{owner, owner ? 1u : 0u,
-                                                  owner && lease.info().size >= 2 ? 1u : 0u,
-                                                  owner ? 1u : 0u};
+  program.participation = RemoteHaloParticipation{
+      owner, owner ? 1u : 0u, owner && lease.info().size >= 2 ? 1u : 0u, owner ? 1u : 0u};
   if (lease.info().size >= 2 && lease.info().rank < 2) {
     RemoteHaloStage stage;
     stage.ft = E_stuff;
@@ -103,15 +101,30 @@ void test_lease_and_agreement() {
 
   GpuMpiPolicy agreed = GpuMpiPolicy::automatic;
   GpuMpiRoute route = GpuMpiRoute::direct;
-  CHECK(collective_resolve_gpu_mpi_policy(true, GpuMpiPolicy::staged, false, false,
-                                          agreed, route, why) &&
+  CHECK(collective_resolve_gpu_mpi_policy(true, GpuMpiPolicy::staged, false, false, agreed, route,
+                                          why) &&
             agreed == GpuMpiPolicy::staged && route == GpuMpiRoute::staged,
         why.c_str());
   if (count_processors() > 1) {
-    const GpuMpiPolicy disagree = my_rank() == 0 ? GpuMpiPolicy::staged
-                                                 : GpuMpiPolicy::automatic;
+    const GpuMpiPolicy disagree = my_rank() == 0 ? GpuMpiPolicy::staged : GpuMpiPolicy::automatic;
     CHECK(!collective_resolve_gpu_mpi_policy(true, disagree, false, false, agreed, route, why),
           "asymmetric requested policy was accepted");
+    const bool local_provider_ready = my_rank() != count_processors() - 1;
+    CHECK(collective_resolve_gpu_mpi_policy(true, GpuMpiPolicy::automatic, local_provider_ready,
+                                            local_provider_ready, agreed, route, why) &&
+              agreed == GpuMpiPolicy::automatic && route == GpuMpiRoute::staged,
+          "asymmetric provider support did not make auto resolve staged collectively");
+    CHECK(!collective_resolve_gpu_mpi_policy(true, GpuMpiPolicy::direct, local_provider_ready,
+                                             local_provider_ready, agreed, route, why),
+          "asymmetric provider support did not reject forced direct collectively");
+    const bool local_direct_support = my_rank() != count_processors() - 1;
+    CHECK(collective_resolve_gpu_mpi_policy(true, GpuMpiPolicy::automatic, true,
+                                            local_direct_support, agreed, route, why) &&
+              route == GpuMpiRoute::staged,
+          "asymmetric positive provider query did not make auto resolve staged collectively");
+    CHECK(!collective_resolve_gpu_mpi_policy(true, GpuMpiPolicy::direct, true, local_direct_support,
+                                             agreed, route, why),
+          "asymmetric positive provider query did not reject forced direct collectively");
   }
   CHECK(retire_backend_communicator_lease(lease, why), why.c_str());
   CHECK(!lease.valid(), "communicator lease remained valid after retirement");
@@ -126,8 +139,12 @@ void test_collective_context_rollback() {
   const void *identity = backend_communicator_context_identity_for_testing();
   if (my_rank() == 0) set_backend_communicator_failure_for_testing("before_dup");
   bool rejected = false;
-  try { (void)divide_parallel_processes(2); }
-  catch (const std::runtime_error &) { rejected = true; }
+  try {
+    (void)divide_parallel_processes(2);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
   CHECK(rejected, "asymmetric communicator preflight failure did not reconcile");
   CHECK(current_backend_communicator_generation() == generation &&
             backend_communicator_context_identity_for_testing() == identity,
@@ -135,8 +152,12 @@ void test_collective_context_rollback() {
   set_backend_communicator_failure_for_testing(NULL);
   if (my_rank() == 0) set_backend_communicator_failure_for_testing("after_dup");
   rejected = false;
-  try { (void)divide_parallel_processes(2); }
-  catch (const std::runtime_error &) { rejected = true; }
+  try {
+    (void)divide_parallel_processes(2);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
   CHECK(rejected, "asymmetric post-duplication failure did not roll back collectively");
   CHECK(current_backend_communicator_generation() == generation &&
             backend_communicator_context_identity_for_testing() == identity,
@@ -144,8 +165,12 @@ void test_collective_context_rollback() {
   set_backend_communicator_failure_for_testing(NULL);
   if (my_rank() == 0) set_backend_communicator_failure_for_testing("before_retire");
   rejected = false;
-  try { (void)divide_parallel_processes(2); }
-  catch (const std::runtime_error &) { rejected = true; }
+  try {
+    (void)divide_parallel_processes(2);
+  }
+  catch (const std::runtime_error &) {
+    rejected = true;
+  }
   CHECK(rejected, "asymmetric context retirement failure did not reject transition");
   CHECK(current_backend_communicator_generation() == generation &&
             backend_communicator_context_identity_for_testing() == identity,
@@ -168,8 +193,12 @@ void test_thread_and_generation_helpers() {
     std::string worker_why;
     worker_ready = backend_mpi_thread_ready(worker_why);
 #ifdef HAVE_MPI
-    try { begin_global_communications(); }
-    catch (const std::exception &) { worker_mutation_rejected = true; }
+    try {
+      begin_global_communications();
+    }
+    catch (const std::exception &) {
+      worker_mutation_rejected = true;
+    }
 #endif
   });
   worker.join();
@@ -189,30 +218,34 @@ void test_frontend_json_allgather() {
     CHECK(value.empty(), "empty frontend JSON gather changed the payload");
 
   const std::string payload = std::string("{\"rank\":") + std::to_string(my_rank()) + "}";
-  const std::vector<std::string> gathered =
-      active_communicator_allgather_json_records(payload);
+  const std::vector<std::string> gathered = active_communicator_allgather_json_records(payload);
   CHECK(gathered.size() == size_t(count_processors()),
         "frontend JSON gather returned the wrong rank count");
   for (int rank = 0; rank < count_processors(); ++rank)
-    CHECK(gathered[size_t(rank)] ==
-              std::string("{\"rank\":") + std::to_string(rank) + "}",
+    CHECK(gathered[size_t(rank)] == std::string("{\"rank\":") + std::to_string(rank) + "}",
           "frontend JSON gather did not preserve rank order or bytes");
 
   if (count_processors() > 1) {
     bool rejected = false;
     try {
-      (void)active_communicator_allgather_json_records(
-          payload, my_rank() != count_processors() - 1, "injected invalid JSON payload");
+      (void)active_communicator_allgather_json_records(payload, my_rank() != count_processors() - 1,
+                                                       "injected invalid JSON payload");
     }
-    catch (const std::runtime_error &) { rejected = true; }
+    catch (const std::runtime_error &) {
+      rejected = true;
+    }
     CHECK(rejected, "asymmetric invalid frontend JSON payload was not rejected collectively");
   }
 
   for (int point = 1; point <= 3; ++point) {
     backend_set_runtime_report_failure_for_testing(0, point);
     bool rejected = false;
-    try { (void)active_communicator_allgather_json_records(payload); }
-    catch (const std::exception &) { rejected = true; }
+    try {
+      (void)active_communicator_allgather_json_records(payload);
+    }
+    catch (const std::exception &) {
+      rejected = true;
+    }
     CHECK(rejected, "asymmetric frontend JSON allocation failure was not reconciled");
     backend_set_runtime_report_failure_for_testing(-1, 0);
   }
@@ -220,8 +253,12 @@ void test_frontend_json_allgather() {
 #ifdef HAVE_MPI
   bool worker_rejected = false;
   std::thread worker([&]() {
-    try { (void)active_communicator_allgather_json_records(payload); }
-    catch (const std::runtime_error &) { worker_rejected = true; }
+    try {
+      (void)active_communicator_allgather_json_records(payload);
+    }
+    catch (const std::runtime_error &) {
+      worker_rejected = true;
+    }
   });
   worker.join();
   CHECK(worker_rejected, "frontend JSON gather accepted a non-main MPI thread");
@@ -293,31 +330,35 @@ int main(int argc, char **argv) {
   int total = 0;
   int saved_rank = 0;
   {
-  initialize mpi(argc, argv);
-  saved_rank = my_rank();
+    initialize mpi(argc, argv);
+    saved_rank = my_rank();
 #ifdef HAVE_MPI
-  bool query_available = false, supports_direct = false;
-  std::string provider, provider_why;
-  CHECK(query_gpu_aware_mpi_provider(query_available, supports_direct, provider, provider_why),
-        provider_why.c_str());
-  CHECK(!provider.empty(), "MPI provider identity is empty");
-#ifdef HAVE_MPIX_QUERY_CUDA_SUPPORT
-  CHECK(query_available, "configured MPIX CUDA-support query was not used at runtime");
+    bool query_available = false, supports_direct = false;
+    std::string provider, provider_why;
+    CHECK(query_gpu_aware_mpi_provider(query_available, supports_direct, provider, provider_why),
+          provider_why.c_str());
+    CHECK(!provider.empty(), "MPI provider identity is empty");
+#if defined(HAVE_MPIX_QUERY_ROCM_SUPPORT) || defined(HAVE_MPIX_QUERY_CUDA_SUPPORT)
+    CHECK(query_available, "configured MPIX GPU-support query was not used at runtime");
 #else
-  CHECK(!query_available, "runtime reported a provider query absent from configure results");
+    CHECK(!query_available, "runtime reported a provider query absent from configure results");
 #endif
 #endif
-  test_thread_and_generation_helpers();
-  test_frontend_json_allgather();
-  test_lease_and_agreement();
-  test_collective_context_rollback();
-  test_split_transitions();
-  total = sum_to_all(failures);
+    test_thread_and_generation_helpers();
+    test_frontend_json_allgather();
+    test_lease_and_agreement();
+    test_collective_context_rollback();
+    test_split_transitions();
+    total = sum_to_all(failures);
   }
 #ifdef HAVE_MPI
   bool finalized_rejected = false;
-  try { (void)active_communicator_allgather_json_records("{}"); }
-  catch (const std::runtime_error &) { finalized_rejected = true; }
+  try {
+    (void)active_communicator_allgather_json_records("{}");
+  }
+  catch (const std::runtime_error &) {
+    finalized_rejected = true;
+  }
   if (!finalized_rejected) ++total;
 #endif
   if (saved_rank == 0)

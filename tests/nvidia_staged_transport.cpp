@@ -632,18 +632,27 @@ bool valid_pci_bus_id(const std::string &value) {
   return value[11] >= '0' && value[11] <= '7';
 }
 
-std::vector<std::string> expected_owner_bdfs() {
+std::vector<std::string> expected_owner_bdfs(size_t required, const char *context) {
   const char *configured = std::getenv("MEEP_AMD_EXPECTED_OWNER_BDFS");
   if (!configured || !*configured)
-    throw std::runtime_error("MEEP_AMD_EXPECTED_OWNER_BDFS is required for np4 topology");
+    throw std::runtime_error(std::string("MEEP_AMD_EXPECTED_OWNER_BDFS is required for ") +
+                             context);
   std::vector<std::string> result;
   std::stringstream values(configured);
   std::string value;
   while (std::getline(values, value, ','))
     if (!value.empty()) result.push_back(normalize_pci_bus_id(value));
-  if (result.size() != 2 || !valid_pci_bus_id(result[0]) || !valid_pci_bus_id(result[1]) ||
-      result[0] == result[1])
-    throw std::runtime_error("MEEP_AMD_EXPECTED_OWNER_BDFS must name two distinct PCI BDFs");
+  std::set<std::string> unique;
+  for (const std::string &bus_id : result)
+    if (!valid_pci_bus_id(bus_id))
+      throw std::runtime_error("MEEP_AMD_EXPECTED_OWNER_BDFS contains an invalid PCI BDF");
+    else
+      unique.insert(bus_id);
+  if (result.size() != required || unique.size() != required) {
+    std::ostringstream message;
+    message << "MEEP_AMD_EXPECTED_OWNER_BDFS must name " << required << " distinct PCI BDFs";
+    throw std::runtime_error(message.str());
+  }
   return result;
 }
 
@@ -799,7 +808,7 @@ void attest_idle_np4_topology(bool owner, int owner_index,
   topology_record local = {};
   std::vector<std::string> expected_bdfs;
   try {
-    expected_bdfs = expected_owner_bdfs();
+    expected_bdfs = expected_owner_bdfs(2, "np4 owner/idle topology");
     local = make_topology_record(owner, owner_index, devices);
   }
   catch (const std::exception &error) {
@@ -837,6 +846,105 @@ void attest_idle_np4_topology(bool owner, int owner_index,
     }
     else { CHECK(false, why.c_str()); }
   }
+}
+
+bool validate_all_owner_topology(const std::vector<topology_record> &records,
+                                 const std::vector<std::string> &expected_bdfs, std::string &why) {
+  if (records.size() != expected_bdfs.size() || records.empty()) {
+    why = "all-owner topology requires one expected BDF per rank";
+    return false;
+  }
+  std::set<std::string> owner_uuids, owner_bdfs;
+  for (size_t i = 0; i < records.size(); ++i) {
+    const topology_record &record = records[i];
+    if (!record.valid) {
+      why = std::string("all-owner rank topology collection failed: ") + record.error;
+      return false;
+    }
+    if (record.rank != static_cast<int>(i) || !record.owner ||
+        record.logical_device != static_cast<int>(i)) {
+      why = "all-owner rank did not own its process-visible logical device";
+      return false;
+    }
+    if (!record.cpu_affinity[0] || record.cpu_numa_count != 1 || !record.cpu_numa_nodes[0]) {
+      why = "all-owner rank CPU affinity is not confined to one NUMA node";
+      return false;
+    }
+    char *end = NULL;
+    const long cpu_numa_node = std::strtol(record.cpu_numa_nodes, &end, 10);
+    if (!record.runtime_uuid[0] || !record.pci_bus_id[0] || record.gpu_numa_node < 0 ||
+        end == record.cpu_numa_nodes || *end || cpu_numa_node != record.gpu_numa_node) {
+      why = "all-owner UUID/BDF/NUMA/affinity attestation is incomplete or non-local";
+      return false;
+    }
+    if (normalize_pci_bus_id(record.pci_bus_id) != expected_bdfs[i]) {
+      why = "all-owner rank did not resolve to its expected physical PCI BDF";
+      return false;
+    }
+    owner_uuids.insert(record.runtime_uuid);
+    owner_bdfs.insert(record.pci_bus_id);
+  }
+  if (owner_uuids.size() != records.size() || owner_bdfs.size() != records.size()) {
+    why = "all-owner ranks have duplicate runtime UUID or PCI BDF";
+    return false;
+  }
+  return true;
+}
+
+bool attest_all_owner_topology(int logical_device,
+                               const std::vector<meep::nvidia::device_properties> &devices) {
+  const size_t ranks = static_cast<size_t>(count_processors());
+  topology_record local = {};
+  std::vector<std::string> expected_bdfs;
+  try {
+    expected_bdfs = expected_owner_bdfs(ranks, "all-owner topology");
+    local = make_topology_record(true, logical_device, devices);
+  }
+  catch (const std::exception &error) {
+    local.rank = my_rank();
+    local.owner = 1;
+    local.logical_device = logical_device;
+    local.gpu_numa_node = -1;
+    copy_topology_text(local.error, sizeof(local.error), error.what());
+  }
+  std::vector<topology_record> records(ranks);
+  if (MPI_Allgather(&local, sizeof(local), MPI_BYTE, records.data(), sizeof(local), MPI_BYTE,
+                    MPI_COMM_WORLD) != MPI_SUCCESS) {
+    CHECK(false, "all-owner topology record allgather failed");
+    return false;
+  }
+  if (my_rank() == 0) {
+    for (const topology_record &record : records)
+      std::printf("HIP_TOPOLOGY rank=%d role=owner logical_device=%d uuid=%s bdf=%s "
+                  "gpu_numa=%d cpu_numa=%s cpu_affinity=%s\n",
+                  record.rank, record.logical_device,
+                  record.runtime_uuid[0] ? record.runtime_uuid : "-",
+                  record.pci_bus_id[0] ? record.pci_bus_id : "-", record.gpu_numa_node,
+                  record.cpu_numa_nodes, record.cpu_affinity);
+  }
+
+  /* Reduce even though the gathered records are identical: a rank-local
+     expected-BDF environment mistake must also fail every rank closed before
+     any device-pointer MPI. */
+  std::string why;
+  const bool topology_valid = validate_all_owner_topology(records, expected_bdfs, why);
+  const bool topology_admitted = and_to_all(topology_valid);
+  if (!topology_valid)
+    CHECK(false, why.c_str());
+  else
+    CHECK(topology_admitted, "another rank rejected all-owner topology admission");
+  if (topology_admitted) {
+    std::vector<topology_record> duplicate = records;
+    if (duplicate.size() > 1)
+      std::memcpy(duplicate[1].runtime_uuid, duplicate[0].runtime_uuid,
+                  sizeof(duplicate[1].runtime_uuid));
+    std::string duplicate_why;
+    CHECK(duplicate.size() < 2 ||
+              (!validate_all_owner_topology(duplicate, expected_bdfs, duplicate_why) &&
+               duplicate_why.find("duplicate") != std::string::npos),
+          "all-owner topology validator accepted duplicate owner identity");
+  }
+  return topology_admitted;
 }
 #endif
 
@@ -957,7 +1065,7 @@ void run_idle_np4_case(const std::vector<meep::nvidia::device_properties> &devic
 } // namespace
 
 int main(int argc, char **argv) {
-  bool staged_only = false, idle_np4_only = false;
+  bool staged_only = false, idle_np4_only = false, direct_all_owners_only = false;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--staged-only"))
       staged_only = true;
@@ -965,10 +1073,16 @@ int main(int argc, char **argv) {
       idle_np4_only = true;
       staged_only = true;
     }
+    else if (!std::strcmp(argv[i], "--direct-all-owners-only")) { direct_all_owners_only = true; }
     else {
-      std::fprintf(stderr, "usage: nvidia_staged_transport [--staged-only] [--idle-np4-only]\n");
+      std::fprintf(stderr, "usage: nvidia_staged_transport [--staged-only] [--idle-np4-only] "
+                           "[--direct-all-owners-only]\n");
       return 2;
     }
+  }
+  if (direct_all_owners_only && (staged_only || idle_np4_only)) {
+    std::fprintf(stderr, "direct all-owner mode cannot be combined with staged-only modes\n");
+    return 2;
   }
 #ifdef HAVE_MPI
   int provided = MPI_THREAD_SINGLE;
@@ -987,6 +1101,36 @@ int main(int argc, char **argv) {
       if (idle_np4_only) {
         CHECK(count_processors() == 4, "--idle-np4-only requires exactly four ranks");
         run_idle_np4_case(devices);
+      }
+      else if (direct_all_owners_only) {
+        const bool rank_count_valid =
+            and_to_all(count_processors() == static_cast<int>(devices.size()));
+        CHECK(rank_count_valid, "--direct-all-owners-only requires one visible device per rank");
+        bool topology_admitted = rank_count_valid;
+#if defined(HAVE_MPI) && defined(MEEP_HIP_PORTABILITY)
+        if (topology_admitted) topology_admitted = attest_all_owner_topology(device, devices);
+#endif
+        bool query_available = false, supports_direct = false;
+        std::string provider, provider_error;
+        const bool query_ok = query_gpu_aware_mpi_provider(query_available, supports_direct,
+                                                           provider, provider_error);
+        GpuMpiPolicy agreed_policy = GpuMpiPolicy::automatic;
+        GpuMpiRoute agreed_route = GpuMpiRoute::staged;
+        std::string agreement_error;
+        const bool admitted = collective_resolve_gpu_mpi_policy(
+            query_ok, GpuMpiPolicy::direct, query_available, supports_direct, agreed_policy,
+            agreed_route, agreement_error);
+        CHECK(admitted && agreed_policy == GpuMpiPolicy::direct &&
+                  agreed_route == GpuMpiRoute::direct,
+              query_ok ? agreement_error.c_str() : provider_error.c_str());
+        if (topology_admitted && admitted) {
+          if (my_rank() == 0) std::printf("DIRECT_RING_BEGIN ranks=%d\n", count_processors());
+          run_case<double>(device, true);
+          run_case<float>(device, true);
+        }
+        else if (!topology_admitted && my_rank() == 0) {
+          std::printf("DIRECT_RING_SKIPPED topology admission failed\n");
+        }
       }
       else {
         run_case<double>(device, false, false, staged_only);
@@ -1052,7 +1196,7 @@ int main(int argc, char **argv) {
     std::unique_ptr<meep::nvidia::device_scope> final_scope;
     std::unique_ptr<meep::nvidia::stream> final_communication;
     std::unique_ptr<meep::nvidia::staged_transport_epoch> final_epoch;
-    if (!idle_np4_only && !devices.empty() && count_processors() >= 2) {
+    if (!idle_np4_only && !direct_all_owners_only && !devices.empty() && count_processors() >= 2) {
       const int device = my_rank() % int(devices.size());
       final_scope.reset(new meep::nvidia::device_scope(device));
       final_communication.reset(new meep::nvidia::stream);

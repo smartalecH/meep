@@ -1,4 +1,4 @@
-/* Standalone two-rank CUDA/MPI transport smoke test. It intentionally has no
+/* Standalone two-rank GPU/MPI transport smoke test. It intentionally has no
    dependency on libmeep and does not select a production MPI transport policy. */
 
 #ifdef HAVE_CONFIG_H
@@ -63,6 +63,7 @@ struct options {
   transport_mode mode;
   int inject_preflight_failure_rank;
   bool forbid_device_mpi;
+  bool require_device_mpi;
 };
 
 void mpi_check(int result, const char *operation) {
@@ -85,7 +86,7 @@ int parse_nonnegative_int(const std::string &text, const char *option) {
 }
 
 options parse_options(int argc, char **argv) {
-  options result = {transport_mode::automatic, -1, false};
+  options result = {transport_mode::automatic, -1, false, false};
   for (int i = 1; i < argc; ++i) {
     const std::string argument(argv[i]);
     const std::string transport_prefix("--transport=");
@@ -106,12 +107,16 @@ options parse_options(int argc, char **argv) {
           argument.substr(failure_prefix.size()), "--inject-preflight-failure-rank");
     }
     else if (argument == "--forbid-device-mpi") { result.forbid_device_mpi = true; }
+    else if (argument == "--require-device-mpi") { result.require_device_mpi = true; }
     else {
       throw std::invalid_argument(
           "usage: nvidia_mpi_runtime_smoke [--transport=staged|auto|direct] "
-          "[--inject-preflight-failure-rank=N] [--forbid-device-mpi]");
+          "[--inject-preflight-failure-rank=N] "
+          "[--forbid-device-mpi|--require-device-mpi]");
     }
   }
+  if (result.forbid_device_mpi && result.require_device_mpi)
+    throw std::invalid_argument("device-pointer MPI cannot be both required and forbidden");
   return result;
 }
 
@@ -189,8 +194,23 @@ bool collectively_report(bool local_success, const std::string &local_error, MPI
   return false;
 }
 
-bool cuda_aware_mpi_enabled() {
-#if defined(HAVE_MPIX_QUERY_CUDA_SUPPORT) && HAVE_MPIX_QUERY_CUDA_SUPPORT
+const char *gpu_aware_mpi_query_name() {
+#if defined(HAVE_MPIX_QUERY_ROCM_SUPPORT) && HAVE_MPIX_QUERY_ROCM_SUPPORT
+  return "MPIX_Query_rocm_support";
+#elif defined(HAVE_MPIX_QUERY_CUDA_SUPPORT) && HAVE_MPIX_QUERY_CUDA_SUPPORT
+  return "MPIX_Query_cuda_support";
+#else
+  return "a GPU-aware MPI provider query";
+#endif
+}
+
+bool gpu_aware_mpi_enabled() {
+#if defined(HAVE_MPIX_QUERY_ROCM_SUPPORT) && HAVE_MPIX_QUERY_ROCM_SUPPORT
+#if !MEEP_TEST_HAVE_MPI_EXT
+  extern int MPIX_Query_rocm_support(void);
+#endif
+  return MPIX_Query_rocm_support() > 0;
+#elif defined(HAVE_MPIX_QUERY_CUDA_SUPPORT) && HAVE_MPIX_QUERY_CUDA_SUPPORT
 #if !MEEP_TEST_HAVE_MPI_EXT
   extern int MPIX_Query_cuda_support(void);
 #endif
@@ -275,7 +295,7 @@ bool exchange_staged(int device, int rank, int peer, MPI_Comm communicator,
     std::memset(state->receive_stage.data(), 0, payload_bytes);
     std::memset(state->verification.data(), 0, payload_bytes);
 
-    /* Complete all fallible CUDA producer work before either rank posts an MPI
+    /* Complete all fallible GPU producer work before either rank posts an MPI
        request. The collective gate below keeps peers in the same state. */
     copy_host_to_device_async(state->send_device, 0, state->initial.data(), payload_bytes,
                               state->transfer);
@@ -290,7 +310,7 @@ bool exchange_staged(int device, int rank, int peer, MPI_Comm communicator,
   }
 
   const bool all_preflight_ok = collectively_report(preflight_ok, preflight_error, communicator,
-                                                    rank, "staged CUDA preflight");
+                                                    rank, "staged GPU preflight");
   if (!all_preflight_ok) {
     state.reset();
     std::string accounting_error;
@@ -368,7 +388,7 @@ bool exchange_direct(int device, int rank, int peer, MPI_Comm communicator,
     std::memset(state->verification.data(), 0, payload_bytes);
 
     /* Device-pointer MPI may read send_device as soon as MPI_Isend returns, so
-       collectively complete its CUDA producer before posting either request. */
+       collectively complete its GPU producer before posting either request. */
     copy_host_to_device_async(state->send_device, 0, state->initial.data(), payload_bytes,
                               state->transfer);
     state->send_ready.record(state->transfer);
@@ -380,7 +400,7 @@ bool exchange_direct(int device, int rank, int peer, MPI_Comm communicator,
   }
 
   const bool all_preflight_ok = collectively_report(preflight_ok, preflight_error, communicator,
-                                                    rank, "direct CUDA preflight");
+                                                    rank, "direct GPU preflight");
   if (!all_preflight_ok) {
     state.reset();
     std::string accounting_error;
@@ -439,7 +459,7 @@ void validate_device_assignment(const std::string &uuid, int local_rank, int loc
     if (other == local_rank) continue;
     const char *other_uuid = gathered.data() + static_cast<size_t>(other) * uuid_bytes;
     if (uuid == other_uuid)
-      throw std::runtime_error("node-local ranks selected the same CUDA device UUID");
+      throw std::runtime_error("node-local ranks selected the same GPU device UUID");
   }
 }
 
@@ -472,6 +492,7 @@ int main(int argc, char **argv) {
     transport_mode mode = transport_mode::automatic;
     int inject_preflight_failure_rank = -1;
     bool forbid_device_mpi = false;
+    bool require_device_mpi = false;
     int local_rank = -1;
     int local_size = 0;
     device_selection selection = {};
@@ -483,6 +504,7 @@ int main(int argc, char **argv) {
       mode = parsed.mode;
       inject_preflight_failure_rank = parsed.inject_preflight_failure_rank;
       forbid_device_mpi = parsed.forbid_device_mpi;
+      require_device_mpi = parsed.require_device_mpi;
       mpi_check(MPI_Comm_rank(local_comm, &local_rank), "MPI_Comm_rank(local)");
       mpi_check(MPI_Comm_size(local_comm, &local_size), "MPI_Comm_size(local)");
       if (provided < MPI_THREAD_FUNNELED)
@@ -498,7 +520,7 @@ int main(int argc, char **argv) {
         throw std::runtime_error("explicit GPU selection did not require collective validation");
       properties = properties_for_device(selection.device);
       if (properties.uuid.size() >= 64)
-        throw std::runtime_error("CUDA UUID exceeds assignment-validation field");
+        throw std::runtime_error("GPU UUID exceeds assignment-validation field");
       device_description = properties.name + " uuid=" + properties.uuid;
     }
     catch (const std::exception &error) {
@@ -540,27 +562,33 @@ int main(int argc, char **argv) {
       }
       else if (rank == 0) { std::cout << "staged D2H->MPI->H2D bidirectional exchange: PASS\n"; }
 
-      int all_cuda_aware = 0;
+      int all_gpu_aware = 0;
       if (!exit_code && mode != transport_mode::staged) {
-        const int local_cuda_aware = cuda_aware_mpi_enabled() ? 1 : 0;
+        const int local_gpu_aware = gpu_aware_mpi_enabled() ? 1 : 0;
         mpi_check(
-            MPI_Allreduce(&local_cuda_aware, &all_cuda_aware, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD),
-            "MPI_Allreduce(CUDA-aware support)");
+            MPI_Allreduce(&local_gpu_aware, &all_gpu_aware, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD),
+            "MPI_Allreduce(GPU-aware support)");
       }
 
-      if (!exit_code && mode != transport_mode::staged && all_cuda_aware && forbid_device_mpi) {
+      if (!exit_code && mode != transport_mode::staged && !all_gpu_aware && require_device_mpi) {
+        const std::string unavailable = std::string("required device-pointer MPI needs positive ") +
+                                        gpu_aware_mpi_query_name() + " on every rank";
+        collectively_report(false, unavailable, MPI_COMM_WORLD, rank, "direct capability");
+        exit_code = 1;
+      }
+      else if (!exit_code && mode != transport_mode::staged && all_gpu_aware && forbid_device_mpi) {
         const std::string forbidden =
             "device-pointer MPI is forbidden by this staged-only validation";
         collectively_report(false, forbidden, MPI_COMM_WORLD, rank, "staged-only capability");
         exit_code = 1;
       }
-      else if (!exit_code && mode == transport_mode::direct && !all_cuda_aware) {
-        const std::string unsupported =
-            "forced direct transport requires positive MPIX_Query_cuda_support on every rank";
+      else if (!exit_code && mode == transport_mode::direct && !all_gpu_aware) {
+        const std::string unsupported = std::string("forced direct transport requires positive ") +
+                                        gpu_aware_mpi_query_name() + " on every rank";
         collectively_report(false, unsupported, MPI_COMM_WORLD, rank, "direct capability");
         exit_code = 1;
       }
-      else if (!exit_code && mode != transport_mode::staged && all_cuda_aware) {
+      else if (!exit_code && mode != transport_mode::staged && all_gpu_aware) {
         uint64_t direct_digest = 0;
         if (!exchange_direct(selection.device, rank, peer, MPI_COMM_WORLD, &direct_digest)) {
           exit_code = 1;
@@ -577,8 +605,8 @@ int main(int argc, char **argv) {
         }
       }
       else if (!exit_code && mode == transport_mode::automatic && rank == 0) {
-        std::cout << "direct device-pointer exchange: SKIP "
-                     "(MPIX_Query_cuda_support=0)\n";
+        std::cout << "direct device-pointer exchange: SKIP (" << gpu_aware_mpi_query_name()
+                  << "=0)\n";
       }
 
       int local_exit = exit_code;
