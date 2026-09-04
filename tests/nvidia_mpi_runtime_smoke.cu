@@ -62,6 +62,7 @@ enum class transport_mode { staged, automatic, direct };
 struct options {
   transport_mode mode;
   int inject_preflight_failure_rank;
+  bool forbid_device_mpi;
 };
 
 void mpi_check(int result, const char *operation) {
@@ -84,7 +85,7 @@ int parse_nonnegative_int(const std::string &text, const char *option) {
 }
 
 options parse_options(int argc, char **argv) {
-  options result = {transport_mode::automatic, -1};
+  options result = {transport_mode::automatic, -1, false};
   for (int i = 1; i < argc; ++i) {
     const std::string argument(argv[i]);
     const std::string transport_prefix("--transport=");
@@ -104,10 +105,11 @@ options parse_options(int argc, char **argv) {
       result.inject_preflight_failure_rank = parse_nonnegative_int(
           argument.substr(failure_prefix.size()), "--inject-preflight-failure-rank");
     }
+    else if (argument == "--forbid-device-mpi") { result.forbid_device_mpi = true; }
     else {
       throw std::invalid_argument(
           "usage: nvidia_mpi_runtime_smoke [--transport=staged|auto|direct] "
-          "[--inject-preflight-failure-rank=N]");
+          "[--inject-preflight-failure-rank=N] [--forbid-device-mpi]");
     }
   }
   return result;
@@ -469,6 +471,7 @@ int main(int argc, char **argv) {
     std::string setup_error;
     transport_mode mode = transport_mode::automatic;
     int inject_preflight_failure_rank = -1;
+    bool forbid_device_mpi = false;
     int local_rank = -1;
     int local_size = 0;
     device_selection selection = {};
@@ -479,6 +482,7 @@ int main(int argc, char **argv) {
       const options parsed = parse_options(argc, argv);
       mode = parsed.mode;
       inject_preflight_failure_rank = parsed.inject_preflight_failure_rank;
+      forbid_device_mpi = parsed.forbid_device_mpi;
       mpi_check(MPI_Comm_rank(local_comm, &local_rank), "MPI_Comm_rank(local)");
       mpi_check(MPI_Comm_size(local_comm, &local_size), "MPI_Comm_size(local)");
       if (provided < MPI_THREAD_FUNNELED)
@@ -544,7 +548,13 @@ int main(int argc, char **argv) {
             "MPI_Allreduce(CUDA-aware support)");
       }
 
-      if (!exit_code && mode == transport_mode::direct && !all_cuda_aware) {
+      if (!exit_code && mode != transport_mode::staged && all_cuda_aware && forbid_device_mpi) {
+        const std::string forbidden =
+            "device-pointer MPI is forbidden by this staged-only validation";
+        collectively_report(false, forbidden, MPI_COMM_WORLD, rank, "staged-only capability");
+        exit_code = 1;
+      }
+      else if (!exit_code && mode == transport_mode::direct && !all_cuda_aware) {
         const std::string unsupported =
             "forced direct transport requires positive MPIX_Query_cuda_support on every rank";
         collectively_report(false, unsupported, MPI_COMM_WORLD, rank, "direct capability");
@@ -557,10 +567,9 @@ int main(int argc, char **argv) {
         }
         else {
           const bool same_output = direct_digest == staged_digest;
-          if (!collectively_report(same_output,
-                                   same_output ? std::string()
-                                               : "staged/direct receive digests differ",
-                                   MPI_COMM_WORLD, rank, "staged/direct equivalence"))
+          if (!collectively_report(
+                  same_output, same_output ? std::string() : "staged/direct receive digests differ",
+                  MPI_COMM_WORLD, rank, "staged/direct equivalence"))
             exit_code = 1;
           else if (rank == 0)
             std::cout << "direct device-pointer bidirectional exchange and staged/direct "

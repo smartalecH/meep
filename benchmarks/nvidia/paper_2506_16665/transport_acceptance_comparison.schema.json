@@ -1,8 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://meep.readthedocs.io/schemas/nvidia-transport-acceptance-comparison-v1.json",
+  "$id": "https://meep.readthedocs.io/schemas/nvidia-transport-acceptance-comparison-v2.json",
   "type": "object", "additionalProperties": false,
-  "required": ["schema_version", "kind", "case_sha256", "cpu", "staged", "direct", "cpu_tolerance_passed", "staged_direct_bitwise", "direct_provider_positive"],
-  "$defs": {"sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}, "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}}},
-  "properties": {"schema_version": {"const": 1}, "kind": {"const": "meep_builtin_transport_acceptance_comparison"}, "case_sha256": {"$ref": "#/$defs/sha256"}, "cpu": {"$ref": "#/$defs/artifact"}, "staged": {"$ref": "#/$defs/artifact"}, "direct": {"$ref": "#/$defs/artifact"}, "cpu_tolerance_passed": {"const": true}, "staged_direct_bitwise": {"const": true}, "direct_provider_positive": {"const": true}}
+  "required": ["schema_version", "kind", "case_sha256", "cpu", "staged", "cpu_tolerance_passed"],
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/sha256"}}},
+    "provider_zero_copy": {"type": "object", "additionalProperties": false, "required": ["provider", "memory_type", "transport", "evidence"], "properties": {"provider": {"const": "ucx"}, "memory_type": {"enum": ["cuda", "rocm"]}, "transport": {"enum": ["cuda_ipc", "rocm_ipc"]}, "evidence": {"$ref": "#/$defs/artifact"}}}
+  },
+  "properties": {"schema_version": {"const": 2}, "kind": {"const": "meep_builtin_transport_acceptance_comparison"}, "case_sha256": {"$ref": "#/$defs/sha256"}, "cpu": {"$ref": "#/$defs/artifact"}, "staged": {"$ref": "#/$defs/artifact"}, "direct": {"$ref": "#/$defs/artifact"}, "cpu_tolerance_passed": {"const": true}, "staged_direct_bitwise": {"const": true}, "device_buffer_mpi_positive": {"const": true}, "provider_zero_copy": {"$ref": "#/$defs/provider_zero_copy"}}
 }

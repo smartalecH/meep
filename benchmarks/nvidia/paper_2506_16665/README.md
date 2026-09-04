@@ -73,20 +73,47 @@ Replay schema, hash, baseline, and raw-observable validation with
 `validate_mpi_benchmark.py --result raw-result.json`.
 
 For a checkout-independent provider gate, `run_transport_acceptance.py` runs a
-small deterministic 1D case against CPU-native, two-rank staged, and two-rank
-direct execution. It uses collective point-field decay, compares GPU samples
-to CPU tolerances and staged to direct bitwise, and rejects direct mode unless
-both ranks report a positive provider query, a resolved direct route, and
-positive direct halo bytes:
+small deterministic 1D case against selected transport routes. The AMD staged
+gate selects only `cpu,staged`, resolves each process-visible ROCr selector to
+a HIP PCI BDF before matching it to `rocm-smi`, checks NUMA-local process
+affinity, and never launches a direct device-pointer MPI route. ROCr and
+`rocm-smi` ordinal order differs on the validation host; ROCr selectors `1,5`
+resolve to physical SMI cards 0/4 (`08:00.0`/`88:00.0`):
 
 ```sh
 /home/alechammond/meep-env/bin/python run_transport_acceptance.py \
   --output-dir /tmp/meep-transport-acceptance \
+  --routes cpu,staged \
+  --prefix /home/alechammond/rocm-mpi/openmpi \
+  --python /home/alechammond/meep-env/bin/python \
+  --mpiexec /home/alechammond/rocm-mpi/openmpi/bin/mpirun \
+  --visible-devices 1,5 \
+  --rocm-smi /usr/local/fbcode/platform010/lib/rocm-latest/bin/rocm-smi \
   --pythonpath /tmp/meep-pr75-python-stage \
-  --library-path /tmp/meep-custom-pr7-5-python-build/src/.libs
+  --library-path /tmp/meep-rocm-python-build/src/.libs
 ```
 
-This is an acceptance-scale transport proof, not paper-performance evidence.
+The runner places the branch build library directory before the private MPI
+prefix in each child `LD_LIBRARY_PATH`; the branch `libmeep` RUNPATH must place
+that same private MPI prefix before its numerical dependency prefix. This keeps
+the Python workers on the same MPI implementation as the launcher.
+
+The legacy default still includes `direct` for CUDA/provider validation. Both
+modes use collective point-field decay and compare every GPU sample to the CPU
+tolerance. This is an acceptance-scale transport proof, not paper-performance
+evidence.
+
+Comparison schema v2 keeps device-buffer MPI and provider zero-copy as
+different claims. A direct result, staged/direct bitwise result, and positive
+device-buffer result must be present together. Provider zero-copy is a separate
+optional object that requires a hash-addressed provider log plus its memory type
+and selected IPC transport; the staged-only AMD gate emits neither claim.
+
+An AMD+MPI build also exposes `make -C tests amd-staged-transport-acceptance`.
+Set `AMD_ACCEPTANCE_PREFIX` to the MPI installation used to build Meep and set
+`AMD_ACCEPTANCE_PYTHON_CMD` and `AMD_ACCEPTANCE_PYTHONPATH` to the executable
+and package from that same build; the MPI launcher, visible devices, output,
+and library path are independently overridable make variables.
 
 Workers never parse stdout. They call
 `meep.active_communicator_allgather_json(payload)`, which must collectively

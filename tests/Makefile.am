@@ -197,6 +197,7 @@ NVIDIA_DEVICE_FLAGS = $(NVCCFLAGS)
 NVIDIA_DEVICE_ARCH_FLAGS = $(CUDA_ARCH_FLAGS)
 NVIDIA_DEVICE_CPPFLAGS = $(CUDA_CPPFLAGS)
 NVIDIA_DEVICE_LINKER_FLAGS = $(CUDA_NVCC_LDFLAGS)
+NVIDIA_HOST_LINKER_FLAGS = $(CUDA_LDFLAGS)
 NVIDIA_DEVICE_LIBS = $(CUDA_LIBS)
 NVIDIA_DEVICE_PRECISE_FLAGS = --fmad=false
 NVIDIA_RUNTIME_TESTS += nvidia_graph_smoke
@@ -212,6 +213,7 @@ NVIDIA_DEVICE_FLAGS = $(HIPCCFLAGS)
 NVIDIA_DEVICE_ARCH_FLAGS = $(HIP_ARCH_FLAGS)
 NVIDIA_DEVICE_CPPFLAGS = $(HIP_CPPFLAGS)
 NVIDIA_DEVICE_LINKER_FLAGS = $(HIP_LDFLAGS)
+NVIDIA_HOST_LINKER_FLAGS = $(HIP_LDFLAGS)
 NVIDIA_DEVICE_LIBS = $(HIP_LIBS)
 NVIDIA_DEVICE_SOURCE_FLAGS = -x hip
 NVIDIA_DEVICE_LINK_FLAGS = -x none
@@ -225,17 +227,25 @@ endif
 endif
 
 if WITH_MPI
-if USE_CUDA_DEVICE_COMPILER
 NVIDIA_RUNTIME_TESTS += nvidia_mpi_runtime_smoke
 check_PROGRAMS += nvidia_staged_transport
-TESTS += nvidia_staged_transport
 nvidia_staged_transport_SOURCES = nvidia_staged_transport.cpp
+nvidia_staged_transport_CPPFLAGS = $(AM_CPPFLAGS) $(NVIDIA_DEVICE_CPPFLAGS)
 nvidia_staged_transport_LDADD = $(MEEPLIBS)
+if USE_CUDA_DEVICE_COMPILER
+TESTS += nvidia_staged_transport
+endif
+if USE_HIP_DEVICE_COMPILER
+NVIDIA_PHONY_TARGETS += amd-staged-mpi-check
+NVIDIA_PHONY_TARGETS += amd-staged-transport-acceptance
+nvidia_staged_transport_LDFLAGS = $(HIP_LDFLAGS)
 endif
 endif
 check_SCRIPTS += $(NVIDIA_RUNTIME_TESTS)
 check_PROGRAMS += $(NVIDIA_INTEGRATION_TESTS)
-CLEANFILES += $(NVIDIA_RUNTIME_TESTS) nvidia-required-graph-rejection.log
+CLEANFILES += $(NVIDIA_RUNTIME_TESTS) nvidia-required-graph-rejection.log \
+  nvidia-mpi-direct-rejection.log nvidia-mpi-oversubscription.log \
+  nvidia-mpi-topology-rejection.log
 nvidia_backend_state_SOURCES = nvidia_backend_state.cpp
 nvidia_backend_state_LDADD = $(MEEPLIBS)
 nvidia_device_reservation_SOURCES = nvidia_device_reservation.cpp
@@ -268,6 +278,9 @@ if HAVE_HIP_GRAPHS
 else
 	$(MAKE) amd-required-graph-rejection-check
 endif
+if WITH_MPI
+	$(MAKE) amd-staged-mpi-check
+endif
 endif
 
 .PHONY: $(NVIDIA_PHONY_TARGETS)
@@ -290,6 +303,89 @@ if USE_CUDA_DEVICE_COMPILER
 if WITH_MPI
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=staged
 	$(RUNCODE) ./nvidia_mpi_runtime_smoke --transport=auto
+endif
+endif
+
+if WITH_MPI
+if USE_HIP_DEVICE_COMPILER
+AMD_MPIEXEC = $(MPIRUN)
+## ROCr and rocm-smi card ordinals differ on the validation host. These
+## defaults resolve through HIP to physical BDFs 08:00.0 and 88:00.0;
+## override both variables together on another host.
+AMD_MPI_VISIBLE_DEVICES = 1,5
+AMD_MPI_EXPECTED_OWNER_BDFS = 0000:08:00.0,0000:88:00.0
+AMD_MPI_INVALID_OWNER_BDFS = 0000:78:00.0,0000:f9:00.0
+AMD_MPI_OVERSUBSCRIBED_VISIBLE_DEVICES = 1
+AMD_MPI_NP2_FLAGS = -np 2 --map-by ppr:1:package:PE=2 --bind-to core
+AMD_MPI_NP4_FLAGS = -np 4 --map-by ppr:2:package:PE=2 --bind-to core
+AMD_MPI_STAGED_ENV = MEEP_GPU_AWARE_MPI=no \
+  ROCR_VISIBLE_DEVICES=$(AMD_MPI_VISIBLE_DEVICES) \
+  MEEP_AMD_EXPECTED_OWNER_BDFS=$(AMD_MPI_EXPECTED_OWNER_BDFS)
+AMD_ACCEPTANCE_PREFIX =
+AMD_ACCEPTANCE_PYTHON_CMD =
+AMD_ACCEPTANCE_PYTHONPATH =
+AMD_ACCEPTANCE_LIBRARY_PATH = $(top_builddir)/src/.libs
+AMD_ACCEPTANCE_ROCM_SMI = $(dir $(HIPCC))rocm-smi
+AMD_ACCEPTANCE_OUTPUT_DIR = $(abs_top_builddir)/amd-staged-transport-acceptance
+
+amd-staged-mpi-check: nvidia_mpi_runtime_smoke nvidia_staged_transport
+	$(AMD_MPI_STAGED_ENV) $(AMD_MPIEXEC) $(AMD_MPI_NP2_FLAGS) \
+	  ./nvidia_mpi_runtime_smoke --transport=staged
+	$(AMD_MPI_STAGED_ENV) $(AMD_MPIEXEC) $(AMD_MPI_NP2_FLAGS) \
+	  ./nvidia_mpi_runtime_smoke --transport=auto --forbid-device-mpi
+	@set -e; if ROCR_VISIBLE_DEVICES=$(AMD_MPI_VISIBLE_DEVICES) \
+	  $(AMD_MPIEXEC) $(AMD_MPI_NP2_FLAGS) \
+	  ./nvidia_mpi_runtime_smoke --transport=direct --forbid-device-mpi \
+	  >nvidia-mpi-direct-rejection.log 2>&1; then \
+	  cat nvidia-mpi-direct-rejection.log; \
+	  echo "expected forced direct transport to fail closed" >&2; exit 1; \
+	fi
+	@grep -q "forced direct transport requires positive MPIX_Query_cuda_support on every rank" \
+	  nvidia-mpi-direct-rejection.log || { cat nvidia-mpi-direct-rejection.log; exit 1; }
+	$(AMD_MPI_STAGED_ENV) $(AMD_MPIEXEC) $(AMD_MPI_NP2_FLAGS) \
+	  ./nvidia_staged_transport --staged-only
+	$(AMD_MPI_STAGED_ENV) $(AMD_MPIEXEC) $(AMD_MPI_NP4_FLAGS) \
+	  ./nvidia_staged_transport --staged-only --idle-np4-only
+	@set -e; if MEEP_GPU_AWARE_MPI=no \
+	  ROCR_VISIBLE_DEVICES=$(AMD_MPI_VISIBLE_DEVICES) \
+	  MEEP_AMD_EXPECTED_OWNER_BDFS=$(AMD_MPI_INVALID_OWNER_BDFS) \
+	  $(AMD_MPIEXEC) $(AMD_MPI_NP4_FLAGS) \
+	  ./nvidia_staged_transport --staged-only --idle-np4-only \
+	  >nvidia-mpi-topology-rejection.log 2>&1; then \
+	  cat nvidia-mpi-topology-rejection.log; \
+	  echo "expected mismatched physical GPU topology to fail" >&2; exit 1; \
+	fi
+	@grep -q "expected physical PCI BDF" nvidia-mpi-topology-rejection.log || { \
+	  cat nvidia-mpi-topology-rejection.log; exit 1; }
+	@set -e; if MEEP_GPU_AWARE_MPI=no \
+	  ROCR_VISIBLE_DEVICES=$(AMD_MPI_OVERSUBSCRIBED_VISIBLE_DEVICES) \
+	  $(AMD_MPIEXEC) $(AMD_MPI_NP2_FLAGS) \
+	  ./nvidia_mpi_runtime_smoke --transport=staged \
+	  >nvidia-mpi-oversubscription.log 2>&1; then \
+	  cat nvidia-mpi-oversubscription.log; \
+	  echo "expected duplicate/oversubscribed GPU assignment to fail" >&2; exit 1; \
+	fi
+	@grep -q "more node-local ranks than visible NVIDIA devices" \
+	  nvidia-mpi-oversubscription.log || { cat nvidia-mpi-oversubscription.log; exit 1; }
+
+# This end-to-end Python gate is explicit because it requires a branch-matched
+# Python module build. No direct route is part of the PR4 invocation.
+amd-staged-transport-acceptance:
+	@test -n "$(AMD_ACCEPTANCE_PREFIX)" || { \
+	  echo "set AMD_ACCEPTANCE_PREFIX to the private MPI installation prefix" >&2; exit 2; }
+	@test -n "$(AMD_ACCEPTANCE_PYTHON_CMD)" || { \
+	  echo "set AMD_ACCEPTANCE_PYTHON_CMD to the branch-matched Python executable" >&2; exit 2; }
+	@test -n "$(AMD_ACCEPTANCE_PYTHONPATH)" || { \
+	  echo "set AMD_ACCEPTANCE_PYTHONPATH to the branch-matched meep package" >&2; exit 2; }
+	$(AMD_ACCEPTANCE_PYTHON_CMD) \
+	  $(top_srcdir)/benchmarks/nvidia/paper_2506_16665/run_transport_acceptance.py \
+	  --output-dir $(AMD_ACCEPTANCE_OUTPUT_DIR) --routes cpu,staged \
+	  --prefix $(AMD_ACCEPTANCE_PREFIX) \
+	  --python $(AMD_ACCEPTANCE_PYTHON_CMD) --mpiexec $(AMD_MPIEXEC) \
+	  --visible-devices $(AMD_MPI_VISIBLE_DEVICES) \
+	  --rocm-smi $(AMD_ACCEPTANCE_ROCM_SMI) \
+	  --pythonpath $(AMD_ACCEPTANCE_PYTHONPATH) \
+	  --library-path $(AMD_ACCEPTANCE_LIBRARY_PATH)
 endif
 endif
 
@@ -446,12 +542,11 @@ nvidia_adjoint_smoke: $(srcdir)/nvidia_adjoint_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
 	  $(NVIDIA_DEVICE_LIBS) -o $@
 
 if WITH_MPI
-if USE_CUDA_DEVICE_COMPILER
 nvidia_mpi_runtime_smoke: $(srcdir)/nvidia_mpi_runtime_smoke.cu $(NVIDIA_DEVICE_ARCHIVE)
 	$(AM_V_GEN)$(CXX) $(DEFS) $(DEFAULT_INCLUDES) $(CPPFLAGS) $(AM_CPPFLAGS) \
 	  $(CXXFLAGS) -x c++ $< -x none \
-	  $(NVIDIA_DEVICE_ARCHIVE) $(CUDA_LDFLAGS) $(CUDA_LIBS) $(LIBS) -o $@
-endif
+	  $(NVIDIA_DEVICE_ARCHIVE) $(LDFLAGS) $(NVIDIA_HOST_LINKER_FLAGS) \
+	  $(NVIDIA_DEVICE_LIBS) $(LIBS) -o $@
 endif
 endif
 

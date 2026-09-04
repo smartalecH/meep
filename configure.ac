@@ -66,29 +66,39 @@ AC_PROG_CC
 AC_PROG_CXX
 AC_LANG([C++])
 
+# Parse accelerator selection before MPI provider checks so AMD builds can keep
+# the existing CUDA-awareness query disabled until ROCm-aware MPI is added.
+AC_ARG_WITH([accelerator],
+            [AS_HELP_STRING([--with-accelerator=no|nvidia|amd],
+                            [build an accelerator backend (default: no)])],
+            [with_accelerator=$withval], [with_accelerator=no])
+
 # Check for MPI library
 
 AC_ARG_WITH(mpi, [AS_HELP_STRING([--with-mpi],[enable MPI parallelization])],
                   with_mpi=$withval, with_mpi=no)
+AC_ARG_VAR([MPIRUN], [MPI launcher used by the test suite])
 
 if test "x$with_mpi" = "xyes"; then
   AX_MPI([],[AC_MSG_ERROR([could not find mpi library for --with-mpi])])
   CXX=$MPICXX
-  AC_CHECK_HEADERS([mpi-ext.h], [
-    AC_LINK_IFELSE(
-      [AC_LANG_PROGRAM([[#include <mpi.h>
+  if test "x$with_accelerator" != "xamd"; then
+    AC_CHECK_HEADERS([mpi-ext.h], [
+      AC_LINK_IFELSE(
+        [AC_LANG_PROGRAM([[#include <mpi.h>
 #include <mpi-ext.h>]], [[return MPIX_Query_cuda_support() < 0;]])],
-      [AC_DEFINE([HAVE_MPIX_QUERY_CUDA_SUPPORT], [1],
-                 [Define when MPIX_Query_cuda_support is available])])
-    AC_COMPILE_IFELSE(
-      [AC_LANG_PROGRAM([[#include <mpi.h>
+        [AC_DEFINE([HAVE_MPIX_QUERY_CUDA_SUPPORT], [1],
+                   [Define when MPIX_Query_cuda_support is available])])
+      AC_COMPILE_IFELSE(
+        [AC_LANG_PROGRAM([[#include <mpi.h>
 #include <mpi-ext.h>
 #if !defined(MPIX_CUDA_AWARE_SUPPORT) && !defined(OMPI_HAVE_MPI_EXT_CUDA)
 #error no Open MPI CUDA-awareness compile-time indicator
 #endif]], [[]])],
-      [AC_DEFINE([HAVE_OPEN_MPI_CUDA_AWARE_SUPPORT_MACRO], [1],
-                 [Define when Open MPI publishes a CUDA-awareness support macro])])
-  ], [], [[#include <mpi.h>]])
+        [AC_DEFINE([HAVE_OPEN_MPI_CUDA_AWARE_SUPPORT_MACRO], [1],
+                   [Define when Open MPI publishes a CUDA-awareness support macro])])
+    ], [], [[#include <mpi.h>]])
+  fi
 fi
 
 # Require C++11 support
@@ -112,10 +122,6 @@ fi
 ##############################################################################
 # optional accelerator backend
 
-AC_ARG_WITH([accelerator],
-            [AS_HELP_STRING([--with-accelerator=no|nvidia|amd],
-                            [build an accelerator backend (default: no)])],
-            [with_accelerator=$withval], [with_accelerator=no])
 AC_ARG_WITH([cuda],
             [AS_HELP_STRING([--with-cuda=DIR],
                             [CUDA toolkit prefix for the NVIDIA backend])],
@@ -173,7 +179,7 @@ case "$with_accelerator" in
 esac
 
 if test "x$use_hip_device_compiler" = "xyes" -a "x$with_mpi" = "xyes"; then
-  AC_MSG_ERROR([--with-accelerator=amd does not support MPI until staged HIP transport is enabled])
+  AC_MSG_NOTICE([AMD/HIP MPI transport is staged-only; provider-direct support is disabled])
 fi
 
 if test "x$use_hip_device_compiler" = "xyes"; then

@@ -1,18 +1,22 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://meep.readthedocs.io/schemas/nvidia-transport-acceptance-v1.json",
+  "$id": "https://meep.readthedocs.io/schemas/nvidia-transport-acceptance-v2.json",
   "type": "object", "additionalProperties": false,
   "required": ["schema_version", "kind", "case", "case_sha256", "route", "build_identity", "rank_records"],
   "properties": {
-    "schema_version": {"const": 1},
+    "schema_version": {"const": 2},
     "kind": {"const": "meep_builtin_transport_acceptance"},
     "case": {"type": "object"},
     "case_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "route": {"enum": ["cpu", "staged", "direct"]},
     "build_identity": {"type": "object", "additionalProperties": false, "required": ["source", "commit", "dirty", "python", "meep_module", "meep_extension"], "properties": {"source": {"type": "string", "minLength": 1}, "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"}, "dirty": {"type": "boolean"}, "python": {"type": "string", "minLength": 1}, "meep_module": {"type": "string", "minLength": 1}, "meep_extension": {"type": "string", "minLength": 1}}},
-    "rank_records": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["rank", "runtime", "steps", "stop_reason", "observables", "counter_deltas"], "properties": {
+    "rank_records": {"type": "array", "minItems": 1, "items": {"type": "object", "additionalProperties": false, "required": ["rank", "runtime", "steps", "stop_reason", "observables", "device", "cpu_affinity", "cpu_numa_nodes", "counter_deltas"], "properties": {
       "rank": {"type": "integer", "minimum": 0}, "runtime": {"type": "object"}, "steps": {"type": "integer", "minimum": 1},
-      "stop_reason": {"enum": ["field_energy_decay", "max_steps"]}, "observables": {"type": "object"}, "counter_deltas": {"type": "object"}
+      "stop_reason": {"enum": ["field_energy_decay", "max_steps"]}, "observables": {"type": "object"},
+      "device": {"type": ["object", "null"]},
+      "cpu_affinity": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 0}},
+      "cpu_numa_nodes": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+      "counter_deltas": {"type": "object"}
     }}}
   }
 }
