@@ -2,6 +2,7 @@ import copy
 import json
 import math
 import pathlib
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -114,27 +115,36 @@ class RunnerResultTests(unittest.TestCase):
         self.addCleanup(geometry.stop)
         self.addCleanup(gdstk.stop)
 
-    def manifest(self, *, backend="cpu", mode="smoke"):
+    def manifest(self, *, backend="cpu", mode="smoke", precision="native"):
         return build_test_manifest(
             self.reference,
             self.cases,
             device_name="crossing",
             backend=backend,
-            precision="native",
+            precision=precision,
             cells_per_material_wavelength=6,
             mode=mode,
             steps=20 if mode == "fixed-step" else None,
         )
 
-    def complete_result(self, manifest_path, manifest, manifest_sha256, *, profiled=False):
+    def complete_result(
+        self,
+        manifest_path,
+        manifest,
+        manifest_sha256,
+        *,
+        profiled=False,
+        accelerator="cuda"
+    ):
         requested = manifest["execution"]["requested"]
         steps = 1 if profiled else int(manifest["stopping"]["steps"])
         warmup = 1 if profiled else int(manifest["execution"]["warmup_steps"])
-        repetitions = 1 if profiled else int(manifest["execution"]["measured_repetitions"])
+        repetitions = (
+            1 if profiled else int(manifest["execution"]["measured_repetitions"])
+        )
         shape = runner._expected_grid_shape(manifest)
-        timestep = (
-            float(manifest["case"]["time_stepping"]["courant_factor"])
-            / float(manifest["discretization"]["resolution_px_per_um"])
+        timestep = float(manifest["case"]["time_stepping"]["courant_factor"]) / float(
+            manifest["discretization"]["resolution_px_per_um"]
         )
         frequency_count = len(
             manifest["excitation"]["monitor_sampling"]["frequencies_meep"]
@@ -151,21 +161,54 @@ class RunnerResultTests(unittest.TestCase):
             for definition in manifest["case"]["monitors"]
             if definition["kind"] == "mode"
         ]
-        runs = [
-            {
-                "initialization_seconds": 1.0,
-                "advance_seconds": 2.0,
-                "grid_shape": shape,
-                "grid_points_exact": math.prod(shape),
-                "dt_meep": timestep,
-                "steps": steps,
-                "warmup_steps": warmup,
-                "total_steps": steps + warmup,
-                "physical_time_meep": (steps + warmup) * timestep,
-                "monitors": copy.deepcopy(monitors),
-            }
-            for _ in range(repetitions)
-        ]
+        runtime_accelerator = accelerator if requested["backend"] == "nvidia" else None
+        device_bytes = 1024 if runtime_accelerator else 0
+        pinned_bytes = 128 if runtime_accelerator else 0
+
+        def memory_gauge(name):
+            if name in {"process_device_bytes_current", "process_device_bytes_peak"}:
+                return device_bytes
+            if name in {"process_pinned_bytes_current", "process_pinned_bytes_peak"}:
+                return pinned_bytes
+            return 0
+
+        counters = {name: 0 for name in runner.RUNTIME_COUNTER_NAMES}
+        runs = []
+        for index in range(repetitions):
+            start_step = warmup + index * steps
+            runs.append(
+                {
+                    "initialization_seconds": 1.0 if index == 0 else 0.0,
+                    "warmup_seconds": 1.0 if index == 0 and warmup else 0.0,
+                    "advance_seconds": 2.0,
+                    "grid_shape": shape,
+                    "grid_points_exact": math.prod(shape),
+                    "dt_meep": timestep,
+                    "steps": steps,
+                    "warmup_steps": warmup if index == 0 else 0,
+                    "start_step": start_step,
+                    "end_step": start_step + steps,
+                    "physical_time_meep": (start_step + steps) * timestep,
+                    "counter_start": copy.deepcopy(counters),
+                    "counter_end": copy.deepcopy(counters),
+                    "counter_deltas": copy.deepcopy(counters),
+                    "memory_start": {
+                        "host_peak_bytes": 4096,
+                        **{
+                            name: memory_gauge(name)
+                            for name in runner.RUNTIME_MEMORY_NAMES
+                        },
+                    },
+                    "memory_end": {
+                        "host_peak_bytes": 4096,
+                        **{
+                            name: memory_gauge(name)
+                            for name in runner.RUNTIME_MEMORY_NAMES
+                        },
+                    },
+                    "monitors": copy.deepcopy(monitors),
+                }
+            )
         translation = {"x_um": 0.0, "y_um": 0.0}
         planes = runner.validate_planes(
             manifest, runner.transformed_ports(manifest, translation)
@@ -174,19 +217,106 @@ class RunnerResultTests(unittest.TestCase):
         if requested["backend"] == "nvidia":
             devices = [
                 {
+                    "accelerator": accelerator,
                     "visible_device": 0,
+                    "visible_devices": ["0"],
                     "process_device_id": 0,
                     "physical_selector": "0",
-                    "uuid": "GPU-test",
+                    "inventory_index": 0,
+                    "uuid": "GPU-11111111-2222-3333-4444-555555555555",
                     "name": "test GPU",
+                    "pci_bus_id": "0000:01:00.0",
                     "memory_bytes": 1024,
-                    "sm_clock_hz": 1.0,
-                    "memory_clock_hz": 1.0,
+                    "core_clock": "1 MHz",
+                    "memory_clock": "1 MHz",
                     "driver_version": "test",
                 }
             ]
+            if accelerator == "hip":
+                devices[0].pop("inventory_index")
+                devices[0].update(
+                    inventory_card="card0",
+                    physical_unique_id="0x1234",
+                    numa_node=0,
+                    architecture="gfx950",
+                )
+        runtime = {
+            **{name: "" for name in runner.RUNTIME_STRING_NAMES},
+            **{name: False for name in runner.RUNTIME_BOOL_NAMES},
+            **{name: 0 for name in runner.RUNTIME_INTEGER_NAMES},
+            **{name: 0 for name in runner.RUNTIME_COUNTER_NAMES},
+            **{name: 0 for name in runner.RUNTIME_MEMORY_NAMES},
+        }
+        runtime.update(
+            requested_backend=requested["backend"],
+            resolved_backend=requested["backend"],
+            requested_precision=requested["precision"],
+            resolved_precision=requested["precision"],
+            requested_transport="staged" if runtime_accelerator else "none",
+            resolved_transport="none",
+            requested_overlap=requested["overlap"],
+            resolved_overlap="off",
+            captured_requested_transport="none",
+            captured_overlap_policy="off",
+            requested_graph=requested["graph"],
+            resolved_graph="eager",
+            mpi_provider="test",
+            counter_scope="rank_local_current_epoch",
+            backend_counter_scope="rank_local_backend_lifetime",
+            memory_gauge_scope="rank_local_process_lifetime",
+            setup_counter_scope="rank_local_current_backend_state",
+            transport_timing_scope="rank_local_current_transport_epoch_host_elapsed",
+            allocation_counter_scope="rank_local_process_lifetime",
+            communicator_size=1,
+            device_id=0 if runtime_accelerator else -1,
+            device_owner=runtime_accelerator is not None,
+            device_uuid=(
+                "GPU-11111111-2222-3333-4444-555555555555"
+                if runtime_accelerator
+                else ""
+            ),
+            executable_build_count=1 if runtime_accelerator else 0,
+            process_device_bytes_current=device_bytes,
+            process_device_bytes_peak=device_bytes,
+            process_pinned_bytes_current=pinned_bytes,
+            process_pinned_bytes_peak=pinned_bytes,
+        )
+        executable = pathlib.Path(sys.executable).resolve()
+        worktree = pathlib.Path(runner.__file__).resolve().parents[3]
+        source_state = runner._source_tree_state(worktree)
+        environment = {
+            "MEEP_FINITE_CHECK": (
+                "off" if profiled or requested["mode"] == "fixed-step" else "step"
+            )
+        }
+        if runtime_accelerator:
+            environment.update(
+                {
+                    "MEEP_ACCELERATOR_RUNTIME": runtime_accelerator,
+                    "MEEP_GPU_AWARE_MPI": "no",
+                    "MEEP_NVIDIA_MPI_OVERLAP": requested["overlap"],
+                    "MEEP_NVIDIA_GRAPH_MODE": requested["graph"],
+                }
+            )
+            if runtime_accelerator == "hip":
+                environment["ROCR_VISIBLE_DEVICES"] = "0"
+        hip_inventory_output = json.dumps(
+            {
+                "card0": {
+                    "Unique ID": "0x1234",
+                    "PCI Bus": "0000:01:00.0",
+                    "VRAM Total Memory (B)": "1024",
+                    "Card Series": "test GPU",
+                    "GFX Version": "gfx950",
+                    "(Topology) Numa Node": "0",
+                    "sclk clock speed:": "1 MHz",
+                    "mclk clock speed:": "1 MHz",
+                },
+                "system": {"Driver version": "test"},
+            }
+        )
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "kind": "paper_2506_16665_single_rank_diagnostic",
             "generated_at_utc": "2026-08-28T00:00:00+00:00",
             "status": {
@@ -213,25 +343,67 @@ class RunnerResultTests(unittest.TestCase):
                 ]["physics_configuration_sha256"],
             },
             "provenance": {
-                "meep_build_source": "/source",
-                "meep_build_commit": "0" * 40,
-                "meep_build_dirty": False,
-                "runner_commit": "1" * 40,
-                "runner_dirty": False,
+                "meep_build_source": str(worktree),
+                "meep_build_commit": source_state["commit"],
+                "meep_build_dirty": source_state["dirty"],
+                "meep_build_diff_sha256": source_state["diff_sha256"],
+                "runner_commit": source_state["commit"],
+                "runner_dirty": source_state["dirty"],
+                "runner_diff_sha256": source_state["diff_sha256"],
+                "runner_source_sha256": runner.bm.sha256_file(
+                    pathlib.Path(runner.__file__).resolve()
+                ),
                 "build_directory": None,
                 "configure_flags": None,
                 "python": "test",
-                "meep_module": "/test/meep.py",
+                "meep_module": {
+                    "path": str(executable),
+                    "sha256": runner.bm.sha256_file(executable),
+                },
+                "meep_extension": {
+                    "path": str(executable),
+                    "sha256": runner.bm.sha256_file(executable),
+                },
                 "gdstk_version": "test",
-                "cuda_toolkit": None,
+                "accelerator": {
+                    "runtime": runtime_accelerator,
+                    "toolchain": (
+                        {
+                            "path": str(executable),
+                            "sha256": runner.bm.sha256_file(executable),
+                            "version": "test",
+                        }
+                        if runtime_accelerator
+                        else None
+                    ),
+                    "inventory_tool": (
+                        {
+                            "path": str(executable),
+                            "sha256": runner.bm.sha256_file(executable),
+                        }
+                        if runtime_accelerator == "hip"
+                        else None
+                    ),
+                    "inventory_snapshot": (
+                        {
+                            "output": hip_inventory_output,
+                            "sha256": runner.hashlib.sha256(
+                                hip_inventory_output.encode("utf-8")
+                            ).hexdigest(),
+                        }
+                        if runtime_accelerator == "hip"
+                        else None
+                    ),
+                },
                 "argv": ["run_benchmark.py"],
                 "cwd": "/tmp",
-                "environment": {},
+                "environment": environment,
                 "requested_execution": copy.deepcopy(requested),
                 "device_records": devices,
             },
             "execution": {
                 "device_id": 0,
+                "accelerator": runtime_accelerator,
                 "profile_steps": steps if profiled else None,
                 "steps": steps,
                 "warmup_steps": warmup,
@@ -245,10 +417,13 @@ class RunnerResultTests(unittest.TestCase):
                 ),
                 "manifest_inputs": runner._manifest_geometry_inputs(manifest),
             },
-            "sampling": copy.deepcopy(
-                manifest["excitation"]["monitor_sampling"]
-            ),
+            "sampling": copy.deepcopy(manifest["excitation"]["monitor_sampling"]),
             "observable_policy": copy.deepcopy(manifest["validation_policy"]),
+            "runtime": runtime,
+            "memory": {
+                "host_peak_bytes": 4096,
+                **{name: runtime[name] for name in runner.RUNTIME_MEMORY_NAMES},
+            },
             "runs": runs,
             "timing_summary": {
                 "samples_seconds": [2.0] * repetitions,
@@ -276,6 +451,7 @@ class RunnerResultTests(unittest.TestCase):
                 result, manifest_path, manifest=loaded, manifest_sha256=digest
             )
             mutations = {
+                "old schema": lambda value: value.update(schema_version=1),
                 "missing status": lambda value: value.pop("status"),
                 "false success": lambda value: value["status"].update(succeeded=False),
                 "speedup claim": lambda value: value["claim_boundary"].update(
@@ -303,13 +479,13 @@ class RunnerResultTests(unittest.TestCase):
                 "material": lambda value: value["geometry"]["material_constants"][
                     "Si"
                 ].update(epsilon=1.0),
-                "sampling": lambda value: value["sampling"]["frequencies_meep"].__setitem__(
-                    0, 1.0
-                ),
+                "sampling": lambda value: value["sampling"][
+                    "frequencies_meep"
+                ].__setitem__(0, 1.0),
                 "grid": lambda value: value["runs"][0]["grid_shape"].__setitem__(0, 1),
-                "duplicate monitor": lambda value: value["runs"][0]["monitors"][1].update(
-                    name="input_incident"
-                ),
+                "duplicate monitor": lambda value: value["runs"][0]["monitors"][
+                    1
+                ].update(name="input_incident"),
                 "monitor port": lambda value: value["runs"][0]["monitors"][0].update(
                     port="o4"
                 ),
@@ -337,9 +513,7 @@ class RunnerResultTests(unittest.TestCase):
             changed["geometry"]["translation_um"]["y_um"] = 0.1
             changed["geometry"]["planes"] = runner.validate_planes(
                 loaded,
-                runner.transformed_ports(
-                    loaded, changed["geometry"]["translation_um"]
-                ),
+                runner.transformed_ports(loaded, changed["geometry"]["translation_um"]),
             )
             with self.assertRaisesRegex(runner.RunnerError, "authenticated GDS bounds"):
                 runner.validate_runner_result(
@@ -387,10 +561,249 @@ class RunnerResultTests(unittest.TestCase):
                 result, manifest_path, manifest=loaded, manifest_sha256=digest
             )
             result["provenance"]["device_records"][0]["process_device_id"] = 1
-            with self.assertRaisesRegex(runner.RunnerError, "device_id"):
+            with self.assertRaisesRegex(runner.RunnerError, "ownership"):
                 runner.validate_runner_result(
                     result, manifest_path, manifest=loaded, manifest_sha256=digest
                 )
+
+    def test_hip_device_identity_and_tool_provenance_are_bound(self):
+        manifest = self.manifest(backend="nvidia")
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = pathlib.Path(temporary) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            loaded, digest = runner._manifest_snapshot(manifest_path)
+            result = self.complete_result(
+                manifest_path, loaded, digest, accelerator="hip"
+            )
+            runner.validate_runner_result(
+                result, manifest_path, manifest=loaded, manifest_sha256=digest
+            )
+            mutations = {
+                "runtime UUID": lambda value: value["runtime"].update(
+                    device_uuid="GPU-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                ),
+                "PCI BDF": lambda value: value["provenance"]["device_records"][
+                    0
+                ].update(pci_bus_id="not-a-bdf"),
+                "valid wrong PCI BDF": lambda value: value["provenance"][
+                    "device_records"
+                ][0].update(pci_bus_id="0000:88:00.0"),
+                "physical unique ID": lambda value: value["provenance"][
+                    "device_records"
+                ][0].update(physical_unique_id="forged"),
+                "inventory hash": lambda value: value["provenance"]["accelerator"][
+                    "inventory_tool"
+                ].update(sha256="0" * 64),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    changed = copy.deepcopy(result)
+                    mutate(changed)
+                    with self.assertRaises(runner.RunnerError):
+                        runner.validate_runner_result(
+                            changed,
+                            manifest_path,
+                            manifest=loaded,
+                            manifest_sha256=digest,
+                        )
+
+    def test_rocm_provenance_joins_runtime_bdf_not_card_ordinal(self):
+        inventory = {
+            "card7": {
+                "Unique ID": "0x1234",
+                "PCI Bus": "0000:88:00.0",
+                "VRAM Total Memory (B)": "309220868096",
+                "Card Series": "AMD Radeon Graphics",
+                "GFX Version": "gfx950",
+                "(Topology) Numa Node": "1",
+                "sclk clock speed:": "(1400Mhz)",
+                "mclk clock speed:": "(2000Mhz)",
+            },
+            "system": {"Driver version": "test-driver"},
+        }
+        completed = type("Completed", (), {"stdout": json.dumps(inventory)})()
+        with mock.patch.object(
+            runner, "_hip_pci_bus_id", return_value="0000:88:00.0"
+        ), mock.patch.object(runner.subprocess, "run", return_value=completed):
+            records, snapshot = runner._rocm_device_provenance(
+                0,
+                "GPU-11111111-2222-3333-4444-555555555555",
+                ["5"],
+                pathlib.Path("/opt/rocm/bin/rocm-smi"),
+            )
+            record = records[0]
+        self.assertEqual(record["physical_selector"], "5")
+        self.assertEqual(record["inventory_card"], "card7")
+        self.assertEqual(record["pci_bus_id"], "0000:88:00.0")
+        self.assertEqual(record["memory_bytes"], 309220868096)
+        self.assertEqual(
+            snapshot["sha256"],
+            runner.hashlib.sha256(snapshot["output"].encode()).hexdigest(),
+        )
+
+    def test_runtime_counters_memory_and_source_tampering_are_rejected(self):
+        manifest = self.manifest(backend="nvidia", mode="fixed-step")
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = pathlib.Path(temporary) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            loaded, digest = runner._manifest_snapshot(manifest_path)
+            result = self.complete_result(manifest_path, loaded, digest)
+            mutations = {
+                "counter delta": lambda value: value["runs"][0]["counter_end"].update(
+                    graph_launch_count=1
+                ),
+                "measured allocation": lambda value: (
+                    value["runs"][0]["counter_end"].update(steady_allocation_count=1),
+                    value["runs"][0]["counter_deltas"].update(
+                        steady_allocation_count=1
+                    ),
+                ),
+                "measured full copy": lambda value: (
+                    value["runs"][0]["counter_end"].update(full_field_copy_count=1),
+                    value["runs"][0]["counter_deltas"].update(full_field_copy_count=1),
+                ),
+                "measured graph recapture": lambda value: (
+                    value["runs"][0]["counter_end"].update(graph_recapture_count=1),
+                    value["runs"][0]["counter_deltas"].update(graph_recapture_count=1),
+                ),
+                "fallback": lambda value: value["runtime"].update(
+                    host_fallback_count=1
+                ),
+                "material warning": lambda value: value["runtime"].update(
+                    material_fallback_warning_count=1
+                ),
+                "memory": lambda value: value["memory"].update(
+                    process_device_bytes_peak=2048
+                ),
+                "cross-window host peak": lambda value: value["runs"][1][
+                    "memory_start"
+                ].update(host_peak_bytes=4095),
+                "cross-window device peak": lambda value: value["runs"][1][
+                    "memory_start"
+                ].update(process_device_bytes_peak=1023),
+                "final device peak": lambda value: (
+                    value["memory"].update(process_device_bytes_peak=1023),
+                    value["runtime"].update(process_device_bytes_peak=1023),
+                ),
+                "final pinned peak": lambda value: (
+                    value["memory"].update(process_pinned_bytes_peak=127),
+                    value["runtime"].update(process_pinned_bytes_peak=127),
+                ),
+                "resolved precision": lambda value: value["runtime"].update(
+                    resolved_precision="f32"
+                ),
+                "resolved backend": lambda value: value["runtime"].update(
+                    resolved_backend="cpu"
+                ),
+                "eager graph enabled": lambda value: value["runtime"].update(
+                    graph_enabled=True
+                ),
+                "missing finite check": lambda value: value["provenance"][
+                    "environment"
+                ].pop("MEEP_FINITE_CHECK"),
+                "wrong finite check": lambda value: value["provenance"][
+                    "environment"
+                ].update(MEEP_FINITE_CHECK="step"),
+                "second initialization": lambda value: value["runs"][1].update(
+                    initialization_seconds=1.0
+                ),
+                "nonsequential window": lambda value: value["runs"][1].update(
+                    start_step=value["runs"][1]["start_step"] + 1
+                ),
+                "runner hash": lambda value: value["provenance"].update(
+                    runner_source_sha256="0" * 64
+                ),
+                "missing Meep module": lambda value: value["provenance"][
+                    "meep_module"
+                ].update(path="/tmp/nonexistent/meep.py"),
+                "source state": lambda value: value["provenance"].update(
+                    runner_diff_sha256="0" * 64
+                ),
+            }
+            for label, mutate in mutations.items():
+                with self.subTest(label=label):
+                    changed = copy.deepcopy(result)
+                    mutate(changed)
+                    with self.assertRaises(runner.RunnerError):
+                        runner.validate_runner_result(
+                            changed,
+                            manifest_path,
+                            manifest=loaded,
+                            manifest_sha256=digest,
+                        )
+
+    def test_fixed_step_uses_one_initialization_and_sequential_windows(self):
+        manifest = self.manifest(mode="fixed-step")
+        with tempfile.TemporaryDirectory() as temporary:
+            manifest_path = pathlib.Path(temporary) / "manifest.json"
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            loaded, digest = runner._manifest_snapshot(manifest_path)
+            runtime = self.complete_result(manifest_path, loaded, digest)["runtime"]
+
+        class Fields:
+            def __init__(self):
+                self.t = 0
+                self.dt = 0.5 / 14.0
+                self.advances = []
+
+            def advance(self, steps):
+                self.advances.append(steps)
+                self.t += steps
+
+        class Simulation:
+            def __init__(self):
+                self.fields = Fields()
+                self.reset_count = 0
+
+            def get_execution_runtime_report(self):
+                value = copy.deepcopy(runtime)
+                value["graph_launch_count"] = self.fields.t
+                return value
+
+            def reset_meep(self):
+                self.reset_count += 1
+
+        class Mp:
+            @staticmethod
+            def all_wait():
+                pass
+
+        simulation = Simulation()
+        with mock.patch.object(
+            runner, "_build_simulation", return_value=(simulation, {})
+        ) as build, mock.patch.object(
+            runner, "_grid_shape", return_value=runner._expected_grid_shape(manifest)
+        ), mock.patch.object(
+            runner, "_monitor_output", return_value=[]
+        ), mock.patch.object(
+            runner, "_host_peak_bytes", return_value=4096
+        ):
+            runs, final_runtime, memory = runner._run_session(
+                Mp(),
+                manifest,
+                [],
+                {},
+                device_id=0,
+                steps=20,
+                warmup_steps=100,
+                repetitions=5,
+                profile=False,
+            )
+        build.assert_called_once()
+        self.assertEqual(simulation.fields.advances, [100, 20, 20, 20, 20, 20])
+        self.assertEqual([run["start_step"] for run in runs], [100, 120, 140, 160, 180])
+        self.assertEqual([run["end_step"] for run in runs], [120, 140, 160, 180, 200])
+        self.assertEqual([run["warmup_steps"] for run in runs], [100, 0, 0, 0, 0])
+        self.assertEqual(
+            [run["initialization_seconds"] > 0 for run in runs],
+            [True, False, False, False, False],
+        )
+        self.assertEqual(
+            [run["counter_deltas"]["graph_launch_count"] for run in runs], [20] * 5
+        )
+        self.assertEqual(final_runtime["graph_launch_count"], 200)
+        self.assertEqual(memory["host_peak_bytes"], 4096)
+        self.assertEqual(simulation.reset_count, 1)
 
     def test_fixed_step_without_verified_cpu_baseline_remains_nonpublishable(self):
         manifest = self.manifest(mode="fixed-step")

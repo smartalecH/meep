@@ -380,12 +380,12 @@ the paper alone.
   and mandatory `--max-steps`. This is a documented Meep adaptation because the
   commercial solvers' auto-shutoff algorithms are not fully specified.
 
-`run_benchmark.py` currently accepts `smoke` and `fixed-step`. A fixed-step
-repetition constructs a fresh simulation, performs the manifest's 100 untimed
-warmup steps on that simulation, times exactly the requested step batch, and
-queries monitors after the timing window. Smoke mode runs ten steps once with
-no warmup. Ten steps occur well before the 20 nm Gaussian pulse peak and prove
-only construction, stepping, and finite monitor access.
+`run_benchmark.py` currently accepts `smoke` and `fixed-step`. A fixed-step run
+constructs one simulation, performs the manifest's 100 untimed warmup steps
+once, and then records five sequential windows of exactly the requested step
+count. Smoke mode runs ten steps once with no warmup. Ten steps occur well
+before the 20 nm Gaussian pulse peak and prove only construction, stepping, and
+finite monitor access.
 
 ## Build and execute
 
@@ -438,13 +438,36 @@ env CUDA_VISIBLE_DEVICES=0 MEEP_FINITE_CHECK=step \
   --output /tmp/crossing-gpu-smoke.result.json --validate-only
 ```
 
+For the private HIP build, keep the public compatibility backend name
+`nvidia`, select the runtime explicitly, and mask by the ROCr selector rather
+than by a `rocm-smi` card ordinal:
+
+```sh
+env MEEP_FINITE_CHECK=step \
+  MEEP_SOURCE_TREE=/path/to/meep MEEP_BUILD_DIR=/tmp/meep-amd-build \
+  PYTHONPATH=/tmp/meep-amd-prefix/lib/python3.11/site-packages \
+  LD_LIBRARY_PATH=/tmp/meep-amd-prefix/lib:/path/to/rocm/lib:/path/to/meep-env/lib \
+  /tmp/meep-benchmark-venv/bin/python run_benchmark.py \
+  --manifest /tmp/crossing-gpu-smoke.json --accelerator hip \
+  --visible-device 1 --toolkit-compiler /path/to/rocm/bin/hipcc \
+  --rocm-smi /path/to/rocm/bin/rocm-smi \
+  --output /tmp/crossing-hip-smoke.result.json
+```
+
 Use `MEEP_FINITE_CHECK=step` for smoke/sanitizer validation and
 `MEEP_FINITE_CHECK=off` only for measured throughput. The diagnostic result
 records the actual `gv.nx()/ny()/nz()`, timestep, raw timings, explicit sampling,
-geometry transform, exact media, module/build provenance, and finite DFT/mode
-arrays. It is separate from the PR7 result document below because a ten-step
-smoke cannot honestly satisfy the CPU-reference physics policy or the runtime
-counters that PR3 does not expose to Python.
+geometry transform, exact media, module/build provenance, finite DFT/mode
+arrays, runtime counter endpoints/deltas, process-lifetime memory gauges, and
+host peak memory. This sequential-window diagnostic shape is schema version 2;
+version-1 results are rejected. CUDA remains the default accelerator. HIP results additionally
+bind the ROCr selector to the runtime UUID and PCI BDF, join that BDF to the
+`rocm-smi` inventory, and hash the selected `hipcc` and `rocm-smi` executables.
+The runtime report must resolve the requested backend and precision without
+fallback, and measured windows reject allocation, full-field-copy, recapture,
+host-fallback, or material-warning deltas. It remains separate from the PR7
+result document below because a ten-step smoke cannot honestly satisfy the
+CPU-reference physics policy.
 
 The runner reads and hashes the manifest bytes once before constructing the
 simulation; execution, result generation, and the in-process validation all use
@@ -464,8 +487,8 @@ verifies compatible physics observables within the manifest's tolerances.
 
 `--profile-steps N` performs one untimed step to compile and initialize the
 resident execution plan, then brackets exactly `fields.advance(N)` with
-`cudaProfilerStart/Stop`. MPB setup and mode decomposition stay outside the
-capture.
+`cudaProfilerStart/Stop` or `hipProfilerStart/Stop`, according to
+`--accelerator`. MPB setup and mode decomposition stay outside the capture.
 
 ```sh
 env CUDA_VISIBLE_DEVICES=0 MEEP_FINITE_CHECK=off \
