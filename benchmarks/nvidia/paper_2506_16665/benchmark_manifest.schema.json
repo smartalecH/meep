@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://meep.readthedocs.io/schemas/nvidia-paper-benchmark-manifest-v5.json",
+  "$id": "https://meep.readthedocs.io/schemas/nvidia-paper-benchmark-manifest-v6.json",
   "title": "Meep NVIDIA paper benchmark run manifest",
   "type": "object",
   "additionalProperties": false,
@@ -66,7 +66,7 @@
     }
   },
   "properties": {
-    "schema_version": {"const": 5},
+    "schema_version": {"const": 6},
     "manifest_schema": {
       "type": "object",
       "additionalProperties": false,
@@ -74,7 +74,7 @@
       "properties": {
         "path": {"type": "string", "minLength": 1},
         "sha256": {"$ref": "#/$defs/sha256"},
-        "schema_version": {"const": 5}
+        "schema_version": {"const": 6}
       }
     },
     "generator": {
@@ -83,7 +83,7 @@
       "required": ["name", "version", "generated_at_utc"],
       "properties": {
         "name": {"const": "paper_2506_16665.benchmark_manifest"},
-        "version": {"const": 5},
+        "version": {"const": 6},
         "generated_at_utc": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*\\+00:00$"}
       }
     },
@@ -132,7 +132,13 @@
         "dimensions": {"const": 3},
         "paper_domain_um": {"type": "array", "minItems": 3, "maxItems": 3, "items": {"type": "number", "exclusiveMinimum": 0}},
         "geometry_summary": {"type": "string", "minLength": 1},
-        "geometry_import": {"type": "object"},
+        "geometry_import": {
+          "type": "object",
+          "required": ["prism_vertex_canonicalization"],
+          "properties": {
+            "prism_vertex_canonicalization": {"const": "per_polygon_centroid_binary64_round_trip_once"}
+          }
+        },
         "layers": {"type": "array", "minItems": 1, "items": {"type": "object"}},
         "cell": {
           "type": "object",
@@ -262,6 +268,6 @@
         "wall_time_is_stretch_goal": {"const": true}
       }
     },
-    "adaptations": {"type": "array", "minItems": 5, "maxItems": 5, "items": {"type": "string", "minLength": 1}}
+    "adaptations": {"type": "array", "minItems": 6, "maxItems": 6, "items": {"type": "string", "minLength": 1}}
   }
 }

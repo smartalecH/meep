@@ -463,6 +463,22 @@ def _gds_snapshot(manifest: Mapping[str, Any]) -> bytes:
     return payload
 
 
+def _canonicalize_prism_points(
+    points: Sequence[Sequence[float]],
+) -> list:
+    if len(points) < 3:
+        raise RunnerError("a Prism polygon must contain at least three vertices")
+    centroid_x = sum(float(point[0]) for point in points) / len(points)
+    centroid_y = sum(float(point[1]) for point in points) / len(points)
+    return [
+        [
+            centroid_x + (float(point[0]) - centroid_x),
+            centroid_y + (float(point[1]) - centroid_y),
+        ]
+        for point in points
+    ]
+
+
 def _geometry_records_from_snapshot(
     manifest: Mapping[str, Any], gdstk: Any, payload: bytes
 ) -> Tuple[list, Dict[str, float]]:
@@ -473,6 +489,11 @@ def _geometry_records_from_snapshot(
         != "center_extended_geometry_bounds_at_origin"
     ):
         raise RunnerError("the authenticated geometry centering rule is unsupported")
+    if (
+        case["geometry_import"].get("prism_vertex_canonicalization")
+        != bm.PRISM_VERTEX_CANONICALIZATION
+    ):
+        raise RunnerError("the authenticated Prism canonicalization is unsupported")
     try:
         with tempfile.NamedTemporaryFile(suffix=".gds") as snapshot:
             snapshot.write(payload)
@@ -512,10 +533,11 @@ def _geometry_records_from_snapshot(
         "y_um": -0.5 * (min(y_values) + max(y_values)),
     }
     for record in records:
-        record["points_um"] = [
+        translated = [
             [point[0] + translation["x_um"], point[1] + translation["y_um"]]
             for point in record["points_um"]
         ]
+        record["points_um"] = _canonicalize_prism_points(translated)
     return records, translation
 
 

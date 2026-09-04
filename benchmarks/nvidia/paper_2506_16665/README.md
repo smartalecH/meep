@@ -262,6 +262,11 @@ shared layer stack; `validate` audits the entire six-case corpus.
 to the Meep runner. It fixes the GDS transform, layer/datatype and z-range
 mappings, ports, source and monitor definitions, padding, all six PML faces,
 the exact nondispersive material constants, and the field-energy decay region.
+After the authenticated case-wide translation, each imported polygon undergoes
+one subtraction/addition round trip about its arithmetic vertex centroid before
+`mp.Prism` construction. This deterministic binary64 canonicalization selects
+the same floating representative reconstructed by libctl's Prism-local
+coordinates; it does not snap to a decimal grid or change polygon topology.
 It also explicitly fixes `epsilon_averaging=false`, a backend-independent
 staircased material assignment used by this performance adaptation. Meep then
 samples scalar permittivity separately at each staggered Yee-grid component
@@ -280,7 +285,7 @@ Gaussian center frequency and `fwidth`. These values are versioned benchmark
 inputs rather than hidden runner defaults. Each manifest also contains the
 expanded wavelength/frequency arrays and the resolved DFT decimation factor.
 
-`benchmark_manifest.schema.json` defines the complete version-5 run document,
+`benchmark_manifest.schema.json` defines the complete version-6 run document,
 including the requested overlap and graph policies.
 Result validation rechecks that schema and the bundled manifest-schema,
 paper-reference, case-definition, result-schema, pinned-commit, GDS, YAML, and

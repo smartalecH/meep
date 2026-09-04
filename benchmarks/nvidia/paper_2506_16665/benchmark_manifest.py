@@ -21,8 +21,8 @@ DEFAULT_CASES = HERE / "runner_cases.json"
 DEFAULT_MANIFEST_SCHEMA = HERE / "benchmark_manifest.schema.json"
 DEFAULT_RESULT_SCHEMA = HERE / "benchmark_result.schema.json"
 DEFAULT_MPI_RESULT_SCHEMA = HERE / "mpi_benchmark_result.schema.json"
-GENERATOR_VERSION = 5
-MANIFEST_SCHEMA_VERSION = 5
+GENERATOR_VERSION = 6
+MANIFEST_SCHEMA_VERSION = 6
 RESULT_SCHEMA_VERSION = 1
 BACKENDS = {"auto", "cpu", "nvidia"}
 PRECISIONS = {"native", "f32", "mixed"}
@@ -47,6 +47,13 @@ MATERIAL_DISCRETIZATION_ADAPTATION = (
     "locations (epsilon_averaging=false), producing a staircased material "
     "assignment that remains backend-independent and does not require host "
     "material fallback."
+)
+PRISM_VERTEX_CANONICALIZATION = "per_polygon_centroid_binary64_round_trip_once"
+PRISM_VERTEX_CANONICALIZATION_ADAPTATION = (
+    "After the authenticated case-wide translation, each imported GDS polygon "
+    "undergoes one binary64 subtraction/addition round trip about its arithmetic "
+    "vertex centroid before Prism construction. This selects libctl-consistent "
+    "floating representatives without decimal snapping or topology changes."
 )
 
 
@@ -333,6 +340,13 @@ def validate_case_definitions(definitions: Mapping[str, Any]) -> None:
     geometry_import = _mapping(definitions.get("geometry_import"), "geometry_import")
     for key in ("gds_scale", "rotation_deg", "port_extension_um"):
         _finite(geometry_import.get(key), f"geometry_import.{key}")
+    if (
+        geometry_import.get("prism_vertex_canonicalization")
+        != PRISM_VERTEX_CANONICALIZATION
+    ):
+        raise ValidationError(
+            "geometry_import.prism_vertex_canonicalization is invalid"
+        )
     layers = _sequence(definitions.get("layers"), "layers")
     layer_names = set()
     for index, raw_layer in enumerate(layers):
@@ -1270,6 +1284,7 @@ def build_manifest(
             reference["common"]["material_mode_caveat"],
             reference["common"]["boundary_caveat"],
             MATERIAL_DISCRETIZATION_ADAPTATION,
+            PRISM_VERTEX_CANONICALIZATION_ADAPTATION,
         ],
     }
     manifest["validation_policy"]["reference"]["physics_configuration_sha256"] = (
@@ -1629,6 +1644,7 @@ def _validate_run_manifest_for_result(
         bundled_reference["common"]["material_mode_caveat"],
         bundled_reference["common"]["boundary_caveat"],
         MATERIAL_DISCRETIZATION_ADAPTATION,
+        PRISM_VERTEX_CANONICALIZATION_ADAPTATION,
     ]
     if not _json_equal(manifest.get("adaptations"), expected_adaptations):
         raise ValidationError(f"{label}.adaptations are not canonical")

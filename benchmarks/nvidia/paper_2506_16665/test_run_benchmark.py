@@ -46,6 +46,62 @@ class RunnerManifestTests(unittest.TestCase):
             manifest["case"]["cell"]["material_discretization"],
             "yee_grid_point_staircased",
         )
+        self.assertEqual(
+            manifest["case"]["geometry_import"]["prism_vertex_canonicalization"],
+            bm.PRISM_VERTEX_CANONICALIZATION,
+        )
+
+    def test_mmi_prism_two_ulp_round_trip_is_canonicalized(self):
+        points = [[4.0, 0.1], [4.0, 0.8], [5.0, 0.7000000000000001], [5.0, 0.2]]
+        centroid_y = sum(point[1] for point in points) / len(points)
+        rebuilt_low = centroid_y + (min(point[1] for point in points) - centroid_y)
+        self.assertEqual(centroid_y.hex(), "0x1.ccccccccccccdp-2")
+        self.assertEqual(rebuilt_low.hex(), "0x1.999999999999cp-4")
+        self.assertEqual(rebuilt_low - 0.1, 2 * math.ulp(0.1))
+
+        canonical = runner._canonicalize_prism_points(points)
+        canonical_centroid_y = sum(point[1] for point in canonical) / len(canonical)
+        canonical_low = min(point[1] for point in canonical)
+        self.assertEqual(
+            canonical_centroid_y + (canonical_low - canonical_centroid_y),
+            canonical_low,
+        )
+        self.assertEqual(runner._canonicalize_prism_points(canonical), canonical)
+
+    def test_all_supported_authenticated_polygons_are_canonical_and_idempotent(self):
+        checkout = pathlib.Path.home() / "fdtd-pipeline"
+        if not checkout.is_dir():
+            self.skipTest("the pinned fdtd-pipeline checkout is unavailable")
+        try:
+            gdstk = runner._load_gdstk_module()
+        except runner.RunnerError as error:
+            self.skipTest(str(error))
+        supported = {
+            name
+            for name, case in self.cases["cases"].items()
+            if case.get("runner_support", {"supported": True})["supported"]
+        }
+        self.assertEqual(
+            supported, {"coupler", "crossing", "mmi2x2", "mode_converter", "ring"}
+        )
+        for device in sorted(supported):
+            manifest = self.manifest(device=device)
+            asset = manifest["input_checkout"]["gds"]
+            asset["path"] = str(checkout / asset["relative_path"])
+            records, _translation = runner._geometry_records(manifest, gdstk)
+            self.assertTrue(records)
+            for record in records:
+                points = record["points_um"]
+                self.assertEqual(runner._canonicalize_prism_points(points), points)
+                for axis in range(2):
+                    values = [point[axis] for point in points]
+                    centroid = sum(values) / len(values)
+                    for bound in (min(values), max(values)):
+                        self.assertEqual(
+                            centroid + (bound - centroid),
+                            bound,
+                            f"{device} axis {axis} bound is not canonical",
+                        )
 
     def test_simulation_receives_manifest_bound_staircased_material_policy(self):
         manifest = self.manifest(backend="nvidia")
@@ -190,7 +246,7 @@ class RunnerResultTests(unittest.TestCase):
         manifest_sha256,
         *,
         profiled=False,
-        accelerator="cuda"
+        accelerator="cuda",
     ):
         requested = manifest["execution"]["requested"]
         steps = 1 if profiled else int(manifest["stopping"]["steps"])

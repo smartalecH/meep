@@ -18,6 +18,7 @@
     "reflect_x": false,
     "reflect_y": false,
     "translation_rule": "center_extended_geometry_bounds_at_origin",
+    "prism_vertex_canonicalization": "per_polygon_centroid_binary64_round_trip_once",
     "port_extension_um": 10.0
   },
   "layers": [

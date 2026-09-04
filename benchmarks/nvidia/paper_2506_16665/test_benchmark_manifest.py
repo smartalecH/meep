@@ -156,6 +156,11 @@ class ReferenceAndCaseTests(unittest.TestCase):
         with self.assertRaisesRegex(bm.ValidationError, "spectral_envelope"):
             bm.validate_case_definitions(cases)
 
+        cases = bm.load_case_definitions()
+        cases["geometry_import"]["prism_vertex_canonicalization"] = "decimal_snap"
+        with self.assertRaisesRegex(bm.ValidationError, "canonicalization"):
+            bm.validate_case_definitions(cases)
+
     def test_case_validation_requires_staircased_material_assignment(self):
         cases = bm.load_case_definitions()
         cases["cell"]["epsilon_averaging"] = True
@@ -378,6 +383,16 @@ class ManifestTests(unittest.TestCase):
                 )
                 self.assertIn(
                     bm.MATERIAL_DISCRETIZATION_ADAPTATION, manifest["adaptations"]
+                )
+                self.assertEqual(
+                    manifest["case"]["geometry_import"][
+                        "prism_vertex_canonicalization"
+                    ],
+                    bm.PRISM_VERTEX_CANONICALIZATION,
+                )
+                self.assertIn(
+                    bm.PRISM_VERTEX_CANONICALIZATION_ADAPTATION,
+                    manifest["adaptations"],
                 )
                 self.assertEqual(
                     manifest["manifest_schema"]["sha256"],
@@ -652,7 +667,7 @@ class ResultTests(unittest.TestCase):
         manifest_schema = bm.load_json_object(
             bm.DEFAULT_MANIFEST_SCHEMA, "run manifest schema"
         )
-        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 5)
+        self.assertEqual(manifest_schema["properties"]["schema_version"]["const"], 6)
 
     def test_result_rejects_nonfinite_and_grid_mismatch(self):
         temporary, result, _manifest = self.template()
@@ -876,6 +891,9 @@ class ResultTests(unittest.TestCase):
             lambda value: value["materials"].update(validation={"sha256": "1" * 64}),
             lambda value: value["case"]["boundaries"].update(thickness_um=2.0),
             lambda value: value["case"]["cell"].update(epsilon_averaging=True),
+            lambda value: value["case"]["geometry_import"].update(
+                prism_vertex_canonicalization="none"
+            ),
             lambda value: value["case"]["monitors"][1].update(mode_order=1),
             lambda value: value["stopping"].update(steps=11),
         )
