@@ -898,6 +898,7 @@ bool MaterialRecipe::operator==(const MaterialRecipe &other) const {
 }
 
 void validate_material_recipe(const MaterialRecipe &recipe) {
+  if (recipe.validation_memo_.done) return;
   MaterialRecipeInput input;
   input.disposition = recipe.disposition();
   input.description = recipe.description();
@@ -922,6 +923,7 @@ void validate_material_recipe(const MaterialRecipe &recipe) {
                         input.callback_tiles, input.callback_owners, input.topology, input.ir);
   if (recipe.version() != material_recipe_format_version || signature != recipe.signature())
     throw std::invalid_argument("material recipe has a stale or unsupported signature");
+  recipe.validation_memo_.done = true;
 }
 
 MaterialRecipe build_host_reference_material_recipe(const fields &f) {

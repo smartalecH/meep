@@ -123,6 +123,7 @@ public:
     keys_.clear();
     index_.clear();
     by_address_.clear();
+    address_index_valid_ = false;
   }
 
   ArrayId register_array(const StorageKey &key, void *address, size_t elements, array_role role,
@@ -167,6 +168,22 @@ private:
   std::vector<StorageKey> keys_;
   std::unordered_map<StorageKey, uint32_t, StorageKeyHash> index_;
   std::unordered_map<const void *, uint32_t> by_address_;
+
+  /* Address index for locate(): host-backed allocations sorted by base, with a
+     running maximum of their end addresses so overlapping (aliased) ranges are
+     still found. locate() is called once per halo/boundary element while
+     compiling an executable, so a linear scan over every array made compile
+     time O(elements x arrays). Rebuilt lazily after any mutation of bases or
+     sizes; the backend compiles single-threaded. */
+  struct AddressRange {
+    uintptr_t begin;
+    uintptr_t end;
+    size_t index;
+  };
+  mutable std::vector<AddressRange> address_ranges_;
+  mutable std::vector<uintptr_t> address_max_end_;
+  mutable bool address_index_valid_ = false;
+  void build_address_index() const;
 };
 
 /* Walks fields_chunk, structure_chunk and dft_chunk and registers every

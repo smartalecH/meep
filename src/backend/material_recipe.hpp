@@ -156,6 +156,23 @@ private:
   std::vector<MaterialIRTopologyRow> topology_;
   std::shared_ptr<const MaterialIR> ir_;
   uint64_t signature_;
+
+  /* validate_material_recipe re-derives the signature from every row value,
+     and executable compilation validates the same recipe object several
+     times. The object is immutable, so a successful full check is remembered
+     for that object only: copies and assignments start unvalidated, keeping
+     the copy/serialization corruption check intact. */
+  struct ValidationMemo {
+    mutable bool done = false;
+    ValidationMemo() = default;
+    ValidationMemo(const ValidationMemo &) {}
+    ValidationMemo &operator=(const ValidationMemo &) {
+      done = false;
+      return *this;
+    }
+  };
+  ValidationMemo validation_memo_;
+  friend void validate_material_recipe(const MaterialRecipe &recipe);
 };
 
 MaterialRecipe build_host_reference_material_recipe(const fields &f);

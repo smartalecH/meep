@@ -20,6 +20,7 @@
 #include "backend/precision.hpp"
 #include "meep_internals.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <stdint.h>
@@ -135,6 +136,7 @@ ArrayId CpuArrayCatalog::register_array(const StorageKey &key, void *address, si
        owner reallocates; keep the identity, refresh the binding. */
     bases_[it->second] = address;
     specs_[it->second].elements = elements;
+    address_index_valid_ = false;
     return ArrayId{it->second};
   }
   const uint32_t id = uint32_t(specs_.size());
@@ -153,6 +155,7 @@ ArrayId CpuArrayCatalog::register_array(const StorageKey &key, void *address, si
   keys_.push_back(key);
   index_[key] = id;
   by_address_[address] = id;
+  address_index_valid_ = false;
   return ArrayId{id};
 }
 
@@ -191,6 +194,7 @@ void CpuArrayCatalog::publish_resolved_plan(const StoragePlan &plan) {
   }
   specs_.swap(specs);
   bases_.swap(bases);
+  address_index_valid_ = false;
   keys_.swap(keys);
   index_.swap(index);
   by_address_.swap(by_address);
@@ -204,25 +208,57 @@ size_t CpuArrayCatalog::host_backed_size() const {
   return result;
 }
 
+void CpuArrayCatalog::build_address_index() const {
+  address_ranges_.clear();
+  for (size_t i = 0; i < specs_.size(); ++i) {
+    if (!bases_[i]) continue;
+    const uintptr_t begin = reinterpret_cast<uintptr_t>(bases_[i]);
+    const size_t bytes = specs_[i].elements * host_element_bytes(specs_[i].element_type);
+    if (!bytes) continue;
+    address_ranges_.push_back(AddressRange{begin, begin + bytes, i});
+  }
+  std::sort(address_ranges_.begin(), address_ranges_.end(),
+            [](const AddressRange &a, const AddressRange &b) {
+              return a.begin != b.begin ? a.begin < b.begin : a.index < b.index;
+            });
+  address_max_end_.resize(address_ranges_.size());
+  uintptr_t max_end = 0;
+  for (size_t k = 0; k < address_ranges_.size(); ++k)
+    address_max_end_[k] = max_end = std::max(max_end, address_ranges_[k].end);
+  address_index_valid_ = true;
+}
+
 bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offset) const {
   id = invalid_array();
   element_offset = 0;
   if (!p) return false;
+  if (!address_index_valid_) build_address_index();
   const uintptr_t address = reinterpret_cast<uintptr_t>(p);
-  for (size_t i = 0; i < specs_.size(); ++i) {
-    const ArraySpec &spec = specs_[i];
-    if (!bases_[i]) continue;
-    const size_t bytes_per_element = host_element_bytes(spec.element_type);
-    const uintptr_t begin = reinterpret_cast<uintptr_t>(bases_[i]);
-    const size_t bytes = spec.elements * bytes_per_element;
-    if (address < begin || address - begin >= bytes) continue;
-    const uintptr_t delta = address - begin;
+  /* Same answer as scanning specs_ in order: among the allocations containing
+     the address at an element boundary, the lowest catalog index wins. Walk
+     back from the last range starting at or before the address while some
+     earlier range may still extend past it. */
+  size_t k = size_t(std::upper_bound(address_ranges_.begin(), address_ranges_.end(), address,
+                                     [](uintptr_t a, const AddressRange &r) {
+                                       return a < r.begin;
+                                     }) -
+                    address_ranges_.begin());
+  size_t best = specs_.size();
+  ptrdiff_t best_offset = 0;
+  while (k > 0 && address_max_end_[k - 1] > address) {
+    const AddressRange &range = address_ranges_[--k];
+    if (address >= range.end || range.index >= best) continue;
+    const size_t bytes_per_element = host_element_bytes(specs_[range.index].element_type);
+    const uintptr_t delta = address - range.begin;
     if (delta % bytes_per_element) continue;
-    id = is_valid(spec.alias_of) ? spec.alias_of : spec.id;
-    element_offset = ptrdiff_t(delta / bytes_per_element);
-    return true;
+    best = range.index;
+    best_offset = ptrdiff_t(delta / bytes_per_element);
   }
-  return false;
+  if (best == specs_.size()) return false;
+  const ArraySpec &spec = specs_[best];
+  id = is_valid(spec.alias_of) ? spec.alias_of : spec.id;
+  element_offset = best_offset;
+  return true;
 }
 
 size_t CpuArrayCatalog::total_bytes() const {
