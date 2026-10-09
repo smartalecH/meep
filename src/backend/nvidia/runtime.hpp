@@ -15,6 +15,7 @@
 #define MEEP_BACKEND_NVIDIA_RUNTIME_HPP
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <stdexcept>
 #include <string>
