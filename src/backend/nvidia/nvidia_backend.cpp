@@ -1058,6 +1058,16 @@ public:
                              "budgeting NVIDIA halo scatter descriptors"),
              "budgeting NVIDIA executable storage");
       budget(halo_scratch_bytes, "budgeting NVIDIA executable storage");
+      build_zero_batches();
+      build_halo_merges(halo_gathers, halo_scatters);
+      if (!zero_batches_.empty()) {
+        budget(checked_product(zero_updates_.size(), sizeof(zero_updates_[0]),
+                               "budgeting NVIDIA zero-batch descriptors"),
+               "budgeting NVIDIA executable storage");
+        budget(checked_product(zero_offsets_host_.size(), sizeof(size_t),
+                               "budgeting NVIDIA zero-batch offsets"),
+               "budgeting NVIDIA executable storage");
+      }
       if (!finite_checks_.empty()) budget(sizeof(uint64_t), "budgeting NVIDIA executable storage");
       budget(checked_product(source_scalar_count_, sizeof(nvidia::source_scalar),
                              "budgeting NVIDIA source scalars"),
@@ -1098,6 +1108,18 @@ public:
                                           halo_scatters_.size(), *state.transfer_);
       }
       if (halo_scratch_bytes) halo_scratch_.allocate(halo_scratch_bytes, state.device_);
+      if (!zero_batches_.empty()) {
+        zero_entries_.allocate(checked_product(zero_updates_.size(), sizeof(zero_updates_[0]),
+                                               "allocating NVIDIA zero-batch descriptors"),
+                               state.device_);
+        nvidia::copy_host_to_device_async(zero_entries_, 0, zero_updates_.data(),
+                                          zero_entries_.size(), *state.transfer_);
+        zero_offsets_.allocate(checked_product(zero_offsets_host_.size(), sizeof(size_t),
+                                               "allocating NVIDIA zero-batch offsets"),
+                               state.device_);
+        nvidia::copy_host_to_device_async(zero_offsets_, 0, zero_offsets_host_.data(),
+                                          zero_offsets_.size(), *state.transfer_);
+      }
       if (!finite_checks_.empty()) {
         finite_result_.allocate(sizeof(uint64_t), state.device_);
         finite_result_host_.allocate(sizeof(uint64_t));
@@ -1230,6 +1252,215 @@ public:
   std::vector<NvidiaCompiledCylindricalOriginAction> cylindrical_origin_actions_;
   std::vector<nvidia::constitutive_launch> constitutive_updates_;
   std::vector<nvidia::zero_launch> zero_updates_;
+
+  /* Batched metal-zero execution. Each transfer_halo operation's zero range
+     [first, first + count) is split into runs of equal precision, and each run
+     is one launch over device copies of zero_updates_ and per-run point
+     offsets. Keyed by the operation's `first`; `count` must match. */
+  struct ZeroBatch {
+    size_t entry_first;
+    size_t entry_count;
+    size_t offset_first;
+    size_t points;
+    nvidia::scalar_precision precision;
+  };
+  struct ZeroBatchRange {
+    size_t count;
+    size_t batch_first;
+    size_t batch_count;
+  };
+  std::vector<ZeroBatch> zero_batches_;
+  std::map<size_t, ZeroBatchRange> zero_batch_ranges_;
+  std::vector<size_t> zero_offsets_host_;
+  nvidia::device_buffer zero_entries_;
+  nvidia::device_buffer zero_offsets_;
+
+  void build_zero_batches() {
+    for (const NvidiaCompiledOperation &op : operations_) {
+      if (op.kind != OpKind::transfer_halo || !op.count) continue;
+      if (op.first > zero_updates_.size() || op.count > zero_updates_.size() - op.first)
+        throw std::logic_error("NVIDIA metal-zero operation range is stale");
+      const auto existing = zero_batch_ranges_.find(op.first);
+      if (existing != zero_batch_ranges_.end()) {
+        if (existing->second.count != op.count)
+          throw std::logic_error("NVIDIA metal-zero operations overlap inconsistently");
+        continue;
+      }
+      ZeroBatchRange range = {op.count, zero_batches_.size(), 0};
+      size_t i = op.first;
+      const size_t end = op.first + op.count;
+      while (i < end) {
+        ZeroBatch batch = {i, 0, zero_offsets_host_.size(), 0, zero_updates_[i].precision};
+        zero_offsets_host_.push_back(0);
+        while (i < end && zero_updates_[i].precision == batch.precision) {
+          size_t points = 1;
+          for (int axis = 0; axis < 3; ++axis)
+            points = checked_product(points, zero_updates_[i].region.counts[axis],
+                                     "counting NVIDIA zero-batch points");
+          batch.points = checked_add(batch.points, points, "counting NVIDIA zero-batch points");
+          zero_offsets_host_.push_back(batch.points);
+          ++batch.entry_count;
+          ++i;
+        }
+        zero_batches_.push_back(batch);
+        ++range.batch_count;
+      }
+      zero_batch_ranges_[op.first] = range;
+    }
+  }
+
+  /* Launch the metal zeroes of one operation; returns the number of kernels
+     launched. Ranges without a batch (none are expected) fall back to
+     per-region launches. */
+  size_t launch_zero_range(size_t first, size_t count, const nvidia::stream &stream) const {
+    if (!count) return 0;
+    const auto found = zero_batch_ranges_.find(first);
+    if (found == zero_batch_ranges_.end() || found->second.count != count) {
+      for (size_t i = first; i < first + count; ++i) nvidia::launch_zero(zero_updates_[i], stream);
+      return count;
+    }
+    const nvidia::zero_launch *entries =
+        static_cast<const nvidia::zero_launch *>(zero_entries_.opaque_handle());
+    const size_t *offsets = static_cast<const size_t *>(zero_offsets_.opaque_handle());
+    for (size_t b = found->second.batch_first;
+         b < found->second.batch_first + found->second.batch_count; ++b) {
+      const ZeroBatch &batch = zero_batches_[b];
+      nvidia::launch_zero_batch(
+          nvidia::zero_batch_launch{entries + batch.entry_first, offsets + batch.offset_first,
+                                    batch.entry_count, batch.points, batch.precision},
+          stream);
+    }
+    return found->second.batch_count;
+  }
+
+  /* Merged halo execution. A transfer_halo operation gathers every plan into
+     the scratch buffer before any plan scatters (matching the CPU's pack-all,
+     unpack-all order), and the gather/scatter kernels already index the global
+     entry arrays by (first, count). Adjacent plans of equal precision are
+     therefore launched as one wider range, provided no two merged gathers
+     write the same scratch slot and no two merged scatters write the same
+     target element; otherwise that operation keeps one launch per plan. */
+  struct HaloMergedRange {
+    size_t count;
+    size_t gather_first;
+    size_t gather_count;
+    size_t scatter_first;
+    size_t scatter_count;
+  };
+  std::vector<nvidia::halo_launch> merged_halo_gathers_;
+  std::vector<nvidia::halo_launch> merged_halo_scatters_;
+  std::map<size_t, HaloMergedRange> merged_halo_ranges_;
+
+  static size_t append_halo_launches(std::vector<nvidia::halo_launch> &out,
+                                     const std::vector<nvidia::halo_launch> &plans, bool merge) {
+    const size_t first = out.size();
+    for (const nvidia::halo_launch &launch : plans) {
+      if (merge && out.size() > first && out.back().precision == launch.precision &&
+          out.back().first + out.back().count == launch.first)
+        out.back().count += launch.count;
+      else
+        out.push_back(launch);
+    }
+    return out.size() - first;
+  }
+
+  void build_halo_merges(const std::vector<nvidia::halo_gather_entry> &gathers,
+                         const std::vector<nvidia::halo_scatter_entry> &scatters) {
+    for (const NvidiaCompiledOperation &op : operations_) {
+      if (op.kind != OpKind::transfer_halo || !op.halo_count) continue;
+      if (op.halo_first > halo_plans_.size() || op.halo_count > halo_plans_.size() - op.halo_first)
+        throw std::logic_error("NVIDIA halo operation range is stale");
+      const auto existing = merged_halo_ranges_.find(op.halo_first);
+      if (existing != merged_halo_ranges_.end()) {
+        if (existing->second.count != op.halo_count)
+          throw std::logic_error("NVIDIA halo operations overlap inconsistently");
+        continue;
+      }
+      std::vector<nvidia::halo_launch> plan_gathers, plan_scatters;
+      std::set<size_t> slots;
+      std::set<std::pair<const void *, ptrdiff_t> > targets;
+      bool gathers_disjoint = true, scatters_disjoint = true;
+      for (size_t p = op.halo_first; p < op.halo_first + op.halo_count; ++p) {
+        const NvidiaCompiledHalo &plan = halo_plans_[p];
+        if (plan.gather.first > gathers.size() ||
+            plan.gather.count > gathers.size() - plan.gather.first ||
+            plan.scatter.first > scatters.size() ||
+            plan.scatter.count > scatters.size() - plan.scatter.first)
+          throw std::logic_error("NVIDIA halo plan references missing descriptors");
+        plan_gathers.push_back(plan.gather);
+        plan_scatters.push_back(plan.scatter);
+        for (size_t e = plan.gather.first; gathers_disjoint && e < plan.gather.first + plan.gather.count;
+             ++e)
+          gathers_disjoint = slots.insert(gathers[e].buffer_index).second;
+        for (size_t e = plan.scatter.first;
+             scatters_disjoint && e < plan.scatter.first + plan.scatter.count; ++e) {
+          const nvidia::halo_scatter_entry &entry = scatters[e];
+          scatters_disjoint =
+              targets.insert(std::make_pair(static_cast<const void *>(entry.target_real),
+                                            entry.target_real_index))
+                  .second;
+          if (scatters_disjoint && entry.target_imag)
+            scatters_disjoint =
+                targets.insert(std::make_pair(static_cast<const void *>(entry.target_imag),
+                                              entry.target_imag_index))
+                    .second;
+        }
+      }
+      HaloMergedRange range;
+      range.count = op.halo_count;
+      range.gather_first = merged_halo_gathers_.size();
+      range.gather_count = append_halo_launches(merged_halo_gathers_, plan_gathers, gathers_disjoint);
+      range.scatter_first = merged_halo_scatters_.size();
+      range.scatter_count =
+          append_halo_launches(merged_halo_scatters_, plan_scatters, scatters_disjoint);
+      merged_halo_ranges_[op.halo_first] = range;
+    }
+  }
+
+  const HaloMergedRange *merged_halo_range(size_t halo_first, size_t halo_count) const {
+    const auto found = merged_halo_ranges_.find(halo_first);
+    return found == merged_halo_ranges_.end() || found->second.count != halo_count ? NULL
+                                                                                    : &found->second;
+  }
+
+  /* Launch every gather (or scatter) of one operation; return kernel count. */
+  size_t launch_halo_gathers(size_t halo_first, size_t halo_count,
+                             const nvidia::stream &stream) const {
+    const HaloMergedRange *range = merged_halo_range(halo_first, halo_count);
+    const size_t first = range ? range->gather_first : halo_first;
+    const size_t count = range ? range->gather_count : halo_count;
+    for (size_t i = first; i < first + count; ++i)
+      nvidia::launch_halo_gather(range ? merged_halo_gathers_[i] : halo_plans_[i].gather,
+                                 halo_gathers_.opaque_handle(), halo_scratch_.opaque_handle(),
+                                 stream);
+    return count;
+  }
+
+  size_t launch_halo_scatters(size_t halo_first, size_t halo_count,
+                              const nvidia::stream &stream) const {
+    const HaloMergedRange *range = merged_halo_range(halo_first, halo_count);
+    const size_t first = range ? range->scatter_first : halo_first;
+    const size_t count = range ? range->scatter_count : halo_count;
+    for (size_t i = first; i < first + count; ++i)
+      nvidia::launch_halo_scatter(range ? merged_halo_scatters_[i] : halo_plans_[i].scatter,
+                                  halo_scatters_.opaque_handle(), halo_scratch_.opaque_handle(),
+                                  stream);
+    return count;
+  }
+
+  size_t halo_range_launch_count(size_t halo_first, size_t halo_count) const {
+    const HaloMergedRange *range = merged_halo_range(halo_first, halo_count);
+    return range ? range->gather_count + range->scatter_count : 2 * halo_count;
+  }
+
+  size_t zero_range_launch_count(size_t first, size_t count) const {
+    if (!count) return 0;
+    const auto found = zero_batch_ranges_.find(first);
+    return found == zero_batch_ranges_.end() || found->second.count != count
+               ? count
+               : found->second.batch_count;
+  }
+
   std::vector<NvidiaCompiledHalo> halo_plans_;
   std::vector<NvidiaFiniteCheck> finite_checks_;
   std::vector<nvidia::source_batch_launch> source_batches_;
@@ -1359,22 +1590,15 @@ void launch_dependency_overlap(NvidiaExecutable &executable, NvidiaBackendState 
   if (halo.kind != OpKind::transfer_halo || halo.ft != dependency.ft ||
       !executable.transport_ || !executable.transport_->has_stage(halo.ft))
     throw std::logic_error("NVIDIA dependency overlap lost its remote halo stage");
-  for (size_t i = halo.first; i < halo.first + halo.count; ++i)
-    nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
-  for (size_t i = halo.halo_first; i < halo.halo_first + halo.halo_count; ++i)
-    nvidia::launch_halo_gather(executable.halo_plans_[i].gather,
-                               executable.halo_gathers_.opaque_handle(),
-                               executable.halo_scratch_.opaque_handle(), *state.transfer_);
+  executable.launch_zero_range(halo.first, halo.count, *state.transfer_);
+  executable.launch_halo_gathers(halo.halo_first, halo.halo_count, *state.transfer_);
   std::string transport_error;
   if (!executable.transport_->begin_stage(halo.ft, *state.transfer_, transport_error))
     throw std::runtime_error(transport_error.empty()
                                  ? "NVIDIA direct overlap transport begin failed"
                                  : transport_error);
   try {
-    for (size_t i = halo.halo_first; i < halo.halo_first + halo.halo_count; ++i)
-      nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
-                                  executable.halo_scatters_.opaque_handle(),
-                                  executable.halo_scratch_.opaque_handle(), *state.transfer_);
+    executable.launch_halo_scatters(halo.halo_first, halo.halo_count, *state.transfer_);
     for (const NvidiaCompiledDependencyRow &row : dependency.rows) {
       if (row.kind == DependencyOperationKind::curl)
         nvidia::launch_curl(row.curl_interior, *state.transfer_);
@@ -10332,22 +10556,9 @@ size_t launch_cw_reconciliation_device(NvidiaCwExecutable &cw, NvidiaBackendStat
   const NvidiaCompiledOperation &op = cw.timestep_->operations_[operation_index];
   size_t launches = 0;
   if (op.kind == OpKind::transfer_halo) {
-    for (size_t i = op.first; i < op.first + op.count; ++i) {
-      nvidia::launch_zero(cw.timestep_->zero_updates_[i], *state.transfer_);
-      ++launches;
-    }
-    for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-      nvidia::launch_halo_gather(cw.timestep_->halo_plans_[i].gather,
-                                 cw.timestep_->halo_gathers_.opaque_handle(),
-                                 cw.timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
-      ++launches;
-    }
-    for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-      nvidia::launch_halo_scatter(cw.timestep_->halo_plans_[i].scatter,
-                                  cw.timestep_->halo_scatters_.opaque_handle(),
-                                  cw.timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
-      ++launches;
-    }
+    launches += cw.timestep_->launch_zero_range(op.first, op.count, *state.transfer_);
+    launches += cw.timestep_->launch_halo_gathers(op.halo_first, op.halo_count, *state.transfer_);
+    launches += cw.timestep_->launch_halo_scatters(op.halo_first, op.halo_count, *state.transfer_);
     return launches;
   }
   if (op.kind == OpKind::update_eh) {
@@ -11232,22 +11443,12 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
       throw std::logic_error("NVIDIA solve_cw reconciliation operation is out of range");
     const NvidiaCompiledOperation &op = cw->timestep_->operations_[operation_index];
     if (op.kind == OpKind::transfer_halo) {
-      for (size_t i = op.first; i < op.first + op.count; ++i) {
-        nvidia::launch_zero(cw->timestep_->zero_updates_[i], *state.transfer_);
-        ++workspace.reconciliation_kernel_launches_;
-      }
-      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-        nvidia::launch_halo_gather(cw->timestep_->halo_plans_[i].gather,
-                                   cw->timestep_->halo_gathers_.opaque_handle(),
-                                   cw->timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
-        ++workspace.reconciliation_kernel_launches_;
-      }
-      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-        nvidia::launch_halo_scatter(cw->timestep_->halo_plans_[i].scatter,
-                                    cw->timestep_->halo_scatters_.opaque_handle(),
-                                    cw->timestep_->halo_scratch_.opaque_handle(), *state.transfer_);
-        ++workspace.reconciliation_kernel_launches_;
-      }
+      workspace.reconciliation_kernel_launches_ +=
+          cw->timestep_->launch_zero_range(op.first, op.count, *state.transfer_);
+      workspace.reconciliation_kernel_launches_ +=
+          cw->timestep_->launch_halo_gathers(op.halo_first, op.halo_count, *state.transfer_);
+      workspace.reconciliation_kernel_launches_ +=
+          cw->timestep_->launch_halo_scatters(op.halo_first, op.halo_count, *state.transfer_);
       return;
     }
     if (op.kind == OpKind::update_eh) {
@@ -12258,16 +12459,13 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       return true;
     }
     case OpKind::transfer_halo: {
-      for (size_t i = op.first; i < op.first + op.count; ++i) {
-        nvidia::launch_zero(executable.zero_updates_[i], *state.transfer_);
+      for (size_t n = executable.launch_zero_range(op.first, op.count, *state.transfer_); n;
+           --n)
         count_cw_kernel();
-      }
-      for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-        nvidia::launch_halo_gather(executable.halo_plans_[i].gather,
-                                   executable.halo_gathers_.opaque_handle(),
-                                   executable.halo_scratch_.opaque_handle(), *state.transfer_);
+      for (size_t n = executable.launch_halo_gathers(op.halo_first, op.halo_count,
+                                                     *state.transfer_);
+           n; --n)
         count_cw_kernel();
-      }
       const bool remote_stage =
           executable.transport_ && executable.transport_->has_stage(op.ft);
       if (remote_stage) {
@@ -12278,12 +12476,10 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
                                        : transport_error);
       }
       try {
-        for (size_t i = op.halo_first; i < op.halo_first + op.halo_count; ++i) {
-          nvidia::launch_halo_scatter(executable.halo_plans_[i].scatter,
-                                      executable.halo_scatters_.opaque_handle(),
-                                      executable.halo_scratch_.opaque_handle(), *state.transfer_);
+        for (size_t n = executable.launch_halo_scatters(op.halo_first, op.halo_count,
+                                                        *state.transfer_);
+             n; --n)
           count_cw_kernel();
-        }
       }
       catch (...) {
         if (remote_stage)
@@ -12911,7 +13107,9 @@ void NvidiaBackend::configure_cw_graph_execution(const StepPlan &plan, const CwP
           case OpKind::apply_sources:
           case OpKind::zero_boundary: timestep_launches += op.count; break;
           case OpKind::transfer_halo:
-            timestep_launches += op.count + 2 * op.halo_count;
+            timestep_launches +=
+                executable.zero_range_launch_count(op.first, op.count) +
+                executable.halo_range_launch_count(op.halo_first, op.halo_count);
             break;
           case OpKind::finite_value_check:
             timestep_launches += op.count;

@@ -97,6 +97,20 @@ struct zero_launch {
   scalar_precision precision;
 };
 
+/* One launch zeroes every region of a contiguous run of zero_launch entries
+   that share a precision. `entries` and `offsets` are device descriptors
+   uploaded once per executable: offsets[k] is the first linear point of entry
+   k within the batch and offsets[entry_count] == points. Metal-zero plans are
+   dominated by single-element residue regions, so per-region launches cost
+   one kernel launch per boundary point per step. */
+struct zero_batch_launch {
+  const void *entries;
+  const void *offsets;
+  size_t entry_count;
+  size_t points;
+  scalar_precision precision;
+};
+
 /* Relocatable same-device halo metadata. The descriptors themselves are
    uploaded once when an executable is compiled. `buffer_index` is measured in
    scalar elements, not bytes. A null imaginary target denotes COPY/NEGATE;
@@ -136,6 +150,7 @@ void launch_curl(const curl_launch &update, const stream &stream);
 void launch_beta(const beta_launch &update, const stream &stream);
 void launch_constitutive(const constitutive_launch &update, const stream &stream);
 void launch_zero(const zero_launch &update, const stream &stream);
+void launch_zero_batch(const zero_batch_launch &launch, const stream &stream);
 void launch_halo_gather(const halo_launch &launch, const void *device_entries, void *device_buffer,
                         const stream &stream);
 void launch_halo_scatter(const halo_launch &launch, const void *device_entries,

@@ -248,6 +248,27 @@ template <typename T> __global__ void zero_kernel(zero_launch update, size_t poi
   static_cast<T *>(update.target)[region_index(update.region, i0, i1, i2)] = T(0);
 }
 
+/* Each thread owns one point of the batch and locates its entry by binary
+   search over the point offsets (entry k covers [offsets[k], offsets[k+1])). */
+template <typename T>
+__global__ void zero_batch_kernel(const zero_launch *entries, const size_t *offsets,
+                                  size_t entry_count, size_t points) {
+  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= points) return;
+  size_t lo = 0, hi = entry_count;
+  while (hi - lo > 1) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (offsets[mid] <= linear)
+      lo = mid;
+    else
+      hi = mid;
+  }
+  const zero_launch &update = entries[lo];
+  size_t i0, i1, i2;
+  region_coordinates(update.region, linear - offsets[lo], i0, i1, i2);
+  static_cast<T *>(update.target)[region_index(update.region, i0, i1, i2)] = T(0);
+}
+
 template <typename T>
 __global__ void finite_check_kernel(finite_check_launch launch,
                                     unsigned long long *first_bad,
@@ -549,6 +570,23 @@ void launch_zero(const zero_launch &update, const stream &execution_stream) {
     launch_zero_t<float>(update, execution_stream);
   else
     launch_zero_t<double>(update, execution_stream);
+}
+
+void launch_zero_batch(const zero_batch_launch &launch, const stream &execution_stream) {
+  if (!launch.entries || !launch.offsets || !launch.entry_count)
+    throw std::invalid_argument("NVIDIA zero batch has incomplete descriptors");
+  unsigned int blocks = 0, threads = 0;
+  linear_launch_geometry(launch.points, blocks, threads);
+  const cudaStream_t cuda_stream = static_cast<cudaStream_t>(execution_stream.opaque_handle());
+  const zero_launch *entries = static_cast<const zero_launch *>(launch.entries);
+  const size_t *offsets = static_cast<const size_t *>(launch.offsets);
+  if (launch.precision == scalar_precision::f32)
+    zero_batch_kernel<float>
+        <<<blocks, threads, 0, cuda_stream>>>(entries, offsets, launch.entry_count, launch.points);
+  else
+    zero_batch_kernel<double>
+        <<<blocks, threads, 0, cuda_stream>>>(entries, offsets, launch.entry_count, launch.points);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA zero batch");
 }
 
 void launch_halo_gather(const halo_launch &launch, const void *device_entries,
