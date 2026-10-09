@@ -144,6 +144,20 @@ struct finite_check_launch {
   scalar_precision precision;
 };
 
+/* One launch checks a run of finite_check_launch entries with equal precision
+   whose ordinals are contiguous (entry k+1 starts where entry k ends).
+   `entries` is a device copy; a thread maps its ordinal to an entry by binary
+   search over ordinal_base. Same first-bad-ordinal result as per-entry
+   launches, which cost one (mostly early-exiting) launch per field array per
+   step. */
+struct finite_check_batch_launch {
+  const void *entries;
+  size_t entry_count;
+  size_t elements;
+  uint64_t ordinal_base;
+  scalar_precision precision;
+};
+
 /* All launches are asynchronous on `stream`. Invalid geometry or a CUDA launch
    failure throws before returning. */
 void launch_curl(const curl_launch &update, const stream &stream);
@@ -157,6 +171,10 @@ void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
                          const void *device_buffer, const stream &stream);
 void launch_finite_check(const finite_check_launch &launch, void *device_first_bad,
                          const stream &stream);
+/* `scalars` may be null (always check) or the graph StepScalars (check only
+   when finite_check_due). */
+void launch_finite_check_batch(const finite_check_batch_launch &launch, void *device_first_bad,
+                               const StepScalars *scalars, const stream &stream);
 void launch_finite_check_graph(const finite_check_launch &launch, void *device_first_bad,
                                const StepScalars *scalars, const stream &stream);
 

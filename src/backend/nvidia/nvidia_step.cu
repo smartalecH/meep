@@ -12,6 +12,7 @@
 
 #include <math.h>
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 
@@ -267,6 +268,33 @@ __global__ void zero_batch_kernel(const zero_launch *entries, const size_t *offs
   size_t i0, i1, i2;
   region_coordinates(update.region, linear - offsets[lo], i0, i1, i2);
   static_cast<T *>(update.target)[region_index(update.region, i0, i1, i2)] = T(0);
+}
+
+template <typename T>
+__global__ void finite_check_batch_kernel(const finite_check_launch *entries, size_t entry_count,
+                                          size_t elements, uint64_t ordinal_base,
+                                          unsigned long long *first_bad,
+                                          const StepScalars *scalars) {
+  /* Fixed-size grid with a grid-stride loop: on the (common) steps where no
+     check is due the whole launch retires in a few microseconds instead of
+     scheduling one thread per field element. */
+  if (scalars && !scalars->finite_check_due) return;
+  const size_t stride = size_t(gridDim.x) * blockDim.x;
+  for (size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x; linear < elements;
+       linear += stride) {
+    const uint64_t ordinal = ordinal_base + linear;
+    size_t lo = 0, hi = entry_count;
+    while (hi - lo > 1) {
+      const size_t mid = lo + (hi - lo) / 2;
+      if (entries[mid].ordinal_base <= ordinal)
+        lo = mid;
+      else
+        hi = mid;
+    }
+    const finite_check_launch &entry = entries[lo];
+    if (!isfinite(static_cast<const T *>(entry.values)[ordinal - entry.ordinal_base]))
+      atomicMin(first_bad, static_cast<unsigned long long>(ordinal));
+  }
 }
 
 template <typename T>
@@ -638,6 +666,28 @@ void launch_finite_check_graph(const finite_check_launch &launch, void *device_f
     launch_finite_check_t<float>(launch, device_first_bad, scalars, execution_stream);
   else
     launch_finite_check_t<double>(launch, device_first_bad, scalars, execution_stream);
+}
+
+void launch_finite_check_batch(const finite_check_batch_launch &launch, void *device_first_bad,
+                               const StepScalars *scalars, const stream &execution_stream) {
+  if (!launch.entries || !launch.entry_count || !device_first_bad)
+    throw std::invalid_argument("NVIDIA finite-value check batch has incomplete storage");
+  if (!launch.elements) throw std::invalid_argument("NVIDIA finite-value check is empty");
+  if (launch.ordinal_base > std::numeric_limits<uint64_t>::max() - (launch.elements - 1))
+    throw std::overflow_error("NVIDIA finite-value check ordinal overflow");
+  unsigned int blocks = 0, threads = 0;
+  linear_launch_geometry(launch.elements, blocks, threads);
+  blocks = std::min(blocks, 1024u);  // grid-stride kernel; see finite_check_batch_kernel
+  const cudaStream_t cuda_stream = static_cast<cudaStream_t>(execution_stream.opaque_handle());
+  const finite_check_launch *entries = static_cast<const finite_check_launch *>(launch.entries);
+  unsigned long long *first_bad = static_cast<unsigned long long *>(device_first_bad);
+  if (launch.precision == scalar_precision::f32)
+    finite_check_batch_kernel<float><<<blocks, threads, 0, cuda_stream>>>(
+        entries, launch.entry_count, launch.elements, launch.ordinal_base, first_bad, scalars);
+  else
+    finite_check_batch_kernel<double><<<blocks, threads, 0, cuda_stream>>>(
+        entries, launch.entry_count, launch.elements, launch.ordinal_base, first_bad, scalars);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA finite-value check batch");
 }
 
 } // namespace nvidia

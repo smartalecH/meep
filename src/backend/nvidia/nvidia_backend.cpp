@@ -1060,6 +1060,10 @@ public:
       budget(halo_scratch_bytes, "budgeting NVIDIA executable storage");
       build_zero_batches();
       build_halo_merges(halo_gathers, halo_scatters);
+      build_finite_batches();
+      budget(checked_product(finite_entries_host_.size(), sizeof(nvidia::finite_check_launch),
+                             "budgeting NVIDIA finite-check descriptors"),
+             "budgeting NVIDIA executable storage");
       if (!zero_batches_.empty()) {
         budget(checked_product(zero_updates_.size(), sizeof(zero_updates_[0]),
                                "budgeting NVIDIA zero-batch descriptors"),
@@ -1121,6 +1125,13 @@ public:
                                           zero_offsets_.size(), *state.transfer_);
       }
       if (!finite_checks_.empty()) {
+        finite_entries_.allocate(checked_product(finite_entries_host_.size(),
+                                                 sizeof(nvidia::finite_check_launch),
+                                                 "allocating NVIDIA finite-check descriptors"),
+                                 state.device_);
+        nvidia::copy_host_to_device_async(finite_entries_, 0, finite_entries_host_.data(),
+                                          finite_entries_.size(), *state.transfer_);
+        bind_finite_batches();
         finite_result_.allocate(sizeof(uint64_t), state.device_);
         finite_result_host_.allocate(sizeof(uint64_t));
       }
@@ -1451,6 +1462,89 @@ public:
   size_t halo_range_launch_count(size_t halo_first, size_t halo_count) const {
     const HaloMergedRange *range = merged_halo_range(halo_first, halo_count);
     return range ? range->gather_count + range->scatter_count : 2 * halo_count;
+  }
+
+  /* Batched finite-value checks: each finite_value_check operation's entries
+     are split into runs of equal precision with contiguous ordinals, each one
+     launch over a device copy of the finite_check_launch descriptors. */
+  struct FiniteBatchRange {
+    size_t count;
+    size_t batch_first;
+    size_t batch_count;
+  };
+  std::vector<nvidia::finite_check_batch_launch> finite_batches_;
+  std::map<size_t, FiniteBatchRange> finite_batch_ranges_;
+  std::vector<nvidia::finite_check_launch> finite_entries_host_;
+  nvidia::device_buffer finite_entries_;
+
+  void build_finite_batches() {
+    if (finite_checks_.empty()) return;
+    finite_entries_host_.reserve(finite_checks_.size());
+    for (const NvidiaFiniteCheck &check : finite_checks_) finite_entries_host_.push_back(check.launch);
+    for (const NvidiaCompiledOperation &op : operations_) {
+      if (op.kind != OpKind::finite_value_check || !op.count) continue;
+      if (op.first > finite_checks_.size() || op.count > finite_checks_.size() - op.first)
+        throw std::logic_error("NVIDIA finite-value check range is stale");
+      if (finite_batch_ranges_.count(op.first)) {
+        if (finite_batch_ranges_[op.first].count != op.count)
+          throw std::logic_error("NVIDIA finite-value checks overlap inconsistently");
+        continue;
+      }
+      FiniteBatchRange range = {op.count, finite_batches_.size(), 0};
+      for (size_t i = op.first; i < op.first + op.count; ++i) {
+        const nvidia::finite_check_launch &launch = finite_entries_host_[i];
+        if (range.batch_count) {
+          nvidia::finite_check_batch_launch &batch = finite_batches_.back();
+          if (batch.precision == launch.precision &&
+              batch.ordinal_base + batch.elements == launch.ordinal_base) {
+            ++batch.entry_count;
+            batch.elements = checked_add(batch.elements, launch.elements,
+                                         "counting NVIDIA finite-value check elements");
+            continue;
+          }
+        }
+        /* `entries` holds an index until the device copy exists. */
+        finite_batches_.push_back(nvidia::finite_check_batch_launch{
+            reinterpret_cast<const void *>(i), 1, launch.elements, launch.ordinal_base,
+            launch.precision});
+        ++range.batch_count;
+      }
+      finite_batch_ranges_[op.first] = range;
+    }
+  }
+
+  void bind_finite_batches() {
+    const nvidia::finite_check_launch *base =
+        static_cast<const nvidia::finite_check_launch *>(finite_entries_.opaque_handle());
+    for (nvidia::finite_check_batch_launch &batch : finite_batches_)
+      batch.entries = base + reinterpret_cast<uintptr_t>(batch.entries);
+  }
+
+  /* Launch one finite_value_check operation; returns the kernel count. */
+  size_t launch_finite_range(size_t first, size_t count, const StepScalars *graph_scalars,
+                             void *first_bad, const nvidia::stream &stream) const {
+    const auto found = finite_batch_ranges_.find(first);
+    if (found == finite_batch_ranges_.end() || found->second.count != count) {
+      for (size_t i = first; i < first + count; ++i) {
+        if (graph_scalars)
+          nvidia::launch_finite_check_graph(finite_checks_[i].launch, first_bad, graph_scalars,
+                                            stream);
+        else
+          nvidia::launch_finite_check(finite_checks_[i].launch, first_bad, stream);
+      }
+      return count;
+    }
+    for (size_t b = found->second.batch_first;
+         b < found->second.batch_first + found->second.batch_count; ++b)
+      nvidia::launch_finite_check_batch(finite_batches_[b], first_bad, graph_scalars, stream);
+    return found->second.batch_count;
+  }
+
+  size_t finite_range_launch_count(size_t first, size_t count) const {
+    const auto found = finite_batch_ranges_.find(first);
+    return found == finite_batch_ranges_.end() || found->second.count != count
+               ? count
+               : found->second.batch_count;
   }
 
   size_t zero_range_launch_count(size_t first, size_t count) const {
@@ -12556,18 +12650,13 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       if (!op.count) return true;
       nvidia::fill_byte_async(executable.finite_result_, 0, 0xff, sizeof(uint64_t),
                               *state.transfer_);
-      for (size_t i = op.first; i < op.first + op.count; ++i) {
-        if (graph_scalars)
-          nvidia::launch_finite_check_graph(executable.finite_checks_[i].launch,
-                                            executable.finite_result_.opaque_handle(),
-                                            graph_scalars, *state.transfer_);
-        else
-          nvidia::launch_finite_check(executable.finite_checks_[i].launch,
-                                      executable.finite_result_.opaque_handle(),
-                                      *state.transfer_);
+      {
+        const size_t launches = executable.launch_finite_range(
+            op.first, op.count, graph_scalars, executable.finite_result_.opaque_handle(),
+            *state.transfer_);
+        if (account_cw) executable.cw_workspace_->timestep_kernel_launches_ += launches;
+        if (account_cw) executable.cw_workspace_->finite_check_kernel_launches_ += launches;
       }
-      if (account_cw) executable.cw_workspace_->timestep_kernel_launches_ += op.count;
-      if (account_cw) executable.cw_workspace_->finite_check_kernel_launches_ += op.count;
       return true;
     case OpKind::pack_state:
     case OpKind::unpack_state:
@@ -13111,10 +13200,12 @@ void NvidiaBackend::configure_cw_graph_execution(const StepPlan &plan, const CwP
                 executable.zero_range_launch_count(op.first, op.count) +
                 executable.halo_range_launch_count(op.halo_first, op.halo_count);
             break;
-          case OpKind::finite_value_check:
-            timestep_launches += op.count;
-            finite_launches += op.count;
+          case OpKind::finite_value_check: {
+            const size_t launches = executable.finite_range_launch_count(op.first, op.count);
+            timestep_launches += launches;
+            finite_launches += launches;
             break;
+          }
           default: break;
         }
       }
