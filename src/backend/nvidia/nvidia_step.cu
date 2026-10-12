@@ -683,7 +683,14 @@ void launch_finite_check_batch(const finite_check_batch_launch &launch, void *de
     throw std::overflow_error("NVIDIA finite-value check ordinal overflow");
   unsigned int blocks = 0, threads = 0;
   linear_launch_geometry(launch.elements, blocks, threads);
-  blocks = std::min(blocks, 65535u);  // grid-stride kernel; see finite_check_batch_kernel
+  /* Grid-stride kernel (see finite_check_batch_kernel): every thread walks
+     every entry, so the grid must be sized to the device (8 blocks/SM), not
+     to the element count. 65535 blocks cost 5.9 ms/step on an RTX 3060. */
+  int device = 0, sms = 0;
+  check_cuda(cudaGetDevice(&device), "query NVIDIA device for finite-value check");
+  check_cuda(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device),
+             "query NVIDIA SM count for finite-value check");
+  blocks = std::min(blocks, unsigned(std::max(sms, 1)) * 8u);
   const cudaStream_t cuda_stream = static_cast<cudaStream_t>(execution_stream.opaque_handle());
   const finite_check_launch *entries = static_cast<const finite_check_launch *>(launch.entries);
   unsigned long long *first_bad = static_cast<unsigned long long *>(device_first_bad);
