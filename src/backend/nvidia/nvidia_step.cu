@@ -210,8 +210,27 @@ __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   size_t i0, i1, i2;
   region_coordinates(update.region, linear, i0, i1, i2);
   const ptrdiff_t i = region_index(update.region, i0, i1, i2);
+  const T *diagonal = static_cast<const T *>(update.diagonal);
+  T *target = static_cast<T *>(update.target);
+  /* Issue every load before any arithmetic or data-dependent branch. With the
+     multiply by diagonal[i] and the target/target_w aliasing test in between,
+     the compiler issued the PML loads only after the first loads returned,
+     i.e. two serialized DRAM round trips per thread: ~1 TB/s on B200 versus
+     ~6 TB/s with all loads in flight (H100 hid it). Arithmetic and its order
+     are unchanged, so results are bitwise identical. */
   T value = static_cast<const T *>(update.primary)[i];
-  if (update.diagonal) value *= static_cast<const T *>(update.diagonal)[i];
+  const T diagonal_i = diagonal ? diagonal[i] : T(0);
+  T previous = T(0), kappa_k = T(0), sigma_k = T(0), old = T(0);
+  T *target_w = NULL;
+  if (Pml) {
+    target_w = static_cast<T *>(update.target_w);
+    const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
+    previous = target_w[i];
+    kappa_k = static_cast<const T *>(update.pml.kappa)[k];
+    sigma_k = static_cast<const T *>(update.pml.sigma)[k];
+    old = target[i];
+  }
+  if (diagonal) value *= diagonal_i;
   if (Offdiagonals >= 1)
     value += offdiagonal_value(static_cast<const T *>(update.offdiagonal1),
                                static_cast<const T *>(update.cross1), i, update.primary_stride,
@@ -221,29 +240,17 @@ __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
                                static_cast<const T *>(update.cross2), i, update.primary_stride,
                                update.cross2_stride);
   if (Nonlinear) value *= nonlinear_factor<T>(update, i);
-  T *target = static_cast<T *>(update.target);
   if (!Pml) {
     target[i] = value;
     return;
   }
-  T *target_w = static_cast<T *>(update.target_w);
-  const T previous = target_w[i];
-  const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
-  const T *sigma = static_cast<const T *>(update.pml.sigma);
-  const T *kappa = static_cast<const T *>(update.pml.kappa);
+  const T delta = (kappa_k + sigma_k) * value - (kappa_k - sigma_k) * previous;
   if (target != target_w) {
-    /* Issue every load before the first store. Through plain pointers the
-       compiler must assume target_w[i] may alias the later loads, which
-       serialized three dependent memory round trips per thread (Nsight:
-       ~83% long-scoreboard stalls at ~37% DRAM throughput). Same arithmetic,
-       so results are bitwise unchanged. */
-    const T kappa_k = kappa[k], sigma_k = sigma[k], old = target[i];
     target_w[i] = value;
-    target[i] = old + ((kappa_k + sigma_k) * value - (kappa_k - sigma_k) * previous);
-    return;
+    target[i] = old + delta;
   }
-  target_w[i] = value;
-  target[i] += (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * previous;
+  else  // aliased: the former store-then-reload of target_w[i] read back `value`
+    target[i] = value + delta;
 }
 
 template <typename T>
