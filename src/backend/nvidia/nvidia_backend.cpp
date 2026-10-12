@@ -30,6 +30,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <unordered_map>
 #include <sstream>
 #include <stdexcept>
 #include <tuple>
@@ -7401,11 +7402,19 @@ void bind_material_compact_inputs(NvidiaBackendState &state, size_t input_bytes)
 void bind_material_classification(NvidiaBackendState &state) {
   unsigned char *const base = static_cast<unsigned char *>(
       state.material_classification_status_.opaque_handle());
+  /* Resolve each row's address once; every material writer (one per bulk span
+     with eps_averaging, i.e. hundreds of thousands) then binds in O(1). The
+     first row with a given address wins, as with the former linear scan. */
+  std::unordered_map<const void *, unsigned char *> status_by_address;
+  status_by_address.reserve(state.material_classification_rows_.size());
+  for (const NvidiaMaterialClassificationRow &row : state.material_classification_rows_)
+    status_by_address.emplace(state.arenas_->resolve(row.allocation).address,
+                              base + row.status_offset);
   const auto status_for_destination = [&](const void *destination) -> unsigned char * {
-    for (const NvidiaMaterialClassificationRow &row : state.material_classification_rows_)
-      if (state.arenas_->resolve(row.allocation).address == destination)
-        return base + row.status_offset;
-    throw std::logic_error("NVIDIA material writer has no classification row");
+    const auto found = status_by_address.find(destination);
+    if (found == status_by_address.end())
+      throw std::logic_error("NVIDIA material writer has no classification row");
+    return found->second;
   };
   for (nvidia::material_fill_launch &launch : state.material_fill_launches_)
     launch.classification = status_for_destination(launch.destination);
