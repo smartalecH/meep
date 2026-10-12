@@ -1061,6 +1061,10 @@ public:
       budget(halo_scratch_bytes, "budgeting NVIDIA executable storage");
       build_zero_batches();
       build_halo_merges(halo_gathers, halo_scatters);
+      build_halo_fused(halo_gathers, halo_scatters);
+      budget(checked_product(halo_segments_host_.size(), sizeof(nvidia::halo_copy_segment),
+                             "budgeting NVIDIA halo copy segments"),
+             "budgeting NVIDIA executable storage");
       build_finite_batches();
       budget(checked_product(finite_entries_host_.size(), sizeof(nvidia::finite_check_launch),
                              "budgeting NVIDIA finite-check descriptors"),
@@ -1113,6 +1117,14 @@ public:
                                           halo_scatters_.size(), *state.transfer_);
       }
       if (halo_scratch_bytes) halo_scratch_.allocate(halo_scratch_bytes, state.device_);
+      if (!halo_segments_host_.empty()) {
+        halo_segments_.allocate(checked_product(halo_segments_host_.size(),
+                                                sizeof(nvidia::halo_copy_segment),
+                                                "allocating NVIDIA halo copy segments"),
+                                state.device_);
+        nvidia::copy_host_to_device_async(halo_segments_, 0, halo_segments_host_.data(),
+                                          halo_segments_.size(), *state.transfer_);
+      }
       if (!zero_batches_.empty()) {
         zero_entries_.allocate(checked_product(zero_updates_.size(), sizeof(zero_updates_[0]),
                                                "allocating NVIDIA zero-batch descriptors"),
@@ -1458,6 +1470,115 @@ public:
                                   halo_scatters_.opaque_handle(), halo_scratch_.opaque_handle(),
                                   stream);
     return count;
+  }
+
+  /* Fused local halo copies (see nvidia::halo_copy_segment). Built per
+     transfer_halo operation when every scatter is real-valued, all plans share
+     one precision, targets are unique, and no target is also a gather
+     source; used only when the operation has no remote transport stage. */
+  struct HaloFusedRange {
+    size_t count;
+    size_t segment_first;
+    size_t segment_count;
+    nvidia::scalar_precision precision;
+  };
+  std::vector<nvidia::halo_copy_segment> halo_segments_host_;
+  std::map<size_t, HaloFusedRange> halo_fused_ranges_;
+  nvidia::device_buffer halo_segments_;
+
+  void build_halo_fused(const std::vector<nvidia::halo_gather_entry> &gathers,
+                        const std::vector<nvidia::halo_scatter_entry> &scatters) {
+    typedef std::pair<uintptr_t, ptrdiff_t> Element;
+    for (const NvidiaCompiledOperation &op : operations_) {
+      if (op.kind != OpKind::transfer_halo || !op.halo_count ||
+          halo_fused_ranges_.count(op.halo_first))
+        continue;
+      const nvidia::scalar_precision precision = halo_plans_[op.halo_first].gather.precision;
+      bool eligible = true;
+      std::unordered_map<size_t, const nvidia::halo_gather_entry *> by_slot;
+      std::vector<Element> sources, targets;
+      for (size_t p = op.halo_first; eligible && p < op.halo_first + op.halo_count; ++p) {
+        const NvidiaCompiledHalo &plan = halo_plans_[p];
+        eligible = plan.gather.precision == precision && plan.scatter.precision == precision;
+        for (size_t e = plan.gather.first; eligible && e < plan.gather.first + plan.gather.count;
+             ++e) {
+          eligible = by_slot.emplace(gathers[e].buffer_index, &gathers[e]).second;
+          sources.push_back(Element(reinterpret_cast<uintptr_t>(gathers[e].source),
+                                    gathers[e].source_index));
+        }
+        for (size_t e = plan.scatter.first;
+             eligible && e < plan.scatter.first + plan.scatter.count; ++e) {
+          eligible = scatters[e].target_imag == NULL;
+          targets.push_back(Element(reinterpret_cast<uintptr_t>(scatters[e].target_real),
+                                    scatters[e].target_real_index));
+        }
+      }
+      if (eligible) {
+        std::sort(sources.begin(), sources.end());
+        std::sort(targets.begin(), targets.end());
+        eligible = std::adjacent_find(targets.begin(), targets.end()) == targets.end();
+        for (size_t a = 0, b = 0; eligible && a < sources.size() && b < targets.size();) {
+          if (sources[a] < targets[b]) ++a;
+          else if (targets[b] < sources[a]) ++b;
+          else eligible = false;
+        }
+      }
+      if (!eligible) continue;
+      HaloFusedRange range = {op.halo_count, halo_segments_host_.size(), 0, precision};
+      for (size_t p = op.halo_first; p < op.halo_first + op.halo_count; ++p) {
+        const NvidiaCompiledHalo &plan = halo_plans_[p];
+        for (size_t e = plan.scatter.first; e < plan.scatter.first + plan.scatter.count; ++e) {
+          const nvidia::halo_scatter_entry &scatter = scatters[e];
+          const auto found = by_slot.find(scatter.buffer_index);
+          if (found == by_slot.end())
+            throw std::logic_error("NVIDIA halo scatter reads an unwritten scratch slot");
+          const nvidia::halo_gather_entry &gather = *found->second;
+          if (range.segment_count) {
+            nvidia::halo_copy_segment &seg = halo_segments_host_.back();
+            const ptrdiff_t ds = gather.source_index - seg.src_start;
+            const ptrdiff_t dt = scatter.target_real_index - seg.dst_start;
+            const ptrdiff_t n = ptrdiff_t(seg.count);
+            if (seg.source == gather.source && seg.target == scatter.target_real &&
+                seg.phase == scatter.phase_real &&
+                (seg.count == 1 ? true : (ds == seg.src_stride * n && dt == seg.dst_stride * n))) {
+              if (seg.count == 1) {
+                seg.src_stride = ds;
+                seg.dst_stride = dt;
+              }
+              ++seg.count;
+              continue;
+            }
+          }
+          halo_segments_host_.push_back(nvidia::halo_copy_segment{
+              gather.source, scatter.target_real, gather.source_index, 0,
+              scatter.target_real_index, 0, 1, scatter.phase_real});
+          ++range.segment_count;
+        }
+      }
+      halo_fused_ranges_[op.halo_first] = range;
+    }
+  }
+
+  /* One fused launch for an operation, or 0 when it has no fused form. */
+  size_t launch_halo_fused(size_t halo_first, size_t halo_count,
+                           const nvidia::stream &stream) const {
+    const auto found = halo_fused_ranges_.find(halo_first);
+    if (found == halo_fused_ranges_.end() || found->second.count != halo_count ||
+        !found->second.segment_count)
+      return 0;
+    nvidia::launch_halo_copy(
+        nvidia::halo_copy_launch{static_cast<const nvidia::halo_copy_segment *>(
+                                     halo_segments_.opaque_handle()) +
+                                     found->second.segment_first,
+                                 found->second.segment_count, found->second.precision},
+        stream);
+    return 1;
+  }
+
+  bool has_halo_fused(size_t halo_first, size_t halo_count) const {
+    const auto found = halo_fused_ranges_.find(halo_first);
+    return found != halo_fused_ranges_.end() && found->second.count == halo_count &&
+           found->second.segment_count;
   }
 
   size_t halo_range_launch_count(size_t halo_first, size_t halo_count) const {
@@ -10660,8 +10781,13 @@ size_t launch_cw_reconciliation_device(NvidiaCwExecutable &cw, NvidiaBackendStat
   size_t launches = 0;
   if (op.kind == OpKind::transfer_halo) {
     launches += cw.timestep_->launch_zero_range(op.first, op.count, *state.transfer_);
-    launches += cw.timestep_->launch_halo_gathers(op.halo_first, op.halo_count, *state.transfer_);
-    launches += cw.timestep_->launch_halo_scatters(op.halo_first, op.halo_count, *state.transfer_);
+    if (const size_t fused =
+            cw.timestep_->launch_halo_fused(op.halo_first, op.halo_count, *state.transfer_))
+      launches += fused;
+    else {
+      launches += cw.timestep_->launch_halo_gathers(op.halo_first, op.halo_count, *state.transfer_);
+      launches += cw.timestep_->launch_halo_scatters(op.halo_first, op.halo_count, *state.transfer_);
+    }
     return launches;
   }
   if (op.kind == OpKind::update_eh) {
@@ -11548,10 +11674,15 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
     if (op.kind == OpKind::transfer_halo) {
       workspace.reconciliation_kernel_launches_ +=
           cw->timestep_->launch_zero_range(op.first, op.count, *state.transfer_);
-      workspace.reconciliation_kernel_launches_ +=
-          cw->timestep_->launch_halo_gathers(op.halo_first, op.halo_count, *state.transfer_);
-      workspace.reconciliation_kernel_launches_ +=
-          cw->timestep_->launch_halo_scatters(op.halo_first, op.halo_count, *state.transfer_);
+      if (const size_t fused =
+              cw->timestep_->launch_halo_fused(op.halo_first, op.halo_count, *state.transfer_))
+        workspace.reconciliation_kernel_launches_ += fused;
+      else {
+        workspace.reconciliation_kernel_launches_ +=
+            cw->timestep_->launch_halo_gathers(op.halo_first, op.halo_count, *state.transfer_);
+        workspace.reconciliation_kernel_launches_ +=
+            cw->timestep_->launch_halo_scatters(op.halo_first, op.halo_count, *state.transfer_);
+      }
       return;
     }
     if (op.kind == OpKind::update_eh) {
@@ -12565,6 +12696,11 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       for (size_t n = executable.launch_zero_range(op.first, op.count, *state.transfer_); n;
            --n)
         count_cw_kernel();
+      if (!(executable.transport_ && executable.transport_->has_stage(op.ft)) &&
+          executable.launch_halo_fused(op.halo_first, op.halo_count, *state.transfer_)) {
+        count_cw_kernel();
+        return true;
+      }
       for (size_t n = executable.launch_halo_gathers(op.halo_first, op.halo_count,
                                                      *state.transfer_);
            n; --n)
@@ -13207,7 +13343,10 @@ void NvidiaBackend::configure_cw_graph_execution(const StepPlan &plan, const CwP
           case OpKind::transfer_halo:
             timestep_launches +=
                 executable.zero_range_launch_count(op.first, op.count) +
-                executable.halo_range_launch_count(op.halo_first, op.halo_count);
+                (!(executable.transport_ && executable.transport_->has_stage(op.ft)) &&
+                         executable.has_halo_fused(op.halo_first, op.halo_count)
+                     ? 1
+                     : executable.halo_range_launch_count(op.halo_first, op.halo_count));
             break;
           case OpKind::finite_value_check: {
             const size_t launches = executable.finite_range_launch_count(op.first, op.count);

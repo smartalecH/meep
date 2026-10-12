@@ -137,6 +137,31 @@ struct halo_launch {
   scalar_precision precision;
 };
 
+/* Fused local halo copy: target[dst_start + j * dst_stride] =
+   phase * source[src_start + j * src_stride] for j < count. Built from the
+   gather/scatter tables of a transfer_halo operation that has no remote
+   stage, only real fields, unique targets and no target that is also a
+   source, so reading sources while targets are written matches the
+   gather-all-then-scatter-all order exactly. Consecutive entries with constant
+   index deltas collapse into one segment (outer faces are regular), replacing
+   ~80 B of per-element descriptors and a scratch round trip with 16 B. */
+struct halo_copy_segment {
+  const void *source;
+  void *target;
+  ptrdiff_t src_start;
+  ptrdiff_t src_stride;
+  ptrdiff_t dst_start;
+  ptrdiff_t dst_stride;
+  size_t count;
+  double phase;
+};
+
+struct halo_copy_launch {
+  const void *segments;
+  size_t segment_count;
+  scalar_precision precision;
+};
+
 struct finite_check_launch {
   const void *values;
   size_t elements;
@@ -165,6 +190,7 @@ void launch_beta(const beta_launch &update, const stream &stream);
 void launch_constitutive(const constitutive_launch &update, const stream &stream);
 void launch_zero(const zero_launch &update, const stream &stream);
 void launch_zero_batch(const zero_batch_launch &launch, const stream &stream);
+void launch_halo_copy(const halo_copy_launch &launch, const stream &stream);
 void launch_halo_gather(const halo_launch &launch, const void *device_entries, void *device_buffer,
                         const stream &stream);
 void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
