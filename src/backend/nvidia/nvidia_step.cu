@@ -228,10 +228,21 @@ __global__ void constitutive_kernel(constitutive_launch update, size_t points) {
   }
   T *target_w = static_cast<T *>(update.target_w);
   const T previous = target_w[i];
-  target_w[i] = value;
   const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
   const T *sigma = static_cast<const T *>(update.pml.sigma);
   const T *kappa = static_cast<const T *>(update.pml.kappa);
+  if (target != target_w) {
+    /* Issue every load before the first store. Through plain pointers the
+       compiler must assume target_w[i] may alias the later loads, which
+       serialized three dependent memory round trips per thread (Nsight:
+       ~83% long-scoreboard stalls at ~37% DRAM throughput). Same arithmetic,
+       so results are bitwise unchanged. */
+    const T kappa_k = kappa[k], sigma_k = sigma[k], old = target[i];
+    target_w[i] = value;
+    target[i] = old + ((kappa_k + sigma_k) * value - (kappa_k - sigma_k) * previous);
+    return;
+  }
+  target_w[i] = value;
   target[i] += (kappa[k] + sigma[k]) * value - (kappa[k] - sigma[k]) * previous;
 }
 
