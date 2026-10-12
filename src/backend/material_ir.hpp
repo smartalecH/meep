@@ -292,6 +292,26 @@ struct MaterialIR {
   std::vector<MaterialIRHybridPatch> hybrid_patches;
   uint64_t signature;
   uint64_t layout_signature;
+
+  /* validate_material_ir re-derives the geometric classification of every
+     bulk/interface point (with eps_averaging, the whole grid) and is called
+     several times per executable compile on the same object. After a full
+     pass it records the (signature, layout_signature) it recomputed; a later
+     call whose freshly recomputed pair matches skips the per-point checks.
+     The two signatures cover every field above, so any edit forces a full
+     pass. Copies and assignments start unvalidated. */
+  struct ValidationMemo {
+    mutable bool valid = false;
+    mutable uint64_t signature = 0;
+    mutable uint64_t layout_signature = 0;
+    ValidationMemo() = default;
+    ValidationMemo(const ValidationMemo &) {}
+    ValidationMemo &operator=(const ValidationMemo &) {
+      valid = false;
+      return *this;
+    }
+  };
+  ValidationMemo validation_memo;
 };
 
 bool material_ir_equal(const MaterialIR &a, const MaterialIR &b);

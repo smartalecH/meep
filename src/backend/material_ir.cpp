@@ -1947,14 +1947,28 @@ int get_material_ir_capture_failure_mode_for_testing() {
   return material_ir_capture_failure_mode;
 }
 
+static void validate_material_ir_contents(const MaterialIR &ir);
+
 void validate_material_ir(const MaterialIR &ir) {
+  const uint64_t content_signature = signature(ir, false);
+  const uint64_t layout_signature = signature(ir, true);
   if (ir.version != material_ir_version || !std::isfinite(ir.subpixel_tol) || ir.subpixel_tol <= 0 ||
       (ir.eps_averaging ? ir.subpixel_maxeval <= 0 : ir.subpixel_maxeval != 0) ||
       ir.dimensions < D1 || ir.dimensions > Dcyl ||
       !std::isfinite(ir.projection_offset) ||
-      ir.signature != signature(ir, false) ||
-      ir.layout_signature != signature(ir, true))
+      ir.signature != content_signature ||
+      ir.layout_signature != layout_signature)
     throw std::invalid_argument("material IR is malformed or stale");
+  if (ir.validation_memo.valid && ir.validation_memo.signature == content_signature &&
+      ir.validation_memo.layout_signature == layout_signature)
+    return;
+  validate_material_ir_contents(ir);
+  ir.validation_memo.signature = content_signature;
+  ir.validation_memo.layout_signature = layout_signature;
+  ir.validation_memo.valid = true;
+}
+
+static void validate_material_ir_contents(const MaterialIR &ir) {
   if (!ir.requires_hybrid && !ir.hybrid_patches.empty())
     throw std::invalid_argument("material IR global hybrid route omits local patches");
   if (ir.materials.empty() || ir.default_material >= ir.materials.size() || ir.cell.size() != 15)
