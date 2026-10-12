@@ -35,3 +35,33 @@ Gcell-steps/s over the full domain (1.18 over the stored half-domain).
 - Geometry uses vertex-defined `Prism`s; `Block` currently trips an exact
   floating-point bounds comparison in material IR capture.
 - Averaged runs need roughly 35 GB of host RAM at this size during setup.
+
+## GPU sweep (staircased, resolution 30, branch head before the finite-check rewrite)
+
+Same case on eight vast.ai GPUs (one `vk jobs` batch, built from this branch).
+"Triad" is measured fp64 STREAM-triad bandwidth on that box; "% roofline"
+assumes ~490 DRAM bytes per stored cell per step (Nsight Compute on sm_86).
+Every spectrum matches the RTX A6000 result to <= 2e-15.
+
+| GPU | $/h | triad GB/s | ms/step | Gcell/s (full domain) | % roofline | setup s | wall min | $/sim |
+|---|---|---|---|---|---|---|---|---|
+| RTX A6000 | 0.40 | 702 | 20.67 | 2.76 | 96% | 546 | 28.0 | 0.19 |
+| RTX 6000 Ada | 0.54 | 815 | 17.87 | 3.19 | 96% | 315 | 21.3 | 0.19 |
+| RTX 4090 | 0.35 | 908 | 15.67 | 3.63 | 98% | 465 | 21.8 | 0.13 |
+| A100 SXM4 40 GB | 0.43 | 1385 | 14.32 | 3.98 | 70% | 530 | 22.1 | 0.16 |
+| RTX PRO 6000 Blackwell | 1.27 | 1466 | 10.59 | 5.38 | 90% | 365 | 15.4 | 0.33 |
+| RTX 5090 | 0.51 | 1554 | 10.36 | 5.50 | 87% | 481 | 16.9 | 0.14 |
+| H100 SXM | 2.41 | 2939 | 7.48 | 7.61 | 63% | 373 | 13.0 | 0.52 |
+| B200 | 6.25 | 6615 | 7.12 | 8.00 | 30% | 412 | 13.3 | 1.39 |
+
+H100 follow-up (Nsight Systems: GPU busy 98% of each step; no host gaps):
+
+| configuration | ms/step | Gcell/s |
+|---|---|---|
+| sweep build (finite check every step) | 7.48 | 7.61 |
+| finite-check rewrite | 6.80 | 8.37 |
+| `MEEP_FINITE_CHECK=off` | 4.72 | 12.07 |
+| `precision="mixed"` + `MEEP_FINITE_CHECK=off` | 3.20 | 17.82 |
+
+`precision="mixed"` changes the transmittance by at most 1.3e-7 relative to
+native precision (the staircase discretization error is 2e-2).
