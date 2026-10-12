@@ -58,12 +58,8 @@ __device__ ptrdiff_t profile_index(const pml_profile_launch &profile, size_t i0,
 }
 
 template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
-__global__ void curl_kernel(curl_launch update, size_t points) {
-  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (linear >= points) return;
-  size_t i0, i1, i2;
-  region_coordinates(update.region, linear, i0, i1, i2);
-  const ptrdiff_t i = region_index(update.region, i0, i1, i2);
+__device__ __forceinline__ void curl_update_ordered(const curl_launch &update, size_t i0, size_t i1,
+                                                    size_t i2, ptrdiff_t i) {
   T *target = static_cast<T *>(update.target);
   const T *plus_source = static_cast<const T *>(update.plus_source);
   const T *minus_source = static_cast<const T *>(update.minus_source);
@@ -130,6 +126,105 @@ __global__ void curl_kernel(curl_launch update, size_t points) {
   const T *inverse_u = static_cast<const T *>(update.pml_u.inverse);
   target[i] = inverse_u[ku] *
               (((kappa_u[ku] - sigma_u[ku]) * target[i] + target_u[i]) - previous_u);
+}
+
+template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
+__global__ void curl_kernel(curl_launch update, size_t points) {
+  const size_t linear = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= points) return;
+  size_t i0, i1, i2;
+  region_coordinates(update.region, linear, i0, i1, i2);
+  const ptrdiff_t i = region_index(update.region, i0, i1, i2);
+  T *target = static_cast<T *>(update.target);
+  T *target_conductivity = static_cast<T *>(update.target_conductivity);
+  T *target_u = static_cast<T *>(update.target_u);
+  if ((AuxiliaryPml && (target_u == target || target_u == target_conductivity)) ||
+      (MainPml && Conductivity && target_conductivity == target)) {
+    curl_update_ordered<T, MainPml, AuxiliaryPml, Conductivity>(update, i0, i1, i2, i);
+    return;
+  }
+  /* Distinct write targets: issue every load before any arithmetic, branch or
+     store, and reuse stored values instead of re-loading them. The ordered form
+     (curl_update_ordered) loaded target[i] after computing the curl and
+     re-loaded target_u[i]/target_conductivity[i] right after storing them,
+     serializing DRAM round trips per thread (latency-bound on B200). Same
+     arithmetic in the same order, so results are bitwise identical. */
+  const T *plus_source = static_cast<const T *>(update.plus_source);
+  const T *minus_source = static_cast<const T *>(update.minus_source);
+  const T *conductivity = static_cast<const T *>(update.conductivity);
+  const T *conductivity_inverse = static_cast<const T *>(update.conductivity_inverse);
+  const T plus_hi = plus_source ? plus_source[i + update.plus_stride] : T(0);
+  const T plus_lo = plus_source ? plus_source[i] : T(0);
+  const T minus_hi = minus_source ? minus_source[i] : T(0);
+  const T minus_lo = minus_source ? minus_source[i + update.minus_stride] : T(0);
+  const T target_i = target[i];
+  const T conductivity_i = Conductivity ? conductivity[i] : T(0);
+  const T conductivity_inverse_i = Conductivity ? conductivity_inverse[i] : T(0);
+  const T conductivity_target_i = (MainPml && Conductivity) ? target_conductivity[i] : T(0);
+  const T u_i = AuxiliaryPml ? target_u[i] : T(0);
+  T kappa_k = T(0), sigma_k = T(0), inverse_k = T(0);
+  if (MainPml) {
+    const ptrdiff_t k = profile_index(update.pml, i0, i1, i2);
+    kappa_k = static_cast<const T *>(update.pml.kappa)[k];
+    sigma_k = static_cast<const T *>(update.pml.sigma)[k];
+    inverse_k = static_cast<const T *>(update.pml.inverse)[k];
+  }
+  T kappa_u = T(0), sigma_u = T(0), inverse_u = T(0);
+  if (AuxiliaryPml) {
+    const ptrdiff_t ku = profile_index(update.pml_u, i0, i1, i2);
+    kappa_u = static_cast<const T *>(update.pml_u.kappa)[ku];
+    sigma_u = static_cast<const T *>(update.pml_u.sigma)[ku];
+    inverse_u = static_cast<const T *>(update.pml_u.inverse)[ku];
+  }
+
+  T curl = T(0);
+  if (plus_source) curl += plus_hi - plus_lo;
+  if (minus_source) curl += minus_hi - minus_lo;
+  const T delta = T(update.dtdx) * curl;
+
+  if (!MainPml && !AuxiliaryPml) {
+    if (Conductivity)
+      target[i] = ((T(1) - T(0.5 * update.dt) * conductivity_i) * target_i - delta) *
+                  conductivity_inverse_i;
+    else
+      target[i] = target_i - delta;
+    return;
+  }
+
+  T intermediate_delta;
+  T previous_u = T(0), new_u = T(0);
+  if (MainPml) {
+    if (Conductivity) {
+      const T previous = conductivity_target_i;
+      const T updated =
+          ((T(1) - T(0.5 * update.dt) * conductivity_i) * previous - delta) *
+          conductivity_inverse_i;
+      target_conductivity[i] = updated;
+      intermediate_delta = updated - previous;
+    }
+    else
+      intermediate_delta = -delta;
+
+    if (AuxiliaryPml) {
+      previous_u = u_i;
+      new_u = ((kappa_k - sigma_k) * u_i + intermediate_delta) * inverse_k;
+      target_u[i] = new_u;
+    }
+    else {
+      target[i] = ((kappa_k - sigma_k) * target_i + intermediate_delta) * inverse_k;
+      return;
+    }
+  }
+  else {
+    previous_u = u_i;
+    if (Conductivity)
+      new_u = ((T(1) - T(0.5 * update.dt) * conductivity_i) * previous_u - delta) *
+              conductivity_inverse_i;
+    else
+      new_u = u_i - delta;
+    target_u[i] = new_u;
+  }
+  target[i] = inverse_u * (((kappa_u - sigma_u) * target_i + new_u) - previous_u);
 }
 
 template <typename T, bool MainPml, bool AuxiliaryPml, bool Conductivity>
