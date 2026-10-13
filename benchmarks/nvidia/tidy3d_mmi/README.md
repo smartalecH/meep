@@ -140,3 +140,29 @@ ranks, for both transports.
   peer access. Communication/compute overlap is only implemented for the
   direct route, so it could not be used here; on NVLink/P2P nodes it is the
   expected path to near-linear scaling.
+
+## Multi-GPU on an NVLink node (4x B200, NV18 between all pairs)
+
+Resolution 40, native unless noted, `MEEP_FINITE_CHECK=off`. Fields on 4 ranks
+are bitwise identical to 1 rank (staged and direct transports).
+
+| GPUs | staged ms/step | direct ms/step (CUDA-aware MPI over NVLink) |
+|---|---|---|
+| 1 | 5.30 (25.4 Gcell/s) | |
+| 2 | 4.45 | 12.0 |
+| 4 | 3.97 (33.9 Gcell/s); mixed 3.62 (37.3) | 45.1 |
+
+- A B200 computes this case so fast (1.3 ms/step per rank at 4 GPUs) that the
+  staged path's per-step halo latency (~2.6 ms at 4 ranks) dominates; at
+  resolution 20, 2 staged ranks are slower than 1 GPU (2.16 vs 1.21 ms).
+- The direct route is 8-25x slower than staged in every UCX configuration
+  tried, and crashes unless `UCX_MEMTYPE_CACHE=n` (UCX misidentifies device
+  buffers). It does not benefit from NVLink as implemented.
+- `MEEP_NVIDIA_MPI_OVERLAP=required` is rejected for this step program
+  ("dependency region successor is not curl or constitutive": the E halo is
+  followed by DFT/time-increment work); `auto` crashed with the direct route.
+- Implication: on fast GPUs, multi-GPU speedup needs a low-latency in-node
+  transport (e.g. CUDA IPC peer copies instead of MPI per halo) and
+  communication/compute overlap that works for real step programs. Until
+  then, larger problems per GPU and PCIe nodes with slower GPUs scale better
+  (8x RTX PRO 6000: 5.2x at resolution 40).
