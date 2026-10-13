@@ -108,3 +108,35 @@ launch-count changes on untraced timings (`bench/steady.py`). With CUDA graphs
 the real per-launch overhead is small; the precision-independent part of the
 step is kernel efficiency (an fp32 curl kernel reaches ~75% of STREAM triad on
 H100 in isolation, fp64 ~100%), and the remaining lever is bytes per cell.
+
+## Multi-GPU strong scaling (8x RTX PRO 6000 Blackwell, PCIe Gen5, no NVLink)
+
+`mpirun -np N`, one rank per GPU (automatic node-local device selection),
+staged transport (`MEEP_GPU_AWARE_MPI=no`), `MEEP_FINITE_CHECK=off`. Fields
+after 300 steps are bitwise identical to the single-GPU run on 2, 4 and 8
+ranks, for both transports.
+
+| case | GPUs | native ms/step | speedup | efficiency | mixed ms/step | first step (setup) |
+|---|---|---|---|---|---|---|
+| res 30 (57.0M cells) | 1 | 8.54 | 1.00 | 100% | 4.68 | 221 s |
+| | 2 | 4.82 | 1.77 | 89% | | 104 s |
+| | 4 | 3.27 | 2.61 | 65% | | 51 s |
+| | 8 | 2.45 | 3.49 | 44% | 2.17 | 30 s |
+| res 40 (135.0M cells) | 1 | 19.27 | 1.00 | 100% | 10.91 | 562 s |
+| | 2 | 10.38 | 1.86 | 93% | | 266 s |
+| | 4 | 6.05 | 3.19 | 80% | | 127 s |
+| | 8 | 3.72 | 5.18 | 65% | 2.82 | 66 s |
+
+8 GPUs, res 40: 36.3 (native) / 47.8 (mixed) Gcell-steps/s over the full domain.
+
+- Per-rank kernel work at 8 GPUs is balanced and within 4% of 1/8 of the
+  single-GPU step; the efficiency loss is ~1.2 ms/step of non-overlapped halo
+  exchange (four exchanges per step, each D2H copy -> MPI -> H2D copy, ~4.6 MB
+  per rank per step: latency, not bandwidth).
+- The first-step backend setup also splits across ranks (221 s -> 30 s).
+- Direct (CUDA-aware) transport needs `UCX_MEMTYPE_CACHE=n` (otherwise UCX
+  segfaults sending device buffers) and on this node is far slower than
+  staged (8 GPUs, res 30: 254 vs 2.45 ms/step) because most GPU pairs lack
+  peer access. Communication/compute overlap is only implemented for the
+  direct route, so it could not be used here; on NVLink/P2P nodes it is the
+  expected path to near-linear scaling.
