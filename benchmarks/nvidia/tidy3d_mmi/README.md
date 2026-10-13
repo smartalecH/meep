@@ -91,3 +91,20 @@ mixed precision not yet saturating bandwidth. A minimal Yee update moves
 ~96 B (fp64) / ~48 B (fp32) per cell, so higher throughput needs fewer bytes
 per cell (fused curl+constitutive, fp32 storage, compact materials, one chunk
 per GPU), not only kernel tuning.
+
+## Experiments that did not help (H100 NVL, resolution 30, untraced)
+
+Both were bitwise neutral and were not merged.
+
+| change | native ms/step | mixed ms/step |
+|---|---|---|
+| baseline (this branch) | 3.94 | 2.80 |
+| batch same-variant regions into one launch (233 -> 49 launches/step) | 3.92 | 3.07 |
+| 2 or 4 elements per thread in curl/constitutive (res 20) | +3% / +15% | +3% / +14% |
+
+Under `nsys --cuda-graph-trace=node` the batched build looked ~20% faster:
+node tracing adds per-kernel overhead, so it overstates launch costs. Judge
+launch-count changes on untraced timings (`bench/steady.py`). With CUDA graphs
+the real per-launch overhead is small; the precision-independent part of the
+step is kernel efficiency (an fp32 curl kernel reaches ~75% of STREAM triad on
+H100 in isolation, fp64 ~100%), and the remaining lever is bytes per cell.
