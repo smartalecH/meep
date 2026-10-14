@@ -100,6 +100,9 @@ struct MaterialRecipeInput {
   uint64_t support_reason_bits;
   std::vector<MaterialRecipeRow> rows;
   std::vector<MaterialRecipeRow> dense_fallback_rows;
+  /* When set (and dense_fallback_rows is empty), the recipe shares these
+     immutable rows instead of owning a copy. */
+  std::shared_ptr<const std::vector<MaterialRecipeRow> > shared_dense_fallback_rows;
   std::vector<MaterialCallbackTile> callback_tiles;
   std::vector<std::shared_ptr<const OwnedMaterialCallback> > callback_owners;
   std::vector<MaterialIRTopologyRow> topology;
@@ -127,6 +130,10 @@ public:
   uint64_t support_reason_bits() const { return support_reason_bits_; }
   const std::vector<MaterialRecipeRow> &rows() const { return rows_; }
   const std::vector<MaterialRecipeRow> &dense_fallback_rows() const {
+    return *dense_fallback_rows_;
+  }
+  const std::shared_ptr<const std::vector<MaterialRecipeRow> > &shared_dense_fallback_rows()
+      const {
     return dense_fallback_rows_;
   }
   const std::vector<MaterialCallbackTile> &callback_tiles() const { return callback_tiles_; }
@@ -151,7 +158,8 @@ private:
   bool from_host_callback_;
   uint64_t support_reason_bits_;
   std::vector<MaterialRecipeRow> rows_;
-  std::vector<MaterialRecipeRow> dense_fallback_rows_;
+  /* Immutable and shared between copies: dense rows are full-grid payloads. */
+  std::shared_ptr<const std::vector<MaterialRecipeRow> > dense_fallback_rows_;
   std::vector<MaterialCallbackTile> callback_tiles_;
   std::vector<std::shared_ptr<const OwnedMaterialCallback> > callback_owners_;
   std::vector<MaterialIRTopologyRow> topology_;
@@ -174,6 +182,17 @@ private:
   };
   ValidationMemo validation_memo_;
   friend void validate_material_recipe(const MaterialRecipe &recipe);
+};
+
+/* While at least one scope is alive, host-reference builds with identical
+   content (host rows, IR topology, PML axes) share one set of dense fallback
+   rows instead of rebuilding them. Used around a single backend setup. */
+class material_recipe_setup_scope {
+public:
+  material_recipe_setup_scope();
+  ~material_recipe_setup_scope();
+  material_recipe_setup_scope(const material_recipe_setup_scope &) = delete;
+  material_recipe_setup_scope &operator=(const material_recipe_setup_scope &) = delete;
 };
 
 MaterialRecipe build_host_reference_material_recipe(const fields &f);

@@ -18,6 +18,9 @@
 #include <set>
 #include <stdexcept>
 #include <thread>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "backend/classification.hpp"
 #include "backend/precision.hpp"
@@ -29,6 +32,35 @@ namespace meep {
 namespace {
 
 const uint32_t material_recipe_format_version = 4;
+
+/* Most recent dense fallback rows and their content key; held only between
+   material_recipe_setup_scope construction and destruction (one setup). */
+struct HostRecipeDenseCache {
+  uint64_t key = 0;
+  std::shared_ptr<const std::vector<MaterialRecipeRow> > rows;
+  int scopes = 0;
+} host_recipe_dense_cache;
+
+/* MEEP_SETUP_TIMING=1 prints per-phase wall time of host recipe builds. */
+struct SetupPhaseTimer {
+  bool enabled;
+  std::chrono::steady_clock::time_point last;
+  std::string line;
+  SetupPhaseTimer() : enabled(std::getenv("MEEP_SETUP_TIMING") != NULL),
+                      last(std::chrono::steady_clock::now()) {}
+  void mark(const char *phase) {
+    if (!enabled) return;
+    const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer), " %s=%.2fs", phase,
+                  std::chrono::duration<double>(now - last).count());
+    line += buffer;
+    last = now;
+  }
+  ~SetupPhaseTimer() {
+    if (enabled) std::fprintf(stderr, "meep setup: host recipe%s\n", line.c_str());
+  }
+};
 const uint64_t material_callback_tile_points = 256;
 int material_recipe_failure_rank_for_testing = -1;
 int material_recipe_failure_mode_for_testing = 0;
@@ -148,12 +180,15 @@ std::vector<unsigned char> logical_default_row(const MaterialIRTopologyRow &topo
   if (topology.element_type != ElementType::realnum_value ||
       topology.logical_storage != native_precision)
     throw std::invalid_argument("material fallback default row has a non-native type");
-  std::vector<realnum> values(topology.elements, realnum(0));
+  /* Built directly in the byte payload (one allocation; operator new storage
+     is suitably aligned for realnum). */
+  std::vector<unsigned char> bytes(topology.elements * sizeof(realnum), 0);
+  realnum *values = reinterpret_cast<realnum *>(bytes.data());
   const array_kind kind = static_cast<array_kind>(topology.key.kind);
   if (kind == array_kind::chi1inv || kind == array_kind::condinv) {
     const component c = component(topology.key.component_);
     if (component_direction(c) == direction(topology.key.aux))
-      std::fill(values.begin(), values.end(), realnum(1));
+      std::fill(values, values + topology.elements, realnum(1));
   }
   else if (kind == array_kind::pml_sig || kind == array_kind::pml_kap ||
            kind == array_kind::pml_siginv) {
@@ -170,15 +205,13 @@ std::vector<unsigned char> logical_default_row(const MaterialIRTopologyRow &topo
                                             ? &axis->sigma
                                             : kind == array_kind::pml_kap ? &axis->kappa
                                                                           : &axis->sigma_inv;
-    if (source->size() != values.size())
+    if (source->size() != topology.elements)
       throw std::invalid_argument("material fallback PML snapshot has the wrong extent");
-    for (size_t i = 0; i < values.size(); ++i) values[i] = realnum((*source)[i]);
+    for (size_t i = 0; i < topology.elements; ++i) values[i] = realnum((*source)[i]);
   }
   else if (kind != array_kind::chi2 && kind != array_kind::chi3 &&
            kind != array_kind::conductivity && kind != array_kind::sigma)
     throw std::invalid_argument("material fallback default row has an unsupported kind");
-  std::vector<unsigned char> bytes(values.size() * sizeof(realnum));
-  if (!bytes.empty()) memcpy(bytes.data(), values.data(), bytes.size());
   return bytes;
 }
 
@@ -924,18 +957,22 @@ MaterialRecipe::MaterialRecipe(MaterialRecipeInput &&input)
       subpixel_tol_(input.subpixel_tol), subpixel_maxeval_(input.subpixel_maxeval),
       host_callback_id_(input.host_callback_id), from_host_callback_(input.from_host_callback),
       support_reason_bits_(input.support_reason_bits), rows_(std::move(input.rows)),
-      dense_fallback_rows_(std::move(input.dense_fallback_rows)),
+      dense_fallback_rows_(
+          input.shared_dense_fallback_rows && input.dense_fallback_rows.empty()
+              ? std::move(input.shared_dense_fallback_rows)
+              : std::make_shared<const std::vector<MaterialRecipeRow> >(
+                    std::move(input.dense_fallback_rows))),
       callback_tiles_(std::move(input.callback_tiles)),
       callback_owners_(std::move(input.callback_owners)), topology_(std::move(input.topology)),
       ir_(std::move(input.ir)), signature_(0) {
   validate_input(MaterialRecipeView{disposition_, description_, eps_averaging_, subpixel_tol_,
                                     subpixel_maxeval_, host_callback_id_, from_host_callback_,
-                                    support_reason_bits_, rows_, dense_fallback_rows_,
+                                    support_reason_bits_, rows_, *dense_fallback_rows_,
                                     callback_tiles_, callback_owners_, topology_, ir_});
   signature_ = compute_signature(version_, disposition_, eps_averaging_,
                                  subpixel_tol_, subpixel_maxeval_, host_callback_id_,
                                  from_host_callback_, support_reason_bits_, rows_,
-                                 dense_fallback_rows_, callback_tiles_, callback_owners_,
+                                 *dense_fallback_rows_, callback_tiles_, callback_owners_,
                                  topology_, ir_);
   validation_memo_.done = true;
 }
@@ -947,7 +984,8 @@ bool MaterialRecipe::operator==(const MaterialRecipe &other) const {
          host_callback_id_ == other.host_callback_id_ &&
          from_host_callback_ == other.from_host_callback_ &&
          support_reason_bits_ == other.support_reason_bits_ && rows_ == other.rows_ &&
-         dense_fallback_rows_ == other.dense_fallback_rows_ &&
+         (dense_fallback_rows_ == other.dense_fallback_rows_ ||
+          *dense_fallback_rows_ == *other.dense_fallback_rows_) &&
          callback_tiles_ == other.callback_tiles_ &&
          callback_owners_.size() == other.callback_owners_.size() &&
          std::equal(callback_owners_.begin(), callback_owners_.end(),
@@ -967,7 +1005,7 @@ void validate_material_recipe(const MaterialRecipe &recipe) {
                                  recipe.eps_averaging_,      recipe.subpixel_tol_,
                                  recipe.subpixel_maxeval_,   recipe.host_callback_id_,
                                  recipe.from_host_callback_, recipe.support_reason_bits_,
-                                 recipe.rows_,               recipe.dense_fallback_rows_,
+                                 recipe.rows_,               *recipe.dense_fallback_rows_,
                                  recipe.callback_tiles_,     recipe.callback_owners_,
                                  recipe.topology_,           recipe.ir_};
   validate_input(input);
@@ -982,6 +1020,12 @@ void validate_material_recipe(const MaterialRecipe &recipe) {
   recipe.validation_memo_.done = true;
 }
 
+material_recipe_setup_scope::material_recipe_setup_scope() { ++host_recipe_dense_cache.scopes; }
+
+material_recipe_setup_scope::~material_recipe_setup_scope() {
+  if (--host_recipe_dense_cache.scopes == 0) host_recipe_dense_cache.rows.reset();
+}
+
 MaterialRecipe build_host_reference_material_recipe(const fields &f) {
   if (material_recipe_failure_rank_for_testing == my_rank()) {
     if (material_recipe_failure_mode_for_testing == 1)
@@ -992,6 +1036,7 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
     throw std::logic_error("material recipe requires a prepared storage catalog");
   validate_plan_shape(*f.storage_plan);
 
+  SetupPhaseTimer timer;
   MaterialRecipeInput input;
   input.description = "cpu:eager-host-reference";
   if (f.material_ir)
@@ -1020,9 +1065,11 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
     input.rows.push_back(row);
     present.insert(row.key);
   }
+  timer.mark("host_copy");
   const MaterialIR *ir = material_ir_for(f);
   if (ir) {
     validate_material_ir(*ir);
+    timer.mark("ir_validate");
     input.eps_averaging = ir->eps_averaging;
     input.subpixel_tol = ir->subpixel_tol;
     input.subpixel_maxeval = ir->subpixel_maxeval;
@@ -1040,25 +1087,72 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
                  const std::shared_ptr<const OwnedMaterialCallback> &b) {
                 return a && b ? a->id < b->id : bool(a);
               });
+    /* Dense rows are a pure function of the host rows, the IR topology and
+       the captured PML axes. Repeated builds during one setup (classification,
+       initialization plan, candidate promotion) share the previous rows when
+       that content key matches; the cache holds only a weak reference. */
+    uint64_t dense_key = UINT64_C(1469598103934665603);
+    mix_u64(dense_key, input.ir->topology.size());
+    for (const MaterialIRTopologyRow &topology : input.ir->topology)
+      mix_topology(dense_key, topology);
+    mix_u64(dense_key, input.ir->pml_axes.size());
+    for (const MaterialIRPmlAxis &axis : input.ir->pml_axes) {
+      mix_u64(dense_key, uint64_t(int64_t(axis.chunk)));
+      mix_u64(dense_key, uint64_t(int64_t(axis.direction)));
+      mix_u64(dense_key, axis.elements);
+      for (const std::vector<double> *values : {&axis.sigma, &axis.kappa, &axis.sigma_inv}) {
+        mix_u64(dense_key, values->size());
+        mix_u64(dense_key, hash_block(reinterpret_cast<const unsigned char *>(values->data()),
+                                      values->size() * sizeof(double)));
+      }
+    }
+    mix_u64(dense_key, input.rows.size());
+    for (const MaterialRecipeRow &row : input.rows) {
+      mix_key(dense_key, row.key);
+      mix_u64(dense_key, uint64_t(row.element_type));
+      mix_u64(dense_key, uint64_t(row.storage));
+      mix_u64(dense_key, row.elements);
+      mix_u64(dense_key, row.alignment);
+      mix_realnum_values(dense_key, row.values);
+    }
+    std::shared_ptr<const std::vector<MaterialRecipeRow> > reuse;
+    if (host_recipe_dense_cache.rows && host_recipe_dense_cache.key == dense_key)
+      reuse = host_recipe_dense_cache.rows;
+    if (reuse) input.shared_dense_fallback_rows = reuse;
     std::map<StorageKey, const MaterialRecipeRow *, StorageKeyLess> dense_sources;
     for (const MaterialRecipeRow &row : input.rows) dense_sources[row.key] = &row;
-    for (const MaterialIRTopologyRow &topology : input.ir->topology) {
-      MaterialRecipeRow dense;
-      dense.key = topology.key;
-      dense.role = array_role::material;
-      dense.element_type = topology.element_type;
-      dense.storage = topology.logical_storage;
-      dense.elements = topology.elements;
-      dense.alignment = topology.alignment;
-      const auto source = dense_sources.find(dense.key);
-      if (source != dense_sources.end()) dense.values = source->second->values;
-      else dense.values = logical_default_row(topology, *input.ir);
-      input.dense_fallback_rows.push_back(dense);
+    if (!reuse)
+      for (const MaterialIRTopologyRow &topology : input.ir->topology) {
+        MaterialRecipeRow dense;
+        dense.key = topology.key;
+        dense.role = array_role::material;
+        dense.element_type = topology.element_type;
+        dense.storage = topology.logical_storage;
+        dense.elements = topology.elements;
+        dense.alignment = topology.alignment;
+        const auto source = dense_sources.find(dense.key);
+        if (source != dense_sources.end()) dense.values = source->second->values;
+        else dense.values = logical_default_row(topology, *input.ir);
+        input.dense_fallback_rows.push_back(std::move(dense));
+      }
+    if (!reuse) {
+      input.shared_dense_fallback_rows = std::make_shared<const std::vector<MaterialRecipeRow> >(
+          std::move(input.dense_fallback_rows));
+      input.dense_fallback_rows.clear();
+      if (host_recipe_dense_cache.scopes) {
+        host_recipe_dense_cache.key = dense_key;
+        host_recipe_dense_cache.rows = input.shared_dense_fallback_rows;
+      }
     }
   }
   else input.dense_fallback_rows = input.rows;
-  const MaterialSupportDecision decision =
-      classify_support_input(input.ir, input.dense_fallback_rows, input.callback_tiles);
+  timer.mark("dense_fallback");
+  const MaterialSupportDecision decision = classify_support_input(
+      input.ir,
+      input.shared_dense_fallback_rows ? *input.shared_dense_fallback_rows
+                                       : input.dense_fallback_rows,
+      input.callback_tiles);
+  timer.mark("support");
   input.disposition = decision.disposition;
   input.support_reason_bits = decision.reason_bits;
   if (decision.disposition == MaterialRecipeDisposition::device_native)
@@ -1073,7 +1167,10 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
       decision.disposition == MaterialRecipeDisposition::hybrid_interface ||
       decision.disposition == MaterialRecipeDisposition::tiled_callback)
     for (MaterialRecipeRow &row : input.rows) row.values.clear();
-  return MaterialRecipe(std::move(input));
+  timer.mark("clear");
+  MaterialRecipe recipe(std::move(input));
+  timer.mark("construct");
+  return recipe;
 }
 
 MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
@@ -1100,7 +1197,7 @@ MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
     copy.elements = row.elements;
     copy.alignment = row.alignment;
   }
-  if (host_route) selected.dense_fallback_rows = recipe.dense_fallback_rows();
+  if (host_route) selected.shared_dense_fallback_rows = recipe.shared_dense_fallback_rows();
   selected.callback_tiles = route == MaterialRecipeDisposition::tiled_callback
                                 ? recipe.callback_tiles()
                                 : std::vector<MaterialCallbackTile>();
@@ -1109,7 +1206,8 @@ MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
   selected.ir = recipe.ir();
   if (route == MaterialRecipeDisposition::host_reference) {
     std::map<StorageKey, const MaterialRecipeRow *, StorageKeyLess> dense;
-    for (const MaterialRecipeRow &row : selected.dense_fallback_rows) dense[row.key] = &row;
+    for (const MaterialRecipeRow &row : *selected.shared_dense_fallback_rows)
+      dense[row.key] = &row;
     for (MaterialRecipeRow &row : selected.rows) {
       const auto source = dense.find(row.key);
       if (source == dense.end())
@@ -1125,9 +1223,13 @@ MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
     {
       for (MaterialRecipeRow &row : selected.rows) row.values.clear();
       selected.dense_fallback_rows.clear();
+      selected.shared_dense_fallback_rows.reset();
     }
   const MaterialSupportDecision support = classify_support_input(
-      selected.ir, selected.dense_fallback_rows, selected.callback_tiles);
+      selected.ir,
+      selected.shared_dense_fallback_rows ? *selected.shared_dense_fallback_rows
+                                          : selected.dense_fallback_rows,
+      selected.callback_tiles);
   selected.support_reason_bits = support.reason_bits;
   /* A collective host coercion can be stronger than the local proposal. */
   if (route != MaterialRecipeDisposition::host_reference && route != support.disposition)

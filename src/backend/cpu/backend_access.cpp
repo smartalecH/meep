@@ -31,6 +31,7 @@
 #include "backend/descriptors.hpp"
 #include "backend/halo_plan.hpp"
 #include "backend/initialization_plan.hpp"
+#include "backend/material_recipe.hpp"
 #include "backend/lifecycle.hpp"
 #include "backend/material_ir.hpp"
 #include "backend/mpi_context.hpp"
@@ -3328,6 +3329,8 @@ void fields::select_backend(const execution_options &opts) {
 }
 
 void fields::init_backend() {
+  /* Repeated host-reference recipe builds in this setup share dense rows. */
+  const material_recipe_setup_scope recipe_scope;
   if (!backend) {
     execution_options opts;
     select_backend(opts);
