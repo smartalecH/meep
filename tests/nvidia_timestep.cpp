@@ -10179,9 +10179,11 @@ struct remote_route_acceptance_result {
 };
 
 static remote_route_acceptance_result run_remote_route_acceptance(
-    GpuMpiPolicy policy, precision_policy_kind precision, bool checkpoint_roundtrip) {
+    GpuMpiPolicy policy, precision_policy_kind precision, bool checkpoint_roundtrip,
+    bool peer = false) {
   setenv("MEEP_GPU_AWARE_MPI", policy == GpuMpiPolicy::direct ? "yes" : "no", 1);
   setenv("MEEP_NVIDIA_MPI_OVERLAP", "off", 1);
+  setenv("MEEP_NVIDIA_PEER_TRANSPORT", peer ? "required" : "off", 1);
   const grid_volume gv = vol1d(4.0, 10.0);
   structure gpu_structure(gv, isotropic_eps, no_pml(), identity(), 2);
   execution_options options;
@@ -10232,15 +10234,15 @@ static remote_route_acceptance_result run_remote_route_acceptance(
   require(transport.dependency_region_count == 0 &&
               result.report.resolved_overlap == "off",
           "disabled overlap reported an admitted dependency region");
-  require(result.report.gather_pack_nanoseconds > 0 &&
-              result.report.mpi_progress_nanoseconds > 0 &&
-              result.report.mpi_wait_nanoseconds > 0 &&
-              result.report.scatter_unpack_nanoseconds > 0,
+  require(peer || (result.report.gather_pack_nanoseconds > 0 &&
+                   result.report.mpi_progress_nanoseconds > 0 &&
+                   result.report.mpi_wait_nanoseconds > 0 &&
+                   result.report.scatter_unpack_nanoseconds > 0),
           "production transport timing counters did not advance");
   require(result.report.material_recipe_prepare_nanoseconds > 0 &&
               result.report.material_initialize_nanoseconds > 0,
           "production setup timing counters did not advance");
-  require(policy == GpuMpiPolicy::direct
+  require(policy == GpuMpiPolicy::direct || peer
               ? (result.report.device_to_host_nanoseconds == 0 &&
                  result.report.host_to_device_nanoseconds == 0)
               : (result.report.device_to_host_nanoseconds > 0 &&
@@ -10327,6 +10329,33 @@ static void test_remote_boundary_direct_acceptance() {
   unsetenv("MEEP_GPU_AWARE_MPI");
   unsetenv("MEEP_NVIDIA_MPI_OVERLAP");
   master_printf("nvidia_timestep: provider-positive direct acceptance PASS\n");
+}
+
+/* Node-local CUDA IPC peer route against staged MPI on the same production
+   problem: identical resident state, and no host staging or MPI progress. */
+static void test_remote_boundary_peer_acceptance() {
+  require(count_processors() == 2, "peer acceptance requires two GPU-owning ranks");
+  const precision_policy_kind policies[] = {precision_policy_kind::native,
+                                             precision_policy_kind::f32};
+  for (precision_policy_kind precision : policies) {
+    const remote_route_acceptance_result staged =
+        run_remote_route_acceptance(GpuMpiPolicy::staged, precision, false, false);
+    const remote_route_acceptance_result peer =
+        run_remote_route_acceptance(GpuMpiPolicy::staged, precision, false, true);
+    require(same_resident_values(staged.state, peer.state),
+            "staged MPI and peer routes produced different resident state");
+    require(staged.field_energy == peer.field_energy,
+            "staged MPI and peer routes produced different field energy");
+    require(peer.report.captured_transport_epoch_active && peer.report.device_to_host_calls == 0 &&
+                peer.report.host_to_device_calls == 0 && peer.report.testsome_polls == 0 &&
+                peer.report.waitall_calls == 0 && peer.report.gather_launches > 0 &&
+                peer.report.scatter_launches > 0 && peer.report.bytes_sent > 0,
+            "peer route report shows host staging or MPI progress");
+  }
+  unsetenv("MEEP_GPU_AWARE_MPI");
+  unsetenv("MEEP_NVIDIA_MPI_OVERLAP");
+  setenv("MEEP_NVIDIA_PEER_TRANSPORT", "off", 1);
+  master_printf("nvidia_timestep: peer route acceptance PASS\n");
 }
 
 static void test_remote_direct_policy_and_communicator_rebuild() {
@@ -11036,6 +11065,9 @@ static void test_compile_allocation_retry() {
 
 int main(int argc, char **argv) {
   initialize mpi(argc, argv);
+  /* Multi-rank modes below assert MPI-route behaviour unless they select the
+     node-local peer route themselves. */
+  setenv("MEEP_NVIDIA_PEER_TRANSPORT", "off", 0);
   if (getenv("MEEP_NVIDIA_MATERIAL_MPI_NATIVE_ONLY")) {
     require(count_processors() == 2,
             "native material MPI validation requires exactly two ranks");
@@ -11073,6 +11105,10 @@ int main(int argc, char **argv) {
   if (getenv("MEEP_NVIDIA_REMOTE_DIRECT_ACCEPTANCE_ONLY")) {
     test_remote_boundary_direct_acceptance();
     test_remote_direct_policy_and_communicator_rebuild();
+    return 0;
+  }
+  if (getenv("MEEP_NVIDIA_REMOTE_PEER_ACCEPTANCE_ONLY")) {
+    test_remote_boundary_peer_acceptance();
     return 0;
   }
   if (getenv("MEEP_NVIDIA_REMOTE_DIRECT_REJECT_ONLY")) {

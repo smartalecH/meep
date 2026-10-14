@@ -357,6 +357,8 @@ bool staged_transport_epoch::has_stage(field_type ft) const {
   return stage != NULL;
 }
 
+bool staged_transport_epoch::uses_peer_route() const { return impl_ && impl_->peer; }
+
 void staged_transport_epoch::record_dependency_overlap(size_t interior_launches,
                                                        size_t boundary_launches) {
   if (!impl_ || impl_->retired || impl_->poisoned)

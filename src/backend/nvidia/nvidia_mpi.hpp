@@ -100,6 +100,8 @@ public:
   staged_transport_epoch &operator=(staged_transport_epoch &&) noexcept;
 
   bool has_stage(field_type ft) const;
+  /* True when halo stages run over node-local CUDA IPC peer stores. */
+  bool uses_peer_route() const;
   bool begin_stage(field_type ft, const stream &compute, std::string &why);
   bool finish_stage(field_type ft, const stream &compute, std::string &why);
   [[noreturn]] void abort_published_stage(field_type ft, const char *operation) noexcept;

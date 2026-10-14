@@ -698,6 +698,110 @@ void run_idle_np4_case(const std::vector<meep::nvidia::device_properties> &devic
 
 } // namespace
 
+
+/* Node-local CUDA IPC peer route: ring exchange over several generations
+   (slot reuse waits on the receiver's acks), payloads exact, no MPI
+   progress or host staging on the per-stage path. */
+template <typename T>
+int run_peer_case(int device) {
+  const int rank = my_rank(), size = count_processors();
+  if (size < 2) return 0;
+  const int previous = (rank + size - 1) % size;
+  const int next = (rank + 1) % size;
+  const size_t elements = 1031;
+  const Precision precision = sizeof(T) == sizeof(float) ? Precision::f32 : Precision::f64;
+  const meep::nvidia::scalar_precision launch_precision =
+      sizeof(T) == sizeof(float) ? meep::nvidia::scalar_precision::f32
+                                 : meep::nvidia::scalar_precision::f64;
+
+  meep::nvidia::device_scope scope(device);
+  meep::nvidia::stream compute, communication;
+  meep::nvidia::device_buffer source(elements * sizeof(T), device);
+  meep::nvidia::device_buffer target(elements * sizeof(T), device);
+  meep::nvidia::pinned_buffer host(elements * sizeof(T));
+
+  meep::nvidia::compiled_boundary_artifact artifact;
+  artifact.wire.version = RemoteHaloProgram::schema_version;
+  artifact.wire.communicator_rank = rank;
+  artifact.wire.communicator_size = size;
+  artifact.wire.communicator_generation = current_backend_communicator_generation();
+  artifact.wire.requested_policy = GpuMpiPolicy::staged;
+  artifact.wire.resolved_route = GpuMpiRoute::staged;
+  artifact.wire.participation = RemoteHaloParticipation{true, 1, 2, 1};
+  RemoteHaloStage wire_stage;
+  wire_stage.ft = E_stuff;
+  wire_stage.receives.push_back(
+      make_message(previous, rank, size, RemoteHaloDirection::incoming, elements, precision));
+  wire_stage.sends.push_back(
+      make_message(rank, next, size, RemoteHaloDirection::outgoing, elements, precision));
+  wire_stage.signature = compute_remote_halo_stage_signature(wire_stage);
+  artifact.wire.stages.push_back(wire_stage);
+  artifact.wire.signature = compute_remote_halo_program_signature(artifact.wire);
+
+  meep::nvidia::bound_boundary_stage bound;
+  bound.ft = E_stuff;
+  bound.receive_slot_bytes = elements * sizeof(T);
+  bound.send_slot_bytes = elements * sizeof(T);
+  bound.publication = RemoteHaloPublicationMode::parallel_unique;
+  bound.canonical_receive_order.push_back(0);
+  for (size_t i = 0; i < elements; ++i) {
+    /* Reversed wire order so a slot/offset mix-up cannot pass. */
+    const size_t slot = elements - 1 - i;
+    bound.gathers.push_back(meep::nvidia::boundary_gather_entry{source.opaque_handle(),
+                                                                ptrdiff_t(i), slot * sizeof(T)});
+    bound.scatters.push_back(meep::nvidia::boundary_scatter_entry{
+        target.opaque_handle(), ptrdiff_t(i), NULL, 0, slot * sizeof(T), 1.0, 0.0});
+  }
+  const meep::nvidia::boundary_launch launch{0, elements, elements, launch_precision};
+  const RemoteHaloMessage &receive = artifact.wire.stages[0].receives[0];
+  const RemoteHaloMessage &send = artifact.wire.stages[0].sends[0];
+  bound.receives.push_back(meep::nvidia::bound_boundary_message{
+      receive.key, receive.direction, launch, receive.wire_bytes,
+      {0, receive.wire_bytes}, {0, receive.wire_bytes}});
+  bound.sends.push_back(meep::nvidia::bound_boundary_message{
+      send.key, send.direction, launch, send.wire_bytes,
+      {0, send.wire_bytes}, {0, send.wire_bytes}});
+  artifact.bound.program_signature = artifact.wire.signature;
+  artifact.bound.stages.push_back(bound);
+
+  std::string why;
+  std::unique_ptr<meep::nvidia::staged_transport_epoch> epoch =
+      meep::nvidia::create_staged_transport_epoch(artifact, device, &communication, why);
+  CHECK(bool(epoch), why.c_str());
+  if (!epoch) return failures;
+  CHECK(epoch->uses_peer_route(), "MEEP_NVIDIA_PEER_TRANSPORT=required did not select peers");
+  const int generations = 5;
+  for (int iteration = 0; iteration < generations; ++iteration) {
+    T *values = static_cast<T *>(host.data());
+    for (size_t i = 0; i < elements; ++i)
+      values[i] = T(rank * 1000 + iteration * 10) + T(i) / T(17);
+    meep::nvidia::copy_host_to_device_async(source, 0, values, elements * sizeof(T), compute);
+    CHECK(epoch->begin_stage(E_stuff, compute, why), why.c_str());
+    CHECK(epoch->finish_stage(E_stuff, compute, why), why.c_str());
+    meep::nvidia::copy_device_to_host_async(values, target, 0, elements * sizeof(T), compute);
+    compute.synchronize();
+    for (size_t i = 0; i < elements; ++i) {
+      const T expected = T(previous * 1000 + iteration * 10) + T(i) / T(17);
+      if (values[i] != expected) {
+        std::fprintf(stderr, "[rank %d] peer payload iteration=%d index=%zu observed=%.17g "
+                     "expected=%.17g\n", rank, iteration, i, double(values[i]),
+                     double(expected));
+        CHECK(false, "peer transport payload differs from previous rank");
+        break;
+      }
+    }
+  }
+  const meep::nvidia::staged_transport_statistics &stats = epoch->statistics();
+  CHECK(stats.messages_sent == size_t(generations) && stats.messages_received == size_t(generations),
+        "peer transport message accounting differs");
+  CHECK(stats.device_to_host_calls == 0 && stats.host_to_device_calls == 0 &&
+            stats.testsome_polls == 0 && stats.waitall_calls == 0,
+        "peer transport used MPI progress or host staging per stage");
+  CHECK(stats.slot_reuses == size_t(generations - 2), "peer slot reuse accounting differs");
+  CHECK(epoch->retire(why), why.c_str());
+  return failures;
+}
+
 int main(int argc, char **argv) {
 #ifdef HAVE_MPI
   int provided = MPI_THREAD_SINGLE;
@@ -706,6 +810,9 @@ int main(int argc, char **argv) {
     return 2;
 #endif
   initialize mpi(argc, argv);
+  /* The MPI-route cases below assert staged/direct behaviour; the peer route
+     (default auto on one node) is exercised separately at the end. */
+  setenv("MEEP_NVIDIA_PEER_TRANSPORT", "off", 1);
   try {
   test_route_state_machine();
     const std::vector<meep::nvidia::device_properties> devices = meep::nvidia::enumerate_devices();
@@ -757,6 +864,10 @@ int main(int argc, char **argv) {
         run_case<double>(my_rank() % int(devices.size()));
         end_divide_parallel();
       }
+      setenv("MEEP_NVIDIA_PEER_TRANSPORT", "required", 1);
+      run_peer_case<double>(device);
+      run_peer_case<float>(device);
+      setenv("MEEP_NVIDIA_PEER_TRANSPORT", "off", 1);
     }
 
 #ifdef HAVE_MPI
