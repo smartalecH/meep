@@ -81,6 +81,14 @@ __global__ void peer_signal_kernel(uint64_t *const *targets, size_t count, uint6
   if (i < count) store_release_system(targets[i], value);
 }
 
+template <typename T>
+__global__ void peer_gather_kernel(const peer_gather_entry *entries, size_t count) {
+  const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  const peer_gather_entry entry = entries[i];
+  *static_cast<T *>(entry.target) = static_cast<const T *>(entry.source)[entry.source_index];
+}
+
 } // namespace
 
 peer_ipc_handle export_peer_handle(const device_buffer &buffer) {
@@ -179,6 +187,21 @@ void launch_peer_signal(const void *targets, size_t count, uint64_t value,
   peer_signal_kernel<<<blocks, threads, 0, static_cast<cudaStream_t>(on_stream.opaque_handle())>>>(
       static_cast<uint64_t *const *>(targets), count, value);
   check_cuda(cudaPeekAtLastError(), "launch NVIDIA peer signal");
+}
+
+void launch_peer_gather(const void *entries, size_t count, scalar_precision precision,
+                        const stream &on_stream) {
+  if (!count) return;
+  const unsigned threads = 256;
+  const size_t blocks = (count + threads - 1) / threads;
+  if (blocks > 0x7fffffffu) throw std::overflow_error("NVIDIA peer gather grid overflows");
+  cudaStream_t s = static_cast<cudaStream_t>(on_stream.opaque_handle());
+  const peer_gather_entry *table = static_cast<const peer_gather_entry *>(entries);
+  if (precision == scalar_precision::f32)
+    peer_gather_kernel<float><<<unsigned(blocks), threads, 0, s>>>(table, count);
+  else
+    peer_gather_kernel<double><<<unsigned(blocks), threads, 0, s>>>(table, count);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA peer gather");
 }
 
 void read_peer_flags(const device_buffer &flags, size_t first, size_t count, uint64_t *out) {

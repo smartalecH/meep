@@ -14,6 +14,7 @@
 #include <new>
 #include <cstring>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -274,7 +275,19 @@ struct staged_transport_epoch::impl {
     std::vector<unsigned char *> send_targets[2];
     device_buffer ready_targets; // uint64_t* per send: the receiver's ready flag
     device_buffer ack_targets;   // uint64_t* per receive: the sender's ack flag
-    peer_stage() : ready_first(0), ack_first(0) {}
+    /* Whole-stage tables per slot (one launch each) when every message of a
+       side shares a precision; otherwise per-message launches. Scatters are
+       rebased onto the receive arena; an ordered (duplicate-target) stage
+       keeps only each target's canonical last writer, which is exact. */
+    device_buffer gathers[2];
+    device_buffer scatters[2];
+    size_t gather_count;
+    size_t scatter_count;
+    scalar_precision gather_precision;
+    scalar_precision scatter_precision;
+    peer_stage()
+        : ready_first(0), ack_first(0), gather_count(0), scatter_count(0),
+          gather_precision(scalar_precision::f64), scatter_precision(scalar_precision::f64) {}
   };
 
   int device;
@@ -394,9 +407,14 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
         launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
                              peer.ack_first,
                          sends, generation - 1, impl_->peer_timeout_seconds, compute);
-      for (size_t i = 0; i < sends; ++i)
-        launch_boundary_gather(stage->plan.sends[i].launch, stage->gather_entries.opaque_handle(),
-                               peer.send_targets[slot_index][i], compute);
+      if (peer.gather_count)
+        launch_peer_gather(peer.gathers[slot_index].opaque_handle(), peer.gather_count,
+                           peer.gather_precision, compute);
+      else
+        for (size_t i = 0; i < sends; ++i)
+          launch_boundary_gather(stage->plan.sends[i].launch,
+                                 stage->gather_entries.opaque_handle(),
+                                 peer.send_targets[slot_index][i], compute);
       launch_peer_signal(peer.ready_targets.opaque_handle(), sends, generation + 1, compute);
     }
     catch (const std::exception &error) {
@@ -524,18 +542,27 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
       launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
                            peer.ready_first,
                        receives, generation + 1, impl_->peer_timeout_seconds, compute);
-      for (uint32_t index : stage->plan.canonical_receive_order) {
-        if (index >= receives) throw std::logic_error("NVIDIA peer transport receive order is stale");
-        const bound_boundary_message &message = stage->plan.receives[index];
-        const void *arena = static_cast<const unsigned char *>(stage->receive_arena.opaque_handle()) +
-                            message.arena_offsets[slot_index];
-        if (stage->plan.publication == RemoteHaloPublicationMode::canonical_serial)
-          launch_boundary_scatter_serial(message.launch, stage->scatter_entries.opaque_handle(),
-                                         arena, compute);
-        else
-          launch_boundary_scatter_parallel(message.launch, stage->scatter_entries.opaque_handle(),
+      if (peer.scatter_count)
+        launch_boundary_scatter_parallel(
+            boundary_launch{0, peer.scatter_count, peer.scatter_count, peer.scatter_precision},
+            peer.scatters[slot_index].opaque_handle(), stage->receive_arena.opaque_handle(),
+            compute);
+      else
+        for (uint32_t index : stage->plan.canonical_receive_order) {
+          if (index >= receives)
+            throw std::logic_error("NVIDIA peer transport receive order is stale");
+          const bound_boundary_message &message = stage->plan.receives[index];
+          const void *arena =
+              static_cast<const unsigned char *>(stage->receive_arena.opaque_handle()) +
+              message.arena_offsets[slot_index];
+          if (stage->plan.publication == RemoteHaloPublicationMode::canonical_serial)
+            launch_boundary_scatter_serial(message.launch, stage->scatter_entries.opaque_handle(),
                                            arena, compute);
-      }
+          else
+            launch_boundary_scatter_parallel(message.launch,
+                                             stage->scatter_entries.opaque_handle(), arena,
+                                             compute);
+        }
       launch_peer_signal(peer.ack_targets.opaque_handle(), receives, generation + 1, compute);
     }
     catch (const std::exception &error) {
@@ -1229,6 +1256,70 @@ bool staged_transport_epoch::enable_peer_route(std::string &why) {
           copy_host_to_device_async(peer.ack_targets, 0, ack_targets.data(), bytes,
                                     *state.communication);
         }
+        bool uniform = !stage.plan.sends.empty();
+        for (const bound_boundary_message &message : stage.plan.sends)
+          uniform = uniform &&
+                    message.launch.precision == stage.plan.sends.front().launch.precision;
+        if (uniform) {
+          for (size_t k = 0; k < 2; ++k) {
+            std::vector<peer_gather_entry> table;
+            for (size_t i = 0; i < stage.plan.sends.size(); ++i) {
+              const boundary_launch &launch = stage.plan.sends[i].launch;
+              for (size_t e = launch.first; e < launch.first + launch.count; ++e) {
+                const boundary_gather_entry &gather = stage.plan.gathers.at(e);
+                table.push_back(peer_gather_entry{gather.source, gather.source_index,
+                                                  peer.send_targets[k][i] +
+                                                      gather.buffer_byte_offset});
+              }
+            }
+            peer.gathers[k].allocate(table.size() * sizeof(peer_gather_entry), state.device);
+            copy_host_to_device_async(peer.gathers[k], 0, table.data(),
+                                      table.size() * sizeof(peer_gather_entry),
+                                      *state.communication);
+            peer.gather_count = table.size();
+          }
+          peer.gather_precision = stage.plan.sends.front().launch.precision;
+        }
+        uniform = !stage.plan.receives.empty();
+        for (const bound_boundary_message &message : stage.plan.receives)
+          uniform = uniform &&
+                    message.launch.precision == stage.plan.receives.front().launch.precision;
+        const bool ordered =
+            stage.plan.publication == RemoteHaloPublicationMode::canonical_serial;
+        if (uniform && ordered)
+          for (const boundary_scatter_entry &scatter : stage.plan.scatters)
+            uniform = uniform && scatter.target_imag == NULL;
+        if (uniform) {
+          for (size_t k = 0; k < 2; ++k) {
+            std::vector<boundary_scatter_entry> table;
+            for (uint32_t index : stage.plan.canonical_receive_order) {
+              const bound_boundary_message &message = stage.plan.receives.at(index);
+              for (size_t e = message.launch.first;
+                   e < message.launch.first + message.launch.count; ++e) {
+                boundary_scatter_entry scatter = stage.plan.scatters.at(e);
+                scatter.buffer_byte_offset += message.arena_offsets[k];
+                table.push_back(scatter);
+              }
+            }
+            if (ordered) {
+              std::set<std::pair<void *, ptrdiff_t> > written;
+              std::vector<boundary_scatter_entry> last;
+              for (size_t e = table.size(); e-- > 0;)
+                if (written.insert(std::make_pair(table[e].target_real,
+                                                  table[e].target_real_index))
+                        .second)
+                  last.push_back(table[e]);
+              table.assign(last.rbegin(), last.rend());
+            }
+            peer.scatters[k].allocate(table.size() * sizeof(boundary_scatter_entry),
+                                      state.device);
+            copy_host_to_device_async(peer.scatters[k], 0, table.data(),
+                                      table.size() * sizeof(boundary_scatter_entry),
+                                      *state.communication);
+            peer.scatter_count = table.size();
+          }
+          peer.scatter_precision = stage.plan.receives.front().launch.precision;
+        }
       }
       state.communication->synchronize();
     }
@@ -1260,6 +1351,21 @@ bool staged_transport_epoch::enable_peer_route(std::string &why) {
   }
   state.peer = true;
   state.peer_timeout_seconds = peer_timeout_from_environment();
+  const char *verbose = std::getenv("MEEP_NVIDIA_PEER_VERBOSE");
+  if (verbose && *verbose && std::strcmp(verbose, "0"))
+    for (size_t s = 0; s < state.stages.size(); ++s) {
+      const impl::stage_state &stage = state.stages[s];
+      const impl::peer_stage &peer = state.peer_stages[s];
+      std::printf("meep peer rank %d ft %d: %zu sends (%zu gathers, %s), %zu receives (%zu "
+                  "scatters -> %zu, %s, %s)\n",
+                  rank, int(stage.plan.ft), stage.plan.sends.size(), stage.plan.gathers.size(),
+                  peer.gather_count ? "batched" : "per-message", stage.plan.receives.size(),
+                  stage.plan.scatters.size(), peer.scatter_count,
+                  stage.plan.publication == RemoteHaloPublicationMode::canonical_serial
+                      ? "ordered"
+                      : "parallel",
+                  peer.scatter_count ? "batched" : "per-message");
+    }
   if (rank == 0)
     std::printf("meep: NVIDIA halo exchange uses CUDA IPC peer stores (%d ranks, one node)\n",
                 size);

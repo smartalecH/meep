@@ -1807,14 +1807,19 @@ void launch_dependency_overlap(NvidiaExecutable &executable, NvidiaBackendState 
       !executable.transport_ || !executable.transport_->has_stage(halo.ft))
     throw std::logic_error("NVIDIA dependency overlap lost its remote halo stage");
   executable.launch_zero_range(halo.first, halo.count, *state.transfer_);
-  executable.launch_halo_gathers(halo.halo_first, halo.halo_count, *state.transfer_);
+  const bool fused = executable.has_halo_fused(halo.halo_first, halo.halo_count);
+  if (!fused)
+    executable.launch_halo_gathers(halo.halo_first, halo.halo_count, *state.transfer_);
   std::string transport_error;
   if (!executable.transport_->begin_stage(halo.ft, *state.transfer_, transport_error))
     throw std::runtime_error(transport_error.empty()
                                  ? "NVIDIA direct overlap transport begin failed"
                                  : transport_error);
   try {
-    executable.launch_halo_scatters(halo.halo_first, halo.halo_count, *state.transfer_);
+    if (fused)
+      executable.launch_halo_fused(halo.halo_first, halo.halo_count, *state.transfer_);
+    else
+      executable.launch_halo_scatters(halo.halo_first, halo.halo_count, *state.transfer_);
     for (const NvidiaCompiledDependencyRow &row : dependency.rows) {
       if (row.kind == DependencyOperationKind::curl)
         nvidia::launch_curl(row.curl_interior, *state.transfer_);
@@ -12696,17 +12701,40 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       for (size_t n = executable.launch_zero_range(op.first, op.count, *state.transfer_); n;
            --n)
         count_cw_kernel();
-      if (!(executable.transport_ && executable.transport_->has_stage(op.ft)) &&
+      const bool remote_stage =
+          executable.transport_ && executable.transport_->has_stage(op.ft);
+      if (!remote_stage &&
           executable.launch_halo_fused(op.halo_first, op.halo_count, *state.transfer_)) {
         count_cw_kernel();
+        return true;
+      }
+      if (remote_stage && executable.has_halo_fused(op.halo_first, op.halo_count)) {
+        /* Remote gathers read their sources in begin_stage, before the fused
+           local copies write any target: the same order as local gathers,
+           remote gathers, local scatters, remote scatters. */
+        std::string transport_error;
+        if (!executable.transport_->begin_stage(op.ft, *state.transfer_, transport_error))
+          throw std::runtime_error(transport_error.empty()
+                                       ? "NVIDIA staged transport begin failed"
+                                       : transport_error);
+        try {
+          executable.launch_halo_fused(op.halo_first, op.halo_count, *state.transfer_);
+          count_cw_kernel();
+        }
+        catch (...) {
+          executable.transport_->abort_published_stage(
+              op.ft, "fused local halo after remote request publication");
+        }
+        if (!executable.transport_->finish_stage(op.ft, *state.transfer_, transport_error))
+          throw std::runtime_error(transport_error.empty()
+                                       ? "NVIDIA staged transport completion failed"
+                                       : transport_error);
         return true;
       }
       for (size_t n = executable.launch_halo_gathers(op.halo_first, op.halo_count,
                                                      *state.transfer_);
            n; --n)
         count_cw_kernel();
-      const bool remote_stage =
-          executable.transport_ && executable.transport_->has_stage(op.ft);
       if (remote_stage) {
         std::string transport_error;
         if (!executable.transport_->begin_stage(op.ft, *state.transfer_, transport_error))
@@ -13343,8 +13371,7 @@ void NvidiaBackend::configure_cw_graph_execution(const StepPlan &plan, const CwP
           case OpKind::transfer_halo:
             timestep_launches +=
                 executable.zero_range_launch_count(op.first, op.count) +
-                (!(executable.transport_ && executable.transport_->has_stage(op.ft)) &&
-                         executable.has_halo_fused(op.halo_first, op.halo_count)
+                (executable.has_halo_fused(op.halo_first, op.halo_count)
                      ? 1
                      : executable.halo_range_launch_count(op.halo_first, op.halo_count));
             break;

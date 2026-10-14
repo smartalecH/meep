@@ -21,6 +21,7 @@
 
 #include <string>
 
+#include "backend/nvidia/nvidia_step.hpp"
 #include "backend/nvidia/runtime.hpp"
 
 namespace meep {
@@ -71,6 +72,17 @@ void launch_peer_wait(const void *flags, size_t count, uint64_t target, double t
    into a peer arena) is visible to a peer that observes the flag. `targets`
    is a device array of (possibly peer-mapped) uint64_t pointers. */
 void launch_peer_signal(const void *targets, size_t count, uint64_t value,
+                        const stream &on_stream);
+
+/* One stage's sends in one launch: target[0] = source[source_index] with
+   `target` an absolute (usually peer-mapped) address. */
+struct peer_gather_entry {
+  const void *source;
+  ptrdiff_t source_index;
+  void *target;
+};
+
+void launch_peer_gather(const void *entries, size_t count, scalar_precision precision,
                         const stream &on_stream);
 
 /* Host read of local flag words (for draining before teardown). */
