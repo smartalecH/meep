@@ -182,6 +182,11 @@ private:
   };
   mutable std::vector<AddressRange> address_ranges_;
   mutable std::vector<uintptr_t> address_max_end_;
+  /* address_exclusive_[k]: no range with a lower catalog index overlaps
+     range k, so every element-aligned address inside it resolves to it.
+     locate() reuses the last such range before searching. */
+  mutable std::vector<bool> address_exclusive_;
+  mutable size_t address_last_hit_ = size_t(-1);
   mutable bool address_index_valid_ = false;
   void build_address_index() const;
 };

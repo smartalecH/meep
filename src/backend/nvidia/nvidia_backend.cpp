@@ -1408,9 +1408,10 @@ public:
         continue;
       }
       std::vector<nvidia::halo_launch> plan_gathers, plan_scatters;
-      std::set<size_t> slots;
-      std::set<std::pair<const void *, ptrdiff_t> > targets;
-      bool gathers_disjoint = true, scatters_disjoint = true;
+      /* Disjointness = no repeated scratch slot / scatter target; checked by
+         sorting rather than per-element set insertion. */
+      std::vector<size_t> slots;
+      std::vector<std::pair<const void *, ptrdiff_t> > targets;
       for (size_t p = op.halo_first; p < op.halo_first + op.halo_count; ++p) {
         const NvidiaCompiledHalo &plan = halo_plans_[p];
         if (plan.gather.first > gathers.size() ||
@@ -1420,23 +1421,22 @@ public:
           throw std::logic_error("NVIDIA halo plan references missing descriptors");
         plan_gathers.push_back(plan.gather);
         plan_scatters.push_back(plan.scatter);
-        for (size_t e = plan.gather.first; gathers_disjoint && e < plan.gather.first + plan.gather.count;
-             ++e)
-          gathers_disjoint = slots.insert(gathers[e].buffer_index).second;
-        for (size_t e = plan.scatter.first;
-             scatters_disjoint && e < plan.scatter.first + plan.scatter.count; ++e) {
+        for (size_t e = plan.gather.first; e < plan.gather.first + plan.gather.count; ++e)
+          slots.push_back(gathers[e].buffer_index);
+        for (size_t e = plan.scatter.first; e < plan.scatter.first + plan.scatter.count; ++e) {
           const nvidia::halo_scatter_entry &entry = scatters[e];
-          scatters_disjoint =
-              targets.insert(std::make_pair(static_cast<const void *>(entry.target_real),
-                                            entry.target_real_index))
-                  .second;
-          if (scatters_disjoint && entry.target_imag)
-            scatters_disjoint =
-                targets.insert(std::make_pair(static_cast<const void *>(entry.target_imag),
-                                              entry.target_imag_index))
-                    .second;
+          targets.push_back(std::make_pair(static_cast<const void *>(entry.target_real),
+                                           entry.target_real_index));
+          if (entry.target_imag)
+            targets.push_back(std::make_pair(static_cast<const void *>(entry.target_imag),
+                                             entry.target_imag_index));
         }
       }
+      std::sort(slots.begin(), slots.end());
+      std::sort(targets.begin(), targets.end());
+      const bool gathers_disjoint = std::adjacent_find(slots.begin(), slots.end()) == slots.end();
+      const bool scatters_disjoint =
+          std::adjacent_find(targets.begin(), targets.end()) == targets.end();
       HaloMergedRange range;
       range.count = op.halo_count;
       range.gather_first = merged_halo_gathers_.size();
@@ -1502,14 +1502,19 @@ public:
         continue;
       const nvidia::scalar_precision precision = halo_plans_[op.halo_first].gather.precision;
       bool eligible = true;
-      std::unordered_map<size_t, const nvidia::halo_gather_entry *> by_slot;
+      /* Scratch slots are small dense indices: a direct table replaces a
+         per-element hash map (NULL = unwritten). */
+      std::vector<const nvidia::halo_gather_entry *> by_slot;
       std::vector<Element> sources, targets;
       for (size_t p = op.halo_first; eligible && p < op.halo_first + op.halo_count; ++p) {
         const NvidiaCompiledHalo &plan = halo_plans_[p];
         eligible = plan.gather.precision == precision && plan.scatter.precision == precision;
         for (size_t e = plan.gather.first; eligible && e < plan.gather.first + plan.gather.count;
              ++e) {
-          eligible = by_slot.emplace(gathers[e].buffer_index, &gathers[e]).second;
+          const size_t slot = gathers[e].buffer_index;
+          if (slot >= by_slot.size()) by_slot.resize(std::max(slot + 1, 2 * by_slot.size()), NULL);
+          eligible = by_slot[slot] == NULL;
+          by_slot[slot] = &gathers[e];
           sources.push_back(Element(reinterpret_cast<uintptr_t>(gathers[e].source),
                                     gathers[e].source_index));
         }
@@ -1536,10 +1541,9 @@ public:
         const NvidiaCompiledHalo &plan = halo_plans_[p];
         for (size_t e = plan.scatter.first; e < plan.scatter.first + plan.scatter.count; ++e) {
           const nvidia::halo_scatter_entry &scatter = scatters[e];
-          const auto found = by_slot.find(scatter.buffer_index);
-          if (found == by_slot.end())
+          if (scatter.buffer_index >= by_slot.size() || !by_slot[scatter.buffer_index])
             throw std::logic_error("NVIDIA halo scatter reads an unwritten scratch slot");
-          const nvidia::halo_gather_entry &gather = *found->second;
+          const nvidia::halo_gather_entry &gather = *by_slot[scatter.buffer_index];
           if (range.segment_count) {
             nvidia::halo_copy_segment &seg = halo_segments_host_.back();
             const ptrdiff_t ds = gather.source_index - seg.src_start;

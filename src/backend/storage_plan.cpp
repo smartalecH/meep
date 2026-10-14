@@ -225,6 +225,22 @@ void CpuArrayCatalog::build_address_index() const {
   uintptr_t max_end = 0;
   for (size_t k = 0; k < address_ranges_.size(); ++k)
     address_max_end_[k] = max_end = std::max(max_end, address_ranges_[k].end);
+  address_exclusive_.assign(address_ranges_.size(), true);
+  for (size_t k = 0; k < address_ranges_.size(); ++k) {
+    const AddressRange &range = address_ranges_[k];
+    for (size_t j = k; j > 0 && address_max_end_[j - 1] > range.begin;) {
+      --j;
+      if (address_ranges_[j].end > range.begin && address_ranges_[j].index < range.index) {
+        address_exclusive_[k] = false;
+        break;
+      }
+    }
+    for (size_t j = k + 1; address_exclusive_[k] && j < address_ranges_.size() &&
+                           address_ranges_[j].begin < range.end;
+         ++j)
+      if (address_ranges_[j].index < range.index) address_exclusive_[k] = false;
+  }
+  address_last_hit_ = size_t(-1);
   address_index_valid_ = true;
 }
 
@@ -234,6 +250,17 @@ bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offs
   if (!p) return false;
   if (!address_index_valid_) build_address_index();
   const uintptr_t address = reinterpret_cast<uintptr_t>(p);
+  if (address_last_hit_ < address_ranges_.size()) {
+    const AddressRange &range = address_ranges_[address_last_hit_];
+    const size_t bytes_per_element = host_element_bytes(specs_[range.index].element_type);
+    if (address_exclusive_[address_last_hit_] && address >= range.begin &&
+        address < range.end && (address - range.begin) % bytes_per_element == 0) {
+      const ArraySpec &spec = specs_[range.index];
+      id = is_valid(spec.alias_of) ? spec.alias_of : spec.id;
+      element_offset = ptrdiff_t((address - range.begin) / bytes_per_element);
+      return true;
+    }
+  }
   /* Same answer as scanning specs_ in order: among the allocations containing
      the address at an element boundary, the lowest catalog index wins. Walk
      back from the last range starting at or before the address while some
@@ -244,6 +271,7 @@ bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offs
                                      }) -
                     address_ranges_.begin());
   size_t best = specs_.size();
+  size_t best_position = size_t(-1);
   ptrdiff_t best_offset = 0;
   while (k > 0 && address_max_end_[k - 1] > address) {
     const AddressRange &range = address_ranges_[--k];
@@ -252,9 +280,11 @@ bool CpuArrayCatalog::locate(const void *p, ArrayId &id, ptrdiff_t &element_offs
     const uintptr_t delta = address - range.begin;
     if (delta % bytes_per_element) continue;
     best = range.index;
+    best_position = k;
     best_offset = ptrdiff_t(delta / bytes_per_element);
   }
   if (best == specs_.size()) return false;
+  address_last_hit_ = best_position;
   const ArraySpec &spec = specs_[best];
   id = is_valid(spec.alias_of) ? spec.alias_of : spec.id;
   element_offset = best_offset;
