@@ -14249,6 +14249,9 @@ void NvidiaBackend::reduce_dft(const DftReductionRequest &request,
   if (!state.initialized_) throw std::logic_error("NVIDIA backend storage is not initialized");
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
+  /* Kernels launch on this rank's stream: select its device (with several
+     GPUs per node, the calling thread's current device may be another). */
+  nvidia::device_scope scope(state.device_);
   if (!local_result && result_count)
     throw std::invalid_argument("NVIDIA DFT reduction has no result buffer");
   if (request.result_count != result_count || !result_count)
@@ -14386,6 +14389,7 @@ void NvidiaBackend::compute_adjoint_gradient(const AdjointGradientRequest &reque
     throw std::invalid_argument("NVIDIA adjoint output-count mismatch");
   if (state.transfer_failed_)
     throw std::logic_error("NVIDIA transfer stream failed; recreate backend state");
+  nvidia::device_scope scope(state.device_);
   if (request.contributions.empty()) {
     std::fill(local_result, local_result + result_count, 0.0);
     return;
