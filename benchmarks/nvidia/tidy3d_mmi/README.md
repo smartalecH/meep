@@ -232,3 +232,24 @@ neighbours (they carry twice the halo work), eager peer kernels ~0.08 ms,
 and each remote halo still splits the step graph. When the MPI route is used on one node,
 prefer `--mca pml ob1 --mca btl self,sm,smcuda` over UCX in vast
 containers (UCX device-buffer latency was 10x worse).
+
+## End to end on 2x H100 SXM (branch custom/phase2-pr10-setup)
+
+Full `mmi_gpu.py --res 30 --until 900` (54,000 steps) with default settings
+(`mpirun -np 2`, peer transport auto, default finite check). Wall time covers
+the whole run: Python start, `init_sim` (incl. MPB mode solve), first-step
+setup, stepping and flux readout.
+
+| geometry | wall time | init_sim | run (setup + steps) | max/rms dT vs CPU Meep | max/rms dT vs Tidy3D |
+|---|---|---|---|---|---|
+| staircased | **183 s (3.1 min)** | 15 s | 165 s | 0.020 / 0.0088 | 0.028 / 0.012 |
+| subpixel averaging (`--avg`) | **568 s (9.5 min)** | 359 s | 205 s | **0.0020 / 0.0010** | 0.0092 / 0.0049 |
+
+Tidy3D's own spectrum (`misc/mmi_simulation_data.h5` in tidy3d-notebooks, a
+10 steps/wavelength run) differs from the CPU Meep reference by 0.0079 max /
+0.0044 rms, so the averaged GPU result agrees with Tidy3D as closely as CPU
+Meep does, and with CPU Meep to 0.2% (unchanged from the single-GPU result
+above). For scale: the notebook reports ~690 min for CPU Meep on a 10-core
+laptop; the single-A6000 staircased run above took 29 min. With averaging,
+`init_sim` (CPU subpixel averaging) is now the dominant cost.
+Plot: `results/compare_2xh100_res30.png`.
