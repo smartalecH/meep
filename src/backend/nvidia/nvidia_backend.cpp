@@ -720,6 +720,11 @@ public:
   std::unique_ptr<nvidia::device_arenas> arenas_;
   std::unique_ptr<nvidia::stream> transfer_;
   std::unique_ptr<nvidia::stream> communication_;
+  /* Graph capture only: independent launches of one phase are forked onto
+     these streams so the captured graph has parallel branches. */
+  std::vector<std::unique_ptr<nvidia::stream> > capture_branches_;
+  std::unique_ptr<nvidia::event> capture_fork_;
+  std::vector<std::unique_ptr<nvidia::event> > capture_joins_;
   nvidia::pinned_buffer staging_;
   nvidia::device_buffer dft_reduction_result_;
   nvidia::device_buffer dft_reduction_partials_;
@@ -1153,9 +1158,11 @@ public:
                                                  sizeof(nvidia::source_scalar),
                                                  "allocating NVIDIA source scalars"),
                                  state.device_);
-        source_staging_.allocate(checked_product(source_staging_elements,
-                                                 sizeof(nvidia::source_scalar),
-                                                 "allocating NVIDIA source-scalar staging"));
+        source_staging_.allocate(checked_product(
+            checked_product(source_staging_elements, size_t(source_staging_slots),
+                            "allocating NVIDIA source-scalar staging slots"),
+            sizeof(nvidia::source_scalar), "allocating NVIDIA source-scalar staging"));
+        source_staging_slot_elements_ = source_staging_elements;
       }
       if (!multilevel_coefficients.empty()) {
         multilevel_coefficients_.allocate(multilevel_coefficients.size(), state.device_);
@@ -1726,6 +1733,36 @@ public:
   nvidia::pinned_buffer finite_result_host_;
   nvidia::device_buffer source_scalars_;
   nvidia::pinned_buffer source_staging_;
+  /* source_staging_ holds source_staging_slots slots of
+     source_staging_slot_elements_ scalars. A graph step writes only the
+     current slot and records its event; the host waits for a slot's event
+     only when it comes round again, so it can enqueue a few steps ahead
+     instead of synchronizing after every step. */
+  enum { source_staging_slots = 3 };
+  size_t source_staging_slot_elements_ = 0;
+  unsigned source_staging_slot_ = 0;
+  std::vector<nvidia::event> source_staging_ready_;
+  std::vector<bool> source_staging_recorded_;
+  nvidia::source_scalar *source_staging_slot() {
+    return static_cast<nvidia::source_scalar *>(source_staging_.data()) +
+           size_t(source_staging_slot_) * source_staging_slot_elements_;
+  }
+  /* Move to the next slot, waiting for its previous uploads to execute. */
+  void begin_source_staging_step() {
+    if (!source_staging_slot_elements_) return;
+    if (source_staging_ready_.empty()) {
+      source_staging_ready_.resize(size_t(source_staging_slots));
+      source_staging_recorded_.assign(size_t(source_staging_slots), false);
+    }
+    source_staging_slot_ = (source_staging_slot_ + 1) % unsigned(source_staging_slots);
+    if (source_staging_recorded_[source_staging_slot_])
+      source_staging_ready_[source_staging_slot_].synchronize();
+  }
+  void end_source_staging_step(const nvidia::stream &stream) {
+    if (!source_staging_slot_elements_ || source_staging_ready_.empty()) return;
+    source_staging_ready_[source_staging_slot_].record(stream);
+    source_staging_recorded_[source_staging_slot_] = true;
+  }
   nvidia::pinned_buffer material_staging_;
   nvidia::device_buffer source_points_;
   nvidia::device_buffer dft_omega_;
@@ -11652,7 +11689,7 @@ CwSolveResult NvidiaBackend::solve_cw(const CwSolveRequest &request, const StepP
     if (sources.scalars.size() != cw->timestep_->source_scalar_count_)
       throw std::logic_error("NVIDIA solve_cw source scalar count changed after compilation");
     nvidia::source_scalar *staging =
-        static_cast<nvidia::source_scalar *>(cw->timestep_->source_staging_.data());
+        cw->timestep_->source_staging_slot();
     for (size_t i = 0; i < sources.scalars.size(); ++i) {
       staging[i].current_real = sources.scalars[i].current.real();
       staging[i].current_imag = sources.scalars[i].current.imag();
@@ -12351,7 +12388,7 @@ void NvidiaBackend::execute_magnetic_half_step(NvidiaExecutable &executable,
         throw std::logic_error("NVIDIA magnetic source scalar block changed after compilation");
       if (!op.count) continue;
       nvidia::source_scalar *staging =
-          static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+          executable.source_staging_slot() +
           op.source_staging_offset;
       for (size_t i = 0; i < op.count; ++i) {
         staging[i].current_real = source_plan.scalars[i].current.real();
@@ -12388,7 +12425,7 @@ void NvidiaBackend::execute_magnetic_half_step(NvidiaExecutable &executable,
             op.count != executable.source_scalar_count_)
           throw std::logic_error("NVIDIA magnetic source scalar block changed after compilation");
         nvidia::source_scalar *staging =
-            static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+            executable.source_staging_slot() +
             op.source_staging_offset;
         for (size_t i = 0; i < op.count; ++i) {
           staging[i].current_real = source_plan.scalars[i].current.real();
@@ -12573,6 +12610,85 @@ void NvidiaBackend::preflight_advance(Executable &raw_executable,
   nvidia::validate_material_phase_state(f_, executable.material_target_signature_);
 }
 
+namespace {
+
+/* Conservative memory footprint of one launch for the graph-branch check:
+   [lo, hi] element offsets from `address`, whole array when unknown. */
+struct NvidiaLaunchAccess {
+  const void *address;
+  ptrdiff_t lo;
+  ptrdiff_t hi;
+  bool write;
+};
+
+const ptrdiff_t whole_array_lo = std::numeric_limits<ptrdiff_t>::min();
+const ptrdiff_t whole_array_hi = std::numeric_limits<ptrdiff_t>::max();
+
+void add_region_access(std::vector<NvidiaLaunchAccess> &out, const void *address,
+                       const nvidia::flat_region &region, bool write) {
+  if (!address) return;
+  ptrdiff_t lo = ptrdiff_t(region.base), hi = ptrdiff_t(region.base);
+  for (int d = 0; d < 3; ++d) {
+    if (!region.counts[d]) return;
+    const ptrdiff_t reach = ptrdiff_t(region.counts[d] - 1) * region.strides[d];
+    (reach < 0 ? lo : hi) += reach;
+  }
+  out.push_back(NvidiaLaunchAccess{address, lo, hi, write});
+}
+
+void add_array_access(std::vector<NvidiaLaunchAccess> &out, const void *address, bool write) {
+  if (address) out.push_back(NvidiaLaunchAccess{address, whole_array_lo, whole_array_hi, write});
+}
+
+std::vector<NvidiaLaunchAccess> launch_accesses(const nvidia::curl_launch &u) {
+  std::vector<NvidiaLaunchAccess> out;
+  add_region_access(out, u.target, u.region, true);
+  add_array_access(out, u.target_u, true);
+  add_array_access(out, u.target_conductivity, true);
+  add_array_access(out, u.plus_source, false);
+  add_array_access(out, u.minus_source, false);
+  add_array_access(out, u.conductivity, false);
+  add_array_access(out, u.conductivity_inverse, false);
+  return out;
+}
+
+std::vector<NvidiaLaunchAccess> launch_accesses(const nvidia::constitutive_launch &u) {
+  std::vector<NvidiaLaunchAccess> out;
+  add_region_access(out, u.target, u.region, true);
+  add_array_access(out, u.target_w, true);
+  add_array_access(out, u.previous_w, true);
+  add_array_access(out, u.primary, false);
+  add_array_access(out, u.cross1, false);
+  add_array_access(out, u.cross2, false);
+  add_array_access(out, u.previous_w_source, false);
+  return out;
+}
+
+/* True when no launch writes memory another launch of the set reads or
+   writes, so any execution order (and concurrency) gives identical bits. */
+bool launches_independent(const std::vector<std::vector<NvidiaLaunchAccess> > &launches) {
+  for (size_t i = 0; i < launches.size(); ++i)
+    for (size_t j = i + 1; j < launches.size(); ++j)
+      for (const NvidiaLaunchAccess &a : launches[i])
+        for (const NvidiaLaunchAccess &b : launches[j])
+          if (a.address == b.address && (a.write || b.write) && a.lo <= b.hi && b.lo <= a.hi)
+            return false;
+  return true;
+}
+
+size_t graph_branch_count() {
+  static const size_t branches = []() -> size_t {
+    const char *value = std::getenv("MEEP_NVIDIA_GRAPH_BRANCHES");
+    if (!value || !*value) return size_t(8);
+    char *end = NULL;
+    const long parsed = std::strtol(value, &end, 10);
+    return end && !*end && parsed >= 1 && parsed <= 32 ? size_t(parsed) : size_t(8);
+  }();
+  return branches;
+}
+
+} // namespace
+
 bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
                                             NvidiaBackendState &state,
                                             const NvidiaCompiledOperation &op,
@@ -12595,9 +12711,52 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
       }
     }
   };
+  /* Graph capture only: fork a phase of independent launches across branch
+     streams (round robin) and join them back, so replay can overlap the
+     many small per-chunk kernels instead of running them as one chain. */
+  const auto branches_for = [&](size_t launches, bool independent) -> size_t {
+    if (!graph_scalars || !independent || launches < 2) return 0;
+    const size_t branches = std::min(graph_branch_count(), launches);
+    if (branches < 2) return 0;
+    if (!state.capture_fork_) state.capture_fork_.reset(new nvidia::event);
+    while (state.capture_branches_.size() < branches) {
+      state.capture_branches_.emplace_back(new nvidia::stream);
+      state.capture_joins_.emplace_back(new nvidia::event);
+    }
+    state.capture_fork_->record(*state.transfer_);
+    for (size_t k = 0; k < branches; ++k) state.capture_fork_->wait(*state.capture_branches_[k]);
+    return branches;
+  };
+  const auto branch_stream = [&](size_t branches, size_t index) -> const nvidia::stream & {
+    return branches ? *state.capture_branches_[index % branches] : *state.transfer_;
+  };
+  const auto join_branches = [&](size_t branches) {
+    for (size_t k = 0; k < branches; ++k) {
+      state.capture_joins_[k]->record(*state.capture_branches_[k]);
+      state.capture_joins_[k]->wait(*state.transfer_);
+    }
+  };
   switch (op.kind) {
-    case OpKind::update_db:
+    case OpKind::update_db: {
+      bool curl_independent = graph_scalars != NULL;
+      if (curl_independent) {
+        std::vector<std::vector<NvidiaLaunchAccess> > accesses;
+        for (size_t i = op.first; curl_independent && i < op.first + op.count; ++i) {
+          const nvidia::curl_launch &curl = executable.curl_updates_[i];
+          curl_independent = curl.radial_prefix_index == UINT32_MAX &&
+                             curl.bfast_update_index == UINT32_MAX;
+          accesses.push_back(launch_accesses(curl));
+        }
+        curl_independent = curl_independent && launches_independent(accesses);
+      }
+      const size_t curl_branches = branches_for(op.count, curl_independent);
       for (size_t i = op.first; i < op.first + op.count; ++i) {
+        if (curl_branches) {
+          nvidia::launch_curl(executable.curl_updates_[i],
+                              branch_stream(curl_branches, i - op.first));
+          count_cw_kernel();
+          continue;
+        }
         const uint32_t prefix = executable.curl_updates_[i].radial_prefix_index;
         if (prefix != UINT32_MAX)
           nvidia::launch_cylindrical_radial_prefix(
@@ -12610,6 +12769,7 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
           nvidia::launch_bfast(executable.bfast_updates_[bfast], *state.transfer_);
         if (bfast != UINT32_MAX) count_cw_kernel();
       }
+      join_branches(curl_branches);
       for (size_t i = op.beta_first; i < op.beta_first + op.beta_count; ++i) {
         nvidia::launch_beta(executable.beta_updates_[i], *state.transfer_);
         count_cw_kernel();
@@ -12631,6 +12791,7 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
         count_cw_kernel();
       }
       return true;
+    }
     case OpKind::update_eh:
       for (size_t i = op.copy_first; i < op.copy_first + op.copy_count; ++i) {
         nvidia::launch_array_copy(executable.source_copies_[i], *state.transfer_);
@@ -12646,9 +12807,21 @@ bool NvidiaBackend::launch_device_operation(NvidiaExecutable &executable,
                                     executable.source_scalars_.opaque_handle(), *state.transfer_);
         count_cw_kernel();
       }
-      for (size_t i = op.first; i < op.first + op.count; ++i) {
-        nvidia::launch_constitutive(executable.constitutive_updates_[i], *state.transfer_);
-        count_cw_kernel();
+      {
+        bool independent = graph_scalars != NULL;
+        if (independent) {
+          std::vector<std::vector<NvidiaLaunchAccess> > accesses;
+          for (size_t i = op.first; i < op.first + op.count; ++i)
+            accesses.push_back(launch_accesses(executable.constitutive_updates_[i]));
+          independent = launches_independent(accesses);
+        }
+        const size_t branches = branches_for(op.count, independent);
+        for (size_t i = op.first; i < op.first + op.count; ++i) {
+          nvidia::launch_constitutive(executable.constitutive_updates_[i],
+                                      branch_stream(branches, i - op.first));
+          count_cw_kernel();
+        }
+        join_branches(branches);
       }
       return true;
     case OpKind::update_polarization: {
@@ -13520,6 +13693,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
       const bool finite_due = finite_mode == FiniteCheckMode::step ||
                               (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps);
       if (executable.graph_enabled_) {
+        executable.begin_source_staging_step();
         StepScalars scalars = {};
         scalars.abi_version = step_scalars_abi_version;
         scalars.byte_size = sizeof(StepScalars);
@@ -13661,7 +13835,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
                 throw std::logic_error("NVIDIA source scalar block changed after compilation");
               if (!op.count) break;
               nvidia::source_scalar *staging =
-                  static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+                  executable.source_staging_slot() +
                   op.source_staging_offset;
               for (size_t i = 0; i < op.count; ++i) {
                 staging[i].current_real = source_plan.scalars[i].current.real();
@@ -13694,9 +13868,10 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               break;
           }
         }
-        /* PR6.2 deliberately retains this synchronization: one pinned source
-           staging allocation is reused by the next step. */
-        state.transfer_->synchronize();
+        /* Source staging is slotted (begin/end_source_staging_step) and
+           every host readback synchronizes on its own, so the host need not
+           wait for this step before enqueuing the next. */
+        executable.end_source_staging_step(*state.transfer_);
         continue;
       }
       for (size_t oi = 0; oi < executable.operations_.size(); ++oi) {
@@ -13754,7 +13929,7 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
               throw std::logic_error("NVIDIA source scalar block changed after compilation");
             if (!op.count) break;
             nvidia::source_scalar *staging =
-                static_cast<nvidia::source_scalar *>(executable.source_staging_.data()) +
+                executable.source_staging_slot() +
                 op.source_staging_offset;
             for (size_t i = 0; i < op.count; ++i) {
               staging[i].current_real = source_plan.scalars[i].current.real();
