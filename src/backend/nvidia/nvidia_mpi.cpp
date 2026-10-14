@@ -270,8 +270,9 @@ struct staged_transport_epoch::impl {
      device, scatters, and stores generation+1 into the sender's ack flag. A
      sender reuses slot g&1 only after the ack for generation g-2. */
   struct peer_stage {
-    size_t ready_first; // local flags, one per receive
-    size_t ack_first;   // local flags, one per send
+    size_t ready_first;      // local flags, one per receive
+    size_t ack_first;        // local flags, one per send
+    size_t generation_index; // local flag word holding this stage's device generation
     std::vector<unsigned char *> send_targets[2];
     device_buffer ready_targets; // uint64_t* per send: the receiver's ready flag
     device_buffer ack_targets;   // uint64_t* per receive: the sender's ack flag
@@ -286,7 +287,7 @@ struct staged_transport_epoch::impl {
     scalar_precision gather_precision;
     scalar_precision scatter_precision;
     peer_stage()
-        : ready_first(0), ack_first(0), gather_count(0), scatter_count(0),
+        : ready_first(0), ack_first(0), generation_index(0), gather_count(0), scatter_count(0),
           gather_precision(scalar_precision::f64), scatter_precision(scalar_precision::f64) {}
   };
 
@@ -300,6 +301,9 @@ struct staged_transport_epoch::impl {
   bool retired;
   bool poisoned;
   bool peer;
+  /* Every stage is batched, so stage generations live on the device and the
+     peer launches are capturable (begin/finish enqueue static kernels). */
+  bool peer_device_generation;
   double peer_timeout_seconds;
   device_buffer peer_flags;
   std::vector<peer_mapping> peer_mappings;
@@ -307,7 +311,7 @@ struct staged_transport_epoch::impl {
 
   impl()
       : device(-1), communication(NULL), retired(false), poisoned(false), peer(false),
-        peer_timeout_seconds(0) {}
+        peer_device_generation(false), peer_timeout_seconds(0) {}
 
   stage_state *find(field_type ft) {
     for (stage_state &stage : stages)
@@ -359,6 +363,10 @@ bool staged_transport_epoch::has_stage(field_type ft) const {
 
 bool staged_transport_epoch::uses_peer_route() const { return impl_ && impl_->peer; }
 
+bool staged_transport_epoch::peer_stages_capturable() const {
+  return impl_ && impl_->peer && impl_->peer_device_generation;
+}
+
 void staged_transport_epoch::record_dependency_overlap(size_t interior_launches,
                                                        size_t boundary_launches) {
   if (!impl_ || impl_->retired || impl_->poisoned)
@@ -404,20 +412,35 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
     impl::peer_stage &peer = impl_->peer_stages[size_t(stage - impl_->stages.data())];
     const uint64_t generation = stage->generation;
     const size_t sends = stage->plan.sends.size();
+    const uint64_t *flags = static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle());
     try {
-      if (generation >= 2)
-        launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
-                             peer.ack_first,
-                         sends, generation - 1, impl_->peer_timeout_seconds, compute);
-      if (peer.gather_count)
-        launch_peer_gather(peer.gathers[slot_index].opaque_handle(), peer.gather_count,
-                           peer.gather_precision, compute);
-      else
-        for (size_t i = 0; i < sends; ++i)
-          launch_boundary_gather(stage->plan.sends[i].launch,
-                                 stage->gather_entries.opaque_handle(),
-                                 peer.send_targets[slot_index][i], compute);
-      launch_peer_signal(peer.ready_targets.opaque_handle(), sends, generation + 1, compute);
+      if (impl_->peer_device_generation) {
+        const uint64_t *device_generation = flags + peer.generation_index;
+        if (sends) {
+          launch_peer_wait_relative(flags + peer.ack_first, sends, device_generation, -1,
+                                    impl_->peer_timeout_seconds, compute);
+          launch_peer_gather_slotted(peer.gathers[0].opaque_handle(),
+                                     peer.gathers[1].opaque_handle(), peer.gather_count,
+                                     device_generation, peer.gather_precision, compute);
+          launch_peer_signal_relative(peer.ready_targets.opaque_handle(), sends,
+                                      device_generation, 1, false, compute);
+        }
+      }
+      else {
+        if (generation >= 2)
+          launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
+                               peer.ack_first,
+                           sends, generation - 1, impl_->peer_timeout_seconds, compute);
+        if (peer.gather_count)
+          launch_peer_gather(peer.gathers[slot_index].opaque_handle(), peer.gather_count,
+                             peer.gather_precision, compute);
+        else
+          for (size_t i = 0; i < sends; ++i)
+            launch_boundary_gather(stage->plan.sends[i].launch,
+                                   stage->gather_entries.opaque_handle(),
+                                   peer.send_targets[slot_index][i], compute);
+        launch_peer_signal(peer.ready_targets.opaque_handle(), sends, generation + 1, compute);
+      }
     }
     catch (const std::exception &error) {
       why = error.what();
@@ -540,32 +563,49 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
     impl::peer_stage &peer = impl_->peer_stages[size_t(stage - impl_->stages.data())];
     const uint64_t generation = stage->generation;
     const size_t receives = stage->plan.receives.size();
+    const uint64_t *flags = static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle());
     try {
-      launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
-                           peer.ready_first,
-                       receives, generation + 1, impl_->peer_timeout_seconds, compute);
-      if (peer.scatter_count)
-        launch_boundary_scatter_parallel(
-            boundary_launch{0, peer.scatter_count, peer.scatter_count, peer.scatter_precision},
-            peer.scatters[slot_index].opaque_handle(), stage->receive_arena.opaque_handle(),
-            compute);
-      else
-        for (uint32_t index : stage->plan.canonical_receive_order) {
-          if (index >= receives)
-            throw std::logic_error("NVIDIA peer transport receive order is stale");
-          const bound_boundary_message &message = stage->plan.receives[index];
-          const void *arena =
-              static_cast<const unsigned char *>(stage->receive_arena.opaque_handle()) +
-              message.arena_offsets[slot_index];
-          if (stage->plan.publication == RemoteHaloPublicationMode::canonical_serial)
-            launch_boundary_scatter_serial(message.launch, stage->scatter_entries.opaque_handle(),
-                                           arena, compute);
-          else
-            launch_boundary_scatter_parallel(message.launch,
-                                             stage->scatter_entries.opaque_handle(), arena,
-                                             compute);
+      if (impl_->peer_device_generation) {
+        const uint64_t *device_generation = flags + peer.generation_index;
+        if (receives) {
+          launch_peer_wait_relative(flags + peer.ready_first, receives, device_generation, 1,
+                                    impl_->peer_timeout_seconds, compute);
+          launch_peer_scatter_slotted(peer.scatters[0].opaque_handle(),
+                                      peer.scatters[1].opaque_handle(), peer.scatter_count,
+                                      stage->receive_arena.opaque_handle(), device_generation,
+                                      peer.scatter_precision, compute);
         }
-      launch_peer_signal(peer.ack_targets.opaque_handle(), receives, generation + 1, compute);
+        /* Acks the senders and advances this stage's generation (always). */
+        launch_peer_signal_relative(peer.ack_targets.opaque_handle(), receives,
+                                    device_generation, 1, true, compute);
+      }
+      else {
+        launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
+                             peer.ready_first,
+                         receives, generation + 1, impl_->peer_timeout_seconds, compute);
+        if (peer.scatter_count)
+          launch_boundary_scatter_parallel(
+              boundary_launch{0, peer.scatter_count, peer.scatter_count, peer.scatter_precision},
+              peer.scatters[slot_index].opaque_handle(), stage->receive_arena.opaque_handle(),
+              compute);
+        else
+          for (uint32_t index : stage->plan.canonical_receive_order) {
+            if (index >= receives)
+              throw std::logic_error("NVIDIA peer transport receive order is stale");
+            const bound_boundary_message &message = stage->plan.receives[index];
+            const void *arena =
+                static_cast<const unsigned char *>(stage->receive_arena.opaque_handle()) +
+                message.arena_offsets[slot_index];
+            if (stage->plan.publication == RemoteHaloPublicationMode::canonical_serial)
+              launch_boundary_scatter_serial(message.launch, stage->scatter_entries.opaque_handle(),
+                                             arena, compute);
+            else
+              launch_boundary_scatter_parallel(message.launch,
+                                               stage->scatter_entries.opaque_handle(), arena,
+                                               compute);
+          }
+        launch_peer_signal(peer.ack_targets.opaque_handle(), receives, generation + 1, compute);
+      }
     }
     catch (const std::exception &error) {
       /* Peers may already be spinning on this generation; they trap after
@@ -873,7 +913,10 @@ bool staged_transport_epoch::retire(std::string &why) noexcept {
             transport_clock::now() + std::chrono::seconds(30);
         for (size_t s = 0; s < impl_->stages.size(); ++s) {
           const size_t sends = impl_->stages[s].plan.sends.size();
-          const uint64_t generation = impl_->stages[s].generation;
+          uint64_t generation = impl_->stages[s].generation;
+          if (impl_->peer_device_generation)
+            read_peer_flags(impl_->peer_flags, impl_->peer_stages[s].generation_index, 1,
+                            &generation);
           if (!sends || !generation) continue;
           std::vector<uint64_t> acks(sends);
           for (;;) {
@@ -1152,6 +1195,8 @@ bool staged_transport_epoch::enable_peer_route(std::string &why) {
     }
     if (next_flag != total_receives + total_sends)
       throw std::logic_error("NVIDIA peer flag layout is inconsistent");
+    for (size_t s = 0; s < state.stages.size(); ++s)
+      state.peer_stages[s].generation_index = next_flag++;
     const size_t flag_bytes = std::max<size_t>(next_flag, 1) * sizeof(uint64_t);
     state.peer_flags.allocate(flag_bytes, state.device);
     fill_byte_async(state.peer_flags, 0, 0, flag_bytes, *state.communication);
@@ -1352,6 +1397,11 @@ bool staged_transport_epoch::enable_peer_route(std::string &why) {
     return false;
   }
   state.peer = true;
+  state.peer_device_generation = true;
+  for (size_t s = 0; s < state.stages.size(); ++s)
+    if ((!state.stages[s].plan.sends.empty() && !state.peer_stages[s].gather_count) ||
+        (!state.stages[s].plan.receives.empty() && !state.peer_stages[s].scatter_count))
+      state.peer_device_generation = false;
   state.peer_timeout_seconds = peer_timeout_from_environment();
   const char *verbose = std::getenv("MEEP_NVIDIA_PEER_VERBOSE");
   if (verbose && *verbose && std::strcmp(verbose, "0"))

@@ -102,6 +102,9 @@ public:
   bool has_stage(field_type ft) const;
   /* True when halo stages run over node-local CUDA IPC peer stores. */
   bool uses_peer_route() const;
+  /* Peer stages enqueue only static device work (device-side generations),
+     so begin/finish may be recorded into a CUDA graph and replayed. */
+  bool peer_stages_capturable() const;
   bool begin_stage(field_type ft, const stream &compute, std::string &why);
   bool finish_stage(field_type ft, const stream &compute, std::string &why);
   [[noreturn]] void abort_published_stage(field_type ft, const char *operation) noexcept;

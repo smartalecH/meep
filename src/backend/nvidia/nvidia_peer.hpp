@@ -85,6 +85,23 @@ struct peer_gather_entry {
 void launch_peer_gather(const void *entries, size_t count, scalar_precision precision,
                         const stream &on_stream);
 
+/* Device-generation variants: `generation` is a local uint64_t counter for
+   one stage, read on the device, so these launches have static parameters
+   and can be captured into a CUDA graph. Slot = generation & 1. */
+void launch_peer_wait_relative(const void *flags, size_t count, const void *generation,
+                               int64_t delta, double timeout_seconds, const stream &on_stream);
+/* targets[i] <- generation + delta (release); with `advance`, the counter is
+   then incremented. Always one block, so it may run with count == 0. */
+void launch_peer_signal_relative(const void *targets, size_t count, const void *generation,
+                                 int64_t delta, bool advance, const stream &on_stream);
+void launch_peer_gather_slotted(const void *table0, const void *table1, size_t count,
+                                const void *generation, scalar_precision precision,
+                                const stream &on_stream);
+/* boundary_scatter_entry tables with byte offsets relative to `arena`. */
+void launch_peer_scatter_slotted(const void *table0, const void *table1, size_t count,
+                                 const void *arena, const void *generation,
+                                 scalar_precision precision, const stream &on_stream);
+
 /* Host read of local flag words (for draining before teardown). */
 void read_peer_flags(const device_buffer &flags, size_t first, size_t count, uint64_t *out);
 

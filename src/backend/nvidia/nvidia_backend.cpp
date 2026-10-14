@@ -1714,6 +1714,17 @@ public:
   std::vector<NvidiaCompiledDependencyStage> dependency_regions_;
   GraphProgram graph_program_;
   std::vector<NvidiaCompiledGraphSegment> graph_segments_;
+  /* Peer route only: maximal schedule runs of segments and remote-halo
+     boundaries captured as one graph (the halo stages then enqueue only
+     static device work), so a step is not split at every halo exchange.
+     graph_run_at_entry_[i] is the run starting at schedule entry i or -1. */
+  struct GraphRun {
+    size_t first_entry;
+    size_t entry_count;
+    NvidiaCapturedGraph graph;
+  };
+  std::vector<GraphRun> graph_runs_;
+  std::vector<int> graph_run_at_entry_;
   std::vector<size_t> graph_cw_timestep_launches_;
   std::vector<size_t> graph_cw_finite_launches_;
   GraphProgram magnetic_half_graph_program_;
@@ -13152,6 +13163,18 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
       }
     };
     reset_segments(executable.graph_segments_);
+    for (NvidiaExecutable::GraphRun &run : executable.graph_runs_) {
+      try { run.graph.executable.reset(); }
+      catch (const std::exception &error) { remember_cleanup_error(error); }
+      catch (...) {
+        if (cleanup_error.empty()) cleanup_error = "unknown CUDA graph executable cleanup failure";
+      }
+      try { run.graph.definition.reset(); }
+      catch (const std::exception &error) { remember_cleanup_error(error); }
+      catch (...) {
+        if (cleanup_error.empty()) cleanup_error = "unknown CUDA graph definition cleanup failure";
+      }
+    }
     reset_segments(executable.magnetic_half_graph_segments_);
     reset_segments(executable.magnetic_restore_graph_segments_);
     for (NvidiaCapturedGraph &graph : executable.magnetic_auxiliary_graphs_) {
@@ -13182,7 +13205,12 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
     for (const NvidiaCapturedGraph &graph : executable.magnetic_auxiliary_graphs_)
       graphs_released = graphs_released && !graph.executable.opaque_handle() &&
                         !graph.definition.opaque_handle() && !graph.definition.capturing();
+    for (const NvidiaExecutable::GraphRun &run : executable.graph_runs_)
+      graphs_released = graphs_released && !run.graph.executable.opaque_handle() &&
+                        !run.graph.definition.opaque_handle() && !run.graph.definition.capturing();
     if (graphs_released) {
+      executable.graph_runs_.clear();
+      executable.graph_run_at_entry_.clear();
       executable.graph_segments_.clear();
       executable.magnetic_half_graph_segments_.clear();
       executable.magnetic_restore_graph_segments_.clear();
@@ -13260,6 +13288,62 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
       }
       compiled.definition.end_capture(*state.transfer_);
       ++executable.graph_statistics_.capture_count;
+    }
+
+    executable.graph_runs_.clear();
+    executable.graph_run_at_entry_.assign(graph_program.schedule.size(), -1);
+    if (executable.transport_ && executable.transport_->peer_stages_capturable() &&
+        executable.program_ != StepProgram::solve_cw) {
+      const auto mergeable = [&](const GraphScheduleEntry &entry) {
+        if (entry.kind == GraphScheduleKind::segment) return true;
+        if (entry.index >= graph_program.boundaries.size()) return false;
+        const GraphBoundary &boundary = graph_program.boundaries[entry.index];
+        if (boundary.kind != GraphBoundaryKind::remote_halo || boundary.operation_count != 1 ||
+            boundary.completion_only || boundary.first_operation >= executable.operations_.size())
+          return false;
+        const NvidiaCompiledOperation &op = executable.operations_[boundary.first_operation];
+        return op.kind == OpKind::transfer_halo && op.guard.kind != GuardKind::segment_boundary &&
+               executable.transport_->has_stage(op.ft);
+      };
+      const std::vector<GraphScheduleEntry> &schedule = graph_program.schedule;
+      for (size_t first = 0; first < schedule.size();) {
+        size_t end = first;
+        bool has_halo = false;
+        while (end < schedule.size() && mergeable(schedule[end])) {
+          has_halo = has_halo || schedule[end].kind == GraphScheduleKind::boundary;
+          ++end;
+        }
+        if (has_halo && end - first >= 2) {
+          executable.graph_runs_.push_back(NvidiaExecutable::GraphRun());
+          NvidiaExecutable::GraphRun &run = executable.graph_runs_.back();
+          run.first_entry = first;
+          run.entry_count = end - first;
+          std::ostringstream label;
+          label << "ordinary-step-run-" << executable.graph_runs_.size() - 1;
+          run.graph.definition.begin_capture(*state.transfer_, label.str());
+          for (size_t e = first; e < end; ++e) {
+            const std::vector<GraphOperationRef> *operations = NULL;
+            std::vector<GraphOperationRef> halo;
+            if (schedule[e].kind == GraphScheduleKind::segment)
+              operations = &graph_program.segments.at(schedule[e].index).operations;
+            else {
+              const GraphBoundary &boundary = graph_program.boundaries[schedule[e].index];
+              halo.push_back(boundary.operation);
+              halo.back().operation_index = boundary.first_operation;
+              operations = &halo;
+            }
+            for (const GraphOperationRef &operation : *operations)
+              if (!launch_device_operation(executable, state,
+                                           executable.operations_.at(operation.operation_index),
+                                           device_scalars, false))
+                throw std::logic_error("NVIDIA graph run contains a host-only operation");
+          }
+          run.graph.definition.end_capture(*state.transfer_);
+          ++executable.graph_statistics_.capture_count;
+          executable.graph_run_at_entry_[first] = int(executable.graph_runs_.size() - 1);
+        }
+        first = end > first ? end : first + 1;
+      }
     }
 
     executable.magnetic_auxiliary_graphs_.reserve(2);
@@ -13355,6 +13439,10 @@ void NvidiaBackend::configure_graph_execution(const StepPlan &plan,
       }
     };
     instantiate_segments(executable.graph_segments_);
+    for (NvidiaExecutable::GraphRun &run : executable.graph_runs_) {
+      run.graph.executable.instantiate(run.graph.definition);
+      ++executable.graph_statistics_.instantiate_count;
+    }
     if (nvidia::testing::consume_failure_for_testing(
             nvidia::testing::failure_point::magnetic_graph_instantiate))
       throw std::runtime_error("injected CUDA magnetic graph instantiate failure");
@@ -13730,7 +13818,19 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         ++executable.graph_statistics_.scalar_write_count;
         ++state.graph_statistics_.scalar_write_count;
         bool graph_segment_guard = false;
-        for (const GraphScheduleEntry &entry : executable.graph_program_.schedule) {
+        const std::vector<GraphScheduleEntry> &schedule = executable.graph_program_.schedule;
+        for (size_t schedule_index = 0; schedule_index < schedule.size(); ++schedule_index) {
+          const GraphScheduleEntry &entry = schedule[schedule_index];
+          if (schedule_index < executable.graph_run_at_entry_.size() &&
+              executable.graph_run_at_entry_[schedule_index] >= 0) {
+            const NvidiaExecutable::GraphRun &run =
+                executable.graph_runs_.at(size_t(executable.graph_run_at_entry_[schedule_index]));
+            run.graph.executable.launch(*state.transfer_);
+            ++executable.graph_statistics_.launch_count;
+            ++state.graph_statistics_.launch_count;
+            schedule_index += run.entry_count - 1;
+            continue;
+          }
           if (entry.kind == GraphScheduleKind::segment) {
             if (entry.index >= executable.graph_segments_.size())
               throw std::logic_error("NVIDIA graph schedule segment is out of range");

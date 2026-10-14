@@ -212,6 +212,7 @@ $(srcdir)/backend/nvidia/nvidia_boundaries.hpp $(srcdir)/backend/nvidia/runtime.
 
 backend/nvidia/nvidia_peer.cuda.lo: $(srcdir)/backend/nvidia/nvidia_peer.cu \
 $(srcdir)/backend/nvidia/nvidia_peer.hpp $(srcdir)/backend/nvidia/nvidia_step.hpp \
+$(srcdir)/backend/nvidia/nvidia_boundaries.hpp \
 $(srcdir)/backend/nvidia/runtime.hpp
 	$(AM_V_at)$(MKDIR_P) $(dir $@).libs
 	$(AM_V_GEN)$(NVCC) $(CUDA_HOST_FLAGS) -std=c++11 $(NVCCFLAGS) $(CUDA_ARCH_FLAGS) \
