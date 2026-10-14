@@ -166,3 +166,33 @@ are bitwise identical to 1 rank (staged and direct transports).
   communication/compute overlap that works for real step programs. Until
   then, larger problems per GPU and PCIe nodes with slower GPUs scale better
   (8x RTX PRO 6000: 5.2x at resolution 40).
+
+## CUDA-aware MPI transport: UCX vs Open MPI smcuda (2x H100 SXM, NV18)
+
+The conda-forge Open MPI 5 is CUDA-aware, but its default UCX PML is the slow
+part on these container hosts. OSU micro-benchmarks, device-to-device:
+
+| path | 8 B latency | 1 MB latency | 4 MB bandwidth |
+|---|---|---|---|
+| UCX (`UCX_TLS=self,sm,cuda_copy,cuda_ipc UCX_MEMTYPE_CACHE=n`; every other UCX config fails) | 208 us | 114 us | 41 GB/s |
+| `--mca pml ob1 --mca btl self,sm,smcuda --mca opal_cuda_support 1` | 12 us | 13 us | 260 GB/s |
+
+MMI resolution 40, native, `MEEP_FINITE_CHECK=off`. Fields on 2 ranks are
+bitwise identical to 1 rank with smcuda (staged and direct):
+
+| GPUs | MPI | transport | ms/step | speedup |
+|---|---|---|---|---|
+| 1 | | | 11.59 | 1.00 |
+| 2 | UCX | staged | 7.15 | 1.62 |
+| 2 | smcuda | staged | 7.21 | 1.61 |
+| 2 | UCX | direct | 14.39 | 0.81 |
+| 2 | smcuda | direct | 7.76 | 1.49 |
+
+- Use `--mca pml ob1 --mca btl self,sm,smcuda` for direct transport on a
+  single node: it removes the 2x direct-route penalty with no code change.
+- Even so, direct is no faster than staged, and 2 ranks lose ~1.4-2 ms/step
+  versus ideal (5.8 ms). The halo payload moves in microseconds at these
+  rates, so the loss is the backend's per-exchange host synchronization
+  (each stage does two `MPI_Allreduce` reconciliations, a host spin on the
+  gather event, `MPI_Waitall` and a `cudaStreamSynchronize`), not MPI.
+- First-step setup on this host: 865 s on 1 rank, 427 s on 2 ranks.
