@@ -196,3 +196,39 @@ bitwise identical to 1 rank with smcuda (staged and direct):
   (each stage does two `MPI_Allreduce` reconciliations, a host spin on the
   gather event, `MPI_Waitall` and a `cudaStreamSynchronize`), not MPI.
 - First-step setup on this host: 865 s on 1 rank, 427 s on 2 ranks.
+
+## Node-local peer transport and graph branches (branch custom/phase2-pr9-peer)
+
+On one node the halo exchange now bypasses MPI: each rank writes its halo
+straight into the neighbour's receive buffer through CUDA IPC and
+publishes a per-message generation flag; the neighbour waits on the flag
+on the device. No host synchronization or MPI call is on the per-step
+path. Per-chunk curl/constitutive kernels are also captured as parallel
+CUDA graph branches (a ~0.7 ms/step serial-kernel floor on H100 was the
+real strong-scaling limit). Fields after 300 steps are bitwise identical
+to 1 rank on 2 and 4 ranks (native and mixed); checkpoint round trips are
+bitwise on staged, direct and peer routes.
+
+Resolution 40 (135M cells), native unless noted, `MEEP_FINITE_CHECK=off`:
+
+| node | GPUs | route | ms/step | Gcell/s | speedup |
+|---|---|---|---|---|---|
+| 2x H100 SXM (NV6) | 1 | | 9.06 | 14.9 | 1.00 |
+| | 2 | staged MPI (before) | 7.81 | 17.3 | 1.16 |
+| | 2 | peer | 4.81 | 28.1 | 1.88 |
+| 4x H200 NVL (NV6 all pairs) | 1 | | 7.29 | 18.5 | 1.00 |
+| | 2 | peer | 3.86 | 35.0 | 1.89 |
+| | 4 | staged MPI | 3.88 | 34.8 | 1.88 |
+| | 4 | peer | 2.13 | 63.4 | 3.43 (86%) |
+| | 4 | peer, mixed | 1.61 | 83.6 | 4.52 |
+
+Knobs: `MEEP_NVIDIA_PEER_TRANSPORT=off|auto|required` (default auto: used
+when every rank is on one node and can map its neighbours' GPUs, else the
+MPI route), `MEEP_NVIDIA_PEER_TIMEOUT` (seconds, default 1800),
+`MEEP_NVIDIA_PEER_VERBOSE=1`, `MEEP_NVIDIA_GRAPH_BRANCHES` (default 8).
+
+Remaining 4-GPU loss (~0.3 ms/step): middle ranks wait ~0.1 ms for
+neighbours (they carry twice the halo work), eager peer kernels ~0.08 ms,
+and each remote halo still splits the step graph. When the MPI route is used on one node,
+prefer `--mca pml ob1 --mca btl self,sm,smcuda` over UCX in vast
+containers (UCX device-buffer latency was 10x worse).
