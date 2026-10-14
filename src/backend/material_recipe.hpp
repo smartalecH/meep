@@ -74,6 +74,21 @@ struct MaterialRecipeRow {
   size_t elements;
   size_t alignment;
   std::vector<unsigned char> values;
+  /* Dense fallback rows that repeat one value (unset tensor entries, absent
+     conductivity/nonlinearity) keep `values` empty and record the value
+     here instead of a full-grid payload. Only realnum rows can be constant. */
+  bool constant;
+  realnum constant_value;
+
+  MaterialRecipeRow()
+      : role(array_role::material), element_type(ElementType::realnum_value),
+        storage(native_precision), elements(0), alignment(0), constant(false),
+        constant_value(0) {}
+  /* Logical payload size in bytes (constant rows included). */
+  size_t payload_bytes() const;
+  /* The row's logical payload: `values`, or the expanded constant. */
+  void copy_payload(unsigned char *destination) const;
+  std::vector<unsigned char> materialized_values() const;
 
   bool operator==(const MaterialRecipeRow &other) const;
 };

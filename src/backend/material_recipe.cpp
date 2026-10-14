@@ -175,6 +175,26 @@ size_t checked_host_bytes(ElementType type, size_t elements) {
   return width * elements;
 }
 
+/* Default rows other than PML profiles repeat one value: 1 on a tensor
+   diagonal (chi1inv/condinv), else 0. Returns false for PML rows. */
+bool constant_default_row(const MaterialIRTopologyRow &topology, realnum &value) {
+  if (topology.element_type != ElementType::realnum_value ||
+      topology.logical_storage != native_precision)
+    throw std::invalid_argument("material fallback default row has a non-native type");
+  const array_kind kind = static_cast<array_kind>(topology.key.kind);
+  if (kind == array_kind::chi1inv || kind == array_kind::condinv) {
+    const component c = component(topology.key.component_);
+    value = component_direction(c) == direction(topology.key.aux) ? realnum(1) : realnum(0);
+    return true;
+  }
+  if (kind == array_kind::chi2 || kind == array_kind::chi3 || kind == array_kind::conductivity ||
+      kind == array_kind::sigma) {
+    value = realnum(0);
+    return true;
+  }
+  return false;
+}
+
 std::vector<unsigned char> logical_default_row(const MaterialIRTopologyRow &topology,
                                                const MaterialIR &ir) {
   if (topology.element_type != ElementType::realnum_value ||
@@ -257,7 +277,15 @@ uint64_t compute_signature(uint32_t version, MaterialRecipeDisposition dispositi
     mix_u64(hash, uint64_t(row.storage));
     mix_u64(hash, row.elements);
     mix_u64(hash, row.alignment);
-    mix_realnum_values(hash, row.values);
+    mix_u64(hash, row.constant ? 1 : 0);
+    if (row.constant) {
+      const double value = double(row.constant_value);
+      uint64_t bits = 0;
+      memcpy(&bits, &value, sizeof(bits));
+      mix_u64(hash, bits);
+    }
+    else
+      mix_realnum_values(hash, row.values);
   }
   mix_u64(hash, callback_tiles.size());
   for (const MaterialCallbackTile &tile : callback_tiles) {
@@ -488,7 +516,7 @@ MaterialSupportDecision classify_support_input(
   for (const MaterialRecipeRow &row : dense_fallback_rows)
     decision.dense_fallback_bytes = checked_u64_add(
         decision.dense_fallback_bytes,
-        checked_u64_bytes(row.values.size(), 1, "dense byte count"), "dense byte count");
+        checked_u64_bytes(row.payload_bytes(), 1, "dense byte count"), "dense byte count");
   if (!ir) {
     return decision;
   }
@@ -706,6 +734,8 @@ void validate_input(const MaterialRecipeView &input) {
       throw std::invalid_argument("material recipe row has an invalid alignment");
     if (!row.elements)
       throw std::invalid_argument("material recipe row has zero extent");
+    if (row.constant)
+      throw std::invalid_argument("material recipe primary row cannot be constant");
     const size_t bytes = checked_host_bytes(row.element_type, row.elements);
     const bool dense = input.disposition == MaterialRecipeDisposition::host_reference;
     if ((dense && row.values.size() != bytes) || (!dense && !row.values.empty()))
@@ -742,7 +772,8 @@ void validate_input(const MaterialRecipeView &input) {
   for (const MaterialRecipeRow &row : input.dense_fallback_rows) {
     if (row.role != array_role::material || row.element_type != ElementType::realnum_value ||
         row.storage != native_precision || row.alignment != alignof(realnum) || !row.elements ||
-        row.values.size() != checked_host_bytes(row.element_type, row.elements) ||
+        (row.constant ? !row.values.empty()
+                      : row.values.size() != checked_host_bytes(row.element_type, row.elements)) ||
         !dense_keys.insert(row.key).second)
       throw std::invalid_argument("dense material fallback sidecar is malformed");
     if (input.ir) {
@@ -929,9 +960,34 @@ MaterialRecipeDisposition reconcile_material_recipe_route(
   return MaterialRecipeDisposition::device_native;
 }
 
+size_t MaterialRecipeRow::payload_bytes() const {
+  if (!constant) return values.size();
+  if (elements > std::numeric_limits<size_t>::max() / sizeof(realnum))
+    throw std::overflow_error("material recipe constant row byte count overflow");
+  return elements * sizeof(realnum);
+}
+
+void MaterialRecipeRow::copy_payload(unsigned char *destination) const {
+  if (!constant) {
+    if (!values.empty()) memcpy(destination, values.data(), values.size());
+    return;
+  }
+  for (size_t i = 0; i < elements; ++i)
+    memcpy(destination + i * sizeof(realnum), &constant_value, sizeof(realnum));
+}
+
+std::vector<unsigned char> MaterialRecipeRow::materialized_values() const {
+  if (!constant) return values;
+  std::vector<unsigned char> result(payload_bytes());
+  copy_payload(result.data());
+  return result;
+}
+
 bool MaterialRecipeRow::operator==(const MaterialRecipeRow &other) const {
   return key == other.key && role == other.role && element_type == other.element_type &&
          storage == other.storage && elements == other.elements && alignment == other.alignment &&
+         constant == other.constant &&
+         (!constant || memcmp(&constant_value, &other.constant_value, sizeof(realnum)) == 0) &&
          values == other.values;
 }
 
@@ -1132,7 +1188,10 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
         dense.alignment = topology.alignment;
         const auto source = dense_sources.find(dense.key);
         if (source != dense_sources.end()) dense.values = source->second->values;
-        else dense.values = logical_default_row(topology, *input.ir);
+        else if (!constant_default_row(topology, dense.constant_value))
+          dense.values = logical_default_row(topology, *input.ir);
+        else
+          dense.constant = true;
         input.dense_fallback_rows.push_back(std::move(dense));
       }
     if (!reuse) {
@@ -1147,6 +1206,16 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
   }
   else input.dense_fallback_rows = input.rows;
   timer.mark("dense_fallback");
+  if (timer.enabled && input.shared_dense_fallback_rows) {
+    size_t bytes = 0;
+    for (const MaterialRecipeRow &row : *input.shared_dense_fallback_rows)
+      bytes += row.values.size();
+    char buffer[96];
+    std::snprintf(buffer, sizeof(buffer), " [%zu dense rows, %.2f GB%s]",
+                  input.shared_dense_fallback_rows->size(), bytes / 1e9,
+                  input.shared_dense_fallback_rows.use_count() > 2 ? ", shared" : "");
+    timer.line += buffer;
+  }
   const MaterialSupportDecision decision = classify_support_input(
       input.ir,
       input.shared_dense_fallback_rows ? *input.shared_dense_fallback_rows
@@ -1216,7 +1285,7 @@ MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
             std::to_string(row.key.chunk) + ", kind=" + std::to_string(row.key.kind) +
             ", component=" + std::to_string(row.key.component_) + ", cmp=" +
             std::to_string(row.key.cmp) + ", aux=" + std::to_string(row.key.aux) + ")");
-      row.values = source->second->values;
+      row.values = source->second->materialized_values();
     }
   }
   else

@@ -8004,9 +8004,9 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
     const size_t logical_bytes = material_checked_product(
         spec.elements, sizeof(realnum), "staging logical material output");
     if (material.disposition() == MaterialRecipeDisposition::host_reference) {
-      if (row->values.size() != logical_bytes)
+      if (row->payload_bytes() != logical_bytes)
         throw std::logic_error("host-reference material row is incomplete");
-      memcpy(logical, row->values.data(), logical_bytes);
+      row->copy_payload(logical);
     }
     else {
       const realnum value = realnum(default_material_row_value(state.plan_.keys[upload.allocation]));
@@ -8105,6 +8105,7 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
       for (const NvidiaInitializationUpload &candidate : state.initialization_uploads_)
         if (candidate.material && candidate.allocation == row.allocation) upload = &candidate;
       const unsigned char *logical = NULL;
+      std::vector<unsigned char> constant_logical;
       if (upload && upload->logical_offset != size_t(-1))
         logical = staging + upload->logical_offset;
       else if (initialization.regional) {
@@ -8115,8 +8116,13 @@ void NvidiaBackend::prepare_initialization(const InitializationPlan &initializat
           }
         if (!logical)
           for (const MaterialRecipeRow &candidate : material.dense_fallback_rows())
-            if (candidate.key == row.key && !candidate.values.empty()) {
-              logical = candidate.values.data();
+            if (candidate.key == row.key && candidate.payload_bytes()) {
+              if (candidate.constant) {
+                constant_logical = candidate.materialized_values();
+                logical = constant_logical.data();
+              }
+              else
+                logical = candidate.values.data();
               break;
             }
       }

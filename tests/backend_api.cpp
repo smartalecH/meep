@@ -8698,7 +8698,7 @@ static void test_geometry_backed_material_ir() {
     const MaterialSupportDecision support = classify_material_support(geometry_recipe);
     uint64_t exact_dense_bytes = 0;
     for (const MaterialRecipeRow &row : geometry_recipe.dense_fallback_rows())
-      exact_dense_bytes += row.values.size();
+      exact_dense_bytes += row.payload_bytes();
     CHECK(geometry_recipe.disposition() == MaterialRecipeDisposition::hybrid_interface &&
               support.disposition == MaterialRecipeDisposition::hybrid_interface &&
               support.reason_bits == material_support_none &&
@@ -10108,11 +10108,12 @@ static void test_owned_tiled_material_route() {
           int(row.key.aux) != int(component_direction(component(row.key.component_))))
         continue;
       saw_synthesized_identity = true;
-      CHECK(row.values.size() == row.elements * sizeof(realnum),
+      const std::vector<unsigned char> payload = row.materialized_values();
+      CHECK(payload.size() == row.elements * sizeof(realnum),
             "synthesized chi1 identity row has the wrong byte count");
       for (size_t point = 0; point < row.elements; ++point) {
         realnum value = 0;
-        memcpy(&value, row.values.data() + point * sizeof(realnum), sizeof(value));
+        memcpy(&value, payload.data() + point * sizeof(realnum), sizeof(value));
         CHECK(value == realnum(1),
               "dense fallback synthesized chi1 diagonal as %.17g instead of +1",
               double(value));
