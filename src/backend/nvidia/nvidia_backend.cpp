@@ -4463,13 +4463,34 @@ struct CompiledHaloRef {
   nvidia::scalar_precision precision;
 };
 
+/* Per-array facts of the last resolved halo reference. Consecutive halo
+   elements almost always share an array, and resolving the device address
+   searches every allocation, so compile_halo keeps one of these per call. */
+struct HaloRefCache {
+  bool valid = false;
+  ArrayId id;
+  void *address = NULL;
+  nvidia::scalar_precision precision = nvidia::scalar_precision::f64;
+  size_t elements = 0;
+};
+
 CompiledHaloRef compile_halo_ref(const ElementRef &source, NvidiaBackendState &state,
-                                 const char *what) {
+                                 const char *what, HaloRefCache *cache = NULL) {
   if (source.index < 0)
     throw std::out_of_range(std::string(what) + " has a negative element index");
+  if (cache && cache->valid && cache->id == source.array && size_t(source.index) < cache->elements)
+    return CompiledHaloRef{cache->address, source.index, cache->precision};
   const nvidia::scalar_precision precision = scalar_precision_for(state.plan_, source.array, what);
   validate_index_range(state.plan_, source.array, source.index, source.index, what);
-  return CompiledHaloRef{device_address(state, source.array, what), source.index, precision};
+  void *address = device_address(state, source.array, what);
+  if (cache) {
+    cache->valid = true;
+    cache->id = source.array;
+    cache->address = address;
+    cache->precision = precision;
+    cache->elements = state.plan_.arrays[source.array.value].elements;
+  }
+  return CompiledHaloRef{address, source.index, precision};
 }
 
 size_t scalar_bytes(nvidia::scalar_precision precision) {
@@ -4502,8 +4523,10 @@ NvidiaCompiledHalo compile_halo(const HaloPlan &source, const fields &f, NvidiaB
 
   bool have_precision = false;
   nvidia::scalar_precision precision = nvidia::scalar_precision::f64;
+  HaloRefCache gather_cache, scatter_cache, imag_cache;
   for (size_t i = 0; i < gather_refs.size(); ++i) {
-    const CompiledHaloRef ref = compile_halo_ref(gather_refs[i], state, "halo gather source");
+    const CompiledHaloRef ref =
+        compile_halo_ref(gather_refs[i], state, "halo gather source", &gather_cache);
     if (have_precision && ref.precision != precision)
       throw std::invalid_argument("local halo gather mixes storage precisions");
     precision = ref.precision;
@@ -4516,7 +4539,8 @@ NvidiaCompiledHalo compile_halo(const HaloPlan &source, const fields &f, NvidiaB
     case CONNECT_NEGATE: {
       const double sign = source.phase == CONNECT_NEGATE ? -1.0 : 1.0;
       for (size_t i = 0; i < scatter_refs.size(); ++i) {
-        const CompiledHaloRef ref = compile_halo_ref(scatter_refs[i], state, "halo scatter target");
+        const CompiledHaloRef ref =
+            compile_halo_ref(scatter_refs[i], state, "halo scatter target", &scatter_cache);
         if (ref.precision != precision)
           throw std::invalid_argument("local halo scatter mixes storage precisions");
         scatters.push_back(nvidia::halo_scatter_entry{ref.address, ref.index, NULL, 0,
@@ -4532,9 +4556,10 @@ NvidiaCompiledHalo compile_halo(const HaloPlan &source, const fields &f, NvidiaB
         throw std::invalid_argument("phase halo values do not match the transfer count");
       for (size_t i = 0; i < source.phase_values.size(); ++i) {
         const CompiledHaloRef real_ref =
-            compile_halo_ref(scatter_refs[2 * i], state, "phase halo real target");
+            compile_halo_ref(scatter_refs[2 * i], state, "phase halo real target", &scatter_cache);
         const CompiledHaloRef imag_ref =
-            compile_halo_ref(scatter_refs[2 * i + 1], state, "phase halo imaginary target");
+            compile_halo_ref(scatter_refs[2 * i + 1], state, "phase halo imaginary target",
+                             &imag_cache);
         if (real_ref.precision != precision || imag_ref.precision != precision)
           throw std::invalid_argument("phase halo mixes storage precisions");
         scatters.push_back(nvidia::halo_scatter_entry{
@@ -9200,11 +9225,9 @@ bool compile_remote_boundary_artifact(
                                  staged.wire, why) ||
       !lower_remote_halo_program(staged.wire, halos, storage, real_fields, mpi_tag_ub,
                                  staged.lowered, why) ||
-      !lower_canonical_halo_zeroes(zeroes, storage, staged.lowered_zeroes, why) ||
+      !count_canonical_halo_zeroes(zeroes, storage, staged.zero_count, why) ||
       !nvidia::bind_remote_boundaries(staged.lowered, storage, device_allocations,
-                                      staged.bound, why) ||
-      !nvidia::bind_boundary_zeroes(staged.lowered_zeroes, storage, device_allocations,
-                                    staged.bound_zeroes, why))
+                                      staged.bound, why))
     return false;
   artifact = std::move(staged);
   return true;
@@ -9326,7 +9349,7 @@ Executable *NvidiaBackend::compile(const StepPlan &plan, BackendState &raw_state
       throw std::invalid_argument(boundary_error);
     remote_boundary_compile_statistics_.valid = true;
     remote_boundary_compile_statistics_.stages = remote_boundaries.bound.stages.size();
-    remote_boundary_compile_statistics_.zeroes = remote_boundaries.bound_zeroes.entries.size();
+    remote_boundary_compile_statistics_.zeroes = remote_boundaries.zero_count;
     remote_boundary_compile_statistics_.program_signature =
         remote_boundaries.bound.program_signature;
     remote_boundary_compile_statistics_.storage_signature =

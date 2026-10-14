@@ -109,6 +109,12 @@ struct compiled_boundary_artifact {
   std::vector<LoweredHaloZeroDescriptor> lowered_zeroes;
   bound_boundary_program bound;
   bound_boundary_zeroes bound_zeroes;
+  /* Distinct canonical halo-zero targets. Production compilation validates
+     and counts them without materializing per-element descriptors: runtime
+     zeroing uses the region-based zero batches, not bound_zeroes. */
+  size_t zero_count;
+
+  compiled_boundary_artifact() : zero_count(0) {}
 };
 
 /* Bind neutral canonical roots to already-created device allocations. This is

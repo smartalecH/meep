@@ -600,7 +600,8 @@ bool bind_boundary_zeroes_from_records(
                             allocations_by_id, why))
     return false;
   bound_boundary_zeroes staged;
-  std::set<uintptr_t> targets;
+  std::vector<uintptr_t> targets;
+  targets.reserve(lowered.size());
   for (const LoweredHaloZeroDescriptor &source : lowered) {
     void *address = NULL;
     ptrdiff_t index = 0;
@@ -609,10 +610,7 @@ bool bind_boundary_zeroes_from_records(
       return false;
     const size_t scalar_bytes = source.storage_precision == Precision::f32 ? sizeof(float)
                                                                            : sizeof(double);
-    if (!targets.insert(reinterpret_cast<uintptr_t>(address) + size_t(index) * scalar_bytes).second) {
-      why = "NVIDIA boundary zero binding contains a duplicate physical target";
-      return false;
-    }
+    targets.push_back(reinterpret_cast<uintptr_t>(address) + size_t(index) * scalar_bytes);
     const scalar_precision precision =
         source.storage_precision == Precision::f32 ? scalar_precision::f32 : scalar_precision::f64;
     if (staged.launches.empty() || staged.launches.back().precision != precision) {
@@ -621,8 +619,13 @@ bool bind_boundary_zeroes_from_records(
     staged.entries.push_back(boundary_zero_entry{address, index});
     ++staged.launches.back().count;
   }
+  std::sort(targets.begin(), targets.end());
+  if (std::adjacent_find(targets.begin(), targets.end()) != targets.end()) {
+    why = "NVIDIA boundary zero binding contains a duplicate physical target";
+    return false;
+  }
   for (boundary_launch &launch : staged.launches) launch.extent = staged.entries.size();
-  bound = staged;
+  bound = std::move(staged);
   return true;
 }
 

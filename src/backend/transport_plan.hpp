@@ -266,6 +266,10 @@ bool lower_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes,
                                  const StoragePlan &storage,
                                  std::vector<LoweredHaloZeroDescriptor> &lowered,
                                  std::string &why);
+/* Same validation as lower_canonical_halo_zeroes without materializing
+   descriptors: the number of distinct canonical zero targets. */
+bool count_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes, const StoragePlan &storage,
+                                 size_t &count, std::string &why);
 
 /* Build from the legacy communication authority and canonicalized HaloPlans.
    chunk_ranks is indexed by global chunk id. The catalog supplies storage

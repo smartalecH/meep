@@ -226,6 +226,17 @@ void backend_validate_host_custom_plan(fields &f, const StepPlan &plan,
 
 namespace {
 
+/* MEEP_SETUP_TIMING=1: wall time of each cold-path setup phase. */
+void setup_timing_mark(const char *phase) {
+  static const bool enabled = std::getenv("MEEP_SETUP_TIMING") != NULL;
+  static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  if (enabled && phase)
+    master_printf("meep setup: %s=%.2fs\n", phase,
+                  std::chrono::duration<double>(now - last).count());
+  last = now;
+}
+
 typedef std::tuple<int, int, int> NoisyGroupTuple;
 typedef std::tuple<int, int, int, int, int> NoisyStreamTuple;
 
@@ -2692,6 +2703,7 @@ bool backend_write_host_range(fields &f, const void *host_address, size_t elemen
 }
 
 void backend_reconcile_host_access(const std::string &local_error, const char *site) {
+  setup_timing_mark(site);
   if (!or_to_all(!local_error.empty())) return;
   if (local_error.empty())
     throw std::runtime_error(std::string(site) +
@@ -3331,6 +3343,7 @@ void fields::select_backend(const execution_options &opts) {
 void fields::init_backend() {
   /* Repeated host-reference recipe builds in this setup share dense rows. */
   const material_recipe_setup_scope recipe_scope;
+  setup_timing_mark(NULL);
   if (!backend) {
     execution_options opts;
     select_backend(opts);
@@ -3746,6 +3759,7 @@ void fields::init_backend() {
       backend_reconcile_host_access(candidate_error,
                                     "fields::init_backend candidate definition preflight");
 
+      setup_timing_mark("preflight");
       std::unique_ptr<PreparedMaterialCoefficientStorage> prepared;
       try {
         prepared = prepare_material_coefficient_storage(*this);
@@ -3759,8 +3773,11 @@ void fields::init_backend() {
       backend_reconcile_host_access(candidate_error,
                                     "fields::init_backend candidate coefficients");
       if (prepared) prepared->commit();
+      setup_timing_mark("coefficients");
       prepare_storage();
+      setup_timing_mark("prepare_storage");
       connect_chunks();
+      setup_timing_mark("connect_chunks");
     }
     if (!entry) try {
         entry.reset(new LiveIdentitySnapshot(LiveIdentitySnapshot::capture(*this)));
@@ -3778,6 +3795,7 @@ void fields::init_backend() {
     const ResidentCandidateResult first_result = build_resident_epoch_candidate(
         *this, completed, local_custom, any_custom, any_multilevel, any_flux, *entry,
         material_preflight, &promotion_classification);
+    setup_timing_mark("candidate");
     if (first_result == ResidentCandidateResult::committed) {
       clear_pending_material_region(*this);
       return;
@@ -3800,7 +3818,9 @@ void fields::init_backend() {
       classification_reentries = 1;
       require_source_components();
       prepare_storage();
+      setup_timing_mark("promotion_prepare_storage");
       connect_chunks();
+      setup_timing_mark("promotion_connect_chunks");
     }
     catch (const std::exception &e) {
       candidate_error = e.what();
@@ -3826,6 +3846,7 @@ void fields::init_backend() {
     const ResidentCandidateResult second_result = build_resident_epoch_candidate(
         *this, promoted_completed, local_custom, any_custom, any_multilevel, any_flux,
         *promoted_entry, material_preflight, NULL);
+    setup_timing_mark("promotion_candidate");
     if (second_result != ResidentCandidateResult::committed)
       throw std::logic_error("material classification requested a second component promotion");
     promotion_epoch->commit();

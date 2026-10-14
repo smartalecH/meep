@@ -1024,16 +1024,57 @@ bool lower_remote_halo_program(const RemoteHaloProgram &program, const halo_plan
   return true;
 }
 
-bool lower_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes,
-                                 const StoragePlan &storage,
-                                 std::vector<LoweredHaloZeroDescriptor> &lowered,
-                                 std::string &why) {
+namespace {
+
+/* Shared walk for halo-zero lowering: validates every slab and residue
+   element exactly as before and calls emit(target, precision) once per
+   canonical scalar, first occurrence first (slabs in order, then residue).
+   Alias resolution depends only on the source array (index checks aside)
+   and a canonical root's scalar identity is (root, index), so both are
+   memoized per array: resolution once, deduplication by bitmap. */
+template <typename Emit>
+bool walk_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes, const StoragePlan &storage,
+                                Emit emit, std::string &why) {
   why.clear();
   if (!validate_storage_authority(storage, why)) return false;
-  std::vector<LoweredHaloZeroDescriptor> staged;
-  std::set<ScalarIdentity> targets;
+  struct ResolvedArray {
+    bool resolved = false;
+    RemoteHaloScalarRef target;
+  };
+  std::vector<ResolvedArray> resolved_arrays(storage.arrays.size());
+  std::vector<std::vector<bool> > seen(storage.arrays.size());
+  const auto visit = [&](const ElementRef &ref) -> bool {
+    if (!is_valid(ref.array) || ref.array.value >= storage.arrays.size()) {
+      why = "halo zero lowering references an absent ArrayId";
+      return false;
+    }
+    const Precision precision = storage.arrays[ref.array.value].storage;
+    ResolvedArray &memo = resolved_arrays[ref.array.value];
+    if (!memo.resolved || ref.index < 0 || size_t(ref.index) >= memo.target.elements) {
+      /* First use of this array, or an index the memo cannot vouch for: the
+         full resolver performs (and reports) every check. */
+      if (!resolve_scalar(storage, ref, precision, memo.target, why)) return false;
+      memo.resolved = true;
+    }
+    RemoteHaloScalarRef target = memo.target;
+    target.index = ref.index;
+    size_t byte_offset = 0;
+    const size_t element_bytes = precision == Precision::f32 ? sizeof(float) : sizeof(double);
+    if (!checked_multiply(size_t(target.index), element_bytes, byte_offset)) {
+      why = "halo zero target byte offset overflows";
+      return false;
+    }
+    std::vector<bool> &root_seen = seen.at(target.root.value);
+    if (root_seen.empty()) root_seen.assign(target.elements, false);
+    /* Metal scans may name the same scalar through two canonical aliases.
+       Preserve one deterministic first occurrence rather than issuing racing
+       identical stores. */
+    if (root_seen[size_t(target.index)]) return true;
+    root_seen[size_t(target.index)] = true;
+    emit(target, precision);
+    return true;
+  };
   for (const ZeroPlan &zero : zeroes) {
-    std::vector<ElementRef> refs;
     size_t expected = zero.residue.size();
     for (const SlabRef &slab : zero.slabs) {
       if (!is_valid(slab.array) || slab.array.value >= storage.arrays.size()) {
@@ -1054,43 +1095,47 @@ bool lower_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes,
                                 slab.strides[2], storage.arrays[slab.array.value].elements,
                                 why))
         return false;
+    }
+    for (const SlabRef &slab : zero.slabs)
       for (int i0 = 0; i0 < slab.counts[0]; ++i0)
         for (int i1 = 0; i1 < slab.counts[1]; ++i1)
           for (int i2 = 0; i2 < slab.counts[2]; ++i2)
-            refs.push_back(ElementRef{
-                slab.array, ptrdiff_t(__int128(slab.base) + __int128(i0) * slab.strides[0] +
-                                     __int128(i1) * slab.strides[1] +
-                                     __int128(i2) * slab.strides[2])});
-    }
-    refs.insert(refs.end(), zero.residue.begin(), zero.residue.end());
-    if (refs.size() != expected) {
-      why = "halo zero descriptor expansion changed its checked extent";
-      return false;
-    }
-    for (const ElementRef &ref : refs) {
-      if (!is_valid(ref.array) || ref.array.value >= storage.arrays.size()) {
-        why = "halo zero lowering references an absent ArrayId";
-        return false;
-      }
-      const Precision precision = storage.arrays[ref.array.value].storage;
-      RemoteHaloScalarRef target;
-      if (!resolve_scalar(storage, ref, precision, target, why)) return false;
-      size_t byte_offset = 0;
-      const size_t element_bytes = precision == Precision::f32 ? sizeof(float) : sizeof(double);
-      if (!checked_multiply(size_t(target.index), element_bytes, byte_offset)) {
-        why = "halo zero target byte offset overflows";
-        return false;
-      }
-      if (!targets.insert(ScalarIdentity{target.key, byte_offset}).second) {
-        /* Metal scans may name the same scalar through two canonical aliases.
-           Preserve one deterministic first occurrence rather than issuing
-           racing identical stores. */
-        continue;
-      }
-      staged.push_back(LoweredHaloZeroDescriptor{target, precision});
-    }
+            if (!visit(ElementRef{
+                    slab.array, ptrdiff_t(__int128(slab.base) + __int128(i0) * slab.strides[0] +
+                                          __int128(i1) * slab.strides[1] +
+                                          __int128(i2) * slab.strides[2])}))
+              return false;
+    for (const ElementRef &ref : zero.residue)
+      if (!visit(ref)) return false;
   }
-  lowered = staged;
+  return true;
+}
+
+} // namespace
+
+bool lower_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes,
+                                 const StoragePlan &storage,
+                                 std::vector<LoweredHaloZeroDescriptor> &lowered,
+                                 std::string &why) {
+  std::vector<LoweredHaloZeroDescriptor> staged;
+  if (!walk_canonical_halo_zeroes(
+          zeroes, storage,
+          [&](const RemoteHaloScalarRef &target, Precision precision) {
+            staged.push_back(LoweredHaloZeroDescriptor{target, precision});
+          },
+          why))
+    return false;
+  lowered = std::move(staged);
+  return true;
+}
+
+bool count_canonical_halo_zeroes(const std::vector<ZeroPlan> &zeroes, const StoragePlan &storage,
+                                 size_t &count, std::string &why) {
+  size_t staged = 0;
+  if (!walk_canonical_halo_zeroes(
+          zeroes, storage, [&](const RemoteHaloScalarRef &, Precision) { ++staged; }, why))
+    return false;
+  count = staged;
   return true;
 }
 
