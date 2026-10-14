@@ -114,6 +114,7 @@ struct MaterialRecipeInput {
 class MaterialRecipe {
 public:
   explicit MaterialRecipe(const MaterialRecipeInput &input);
+  explicit MaterialRecipe(MaterialRecipeInput &&input);
 
   uint32_t version() const { return version_; }
   MaterialRecipeDisposition disposition() const { return disposition_; }

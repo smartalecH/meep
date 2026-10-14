@@ -17,6 +17,7 @@
 #include <sstream>
 #include <set>
 #include <stdexcept>
+#include <thread>
 
 #include "backend/classification.hpp"
 #include "backend/precision.hpp"
@@ -57,26 +58,60 @@ void mix_bytes(uint64_t &hash, const void *data, size_t bytes) {
   for (size_t i = 0; i < bytes; ++i) mix_byte(hash, p[i]);
 }
 
+/* Four independent multiply-xorshift lanes over 8-byte words (tail bytes
+   zero-padded): the bit pattern of every scalar still reaches the hash, at
+   ~1 cycle per word instead of eight dependent multiplies per scalar. */
+uint64_t hash_block(const unsigned char *data, size_t bytes) {
+  const uint64_t k = UINT64_C(0x9e3779b97f4a7c15);
+  uint64_t lane[4] = {UINT64_C(0x243f6a8885a308d3), UINT64_C(0x13198a2e03707344),
+                      UINT64_C(0xa4093822299f31d0), UINT64_C(0x082efa98ec4e6c89)};
+  size_t i = 0;
+  for (; i + 32 <= bytes; i += 32)
+    for (int l = 0; l < 4; ++l) {
+      uint64_t w;
+      memcpy(&w, data + i + 8 * l, 8);
+      lane[l] = (lane[l] ^ w) * k;
+      lane[l] ^= lane[l] >> 29;
+    }
+  for (int l = 0; i < bytes; i += 8, l = (l + 1) & 3) {
+    uint64_t w = 0;
+    memcpy(&w, data + i, std::min<size_t>(8, bytes - i));
+    lane[l] = (lane[l] ^ w) * k;
+    lane[l] ^= lane[l] >> 29;
+  }
+  uint64_t h = uint64_t(bytes);
+  for (int l = 0; l < 4; ++l) {
+    h = (h ^ lane[l]) * k;
+    h ^= h >> 31;
+  }
+  return h;
+}
+
+/* Rows are hashed in fixed 4 MiB blocks combined in order, so the value is
+   independent of the thread count; large rows use several threads. */
 void mix_realnum_values(uint64_t &hash, const std::vector<unsigned char> &values) {
   if (values.size() % sizeof(realnum))
     throw std::invalid_argument("material recipe row has a partial scalar");
   mix_u64(hash, values.size() / sizeof(realnum));
-  for (size_t offset = 0; offset < values.size(); offset += sizeof(realnum)) {
-    realnum value = 0;
-    memcpy(&value, values.data() + offset, sizeof(value));
-    if (sizeof(realnum) == sizeof(float)) {
-      uint32_t bits = 0;
-      const float narrowed = float(value);
-      memcpy(&bits, &narrowed, sizeof(bits));
-      mix_u64(hash, bits);
-    }
-    else {
-      uint64_t bits = 0;
-      const double widened = double(value);
-      memcpy(&bits, &widened, sizeof(bits));
-      mix_u64(hash, bits);
-    }
+  const size_t block = size_t(4) << 20;
+  const size_t blocks = (values.size() + block - 1) / block;
+  std::vector<uint64_t> partial(blocks);
+  const auto run = [&](size_t first, size_t stride) {
+    for (size_t b = first; b < blocks; b += stride)
+      partial[b] = hash_block(values.data() + b * block,
+                              std::min(block, values.size() - b * block));
+  };
+  const size_t threads =
+      std::min<size_t>(blocks, std::max(1u, std::min(16u, std::thread::hardware_concurrency())));
+  if (threads <= 1)
+    run(0, 1);
+  else {
+    std::vector<std::thread> pool;
+    for (size_t t = 1; t < threads; ++t) pool.emplace_back(run, t, threads);
+    run(0, threads);
+    for (std::thread &thread : pool) thread.join();
   }
+  for (uint64_t h : partial) mix_u64(hash, h);
 }
 
 void mix_key(uint64_t &hash, const StorageKey &key) {
@@ -543,7 +578,26 @@ std::vector<MaterialCallbackTile> canonical_callback_tiles(const MaterialIR &ir)
   return result;
 }
 
-void validate_input(const MaterialRecipeInput &input) {
+/* By-reference view over either a MaterialRecipeInput or a constructed
+   MaterialRecipe, so validating a recipe never copies its row payloads. */
+struct MaterialRecipeView {
+  const MaterialRecipeDisposition &disposition;
+  const std::string &description;
+  const bool &eps_averaging;
+  const double &subpixel_tol;
+  const int &subpixel_maxeval;
+  const uint32_t &host_callback_id;
+  const bool &from_host_callback;
+  const uint64_t &support_reason_bits;
+  const std::vector<MaterialRecipeRow> &rows;
+  const std::vector<MaterialRecipeRow> &dense_fallback_rows;
+  const std::vector<MaterialCallbackTile> &callback_tiles;
+  const std::vector<std::shared_ptr<const OwnedMaterialCallback> > &callback_owners;
+  const std::vector<MaterialIRTopologyRow> &topology;
+  const std::shared_ptr<const MaterialIR> &ir;
+};
+
+void validate_input(const MaterialRecipeView &input) {
   if (input.description.empty()) throw std::invalid_argument("material recipe has no description");
   if (!std::isfinite(input.subpixel_tol) || input.subpixel_tol <= 0.0)
     throw std::invalid_argument("material recipe has an invalid subpixel tolerance");
@@ -859,21 +913,31 @@ MaterialRecipeInput::MaterialRecipeInput()
       from_host_callback(false), support_reason_bits(material_support_no_owned_ir) {}
 
 MaterialRecipe::MaterialRecipe(const MaterialRecipeInput &input)
+    : MaterialRecipe(MaterialRecipeInput(input)) {}
+
+/* Validates and signs the moved-in members themselves (no payload copy).
+   A recipe that just passed construction is marked validated; copies and
+   assignments still start unvalidated (ValidationMemo). */
+MaterialRecipe::MaterialRecipe(MaterialRecipeInput &&input)
     : version_(material_recipe_format_version), disposition_(input.disposition),
-      description_(input.description), eps_averaging_(input.eps_averaging),
+      description_(std::move(input.description)), eps_averaging_(input.eps_averaging),
       subpixel_tol_(input.subpixel_tol), subpixel_maxeval_(input.subpixel_maxeval),
       host_callback_id_(input.host_callback_id), from_host_callback_(input.from_host_callback),
-      support_reason_bits_(input.support_reason_bits),
-      rows_(input.rows), dense_fallback_rows_(input.dense_fallback_rows),
-      callback_tiles_(input.callback_tiles), callback_owners_(input.callback_owners),
-      topology_(input.topology),
-      ir_(input.ir), signature_(0) {
-  validate_input(input);
+      support_reason_bits_(input.support_reason_bits), rows_(std::move(input.rows)),
+      dense_fallback_rows_(std::move(input.dense_fallback_rows)),
+      callback_tiles_(std::move(input.callback_tiles)),
+      callback_owners_(std::move(input.callback_owners)), topology_(std::move(input.topology)),
+      ir_(std::move(input.ir)), signature_(0) {
+  validate_input(MaterialRecipeView{disposition_, description_, eps_averaging_, subpixel_tol_,
+                                    subpixel_maxeval_, host_callback_id_, from_host_callback_,
+                                    support_reason_bits_, rows_, dense_fallback_rows_,
+                                    callback_tiles_, callback_owners_, topology_, ir_});
   signature_ = compute_signature(version_, disposition_, eps_averaging_,
                                  subpixel_tol_, subpixel_maxeval_, host_callback_id_,
                                  from_host_callback_, support_reason_bits_, rows_,
                                  dense_fallback_rows_, callback_tiles_, callback_owners_,
                                  topology_, ir_);
+  validation_memo_.done = true;
 }
 
 bool MaterialRecipe::operator==(const MaterialRecipe &other) const {
@@ -899,21 +963,13 @@ bool MaterialRecipe::operator==(const MaterialRecipe &other) const {
 
 void validate_material_recipe(const MaterialRecipe &recipe) {
   if (recipe.validation_memo_.done) return;
-  MaterialRecipeInput input;
-  input.disposition = recipe.disposition();
-  input.description = recipe.description();
-  input.eps_averaging = recipe.eps_averaging();
-  input.subpixel_tol = recipe.subpixel_tol();
-  input.subpixel_maxeval = recipe.subpixel_maxeval();
-  input.host_callback_id = recipe.host_callback_id();
-  input.from_host_callback = recipe.from_host_callback();
-  input.support_reason_bits = recipe.support_reason_bits();
-  input.rows = recipe.rows();
-  input.dense_fallback_rows = recipe.dense_fallback_rows();
-  input.callback_tiles = recipe.callback_tiles();
-  input.callback_owners = recipe.callback_owners();
-  input.topology = recipe.topology();
-  input.ir = recipe.ir();
+  const MaterialRecipeView input{recipe.disposition_,        recipe.description_,
+                                 recipe.eps_averaging_,      recipe.subpixel_tol_,
+                                 recipe.subpixel_maxeval_,   recipe.host_callback_id_,
+                                 recipe.from_host_callback_, recipe.support_reason_bits_,
+                                 recipe.rows_,               recipe.dense_fallback_rows_,
+                                 recipe.callback_tiles_,     recipe.callback_owners_,
+                                 recipe.topology_,           recipe.ir_};
   validate_input(input);
   const uint64_t signature =
       compute_signature(recipe.version(), input.disposition,
@@ -1017,7 +1073,7 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
       decision.disposition == MaterialRecipeDisposition::hybrid_interface ||
       decision.disposition == MaterialRecipeDisposition::tiled_callback)
     for (MaterialRecipeRow &row : input.rows) row.values.clear();
-  return MaterialRecipe(input);
+  return MaterialRecipe(std::move(input));
 }
 
 MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
@@ -1031,8 +1087,20 @@ MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
   selected.subpixel_maxeval = recipe.subpixel_maxeval();
   selected.host_callback_id = recipe.host_callback_id();
   selected.from_host_callback = recipe.from_host_callback();
-  selected.rows = recipe.rows();
-  selected.dense_fallback_rows = recipe.dense_fallback_rows();
+  const bool host_route = route == MaterialRecipeDisposition::host_reference;
+  /* Only the host route keeps payloads; otherwise copy row metadata alone. */
+  selected.rows.reserve(recipe.rows().size());
+  for (const MaterialRecipeRow &row : recipe.rows()) {
+    selected.rows.push_back(MaterialRecipeRow());
+    MaterialRecipeRow &copy = selected.rows.back();
+    copy.key = row.key;
+    copy.role = row.role;
+    copy.element_type = row.element_type;
+    copy.storage = row.storage;
+    copy.elements = row.elements;
+    copy.alignment = row.alignment;
+  }
+  if (host_route) selected.dense_fallback_rows = recipe.dense_fallback_rows();
   selected.callback_tiles = route == MaterialRecipeDisposition::tiled_callback
                                 ? recipe.callback_tiles()
                                 : std::vector<MaterialCallbackTile>();
@@ -1064,7 +1132,7 @@ MaterialRecipe select_material_recipe_route(const MaterialRecipe &recipe,
   /* A collective host coercion can be stronger than the local proposal. */
   if (route != MaterialRecipeDisposition::host_reference && route != support.disposition)
     throw std::invalid_argument("selected material route disagrees with local support");
-  return MaterialRecipe(selected);
+  return MaterialRecipe(std::move(selected));
 }
 
 void mark_material_storage_provisional(const MaterialRecipe &recipe, StoragePlan &plan) {
