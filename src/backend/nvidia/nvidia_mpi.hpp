@@ -119,6 +119,11 @@ private:
   staged_transport_epoch &operator=(const staged_transport_epoch &);
   struct impl;
   impl *impl_;
+  /* Collective. Switches a freshly allocated epoch to the node-local CUDA IPC
+     peer route when MEEP_NVIDIA_PEER_TRANSPORT (off|auto|required, default
+     auto) allows it and every rank can map every peer it exchanges with.
+     Returns false only when the route is required but unavailable. */
+  bool enable_peer_route(std::string &why);
 
   friend std::unique_ptr<staged_transport_epoch>
   create_staged_transport_epoch(const compiled_boundary_artifact &, int, stream *, std::string &,

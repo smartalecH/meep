@@ -3,6 +3,7 @@
 #include "backend/nvidia/nvidia_mpi.hpp"
 
 #include "backend/mpi_context.hpp"
+#include "backend/nvidia/nvidia_peer.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -11,7 +12,10 @@
 #include <cstdlib>
 #include <limits>
 #include <new>
+#include <cstring>
+#include <map>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -259,6 +263,20 @@ struct staged_transport_epoch::impl {
     stage_state() : generation(0) {}
   };
 
+  /* Node-local peer route (parallel to `stages`): sends gather straight into
+     the receiver's mapped arena slot, then release-store generation+1 into
+     the receiver's ready flag; the receiver waits on its ready flags on the
+     device, scatters, and stores generation+1 into the sender's ack flag. A
+     sender reuses slot g&1 only after the ack for generation g-2. */
+  struct peer_stage {
+    size_t ready_first; // local flags, one per receive
+    size_t ack_first;   // local flags, one per send
+    std::vector<unsigned char *> send_targets[2];
+    device_buffer ready_targets; // uint64_t* per send: the receiver's ready flag
+    device_buffer ack_targets;   // uint64_t* per receive: the sender's ack flag
+    peer_stage() : ready_first(0), ack_first(0) {}
+  };
+
   int device;
   stream *communication;
   BackendCommunicatorLease communicator;
@@ -268,8 +286,15 @@ struct staged_transport_epoch::impl {
   transport_structural_identity identity;
   bool retired;
   bool poisoned;
+  bool peer;
+  double peer_timeout_seconds;
+  device_buffer peer_flags;
+  std::vector<peer_mapping> peer_mappings;
+  std::vector<peer_stage> peer_stages;
 
-  impl() : device(-1), communication(NULL), retired(false), poisoned(false) {}
+  impl()
+      : device(-1), communication(NULL), retired(false), poisoned(false), peer(false),
+        peer_timeout_seconds(0) {}
 
   stage_state *find(field_type ft) {
     for (stage_state &stage : stages)
@@ -354,6 +379,37 @@ bool staged_transport_epoch::begin_stage(field_type ft, const stream &compute, s
   impl::slot_state &slot = stage->slots[slot_index];
   if (slot.phase != impl::slot_phase::idle)
     local_error = "NVIDIA staged transport slot was reused before completion";
+  if (impl_->peer) {
+    /* Everything is enqueued on the compute stream behind the caller's
+       zeroing and local gathers; the host never waits. */
+    if (!local_error.empty()) {
+      why = local_error;
+      return false;
+    }
+    impl::peer_stage &peer = impl_->peer_stages[size_t(stage - impl_->stages.data())];
+    const uint64_t generation = stage->generation;
+    const size_t sends = stage->plan.sends.size();
+    try {
+      if (generation >= 2)
+        launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
+                             peer.ack_first,
+                         sends, generation - 1, impl_->peer_timeout_seconds, compute);
+      for (size_t i = 0; i < sends; ++i)
+        launch_boundary_gather(stage->plan.sends[i].launch, stage->gather_entries.opaque_handle(),
+                               peer.send_targets[slot_index][i], compute);
+      launch_peer_signal(peer.ready_targets.opaque_handle(), sends, generation + 1, compute);
+    }
+    catch (const std::exception &error) {
+      why = error.what();
+      return false;
+    }
+    impl_->stats.gather_launches =
+        checked_counter_add(impl_->stats.gather_launches, sends, "gather launch");
+    if (generation >= 2)
+      impl_->stats.slot_reuses = checked_counter_add(impl_->stats.slot_reuses, 1, "slot reuse");
+    slot.phase = impl::slot_phase::begun;
+    return true;
+  }
 #ifdef HAVE_MPI
   for (MPI_Request &request : slot.requests)
     if (!transport_request_is_null(&request))
@@ -459,6 +515,54 @@ bool staged_transport_epoch::finish_stage(field_type ft, const stream &compute, 
   if (slot.phase != impl::slot_phase::begun) {
     why = "NVIDIA staged transport stage was not begun";
     return false;
+  }
+  if (impl_->peer) {
+    impl::peer_stage &peer = impl_->peer_stages[size_t(stage - impl_->stages.data())];
+    const uint64_t generation = stage->generation;
+    const size_t receives = stage->plan.receives.size();
+    try {
+      launch_peer_wait(static_cast<const uint64_t *>(impl_->peer_flags.opaque_handle()) +
+                           peer.ready_first,
+                       receives, generation + 1, impl_->peer_timeout_seconds, compute);
+      for (uint32_t index : stage->plan.canonical_receive_order) {
+        if (index >= receives) throw std::logic_error("NVIDIA peer transport receive order is stale");
+        const bound_boundary_message &message = stage->plan.receives[index];
+        const void *arena = static_cast<const unsigned char *>(stage->receive_arena.opaque_handle()) +
+                            message.arena_offsets[slot_index];
+        if (stage->plan.publication == RemoteHaloPublicationMode::canonical_serial)
+          launch_boundary_scatter_serial(message.launch, stage->scatter_entries.opaque_handle(),
+                                         arena, compute);
+        else
+          launch_boundary_scatter_parallel(message.launch, stage->scatter_entries.opaque_handle(),
+                                           arena, compute);
+      }
+      launch_peer_signal(peer.ack_targets.opaque_handle(), receives, generation + 1, compute);
+    }
+    catch (const std::exception &error) {
+      /* Peers may already be spinning on this generation; they trap after
+         the peer timeout instead of hanging. */
+      impl_->poisoned = true;
+      why = error.what();
+      return false;
+    }
+    impl_->stats.scatter_launches =
+        checked_counter_add(impl_->stats.scatter_launches, receives, "scatter launch");
+    impl_->stats.messages_received =
+        checked_counter_add(impl_->stats.messages_received, receives, "received messages");
+    impl_->stats.messages_sent = checked_counter_add(
+        impl_->stats.messages_sent, stage->plan.sends.size(), "sent messages");
+    for (const bound_boundary_message &message : stage->plan.receives)
+      impl_->stats.bytes_received =
+          checked_counter_add(impl_->stats.bytes_received, message.wire_bytes, "received bytes");
+    for (const bound_boundary_message &message : stage->plan.sends) {
+      impl_->stats.bytes_sent =
+          checked_counter_add(impl_->stats.bytes_sent, message.wire_bytes, "sent bytes");
+      impl_->stats.direct_bytes =
+          checked_counter_add(impl_->stats.direct_bytes, message.wire_bytes, "direct bytes");
+    }
+    slot.phase = impl::slot_phase::idle;
+    ++stage->generation;
+    return true;
   }
 #ifdef HAVE_MPI
   if (!backend_mpi_thread_ready(why)) {
@@ -730,6 +834,35 @@ bool staged_transport_epoch::retire(std::string &why) noexcept {
     if (impl_->device >= 0) {
       device_scope scope(impl_->device);
       if (impl_->communication) impl_->communication->synchronize();
+      if (impl_->peer) {
+        /* Peer stores (ours into mapped peer memory, and the acks peers send
+           into our flags after consuming our last messages) must land before
+           the mappings close and the flags are freed. No collective here:
+           the wait is bounded so a peer that already exited cannot hang us. */
+        synchronize_device(impl_->device);
+        const transport_clock::time_point deadline =
+            transport_clock::now() + std::chrono::seconds(30);
+        for (size_t s = 0; s < impl_->stages.size(); ++s) {
+          const size_t sends = impl_->stages[s].plan.sends.size();
+          const uint64_t generation = impl_->stages[s].generation;
+          if (!sends || !generation) continue;
+          std::vector<uint64_t> acks(sends);
+          for (;;) {
+            read_peer_flags(impl_->peer_flags, impl_->peer_stages[s].ack_first, sends,
+                            acks.data());
+            if (*std::min_element(acks.begin(), acks.end()) >= generation) break;
+            if (transport_clock::now() > deadline) {
+              std::fprintf(stderr, "NVIDIA peer transport: retiring without final peer acks\n");
+              break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          }
+        }
+        impl_->peer_mappings.clear();
+        impl_->peer_stages.clear();
+        impl_->peer_flags.reset();
+        impl_->peer = false;
+      }
       /* Requests are drained before entering this path. Destroy CUDA events and
          staging arenas while the owning device is selected, then retire the
          duplicated communicator collectively. */
@@ -799,6 +932,341 @@ bool staged_transport_epoch::structural_identity_matches_current(
     return false;
   }
   return true;
+}
+
+namespace {
+
+/* Fixed-size records exchanged once per epoch to wire the peer route. */
+struct peer_record {
+  peer_ipc_handle flags;
+  peer_ipc_handle arenas[NUM_FIELD_TYPES];
+  unsigned char has_arena[NUM_FIELD_TYPES];
+};
+
+struct peer_entry {
+  int32_t outgoing; // 0: a receive on the publishing rank, 1: a send
+  int32_t ft;
+  int32_t source_rank;
+  int32_t destination_rank;
+  int32_t source_chunk;
+  int32_t destination_chunk;
+  int32_t tag;
+  int32_t reserved;
+  uint64_t canonical_ordinal;
+  uint64_t arena_offsets[2];
+  uint64_t wire_bytes;
+  uint64_t flag_index;
+};
+
+bool peer_entry_matches(const peer_entry &entry, const RemoteHaloWireKey &key) {
+  return entry.ft == int32_t(key.ft) && entry.source_rank == key.source_rank &&
+         entry.destination_rank == key.destination_rank &&
+         entry.source_chunk == key.source_chunk &&
+         entry.destination_chunk == key.destination_chunk && entry.tag == key.tag &&
+         entry.canonical_ordinal == key.canonical_ordinal;
+}
+
+/* -1 invalid, 0 off, 1 auto, 2 required. */
+int peer_policy_from_environment() {
+  const char *value = std::getenv("MEEP_NVIDIA_PEER_TRANSPORT");
+  if (!value || !*value || !std::strcmp(value, "auto")) return 1;
+  if (!std::strcmp(value, "off") || !std::strcmp(value, "no") || !std::strcmp(value, "0"))
+    return 0;
+  if (!std::strcmp(value, "required") || !std::strcmp(value, "yes") || !std::strcmp(value, "1"))
+    return 2;
+  return -1;
+}
+
+double peer_timeout_from_environment() {
+  const char *value = std::getenv("MEEP_NVIDIA_PEER_TIMEOUT");
+  if (!value || !*value) return 1800.0;
+  char *end = NULL;
+  const double seconds = std::strtod(value, &end);
+  return end && !*end && seconds >= 0 ? seconds : 1800.0;
+}
+
+} // namespace
+
+bool staged_transport_epoch::enable_peer_route(std::string &why) {
+  why.clear();
+#ifdef HAVE_MPI
+  impl &state = *impl_;
+  MPI_Comm communicator = backend_communicator(state.communicator);
+  const int rank = state.communicator.info().rank;
+  const int size = state.communicator.info().size;
+
+  const int policy = peer_policy_from_environment();
+  int policy_min = 0, policy_max = 0;
+  mpi_require(MPI_Allreduce(&policy, &policy_min, 1, MPI_INT, MPI_MIN, communicator),
+              communicator, "peer policy reconciliation");
+  mpi_require(MPI_Allreduce(&policy, &policy_max, 1, MPI_INT, MPI_MAX, communicator),
+              communicator, "peer policy reconciliation");
+  if (policy_min < 0 || (policy_min != policy_max && policy_max == 2)) {
+    why = "MEEP_NVIDIA_PEER_TRANSPORT must be off, auto or required, identically on every rank";
+    return false;
+  }
+  if (policy_min != policy_max || policy_min == 0) return true;
+  const bool required = policy_min == 2;
+
+  /* Every phase below runs every collective even after a local failure, so
+     ranks agree on the outcome without diverging control flow. */
+  std::string local_error;
+  int failed = 0, any_failed = 0;
+  if (!state.wire.participation.device_owner || state.device < 0 || !state.communication)
+    local_error = "a rank owns no device chunks";
+
+  MPI_Comm node = MPI_COMM_NULL;
+  int node_size = 0;
+  mpi_require(MPI_Comm_split_type(communicator, MPI_COMM_TYPE_SHARED, rank, MPI_INFO_NULL, &node),
+              communicator, "peer node split");
+  mpi_require(MPI_Comm_size(node, &node_size), communicator, "peer node size");
+  mpi_require(MPI_Comm_free(&node), communicator, "peer node free");
+  if (node_size != size && local_error.empty()) local_error = "ranks span more than one node";
+
+  const int bus_bytes = 32;
+  std::vector<char> bus(bus_bytes, 0), buses(size_t(bus_bytes) * size, 0);
+  if (local_error.empty()) try {
+      std::strncpy(bus.data(), device_pci_bus_id(state.device).c_str(), bus_bytes - 1);
+    }
+    catch (const std::exception &error) {
+      local_error = error.what();
+    }
+  mpi_require(MPI_Allgather(bus.data(), bus_bytes, MPI_CHAR, buses.data(), bus_bytes, MPI_CHAR,
+                            communicator),
+              communicator, "peer bus-id exchange");
+
+  std::vector<bool> talks_to(size, false);
+  size_t total_receives = 0, total_sends = 0;
+  for (const impl::stage_state &stage : state.stages) {
+    for (const bound_boundary_message &message : stage.plan.sends)
+      if (message.key.destination_rank >= 0 && message.key.destination_rank < size)
+        talks_to[message.key.destination_rank] = true;
+    for (const bound_boundary_message &message : stage.plan.receives)
+      if (message.key.source_rank >= 0 && message.key.source_rank < size)
+        talks_to[message.key.source_rank] = true;
+    total_receives += stage.plan.receives.size();
+    total_sends += stage.plan.sends.size();
+  }
+  for (int r = 0; local_error.empty() && r < size; ++r) {
+    if (!talks_to[r] || r == rank) continue;
+    const int peer_device = device_for_pci_bus_id(std::string(&buses[size_t(r) * bus_bytes]));
+    if (peer_device < 0)
+      local_error = "the GPU of rank " + std::to_string(r) + " is not visible to rank " +
+                    std::to_string(rank);
+    else if (peer_device != state.device && !devices_can_access_peer(state.device, peer_device))
+      local_error = "no CUDA peer access between the GPUs of ranks " + std::to_string(rank) +
+                    " and " + std::to_string(r);
+  }
+  failed = local_error.empty() ? 0 : 1;
+  mpi_require(MPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_LOR, communicator), communicator,
+              "peer capability reconciliation");
+  if (any_failed) {
+    if (!required) return true;
+    why = "MEEP_NVIDIA_PEER_TRANSPORT=required: " +
+          (local_error.empty() ? std::string("unavailable on another rank") : local_error);
+    return false;
+  }
+
+  /* Phase 2: local flags, exported handles and the message tables. */
+  peer_record record;
+  std::memset(&record, 0, sizeof(record));
+  std::vector<peer_entry> entries;
+  try {
+    device_scope scope(state.device);
+    state.peer_stages.clear();
+    state.peer_stages.resize(state.stages.size());
+    size_t next_flag = 0;
+    for (size_t s = 0; s < state.stages.size(); ++s) {
+      const impl::stage_state &stage = state.stages[s];
+      impl::peer_stage &peer = state.peer_stages[s];
+      peer.ready_first = next_flag;
+      next_flag += stage.plan.receives.size();
+      peer.ack_first = next_flag;
+      next_flag += stage.plan.sends.size();
+      const int ft = int(stage.plan.ft);
+      if (stage.receive_arena.opaque_handle() && ft >= 0 && ft < NUM_FIELD_TYPES) {
+        record.arenas[ft] = export_peer_handle(stage.receive_arena);
+        record.has_arena[ft] = 1;
+      }
+      for (size_t i = 0; i < stage.plan.receives.size(); ++i) {
+        const bound_boundary_message &message = stage.plan.receives[i];
+        peer_entry entry = {};
+        entry.outgoing = 0;
+        entry.ft = int32_t(message.key.ft);
+        entry.source_rank = message.key.source_rank;
+        entry.destination_rank = message.key.destination_rank;
+        entry.source_chunk = message.key.source_chunk;
+        entry.destination_chunk = message.key.destination_chunk;
+        entry.tag = message.key.tag;
+        entry.canonical_ordinal = message.key.canonical_ordinal;
+        entry.arena_offsets[0] = message.arena_offsets[0];
+        entry.arena_offsets[1] = message.arena_offsets[1];
+        entry.wire_bytes = message.wire_bytes;
+        entry.flag_index = peer.ready_first + i;
+        entries.push_back(entry);
+      }
+      for (size_t i = 0; i < stage.plan.sends.size(); ++i) {
+        const bound_boundary_message &message = stage.plan.sends[i];
+        peer_entry entry = {};
+        entry.outgoing = 1;
+        entry.ft = int32_t(message.key.ft);
+        entry.source_rank = message.key.source_rank;
+        entry.destination_rank = message.key.destination_rank;
+        entry.source_chunk = message.key.source_chunk;
+        entry.destination_chunk = message.key.destination_chunk;
+        entry.tag = message.key.tag;
+        entry.canonical_ordinal = message.key.canonical_ordinal;
+        entry.wire_bytes = message.wire_bytes;
+        entry.flag_index = peer.ack_first + i;
+        entries.push_back(entry);
+      }
+    }
+    if (next_flag != total_receives + total_sends)
+      throw std::logic_error("NVIDIA peer flag layout is inconsistent");
+    const size_t flag_bytes = std::max<size_t>(next_flag, 1) * sizeof(uint64_t);
+    state.peer_flags.allocate(flag_bytes, state.device);
+    fill_byte_async(state.peer_flags, 0, 0, flag_bytes, *state.communication);
+    state.communication->synchronize();
+    record.flags = export_peer_handle(state.peer_flags);
+  }
+  catch (const std::exception &error) {
+    local_error = error.what();
+  }
+  std::vector<peer_record> records(size);
+  mpi_require(MPI_Allgather(&record, int(sizeof(record)), MPI_BYTE, records.data(),
+                            int(sizeof(record)), MPI_BYTE, communicator),
+              communicator, "peer handle exchange");
+  int local_count = local_error.empty() ? int(entries.size()) : 0;
+  std::vector<int> counts(size), byte_counts(size), displacements(size);
+  mpi_require(MPI_Allgather(&local_count, 1, MPI_INT, counts.data(), 1, MPI_INT, communicator),
+              communicator, "peer table size exchange");
+  size_t all_entries = 0;
+  for (int r = 0; r < size; ++r) {
+    byte_counts[r] = counts[r] * int(sizeof(peer_entry));
+    displacements[r] = int(all_entries * sizeof(peer_entry));
+    all_entries += size_t(counts[r]);
+  }
+  std::vector<peer_entry> table(std::max<size_t>(all_entries, 1));
+  mpi_require(MPI_Allgatherv(entries.data(), local_count * int(sizeof(peer_entry)), MPI_BYTE,
+                             table.data(), byte_counts.data(), displacements.data(), MPI_BYTE,
+                             communicator),
+              communicator, "peer table exchange");
+
+  /* Phase 3: map peer allocations and resolve every message endpoint. */
+  if (local_error.empty()) try {
+      device_scope scope(state.device);
+      std::map<int, size_t> flag_mapping;
+      std::map<std::pair<int, int>, size_t> arena_mapping;
+      auto mapped = [&](const peer_ipc_handle &handle) -> size_t {
+        state.peer_mappings.emplace_back();
+        state.peer_mappings.back().open(handle, state.device);
+        return state.peer_mappings.size() - 1;
+      };
+      /* A rank's own allocations are reached through the same IPC path only
+         if a message ever targets self; MPI never routes those here. */
+      auto find_entry = [&](int owner, int outgoing,
+                            const RemoteHaloWireKey &key) -> const peer_entry & {
+        const peer_entry *found = NULL;
+        size_t first = size_t(displacements[owner]) / sizeof(peer_entry);
+        for (size_t k = first; k < first + size_t(counts[owner]); ++k)
+          if (table[k].outgoing == outgoing && peer_entry_matches(table[k], key)) {
+            if (found) throw std::logic_error("NVIDIA peer message key is ambiguous");
+            found = &table[k];
+          }
+        if (!found)
+          throw std::logic_error("NVIDIA peer message has no matching endpoint on rank " +
+                                 std::to_string(owner));
+        return *found;
+      };
+      auto flags_of = [&](int owner) -> uint64_t * {
+        std::map<int, size_t>::iterator it = flag_mapping.find(owner);
+        if (it == flag_mapping.end())
+          it = flag_mapping.insert(std::make_pair(owner, mapped(records[owner].flags))).first;
+        return static_cast<uint64_t *>(state.peer_mappings[it->second].address());
+      };
+      auto arena_of = [&](int owner, int ft) -> unsigned char * {
+        if (ft < 0 || ft >= NUM_FIELD_TYPES || !records[owner].has_arena[ft])
+          throw std::logic_error("NVIDIA peer receive arena is missing");
+        const std::pair<int, int> key(owner, ft);
+        std::map<std::pair<int, int>, size_t>::iterator it = arena_mapping.find(key);
+        if (it == arena_mapping.end())
+          it = arena_mapping.insert(std::make_pair(key, mapped(records[owner].arenas[ft]))).first;
+        return static_cast<unsigned char *>(state.peer_mappings[it->second].address());
+      };
+      state.peer_mappings.reserve(2 * size_t(size) * (1 + NUM_FIELD_TYPES));
+      for (size_t s = 0; s < state.stages.size(); ++s) {
+        const impl::stage_state &stage = state.stages[s];
+        impl::peer_stage &peer = state.peer_stages[s];
+        std::vector<uint64_t *> ready_targets, ack_targets;
+        for (const bound_boundary_message &message : stage.plan.sends) {
+          const int owner = message.key.destination_rank;
+          if (owner < 0 || owner >= size || owner == rank)
+            throw std::logic_error("NVIDIA peer send has an invalid destination");
+          const peer_entry &entry = find_entry(owner, 0, message.key);
+          if (entry.wire_bytes != message.wire_bytes)
+            throw std::logic_error("NVIDIA peer message sizes disagree");
+          unsigned char *arena = arena_of(owner, entry.ft);
+          peer.send_targets[0].push_back(arena + entry.arena_offsets[0]);
+          peer.send_targets[1].push_back(arena + entry.arena_offsets[1]);
+          ready_targets.push_back(flags_of(owner) + entry.flag_index);
+        }
+        for (const bound_boundary_message &message : stage.plan.receives) {
+          const int owner = message.key.source_rank;
+          if (owner < 0 || owner >= size || owner == rank)
+            throw std::logic_error("NVIDIA peer receive has an invalid source");
+          const peer_entry &entry = find_entry(owner, 1, message.key);
+          ack_targets.push_back(flags_of(owner) + entry.flag_index);
+        }
+        if (!ready_targets.empty()) {
+          const size_t bytes = ready_targets.size() * sizeof(uint64_t *);
+          peer.ready_targets.allocate(bytes, state.device);
+          copy_host_to_device_async(peer.ready_targets, 0, ready_targets.data(), bytes,
+                                    *state.communication);
+        }
+        if (!ack_targets.empty()) {
+          const size_t bytes = ack_targets.size() * sizeof(uint64_t *);
+          peer.ack_targets.allocate(bytes, state.device);
+          copy_host_to_device_async(peer.ack_targets, 0, ack_targets.data(), bytes,
+                                    *state.communication);
+        }
+      }
+      state.communication->synchronize();
+    }
+    catch (const std::exception &error) {
+      local_error = error.what();
+    }
+  failed = local_error.empty() ? 0 : 1;
+  mpi_require(MPI_Allreduce(&failed, &any_failed, 1, MPI_INT, MPI_LOR, communicator), communicator,
+              "peer mapping reconciliation");
+  if (any_failed) {
+    try {
+      device_scope scope(state.device >= 0 ? state.device : 0);
+      state.peer_mappings.clear();
+      state.peer_stages.clear();
+      state.peer_flags.reset();
+    }
+    catch (...) {
+      fatal_transport(communicator, "peer route cleanup", 1);
+    }
+    if (!required) {
+      if (rank == 0)
+        std::fprintf(stderr, "meep: NVIDIA peer halo transport unavailable (%s); using MPI\n",
+                     local_error.empty() ? "failed on another rank" : local_error.c_str());
+      return true;
+    }
+    why = "MEEP_NVIDIA_PEER_TRANSPORT=required: " +
+          (local_error.empty() ? std::string("failed on another rank") : local_error);
+    return false;
+  }
+  state.peer = true;
+  state.peer_timeout_seconds = peer_timeout_from_environment();
+  if (rank == 0)
+    std::printf("meep: NVIDIA halo exchange uses CUDA IPC peer stores (%d ranks, one node)\n",
+                size);
+  return true;
+#else
+  return true;
+#endif
 }
 
 std::unique_ptr<staged_transport_epoch>
@@ -1059,6 +1527,20 @@ create_staged_transport_epoch(const compiled_boundary_artifact &artifact, int de
     return NULL;
   }
 #endif
+  if (!result->enable_peer_route(why)) {
+    try {
+      if (device >= 0) {
+        device_scope scope(device);
+        result->impl_->stages.clear();
+      }
+    }
+    catch (...) {
+    }
+    std::string retire_error;
+    (void)retire_backend_communicator_lease(result->impl_->communicator, retire_error);
+    result->impl_->retired = true;
+    return NULL;
+  }
   return result;
 }
 
