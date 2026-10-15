@@ -267,3 +267,15 @@ rank) and batched device material initialization:
 
 The accurate (averaged) configuration now costs only ~10 s more than the
 staircased one; stepping (~150 s for 54,000 steps) dominates both.
+
+### Mixed precision and the finite check (2x H100, averaged, res 30)
+
+| precision | finite check | wall time | max/rms dT vs CPU Meep |
+|---|---|---|---|
+| native | default (every step) | 176 s | 0.0020 / 0.0010 |
+| native | off | 152 s | 0.0020 / 0.0010 |
+| mixed (fp32 fields, fp64 DFT) | default | 128 s | 0.0020 / 0.0010 |
+| mixed | off | **110 s (1.8 min)** | 0.0020 / 0.0010 |
+
+Mixed precision moves the spectrum by at most 1e-7. The per-step non-finite
+scan costs 18-24 s here (an extra full read of every field each step).
