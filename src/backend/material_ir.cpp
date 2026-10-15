@@ -3,6 +3,10 @@
 #include "backend/material_ir.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <exception>
+#include <thread>
+#include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -463,6 +467,7 @@ uint64_t signature(const MaterialIR &ir, bool include_rank_layout, bool portable
   mix_i64(h, ir.subpixel_maxeval); mix_bool(h, ir.ensure_periodicity);
   mix_bool(h, ir.contains_host_callback); mix_bool(h, ir.device_native_eligible);
   mix_bool(h, ir.prism_include_boundaries);
+  mix_bool(h, ir.magnetic_averaging);
   mix_i64(h, ir.dimensions); mix_double(h, ir.projection_offset);
   mix_values(h, ir.cell);
   for (int i = 0; i < 6; ++i) mix_double(h, ir.captured_volume[i]);
@@ -1029,6 +1034,14 @@ bool material_records_equal(const MaterialIR &ir, uint32_t a_index, uint32_t b_i
   }
 }
 
+/* chi1inv rows that subpixel averaging classifies point by point. */
+bool averaged_destination(const MaterialIR &ir, const MaterialIRDestination &destination) {
+  if (destination.property != MaterialIRProperty::chi1inv || !ir.eps_averaging ||
+      destination.tensor_column < 0 || ir.contains_host_callback)
+    return false;
+  return ir.magnetic_averaging || !is_H_or_B(component(destination.component));
+}
+
 int object_subtype(const MaterialIRObject &object) {
   if (object.kind == geometric_object::BLOCK) return int(object.parameters[24]);
   if (object.kind == geometric_object::CYLINDER) return int(object.parameters[8]);
@@ -1397,19 +1410,6 @@ MaterialIRProperty property_for(array_kind kind) {
   }
 }
 
-void append_bulk_point(MaterialIR &ir, uint32_t destination, uint64_t point) {
-  if (!ir.bulk_spans.empty()) {
-    MaterialIRBulkSpan &last = ir.bulk_spans.back();
-    if (last.destination == destination && last.first_point + last.count == point) {
-      if (last.count == std::numeric_limits<uint64_t>::max())
-        throw std::overflow_error("material IR bulk span count overflow");
-      ++last.count;
-      return;
-    }
-  }
-  ir.bulk_spans.push_back(MaterialIRBulkSpan{destination, point, 1});
-}
-
 } // namespace
 
 uint32_t material_ir_material_at_point(const MaterialIR &ir, const double point[3],
@@ -1477,6 +1477,23 @@ size_t material_ir_destination_storage_index(const MaterialIR &ir,
   return destination_index;
 }
 
+
+/* Set only while capture_material_ir validates its own freshly classified
+   output: structural checks still run, the per-point re-classification of
+   what was just classified by the same code is skipped. */
+static bool skip_point_reclassification = false;
+
+/* MEEP_SETUP_TIMING=1: wall time since the previous mark, for init_sim phases. */
+static void material_ir_setup_mark(const char *phase) {
+  static const bool enabled = std::getenv("MEEP_SETUP_TIMING") != NULL;
+  static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  if (enabled && phase)
+    master_printf("meep setup: %s=%.2fs\n", phase,
+                        std::chrono::duration<double>(now - last).count());
+  last = now;
+}
+
 std::shared_ptr<const void> capture_material_ir(const structure &s,
                                                meep_geom::geom_epsilon &geps,
                                                bool eps_averaging, double tol, int maxeval,
@@ -1495,6 +1512,8 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
   ir->subpixel_tol = tol; ir->subpixel_maxeval = eps_averaging ? maxeval : 0;
   ir->ensure_periodicity = geps.captured_ensure_periodicity; ir->contains_host_callback = false;
   ir->requires_hybrid = false;
+  ir->magnetic_averaging = geps.has_mu();
+  material_ir_setup_mark(NULL);
   ir->prism_include_boundaries = prism_boundary_policy();
   if (s.num_chunks <= 0 || !s.chunks[0])
     throw std::invalid_argument("material IR has no live chunk dimension authority");
@@ -1804,100 +1823,173 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
     destination.point_count = ir->chunks[destination.chunk_index].loop_count[c];
     const uint32_t destination_index = uint32_t(ir->destinations.size());
     ir->destinations.push_back(destination);
+  }
 
-    if (kind != array_kind::chi1inv || !ir->eps_averaging ||
-        destination.tensor_column < 0 || ir->contains_host_callback) {
-      if (destination.point_count)
-        ir->bulk_spans.push_back(
-            MaterialIRBulkSpan{destination_index, 0, destination.point_count});
-      continue;
+  /* Point classification (and host cubature for patches) per averaged
+     destination is independent, so destinations are traversed in parallel
+     into per-destination lists that are merged in destination order: the
+     IR is identical to a serial traversal. */
+  struct DestinationWork {
+    std::vector<MaterialIRBulkSpan> bulk;
+    std::vector<MaterialIRAnalyticInterface> analytic;
+    std::vector<MaterialIRHybridPatch> patches;
+    void append_bulk(uint32_t destination, uint64_t point) {
+      if (!bulk.empty() && bulk.back().destination == destination &&
+          bulk.back().first_point + bulk.back().count == point) {
+        if (bulk.back().count == std::numeric_limits<uint64_t>::max())
+          throw std::overflow_error("material IR bulk span count overflow");
+        ++bulk.back().count;
+        return;
+      }
+      bulk.push_back(MaterialIRBulkSpan{destination, point, 1});
     }
+  };
+  std::vector<DestinationWork> works(ir->destinations.size());
+  std::vector<uint32_t> averaged;
+  for (uint32_t index = 0; index < ir->destinations.size(); ++index) {
+    const MaterialIRDestination &destination = ir->destinations[index];
+    if (averaged_destination(*ir, destination))
+      averaged.push_back(index);
+    else if (destination.point_count)
+      works[index].bulk.push_back(MaterialIRBulkSpan{index, 0, destination.point_count});
+  }
+  const MaterialIR &ir_view = *ir;
+  const auto traverse = [&](uint32_t destination_index, DestinationWork &work) {
+    const MaterialIRDestination &destination = ir_view.destinations[destination_index];
+    const MaterialIRTopologyRow &row = ir_view.topology[destination.topology_index];
+    const component c = component(row.key.component_);
+      const grid_volume &gv = s.chunks[row.key.chunk]->gv;
+      const direction dc = component_direction(c);
+      const ivec shift1(unit_ivec(gv.dim, dc) * (type(c) == E_stuff ? 1 : -1));
+      uint64_t point = 0;
+      LOOP_OVER_VOL(gv, c, storage_index) {
+        (void)storage_index;
+        IVEC_LOOP_ILOC(gv, here);
+        const meep::volume evaluation = gv.dV(destination.offdiagonal ? here - shift1 : here, 1.0);
+        const FrontObjectResult front = classify_front_object(ir_view, evaluation);
+        bool bulk = false;
+        MaterialIRPatchReason reason = MaterialIRPatchReason::unsupported_analytic_shape;
+        if (!front.ambiguous &&
+            material_records_equal(ir_view, front.front, front.behind))
+          bulk = true;
+        else if (!front.ambiguous &&
+                 (ir_material_is_metal(ir_view.materials[front.front], type(c)) ||
+                  ir_material_is_metal(ir_view.materials[front.behind], type(c))))
+          bulk = true;
+        else if (front.ambiguous)
+          reason = MaterialIRPatchReason::ambiguous_front;
 
-    const grid_volume &gv = s.chunks[row.key.chunk]->gv;
-    const direction dc = component_direction(c);
-    const ivec shift1(unit_ivec(gv.dim, dc) * (type(c) == E_stuff ? 1 : -1));
-    uint64_t point = 0;
-    LOOP_OVER_VOL(gv, c, storage_index) {
-      (void)storage_index;
-      IVEC_LOOP_ILOC(gv, here);
-      const meep::volume evaluation = gv.dV(destination.offdiagonal ? here - shift1 : here, 1.0);
-      const FrontObjectResult front = classify_front_object(*ir, evaluation);
-      bool bulk = false;
-      MaterialIRPatchReason reason = MaterialIRPatchReason::unsupported_analytic_shape;
-      if (!front.ambiguous &&
-          material_records_equal(*ir, front.front, front.behind))
-        bulk = true;
-      else if (!front.ambiguous &&
-               (ir_material_is_metal(ir->materials[front.front], type(c)) ||
-                ir_material_is_metal(ir->materials[front.behind], type(c))))
-        bulk = true;
-      else if (front.ambiguous)
-        reason = MaterialIRPatchReason::ambiguous_front;
-
-      vector3 normal = {0, 0, 0};
-      double fill = 0.0;
-      bool analytic = false;
-      uint32_t image_index = std::numeric_limits<uint32_t>::max();
-      if (!bulk && !front.ambiguous &&
-          front.object != std::numeric_limits<uint32_t>::max() &&
-          ir->materials[front.front].kind == meep_geom::material_data::MEDIUM &&
-          ir->materials[front.behind].kind == meep_geom::material_data::MEDIUM &&
-          axis_aligned_block_face(*ir, front.object, front.image, evaluation, normal, fill)) {
-        image_index = front.image;
-        analytic = true;
+        vector3 normal = {0, 0, 0};
+        double fill = 0.0;
+        bool analytic = false;
+        uint32_t image_index = std::numeric_limits<uint32_t>::max();
+        if (!bulk && !front.ambiguous &&
+            front.object != std::numeric_limits<uint32_t>::max() &&
+            ir_view.materials[front.front].kind == meep_geom::material_data::MEDIUM &&
+            ir_view.materials[front.behind].kind == meep_geom::material_data::MEDIUM &&
+            axis_aligned_block_face(ir_view, front.object, front.image, evaluation, normal, fill)) {
+          image_index = front.image;
+          analytic = true;
+        }
+        if (bulk) work.append_bulk(destination_index, point);
+        else if (analytic) {
+          MaterialIRAnalyticInterface job = {};
+          job.destination = destination_index;
+          job.point = point;
+          job.front_material = front.front;
+          job.behind_material = front.behind;
+          job.object = front.object;
+          job.image = image_index;
+          job.normal[0] = normal.x; job.normal[1] = normal.y; job.normal[2] = normal.z;
+          job.fill = fill;
+          work.analytic.push_back(job);
+        }
+        else {
+          double values[3] = {0, 0, 0};
+          bool adaptive_fallback = false, negative_fallback = false;
+          geps.eff_chi1inv_row_with_outcome(c, values, evaluation, tol, maxeval,
+                                            adaptive_fallback, negative_fallback);
+          const realnum rounded = realnum(values[destination.tensor_column]);
+          MaterialIRHybridPatch patch;
+          patch.destination = destination_index;
+          patch.point = point;
+          patch.value = double(rounded);
+          patch.front_material = front.front;
+          patch.behind_material = front.behind;
+          patch.object = front.object;
+          patch.image = front.image;
+          patch.ambiguous = front.ambiguous;
+          patch.variable_material = front.variable_material;
+          patch.variable_causes = front.variable_causes;
+          patch.adaptive_fallback = adaptive_fallback;
+          patch.negative_fallback = negative_fallback;
+          patch.reason = reason;
+          if (negative_fallback)
+            patch.reason = MaterialIRPatchReason::negative_material_fallback;
+          else if (front.variable_causes & material_variable_grid)
+            patch.reason = MaterialIRPatchReason::material_grid_averaging;
+          else if (adaptive_fallback)
+            patch.reason = MaterialIRPatchReason::adaptive_overlap;
+          work.patches.push_back(patch);
+        }
+        if (point == std::numeric_limits<uint64_t>::max())
+          throw std::overflow_error("material IR destination point ordinal overflow");
+        ++point;
       }
-      if (bulk) append_bulk_point(*ir, destination_index, point);
-      else if (analytic) {
-        MaterialIRAnalyticInterface job = {};
-        job.destination = destination_index;
-        job.point = point;
-        job.front_material = front.front;
-        job.behind_material = front.behind;
-        job.object = front.object;
-        job.image = image_index;
-        job.normal[0] = normal.x; job.normal[1] = normal.y; job.normal[2] = normal.z;
-        job.fill = fill;
-        ir->analytic_interfaces.push_back(job);
-      }
-      else {
-        double values[3] = {0, 0, 0};
-        bool adaptive_fallback = false, negative_fallback = false;
-        geps.eff_chi1inv_row_with_outcome(c, values, evaluation, tol, maxeval,
-                                          adaptive_fallback, negative_fallback);
-        const realnum rounded = realnum(values[destination.tensor_column]);
-        MaterialIRHybridPatch patch;
-        patch.destination = destination_index;
-        patch.point = point;
-        patch.value = double(rounded);
-        patch.front_material = front.front;
-        patch.behind_material = front.behind;
-        patch.object = front.object;
-        patch.image = front.image;
-        patch.ambiguous = front.ambiguous;
-        patch.variable_material = front.variable_material;
-        patch.variable_causes = front.variable_causes;
-        patch.adaptive_fallback = adaptive_fallback;
-        patch.negative_fallback = negative_fallback;
-        patch.reason = reason;
-        if (negative_fallback)
-          patch.reason = MaterialIRPatchReason::negative_material_fallback;
-        else if (front.variable_causes & material_variable_grid)
-          patch.reason = MaterialIRPatchReason::material_grid_averaging;
-        else if (adaptive_fallback)
-          patch.reason = MaterialIRPatchReason::adaptive_overlap;
-        ir->hybrid_patches.push_back(patch);
-      }
-      if (point == std::numeric_limits<uint64_t>::max())
-        throw std::overflow_error("material IR destination point ordinal overflow");
-      ++point;
-    }
-    if (point != destination.point_count)
-      throw std::logic_error("material IR partition traversal count changed");
+      if (point != destination.point_count)
+        throw std::logic_error("material IR partition traversal count changed");
+  };
+  {
+    size_t threads =
+        geps.is_thread_safe()
+            ? std::min<size_t>(averaged.size(),
+                               std::max(1u, std::thread::hardware_concurrency()))
+            : size_t(1);
+    if (const char *forced = std::getenv("MEEP_IR_CAPTURE_THREADS"))
+      threads = std::max<size_t>(1, std::min<size_t>(threads, std::strtoul(forced, NULL, 10)));
+    std::atomic<size_t> next(0);
+    std::vector<std::exception_ptr> errors(averaged.size());
+    const auto worker = [&]() {
+      for (size_t k = next++; k < averaged.size(); k = next++) try {
+          traverse(averaged[k], works[averaged[k]]);
+        }
+        catch (...) {
+          errors[k] = std::current_exception();
+        }
+    };
+    std::vector<std::thread> pool;
+    for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker);
+    worker();
+    for (std::thread &thread : pool) thread.join();
+    for (const std::exception_ptr &error : errors)
+      if (error) std::rethrow_exception(error);
+  }
+  for (DestinationWork &work : works) {
+    ir->bulk_spans.insert(ir->bulk_spans.end(), work.bulk.begin(), work.bulk.end());
+    ir->analytic_interfaces.insert(ir->analytic_interfaces.end(), work.analytic.begin(),
+                                   work.analytic.end());
+    ir->hybrid_patches.insert(ir->hybrid_patches.end(), work.patches.begin(),
+                              work.patches.end());
   }
   ir->requires_hybrid = !ir->hybrid_patches.empty();
+  material_ir_setup_mark("ir capture traversal");
+  if (std::getenv("MEEP_SETUP_TIMING"))
+    master_printf("meep setup: ir destinations=%zu bulk_spans=%zu analytic=%zu patches=%zu\n",
+                  ir->destinations.size(), ir->bulk_spans.size(),
+                  ir->analytic_interfaces.size(), ir->hybrid_patches.size());
   ir->signature = signature(*ir, false);
   ir->layout_signature = signature(*ir, true);
-  validate_material_ir(*ir);
+  material_ir_setup_mark("ir capture signatures");
+  skip_point_reclassification = true;
+  try {
+    validate_material_ir(*ir);
+  }
+  catch (...) {
+    skip_point_reclassification = false;
+    throw;
+  }
+  skip_point_reclassification = false;
+  material_ir_setup_mark("ir capture validation");
   {
     std::lock_guard<std::mutex> lock(material_ir_owners_mutex);
     material_ir_owners[ir.get()] = captured->owners;
@@ -2720,8 +2812,7 @@ static void validate_material_ir_contents(const MaterialIR &ir) {
                         span.first_point <= previous_end))))
       throw std::invalid_argument("material IR bulk span is invalid");
     const MaterialIRDestination &destination = ir.destinations[span.destination];
-    if (destination.property == MaterialIRProperty::chi1inv && ir.eps_averaging &&
-        destination.tensor_column >= 0 && !ir.contains_host_callback)
+    if (averaged_destination(ir, destination) && !skip_point_reclassification)
       for (uint64_t point = span.first_point; point < span.first_point + span.count; ++point) {
         const meep::volume evaluation = destination_evaluation_volume(ir, destination, point);
         const FrontObjectResult front = classify_front_object(ir, evaluation);
@@ -2761,13 +2852,20 @@ static void validate_material_ir_contents(const MaterialIR &ir) {
     }
     if (!(norm2 > 0.0))
       throw std::invalid_argument("material IR analytic interface has a zero normal");
+    if (skip_point_reclassification) {
+      if (!averaged_destination(ir, ir.destinations[job.destination]))
+        throw std::invalid_argument("material IR analytic interface is stale");
+      previous_job_destination = job.destination;
+      previous_job_point = job.point;
+      have_job = true;
+      continue;
+    }
     const MaterialIRDestination &destination = ir.destinations[job.destination];
     const meep::volume evaluation = destination_evaluation_volume(ir, destination, job.point);
     const FrontObjectResult front = classify_front_object(ir, evaluation);
     vector3 expected_normal = {0, 0, 0};
     double expected_fill = 0.0;
-    if (destination.property != MaterialIRProperty::chi1inv || !ir.eps_averaging ||
-        destination.tensor_column < 0 || ir.contains_host_callback || front.ambiguous ||
+    if (!averaged_destination(ir, destination) || front.ambiguous ||
         front.object == std::numeric_limits<uint32_t>::max() ||
         ir.materials[front.front].kind != meep_geom::material_data::MEDIUM ||
         ir.materials[front.behind].kind != meep_geom::material_data::MEDIUM ||
@@ -2799,9 +2897,14 @@ static void validate_material_ir_contents(const MaterialIR &ir) {
                          patch.point <= previous_patch_point))))
       throw std::invalid_argument("material IR hybrid patch is invalid");
     const MaterialIRDestination &destination = ir.destinations[patch.destination];
-    if (destination.property != MaterialIRProperty::chi1inv || !ir.eps_averaging ||
-        destination.tensor_column < 0 || ir.contains_host_callback)
+    if (!averaged_destination(ir, destination))
       throw std::invalid_argument("material IR hybrid patch route is invalid");
+    if (skip_point_reclassification) {
+      previous_patch_destination = patch.destination;
+      previous_patch_point = patch.point;
+      have_patch = true;
+      continue;
+    }
     const meep::volume evaluation = destination_evaluation_volume(ir, destination, patch.point);
     const FrontObjectResult front = classify_front_object(ir, evaluation);
     if (front.front != patch.front_material || front.behind != patch.behind_material ||

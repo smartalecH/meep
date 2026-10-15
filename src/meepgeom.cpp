@@ -19,6 +19,8 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <chrono>
+#include <cstdlib>
 #include "backend/adjoint_plan.hpp"
 #include "backend/backend.hpp"
 #include "backend/material_callback.hpp"
@@ -2155,6 +2157,18 @@ void set_materials_from_geometry(meep::structure *s, geometric_object_list g, ve
 
 /* from a previously created geom_epsilon object,
 set the materials as specified */
+
+/* MEEP_SETUP_TIMING=1: wall time since the previous mark, for init_sim phases. */
+static void material_setup_mark(const char *phase) {
+  static const bool enabled = std::getenv("MEEP_SETUP_TIMING") != NULL;
+  static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+  const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+  if (enabled && phase)
+    master_printf("meep setup: %s=%.2fs\n", phase,
+                        std::chrono::duration<double>(now - last).count());
+  last = now;
+}
+
 void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
                                      bool use_anisotropic_averaging, double tol, int maxeval,
                                      absorber_list alist) {
@@ -2187,6 +2201,7 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
   /* Freeze every dynamic/file/grid/user input before eager evaluation.  User
      callbacks are represented only by an opaque host-owned marker; no raw
      function or user-data pointer crosses the backend boundary. */
+  material_setup_mark(NULL);
   std::shared_ptr<const void> staged_material_ir;
   std::string capture_error;
   try {
@@ -2203,7 +2218,9 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
   meep::backend_reconcile_host_access(capture_error, "set_materials material IR capture");
   meep::MaterialIR *captured_ir =
       const_cast<meep::MaterialIR *>(static_cast<const meep::MaterialIR *>(staged_material_ir.get()));
+  material_setup_mark("material ir capture (total)");
   meep::finalize_material_ir_collective(*captured_ir);
+  material_setup_mark("material ir finalize");
   uint64_t local_signature =
       captured_ir->signature;
   if (meep::get_material_ir_capture_failure_rank_for_testing() == meep::my_rank() &&
@@ -2215,9 +2232,12 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
     capture_error = "material IR semantic signature differs across MPI ranks";
   meep::backend_reconcile_host_access(capture_error,
                                       "set_materials material IR reconciliation");
+  material_setup_mark("material ir reconcile");
   s->set_materials(*geps, use_anisotropic_averaging, tol, maxeval);
+  material_setup_mark("cpu set_materials");
   s->remove_susceptibilities();
   geps->add_susceptibilities(s);
+  material_setup_mark("susceptibilities");
   s->material_ir = staged_material_ir;
   geps->bind_owned_recipe(staged_material_ir, captured_ir->signature);
 

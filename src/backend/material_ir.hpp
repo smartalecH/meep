@@ -261,6 +261,10 @@ struct MaterialIR {
   bool device_native_eligible;
   bool requires_hybrid;
   bool prism_include_boundaries;
+  /* Whether H/B chi1inv rows are subpixel-averaged. Mirrors CPU Meep, which
+     averages mu only when some material has mu != 1 (structure::set_materials);
+     otherwise those rows are evaluated as bulk (identity). */
+  bool magnetic_averaging = true;
   int dimensions;
   double projection_offset;
   std::vector<double> cell;
