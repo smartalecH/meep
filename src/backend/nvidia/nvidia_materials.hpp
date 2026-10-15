@@ -135,6 +135,22 @@ struct geometry_bulk_launch {
   uint64_t count;
 };
 
+/* Several bulk spans of one destination (same common descriptor) in one
+   launch: spans[k] covers points [first_point, first_point + count) and
+   starts at thread `offset` (exclusive prefix of counts); `total` threads. */
+struct geometry_bulk_span {
+  uint64_t first_point;
+  uint64_t count;
+  uint64_t offset;
+};
+
+struct geometry_bulk_batch_launch {
+  geometry_launch_common common;
+  const geometry_bulk_span *spans;
+  size_t span_count;
+  uint64_t total;
+};
+
 struct geometry_analytic_record {
   uint64_t point;
   uint32_t front_material;
@@ -160,13 +176,19 @@ struct geometry_patch_launch {
   size_t count;
 };
 
+/* validate_shared = false skips the common-descriptor checks when the
+   caller has just validated an identical descriptor (spans of one
+   destination share it); the launch's own range checks always run. */
 void validate_geometry_bulk_launch(const geometry_bulk_launch &launch,
-                                   const unsigned char *host_inputs, size_t host_bytes);
+                                   const unsigned char *host_inputs, size_t host_bytes,
+                                   bool validate_shared = true);
 void validate_geometry_analytic_launch(const geometry_analytic_launch &launch,
                                        const unsigned char *host_inputs, size_t host_bytes);
 void validate_geometry_patch_launch(const geometry_patch_launch &launch,
                                     const unsigned char *host_inputs, size_t host_bytes);
 void launch_material_geometry_bulk(const geometry_bulk_launch &launch, const stream &stream);
+void launch_material_geometry_bulk_batch(const geometry_bulk_batch_launch &launch,
+                                         const stream &stream);
 void launch_material_geometry_analytic(const geometry_analytic_launch &launch,
                                        const stream &stream);
 void launch_material_geometry_patch(const geometry_patch_launch &launch, const stream &stream);

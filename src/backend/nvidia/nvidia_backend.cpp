@@ -720,6 +720,9 @@ public:
   std::unique_ptr<nvidia::device_arenas> arenas_;
   std::unique_ptr<nvidia::stream> transfer_;
   std::unique_ptr<nvidia::stream> communication_;
+  /* Bulk material spans grouped per destination for batched launches. */
+  nvidia::device_buffer material_geometry_bulk_spans_;
+  std::vector<nvidia::geometry_bulk_span> material_geometry_bulk_span_host_;
   /* Graph capture only: independent launches of one phase are forked onto
      these streams so the captured graph has parallel branches. */
   std::vector<std::unique_ptr<nvidia::stream> > capture_branches_;
@@ -6370,12 +6373,36 @@ bool same_geometry_common(nvidia::geometry_launch_common left,
   return true;
 }
 
+/* find_storage_key scans every storage array; material geometry resolves a
+   destination's array once per span/patch/authority (millions of times at
+   large resolutions). Resolve each destination once, lazily. */
+struct NvidiaDestinationArrays {
+  const StoragePlan &plan;
+  const MaterialIR &ir;
+  std::vector<ArrayId> ids;
+  std::vector<bool> known;
+  NvidiaDestinationArrays(const StoragePlan &p, const MaterialIR &m)
+      : plan(p), ir(m), ids(m.destinations.size(), invalid_array()),
+        known(m.destinations.size(), false) {}
+  ArrayId operator()(uint32_t destination) {
+    if (destination >= ids.size())
+      return find_storage_key(plan, ir.destinations.at(destination).key);
+    if (!known[destination]) {
+      ids[destination] = find_storage_key(plan, ir.destinations[destination].key);
+      known[destination] = true;
+    }
+    return ids[destination];
+  }
+};
+
 nvidia::geometry_launch_common geometry_common_for(
     const MaterialIR &ir, const MaterialIRDestination &destination,
     const NvidiaBackendState &state, size_t object_offset, size_t object_count,
     size_t image_offset, size_t image_count, size_t value_offset,
-    size_t absorber_header_offset, size_t absorber_count, double dt) {
-  const ArrayId id = find_storage_key(state.plan_, destination.key);
+    size_t absorber_header_offset, size_t absorber_count, double dt,
+    ArrayId resolved = invalid_array()) {
+  const ArrayId id =
+      is_valid(resolved) ? resolved : find_storage_key(state.plan_, destination.key);
   if (!is_valid(id)) throw std::invalid_argument("NVIDIA geometry destination is absent");
   const MaterialIRChunk &chunk = ir.chunks[destination.chunk_index];
   const component c = component(destination.component);
@@ -6438,6 +6465,7 @@ nvidia::geometry_launch_common geometry_common_for(
 void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, double dt,
                                MaterialCompactPack &compact, size_t absorber_header_offset,
                                size_t absorber_count) {
+  NvidiaDestinationArrays destination_arrays(state.plan_, ir);
   std::vector<nvidia::geometry_object_record> objects;
   objects.reserve(ir.objects.size());
   for (const MaterialIRObject &source : ir.objects) {
@@ -6672,7 +6700,8 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
     launch.common = geometry_common_for(ir, ir.destinations[source.destination], state,
                                         object_offset, objects.size(), image_offset,
                                         images.size(), value_offsets[source.destination],
-                                        absorber_header_offset, absorber_count, dt);
+                                        absorber_header_offset, absorber_count, dt,
+                                        destination_arrays(source.destination));
     launch.first_point = source.first_point;
     launch.count = source.count;
     state.material_geometry_bulk_launches_.push_back(launch);
@@ -6681,7 +6710,7 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
     authority.destination = source.destination;
     authority.source_index = source_index;
     authority.source_count = source.count;
-    authority.array = find_storage_key(state.plan_, ir.destinations[source.destination].key);
+    authority.array = destination_arrays(source.destination);
     authority.topology = ir.topology[ir.destinations[source.destination].topology_index];
     authority.object_offset = launch.common.object_offset;
     authority.object_count = launch.common.object_count;
@@ -6713,7 +6742,8 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
     launch.common = geometry_common_for(ir, ir.destinations[destination], state,
                                         object_offset, objects.size(), image_offset,
                                         images.size(), value_offsets[destination],
-                                        absorber_header_offset, absorber_count, dt);
+                                        absorber_header_offset, absorber_count, dt,
+                                        destination_arrays(destination));
     launch.job_offset = compact.append_records(jobs, "packing geometry analytic jobs");
     launch.count = jobs.size();
     state.material_geometry_analytic_launches_.push_back(launch);
@@ -6722,7 +6752,7 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
     authority.destination = destination;
     authority.source_index = source_begin;
     authority.source_count = jobs.size();
-    authority.array = find_storage_key(state.plan_, ir.destinations[destination].key);
+    authority.array = destination_arrays(destination);
     authority.topology = ir.topology[ir.destinations[destination].topology_index];
     authority.object_offset = launch.common.object_offset;
     authority.object_count = launch.common.object_count;
@@ -6753,7 +6783,8 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
     launch.common = geometry_common_for(ir, ir.destinations[destination], state,
                                         object_offset, objects.size(), image_offset,
                                         images.size(), value_offsets[destination],
-                                        absorber_header_offset, absorber_count, dt);
+                                        absorber_header_offset, absorber_count, dt,
+                                        destination_arrays(destination));
     launch.patch_offset = compact.append_records(patches, "packing geometry patches");
     launch.count = patches.size();
     state.material_geometry_patch_launches_.push_back(launch);
@@ -6762,7 +6793,7 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
     authority.destination = destination;
     authority.source_index = source_begin;
     authority.source_count = patches.size();
-    authority.array = find_storage_key(state.plan_, ir.destinations[destination].key);
+    authority.array = destination_arrays(destination);
     authority.topology = ir.topology[ir.destinations[destination].topology_index];
     authority.object_offset = launch.common.object_offset;
     authority.object_count = launch.common.object_count;
@@ -6785,7 +6816,8 @@ void validate_material_geometry_authority(
     const MaterialIR &ir, const NvidiaBackendState &state, const MaterialCompactPack &compact,
     const NvidiaMaterialGeometryAuthority &authority,
     const nvidia::geometry_launch_common &common, uint64_t first_point, size_t record_offset,
-    size_t count, double dt, bool require_device_pointer) {
+    size_t count, double dt, bool require_device_pointer,
+    NvidiaDestinationArrays *destination_arrays = NULL) {
   if (authority.destination >= ir.destinations.size())
     throw std::invalid_argument("NVIDIA geometry authority destination is invalid");
   if (authority.array.value >= state.plan_.arrays.size())
@@ -6796,7 +6828,12 @@ void validate_material_geometry_authority(
   if (!(authority.topology ==
         ir.topology[ir.destinations[authority.destination].topology_index]))
     throw std::invalid_argument("NVIDIA geometry authority topology is stale");
-  if (!(authority.array == find_storage_key(state.plan_, authority.topology.key)))
+  /* topology.key equals the destination key (checked above), so the per-
+     destination table gives find_storage_key(state.plan_, topology.key). */
+  const ArrayId bound = destination_arrays
+                            ? (*destination_arrays)(authority.destination)
+                            : find_storage_key(state.plan_, authority.topology.key);
+  if (!(authority.array == bound))
     throw std::invalid_argument("NVIDIA geometry authority binding is stale");
   if (authority.source_count != count || authority.first_point != first_point ||
       authority.record_offset != record_offset)
@@ -6805,7 +6842,7 @@ void validate_material_geometry_authority(
       ir, ir.destinations[authority.destination], state, authority.object_offset,
       authority.object_count, authority.image_offset, authority.image_count,
       authority.value_offset, authority.absorber_header_offset, authority.absorber_count,
-      dt);
+      dt, bound);
   expected.compact_input_bytes = compact.bytes.size();
   expected.compact_inputs = require_device_pointer
                                 ? static_cast<const unsigned char *>(
@@ -6875,6 +6912,8 @@ void validate_all_material_geometry_authority(const MaterialIR &ir,
   if (state.material_geometry_compact_hash_ != geometry_compact_hash(compact.bytes))
     throw std::invalid_argument("NVIDIA geometry compact authority is stale");
   size_t bulk = 0, analytic = 0, patch = 0;
+  NvidiaDestinationArrays destination_arrays(state.plan_, ir);
+  const nvidia::geometry_launch_common *last_bulk_common = NULL;
   for (const NvidiaMaterialGeometryAuthority &authority :
        state.material_geometry_authorities_) {
     if (authority.kind == NvidiaMaterialGeometryKind::bulk) {
@@ -6883,8 +6922,14 @@ void validate_all_material_geometry_authority(const MaterialIR &ir,
       const nvidia::geometry_bulk_launch &launch = state.material_geometry_bulk_launches_[bulk++];
       validate_material_geometry_authority(ir, state, compact, authority, launch.common,
                                            launch.first_point, 0, launch.count,
-                                           dt, require_device_pointer);
-      nvidia::validate_geometry_bulk_launch(launch, compact.bytes.data(), compact.bytes.size());
+                                           dt, require_device_pointer, &destination_arrays);
+      /* Spans of one destination share their common descriptor: its (costly)
+         checks need to run once per distinct descriptor. */
+      const bool shared_validated =
+          last_bulk_common && same_geometry_common(*last_bulk_common, launch.common);
+      nvidia::validate_geometry_bulk_launch(launch, compact.bytes.data(), compact.bytes.size(),
+                                            !shared_validated);
+      last_bulk_common = &launch.common;
     }
     else if (authority.kind == NvidiaMaterialGeometryKind::analytic) {
       if (analytic >= state.material_geometry_analytic_launches_.size())
@@ -6893,7 +6938,7 @@ void validate_all_material_geometry_authority(const MaterialIR &ir,
           state.material_geometry_analytic_launches_[analytic++];
       validate_material_geometry_authority(ir, state, compact, authority, launch.common, 0,
                                            launch.job_offset, launch.count,
-                                           dt, require_device_pointer);
+                                           dt, require_device_pointer, &destination_arrays);
       nvidia::validate_geometry_analytic_launch(launch, compact.bytes.data(),
                                                 compact.bytes.size());
     }
@@ -6903,7 +6948,7 @@ void validate_all_material_geometry_authority(const MaterialIR &ir,
       const nvidia::geometry_patch_launch &launch = state.material_geometry_patch_launches_[patch++];
       validate_material_geometry_authority(ir, state, compact, authority, launch.common, 0,
                                            launch.patch_offset, launch.count,
-                                           dt, require_device_pointer);
+                                           dt, require_device_pointer, &destination_arrays);
       nvidia::validate_geometry_patch_launch(launch, compact.bytes.data(), compact.bytes.size());
     }
   }
@@ -8308,6 +8353,47 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
           compact_input_bytes;
     }
     if (native_material) {
+      /* Consecutive bulk spans with an identical common descriptor (one
+         destination) become one batched launch; spans write disjoint points,
+         so the stored values are unchanged. */
+      struct BulkGroup {
+        nvidia::geometry_bulk_batch_launch launch;
+        int phase;
+        size_t first_span;
+      };
+      std::vector<BulkGroup> bulk_groups;
+      std::vector<nvidia::geometry_bulk_span> &spans = state.material_geometry_bulk_span_host_;
+      spans.clear();
+      for (const nvidia::geometry_bulk_launch &launch : state.material_geometry_bulk_launches_) {
+        if (!launch.count) continue;
+        const int phase = geometry_property_phase(launch.common.property);
+        if (bulk_groups.empty() || bulk_groups.back().phase != phase ||
+            !same_geometry_common(bulk_groups.back().launch.common, launch.common)) {
+          BulkGroup group = {};
+          group.launch.common = launch.common;
+          group.phase = phase;
+          group.first_span = spans.size();
+          bulk_groups.push_back(group);
+        }
+        BulkGroup &group = bulk_groups.back();
+        spans.push_back(nvidia::geometry_bulk_span{launch.first_point, launch.count,
+                                                   group.launch.total});
+        group.launch.total = material_checked_add(group.launch.total, launch.count,
+                                                  "accounting geometry bulk batch");
+        ++group.launch.span_count;
+      }
+      if (!spans.empty()) {
+        const size_t span_bytes = material_checked_product(
+            spans.size(), sizeof(nvidia::geometry_bulk_span), "sizing geometry bulk spans");
+        if (state.material_geometry_bulk_spans_.size() < span_bytes)
+          state.material_geometry_bulk_spans_.allocate(span_bytes, state.device_);
+        nvidia::copy_host_to_device_async(state.material_geometry_bulk_spans_, 0, spans.data(),
+                                          span_bytes, *state.transfer_);
+        const nvidia::geometry_bulk_span *device_spans =
+            static_cast<const nvidia::geometry_bulk_span *>(
+                state.material_geometry_bulk_spans_.opaque_handle());
+        for (BulkGroup &group : bulk_groups) group.launch.spans = device_spans + group.first_span;
+      }
       for (uint32_t phase = 0; phase <= 5; ++phase) {
         for (const nvidia::material_fill_launch &launch : state.material_fill_launches_)
           if (launch.phase == phase) {
@@ -8315,15 +8401,17 @@ void NvidiaBackend::initialize(const InitializationPlan &initialization, Backend
             ++state.material_initialization_statistics_.constant_fill_kernel_launches;
             ++state.material_initialization_statistics_.pointwise_kernel_launches;
           }
-        for (const nvidia::geometry_bulk_launch &launch :
-             state.material_geometry_bulk_launches_)
-          if (geometry_property_phase(launch.common.property) == int(phase)) {
-            nvidia::launch_material_geometry_bulk(launch, *state.transfer_);
-            ++state.material_initialization_statistics_.geometry_bulk_kernel_launches;
-            ++state.material_initialization_statistics_.pointwise_kernel_launches;
+        for (const BulkGroup &group : bulk_groups)
+          if (group.phase == int(phase)) {
+            nvidia::launch_material_geometry_bulk_batch(group.launch, *state.transfer_);
+            /* Statistics keep counting logical spans (one per former launch). */
+            state.material_initialization_statistics_.geometry_bulk_kernel_launches +=
+                group.launch.span_count;
+            state.material_initialization_statistics_.pointwise_kernel_launches +=
+                group.launch.span_count;
             state.material_initialization_statistics_.geometry_bulk_points =
                 material_checked_add(state.material_initialization_statistics_.geometry_bulk_points,
-                                     launch.count, "accounting geometry bulk points");
+                                     size_t(group.launch.total), "accounting geometry bulk points");
           }
         if (phase == 1) {
           for (const nvidia::geometry_analytic_launch &launch :

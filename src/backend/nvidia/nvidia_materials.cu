@@ -817,6 +817,26 @@ __global__ void geometry_bulk_kernel(geometry_bulk_launch launch) {
 }
 
 template <typename T>
+__global__ void geometry_bulk_batch_kernel(geometry_bulk_batch_launch launch) {
+  const uint64_t thread = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (thread >= launch.total) return;
+  size_t low = 0, high = launch.span_count;
+  while (high - low > 1) {
+    const size_t middle = low + (high - low) / 2;
+    if (launch.spans[middle].offset <= thread) low = middle;
+    else high = middle;
+  }
+  const geometry_bulk_span span = launch.spans[low];
+  const size_t point = span.first_point + (thread - span.offset);
+  size_t destination = 0;
+  material_geometry_numeric::vector position;
+  double physical[5] = {};
+  point_for(launch.common, point, destination, position, physical);
+  store_value<T>(launch.common, destination, point,
+                 value_at(launch.common, position, physical));
+}
+
+template <typename T>
 __global__ void geometry_analytic_kernel(geometry_analytic_launch launch) {
   const size_t thread = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
   if (thread >= launch.count) return;
@@ -855,6 +875,14 @@ void launch_bulk_typed(const geometry_bulk_launch &launch, const stream &executi
 }
 
 template <typename T>
+void launch_bulk_batch_typed(const geometry_bulk_batch_launch &launch, const stream &execution) {
+  const dim3 grid(launch_blocks(size_t(launch.total), "NVIDIA material geometry"));
+  const cudaStream_t cuda_stream = static_cast<cudaStream_t>(execution.opaque_handle());
+  geometry_bulk_batch_kernel<T><<<grid, 256, 0, cuda_stream>>>(launch);
+  check_cuda(cudaPeekAtLastError(), "launching NVIDIA material geometry kernel");
+}
+
+template <typename T>
 void launch_analytic_typed(const geometry_analytic_launch &launch,
                            const stream &execution) {
   const dim3 grid(launch_blocks(launch.count, "NVIDIA material geometry"));
@@ -874,8 +902,10 @@ void launch_patch_typed(const geometry_patch_launch &launch, const stream &execu
 } // namespace
 
 void validate_geometry_bulk_launch(const geometry_bulk_launch &launch,
-                                   const unsigned char *host_inputs, size_t host_bytes) {
-  validate_common(launch.common, host_inputs, host_bytes, "NVIDIA material geometry bulk");
+                                   const unsigned char *host_inputs, size_t host_bytes,
+                                   bool validate_shared) {
+  if (validate_shared)
+    validate_common(launch.common, host_inputs, host_bytes, "NVIDIA material geometry bulk");
   if (!launch.count || launch.first_point > launch.common.point_count ||
       launch.count > launch.common.point_count - launch.first_point)
     throw std::invalid_argument("NVIDIA material geometry bulk span is invalid");
@@ -935,6 +965,21 @@ void launch_material_geometry_bulk(const geometry_bulk_launch &launch,
     launch_bulk_typed<float>(launch, execution);
   else if (launch.common.precision == scalar_precision::f64)
     launch_bulk_typed<double>(launch, execution);
+  else
+    throw std::invalid_argument("NVIDIA material geometry precision is invalid");
+}
+
+void launch_material_geometry_bulk_batch(const geometry_bulk_batch_launch &launch,
+                                         const stream &execution) {
+  if (!launch.total) return;
+  if (!launch.spans || !launch.span_count)
+    throw std::invalid_argument("NVIDIA material geometry bulk batch has no spans");
+  if (testing::consume_failure_for_testing(testing::failure_point::material_geometry_bulk_launch))
+    throw std::runtime_error("injected NVIDIA material geometry bulk launch failure");
+  if (launch.common.precision == scalar_precision::f32)
+    launch_bulk_batch_typed<float>(launch, execution);
+  else if (launch.common.precision == scalar_precision::f64)
+    launch_bulk_batch_typed<double>(launch, execution);
   else
     throw std::invalid_argument("NVIDIA material geometry precision is invalid");
 }
