@@ -253,3 +253,17 @@ above). For scale: the notebook reports ~690 min for CPU Meep on a 10-core
 laptop; the single-A6000 staircased run above took 29 min. With averaging,
 `init_sim` (CPU subpixel averaging) is now the dominant cost.
 Plot: `results/compare_2xh100_res30.png`.
+
+### After faster averaged setup (branch custom/phase2-pr11-gpu-avg)
+
+Same runs, same 2x H100 box type, with parallel material-IR capture, mu-aware
+averaging, OpenMP CPU averaging (`--with-openmp`, `OMP_NUM_THREADS` = cores per
+rank) and batched device material initialization:
+
+| geometry | wall time | init_sim | run (setup + steps) | max/rms dT vs CPU Meep |
+|---|---|---|---|---|
+| staircased | **166 s (2.8 min)** | 2.3 s | 161 s | 0.020 / 0.0088 |
+| subpixel averaging | **176 s (2.9 min)** | 5.8 s (was 359 s) | 167 s | **0.0020 / 0.0010** |
+
+The accurate (averaged) configuration now costs only ~10 s more than the
+staircased one; stepping (~150 s for 54,000 steps) dominates both.
