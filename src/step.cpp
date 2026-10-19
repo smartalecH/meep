@@ -384,9 +384,11 @@ void fields::advance_cpu(int n) {
   /* Storage is realized before the loop, never inside it. From here the
      timestep only executes. */
   const FiniteCheckMode mode = finite_check_mode();
+  const int interval = finite_check_interval();
   for (int i = 0; i < n; ++i) {
     step_once();
-    if (mode == FiniteCheckMode::step) check_finite_fields();
+    if (mode == FiniteCheckMode::step || (mode == FiniteCheckMode::interval && t % interval == 0))
+      check_finite_fields();
   }
   if (mode == FiniteCheckMode::batch) check_finite_fields();
 }

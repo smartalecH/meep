@@ -38,22 +38,35 @@ struct DiagnosticBlock {
   int32_t first_bad_component;
 };
 
-/* MEEP_FINITE_CHECK=step|batch|off.
+/* MEEP_FINITE_CHECK=step|batch|off|interval:N (a bare positive N also means
+   interval:N).
 
    step  (default) -- the historical behavior: read the cell center once per
                       timestep and abort immediately.
    batch           -- the *same* center-point read, performed once at each
                       advance() boundary. first_bad_step is reported as the
                       batch end, because that is when the observation was made.
-   off             -- no check. */
-enum class FiniteCheckMode { step, batch, off };
+   off             -- no check.
+   interval:N      -- check after every timestep t with t % N == 0, so a
+                      non-finite value is caught within N steps; first_bad_step
+                      is the timestep of the observation. */
+enum class FiniteCheckMode { step, batch, off, interval };
 
 /* Reads MEEP_FINITE_CHECK once and caches it. An unrecognized value warns and
    falls back to `step`. */
 FiniteCheckMode finite_check_mode();
+/* N for FiniteCheckMode::interval (1 otherwise). */
+int finite_check_interval();
+/* False when MEEP_FINITE_CHECK is unset and no test override was installed:
+   backends may then pick their own default (the NVIDIA backend checks every
+   default_device_finite_check_interval steps, since its check is a full-field
+   scan rather than the CPU's center-point read). */
+bool finite_check_mode_explicit();
+const int default_device_finite_check_interval = 100;
 
 /* Test hook: overrides the environment for the remainder of the process. */
 void set_finite_check_mode(FiniteCheckMode mode);
+void set_finite_check_mode(FiniteCheckMode mode, int interval);
 
 } // namespace meep
 

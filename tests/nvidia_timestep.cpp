@@ -9582,8 +9582,9 @@ static void test_multilevel_capability_rejections() {
 
 static void run_finite_diagnostic_case(const char *name, precision_policy_kind policy,
                                        FiniteCheckMode mode, bool poison, realnum value,
-                                       bool expect_rejection, int expected_step) {
-  set_finite_check_mode(mode);
+                                       bool expect_rejection, int expected_step,
+                                       int interval = 1, int advance_steps = 2) {
+  set_finite_check_mode(mode, interval);
   const grid_volume gv = vol2d(2.0, 2.0, 6.0);
   structure s(gv, isotropic_eps, no_pml(), identity(), 1);
   execution_options options;
@@ -9617,7 +9618,7 @@ static void run_finite_diagnostic_case(const char *name, precision_policy_kind p
 
   bool rejected = false;
   try {
-    f.advance(2);
+    f.advance(advance_steps);
   }
   catch (const std::runtime_error &error) {
     rejected =
@@ -9643,6 +9644,10 @@ static void test_finite_diagnostics(precision_policy_kind policy) {
                              std::numeric_limits<realnum>::infinity(), true, 2);
   run_finite_diagnostic_case("off", policy, FiniteCheckMode::off, true,
                              std::numeric_limits<realnum>::quiet_NaN(), false, 2);
+  run_finite_diagnostic_case("interval-pass", policy, FiniteCheckMode::interval, false,
+                             realnum(0), false, 5, 3, 5);
+  run_finite_diagnostic_case("nan-interval", policy, FiniteCheckMode::interval, true,
+                             std::numeric_limits<realnum>::quiet_NaN(), true, 3, 3, 5);
 }
 
 struct noisy_snapshot {

@@ -13817,7 +13817,15 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
   if (executable.has_noisy_updates_ && f_.t < 0)
     throw std::invalid_argument("NVIDIA noisy polarization timestep is negative");
 
-  const FiniteCheckMode finite_mode = finite_check_mode();
+  /* The device check scans every field array, so when the user has not
+     chosen a mode it runs every default_device_finite_check_interval steps
+     rather than every step. */
+  FiniteCheckMode finite_mode = finite_check_mode();
+  int finite_interval = finite_check_interval();
+  if (!finite_check_mode_explicit()) {
+    finite_mode = FiniteCheckMode::interval;
+    finite_interval = default_device_finite_check_interval;
+  }
   try {
     nvidia::device_scope scope(state.device_);
     const bool account_cw = executable.program_ == StepProgram::solve_cw &&
@@ -13899,8 +13907,11 @@ void NvidiaBackend::advance(Executable &raw_executable, BackendState &raw_state,
         f_.step_source_times[1] = std::fma(double(f_.t), f_.dt, 0.5 * f_.dt);
         f_.step_source_times[2] = std::fma(double(f_.t), f_.dt, f_.dt);
       }
-      const bool finite_due = finite_mode == FiniteCheckMode::step ||
-                              (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps);
+      const bool finite_due =
+          finite_mode == FiniteCheckMode::step ||
+          (finite_mode == FiniteCheckMode::batch && step + 1 == num_steps) ||
+          (finite_mode == FiniteCheckMode::interval &&
+           (int64_t(f_.t) + 1) % int64_t(finite_interval) == 0);
       if (executable.graph_enabled_) {
         executable.begin_source_staging_step();
         StepScalars scalars = {};
