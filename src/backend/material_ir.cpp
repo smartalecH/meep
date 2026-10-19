@@ -2380,13 +2380,20 @@ static void validate_material_ir_contents(const MaterialIR &ir) {
     const geom_box rebuilt = object_bounds_from_ir(ir, o);
     const double rebuilt_low[3] = {rebuilt.low.x, rebuilt.low.y, rebuilt.low.z};
     const double rebuilt_high[3] = {rebuilt.high.x, rebuilt.high.y, rebuilt.high.z};
+    // libctl and the IR derive bounds through different arithmetic (prism
+    // centroid offsets, block center +/- size/2), so they can differ by ulps.
+    const auto bound_differs = [](double stored, double rebuilt_value) {
+      const double scale = std::max(1.0, std::max(std::fabs(stored), std::fabs(rebuilt_value)));
+      return std::fabs(stored - rebuilt_value) >
+             64 * std::numeric_limits<double>::epsilon() * scale;
+    };
     for (int axis = 0; axis < 3; ++axis) {
       if (std::isnan(o.low[axis]) || std::isnan(o.high[axis])) continue;
       const bool finite_axis = std::isfinite(o.low[axis]) && std::isfinite(o.high[axis]);
       if ((finite_axis && (!std::isfinite(rebuilt_low[axis]) ||
                            !std::isfinite(rebuilt_high[axis]) ||
-                           o.low[axis] != rebuilt_low[axis] ||
-                           o.high[axis] != rebuilt_high[axis])) ||
+                           bound_differs(o.low[axis], rebuilt_low[axis]) ||
+                           bound_differs(o.high[axis], rebuilt_high[axis]))) ||
           (!finite_axis && !std::isnan(rebuilt_low[axis]) &&
            !std::isnan(rebuilt_high[axis]) &&
            (o.low[axis] != rebuilt_low[axis] || o.high[axis] != rebuilt_high[axis])))
