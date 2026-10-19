@@ -198,6 +198,8 @@ class Built:
                 sim.add_flux(self.freqs, mp.FluxRegion(center=center, size=size))
                 if kind == "flux" else
                 sim.add_mode_monitor(self.freqs, mp.ModeRegion(center=center, size=size)))
+        if case.custom is not None:   # extra monitors (near2far, field planes, ...)
+            case.custom(case, {"stage": "monitors", "built": self, "sim": sim})
         return sim
 
     def grid(self) -> Tuple[int, int, int]:

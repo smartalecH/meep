@@ -171,7 +171,8 @@ class Case:
     # material at the shortest wavelength (arXiv 2506.16665 / Tidy3D).
     n_max: float = 3.48
     # Escape hatch for cases the declarative fields cannot express: called as
-    # custom(case, context) and may return a dict of extra simulation kwargs
-    # or post-run observable values (see meepbench.runner).
+    # custom(case, context) with context["stage"] in {"simulation" (return
+    # extra mp.Simulation kwargs), "monitors" (add monitors to
+    # context["sim"]), "observables" (return extra values)}; see runner.
     custom: Optional[Callable[..., Any]] = None
     tags: Sequence[str] = ()
