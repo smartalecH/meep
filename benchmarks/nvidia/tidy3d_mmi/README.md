@@ -279,3 +279,7 @@ staircased one; stepping (~150 s for 54,000 steps) dominates both.
 
 Mixed precision moves the spectrum by at most 1e-7. The per-step non-finite
 scan costs 18-24 s here (an extra full read of every field each step).
+
+With the NVIDIA default now checking for non-finite values every 100 steps
+(`MEEP_FINITE_CHECK=interval:100`; set `step` for the old behaviour), the
+default-settings averaged run takes **112 s (mixed)** / **155 s (native)**.
