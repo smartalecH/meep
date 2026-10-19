@@ -102,9 +102,17 @@ class Built:
         z0 = box.zmin if box.zmin is not None else cz - sz / 2 - big
         z1 = box.zmax if box.zmax is not None else cz + sz / 2 + big
         # A vertex-defined Prism rather than mp.Block (see tidy3d_mmi/README.md).
-        return mp.Prism(vertices=[self._local(x0, y0, z0), self._local(x1, y0, z0),
-                                  self._local(x1, y1, z0), self._local(x0, y1, z0)],
-                        height=z1 - z0, axis=mp.Vector3(0, 0, 1),
+        # Open sides are snapped outward to multiples of 0.5 um in simulation
+        # coordinates: the GPU material IR re-derives object bounds and
+        # compares them exactly, which fails by an ulp for arbitrary values.
+        lo, hi = self._local(x0, y0, z0), self._local(x1, y1, z1)
+        snap_lo = lambda v, given: v if given is not None else math.floor(v * 2) / 2
+        snap_hi = lambda v, given: v if given is not None else math.ceil(v * 2) / 2
+        X0, Y0, Z0 = snap_lo(lo.x, box.xmin), snap_lo(lo.y, box.ymin), snap_lo(lo.z, box.zmin)
+        X1, Y1, Z1 = snap_hi(hi.x, box.xmax), snap_hi(hi.y, box.ymax), snap_hi(hi.z, box.zmax)
+        return mp.Prism(vertices=[mp.Vector3(X0, Y0, Z0), mp.Vector3(X1, Y0, Z0),
+                                  mp.Vector3(X1, Y1, Z0), mp.Vector3(X0, Y1, Z0)],
+                        height=Z1 - Z0, axis=mp.Vector3(0, 0, 1),
                         material=self.media[box.material])
 
     # -- ports --------------------------------------------------------------
@@ -261,6 +269,11 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
     t0 = time.time()
     sim.init_sim()
     t_init = time.time() - t0
+    # One untimed-in-run step: on the NVIDIA backend the first step compiles
+    # material recipes and captures graphs, which is setup, not stepping.
+    t0 = time.time()
+    sim.fields.step()
+    t_first = time.time() - t0
     run_ctl = case.run
     t0 = time.time()
     until = options.until if options.until is not None else run_ctl.until
@@ -342,8 +355,9 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
         "resolution": built.resolution,
         "grid": [nx, ny, nz], "cells": cells, "steps": steps,
         "ranks": mp.count_processors(),
-        "time_s": {"init_sim": t_init, "run": t_run, "total": time.time() - t_wall},
-        "gcell_steps_per_s": cells * steps / t_run / 1e9 if t_run > 0 else None,
+        "time_s": {"init_sim": t_init, "first_step": t_first, "run": t_run,
+                   "total": time.time() - t_wall},
+        "gcell_steps_per_s": cells * (steps - 1) / t_run / 1e9 if t_run > 0 else None,
         "values": values, "checks": checks, "spectrum_checks": spectrum_checks,
         "wavelengths": wl.tolist(), "spectra": spectra,
         "reference": {
