@@ -127,7 +127,7 @@ class Run:
     decay: Optional[float] = 1e-5
     check_dt: float = 50.0
     until: Optional[float] = None
-    min_time: float = 0.0
+    min_time: float = 0.0         # 0: one device transit (see runner)
     max_time: Optional[float] = None
     after_sources: bool = True    # until counts from source turn-off (else from t=0)
 

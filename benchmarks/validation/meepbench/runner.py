@@ -298,8 +298,16 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
         sim.run(until_after_sources=mp.stop_when_energy_decayed(dt=run_ctl.check_dt,
                                                                 decay_by=run_ctl.decay))
     else:
+        # DFT decay must not be judged before light crosses the device: with a
+        # short pulse the input monitor settles first and the check would stop
+        # with nothing at the outputs. Default floor: one transit at group
+        # index ~1.2 n_max along the in-plane Manhattan path.
+        # minimum_run_time is absolute simulation time, so add the source
+        # duration (last_source_time) to the transit.
+        min_time = run_ctl.min_time or (sim.fields.last_source_time() + 1.2 * case.n_max *
+                                        (built.domain[0] + built.domain[1]))
         sim.run(until_after_sources=mp.stop_when_dft_decayed(
-            tol=run_ctl.decay, minimum_run_time=run_ctl.min_time,
+            tol=run_ctl.decay, minimum_run_time=min_time,
             maximum_run_time=run_ctl.max_time))
     t_run = time.time() - t0
     steps = int(sim.fields.t)
