@@ -283,3 +283,20 @@ scan costs 18-24 s here (an extra full read of every field each step).
 With the NVIDIA default now checking for non-finite values every 100 steps
 (`MEEP_FINITE_CHECK=interval:100`; set `step` for the old behaviour), the
 default-settings averaged run takes **112 s (mixed)** / **155 s (native)**.
+
+### Strong scaling on 8x H200 (NVSwitch), averaged MMI res 30, default settings
+
+| GPUs | precision | wall time | first-step setup | 54,000 steps | step speedup |
+|---|---|---|---|---|---|
+| 1 | native | 230 s | — | — | — |
+| 1 | mixed | 182 s | 33 s | 135 s (2.49 ms/step) | 1.0x |
+| 2 | mixed | 104 s | 19 s | 75 s (1.38 ms/step) | 1.8x |
+| 4 | mixed | 70 s | 15 s | 44 s (0.82 ms/step) | 3.0x |
+| 8 | mixed | **58 s** | 15 s | 29 s (0.54 ms/step) | 4.6x |
+| 8 | native | 64 s | — | — | — |
+
+Spectra on 2, 4 and 8 GPUs are bitwise identical to 1 GPU; all match CPU
+Meep to 0.0020 max / 0.0010 rms. Beyond 4 GPUs the fixed costs (Python
+start, MPB, init_sim ~10 s, first-step setup ~15 s) are about half the wall
+time, and the per-GPU subdomain (7M stored cells at 8 GPUs) is small enough
+that native and mixed precision converge (64 vs 58 s).
