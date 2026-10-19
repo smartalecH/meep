@@ -276,10 +276,13 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
     t0 = time.time()
     sim.init_sim()
     t_init = time.time() - t0
-    # One untimed-in-run step: on the NVIDIA backend the first step compiles
-    # material recipes and captures graphs, which is setup, not stepping.
+    # One step timed apart from the run: on the NVIDIA backend the first step
+    # compiles material recipes and captures graphs, which is setup, not
+    # stepping. It goes through sim.run so pymeep creates its DFT monitors
+    # before the backend freezes its storage catalog (a bare fields.step()
+    # leaves them out and dft_norm later fails).
     t0 = time.time()
-    sim.fields.step()
+    sim.run(until=sim.fields.dt)
     t_first = time.time() - t0
     run_ctl = case.run
     t0 = time.time()
