@@ -72,7 +72,11 @@ class ModeSource:
     mode: str = "TE0"           # "TE0", "TM0", "TE1", ... or "band:N"
     distance: float = 0.6       # source plane, um outside the port (on the extension)
     monitor_gap: float = 0.3    # incident-power monitor, um downstream of the source
-    fwidth_factor: float = 1.5  # Gaussian pulse width / monitored frequency span
+    # Meep GaussianSource fwidth / monitored frequency span. Meep's fwidth is
+    # 2*pi times Tidy3D's GaussianPulse fwidth for the same pulse, so 2*pi
+    # reproduces Tidy3D's fwidth = span (arXiv 2506.16665 pipeline); smaller
+    # factors give longer pulses and more steps.
+    fwidth_factor: float = 6.283185307179586
 
 
 @dataclasses.dataclass
