@@ -1854,7 +1854,10 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
       works[index].bulk.push_back(MaterialIRBulkSpan{index, 0, destination.point_count});
   }
   const MaterialIR &ir_view = *ir;
-  const auto traverse = [&](uint32_t destination_index, DestinationWork &work) {
+  /* Points [first, last) of one destination; the loop still walks earlier
+     points (cheap index arithmetic) so ordinals match a full traversal. */
+  const auto traverse = [&](uint32_t destination_index, DestinationWork &work, uint64_t first,
+                            uint64_t last) {
     const MaterialIRDestination &destination = ir_view.destinations[destination_index];
     const MaterialIRTopologyRow &row = ir_view.topology[destination.topology_index];
     const component c = component(row.key.component_);
@@ -1864,6 +1867,11 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
       uint64_t point = 0;
       LOOP_OVER_VOL(gv, c, storage_index) {
         (void)storage_index;
+        if (point < first) {
+          ++point;
+          continue;
+        }
+        if (point >= last) return;
         IVEC_LOOP_ILOC(gv, here);
         const meep::volume evaluation = gv.dV(destination.offdiagonal ? here - shift1 : here, 1.0);
         const FrontObjectResult front = classify_front_object(ir_view, evaluation);
@@ -1940,29 +1948,75 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
         throw std::logic_error("material IR partition traversal count changed");
   };
   {
-    size_t threads =
-        geps.is_thread_safe()
-            ? std::min<size_t>(averaged.size(),
-                               std::max(1u, std::thread::hardware_concurrency()))
-            : size_t(1);
+    /* A run has only a few averaged destinations (one per chunk, component
+       and tensor column), so each is also split into point blocks; blocks
+       are merged back in order, giving the serial result. */
+    size_t threads = geps.is_thread_safe()
+                         ? size_t(std::max(1u, std::thread::hardware_concurrency()))
+                         : size_t(1);
     if (const char *forced = std::getenv("MEEP_IR_CAPTURE_THREADS"))
       threads = std::max<size_t>(1, std::min<size_t>(threads, std::strtoul(forced, NULL, 10)));
+    struct Block {
+      uint32_t destination;
+      uint64_t first, last;
+    };
+    std::vector<Block> blocks;
+    std::vector<size_t> first_block(averaged.size() + 1, 0);
+    const size_t per_destination =
+        threads > 1 && !averaged.empty()
+            ? std::max<size_t>(1, (8 * threads + averaged.size() - 1) / averaged.size())
+            : 1;
+    for (size_t k = 0; k < averaged.size(); ++k) {
+      first_block[k] = blocks.size();
+      const uint64_t count = ir->destinations[averaged[k]].point_count;
+      const uint64_t step = std::max<uint64_t>(4096, (count + per_destination - 1) / per_destination);
+      uint64_t first = 0;
+      do {
+        const uint64_t last = std::min<uint64_t>(count, first + step);
+        blocks.push_back(Block{averaged[k], first, last});
+        first = last;
+      } while (first < count);
+    }
+    first_block[averaged.size()] = blocks.size();
+    std::vector<DestinationWork> block_work(blocks.size());
     std::atomic<size_t> next(0);
-    std::vector<std::exception_ptr> errors(averaged.size());
+    std::vector<std::exception_ptr> errors(blocks.size());
     const auto worker = [&]() {
-      for (size_t k = next++; k < averaged.size(); k = next++) try {
-          traverse(averaged[k], works[averaged[k]]);
+      for (size_t k = next++; k < blocks.size(); k = next++) try {
+          traverse(blocks[k].destination, block_work[k], blocks[k].first, blocks[k].last);
         }
         catch (...) {
           errors[k] = std::current_exception();
         }
     };
+    threads = std::min(threads, std::max<size_t>(1, blocks.size()));
     std::vector<std::thread> pool;
     for (size_t t = 1; t < threads; ++t) pool.emplace_back(worker);
     worker();
     for (std::thread &thread : pool) thread.join();
     for (const std::exception_ptr &error : errors)
       if (error) std::rethrow_exception(error);
+    for (size_t k = 0; k < averaged.size(); ++k) {
+      DestinationWork &work = works[averaged[k]];
+      for (size_t b = first_block[k]; b < first_block[k + 1]; ++b) {
+        DestinationWork &part = block_work[b];
+        for (const MaterialIRBulkSpan &span : part.bulk) {
+          if (!work.bulk.empty() && work.bulk.back().destination == span.destination &&
+              work.bulk.back().first_point + work.bulk.back().count == span.first_point) {
+            if (std::numeric_limits<uint64_t>::max() - work.bulk.back().count < span.count)
+              throw std::overflow_error("material IR bulk span count overflow");
+            work.bulk.back().count += span.count;
+          }
+          else
+            work.bulk.push_back(span);
+        }
+        work.analytic.insert(work.analytic.end(), part.analytic.begin(), part.analytic.end());
+        work.patches.insert(work.patches.end(), part.patches.begin(), part.patches.end());
+        std::vector<MaterialIRBulkSpan>().swap(part.bulk);
+        std::vector<MaterialIRAnalyticInterface>().swap(part.analytic);
+        std::vector<MaterialIRHybridPatch>().swap(part.patches);
+      }
+    }
   }
   for (DestinationWork &work : works) {
     ir->bulk_spans.insert(ir->bulk_spans.end(), work.bulk.begin(), work.bulk.end());
