@@ -28,6 +28,7 @@ class Options:
     materials: str = "const"                        # const | dispersive
     eps_averaging: Optional[bool] = None            # None: the case default
     until: Optional[float] = None                   # override run control (um/c)
+    stop: Optional[str] = None                      # override Run.stop: dft | energy
     verbosity: int = 0
 
 
@@ -177,19 +178,19 @@ class Built:
         sim = mp.Simulation(**kwargs)
         # Monitors: incident normalization just downstream of the source and
         # one monitor per observed (port, kind).
-        kinds = {o.kind for o in case.observables}
         if case.source is not None:
             src = case.source
             center, size, _, _ = self._port_plane(self.ports[src.port],
                                                   src.distance - src.monitor_gap)
-            if kinds & {"mode_transmission", "ring_resonance"}:
+            measures = {_measure(o) for o in case.observables}
+            if "mode" in measures:
                 self.monitors["__input__", "mode"] = sim.add_mode_monitor(
                     self.freqs, mp.ModeRegion(center=center, size=size))
-            if "flux_ratio" in kinds:
+            if "flux" in measures:
                 self.monitors["__input__", "flux"] = sim.add_flux(
                     self.freqs, mp.FluxRegion(center=center, size=size))
         for obs in case.observables:
-            kind = "flux" if obs.kind == "flux_ratio" else "mode"
+            kind = _measure(obs)
             if (obs.name, kind) in self.monitors:
                 raise ValueError(f"duplicate observable name {obs.name!r}")
             center, size, _, _ = self._port_plane(self.ports[obs.port], obs.distance)
@@ -201,6 +202,12 @@ class Built:
 
     def grid(self) -> Tuple[int, int, int]:
         return tuple(int(round((d + 2 * self.case.pml) * self.resolution)) for d in self.domain)
+
+
+def _measure(obs: Observable) -> str:
+    if obs.kind == "flux_ratio" or (obs.kind == "ring_resonance" and obs.measure == "flux"):
+        return "flux"
+    return "mode"
 
 
 def _outward_sign(port: Port) -> Tuple[int, int]:
@@ -282,6 +289,9 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
             sim.run(until_after_sources=until)
         else:
             sim.run(until=until)
+    elif (options.stop or run_ctl.stop) == "energy":
+        sim.run(until_after_sources=mp.stop_when_energy_decayed(dt=run_ctl.check_dt,
+                                                                decay_by=run_ctl.decay))
     else:
         sim.run(until_after_sources=mp.stop_when_dft_decayed(
             tol=run_ctl.decay, minimum_run_time=run_ctl.min_time,
@@ -303,13 +313,13 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
             incident["flux"] = _flux(built, ("__input__", "flux"), port, outgoing=False)
     for obs in case.observables:
         port = built.ports[obs.port]
-        if obs.kind == "flux_ratio":
+        if obs.kind not in ("flux_ratio", "mode_transmission", "ring_resonance"):
+            raise ValueError(f"unknown observable kind {obs.kind!r}")
+        if _measure(obs) == "flux":
             spectrum = _flux(built, (obs.name, "flux"), port, outgoing=True) / incident["flux"]
-        elif obs.kind in ("mode_transmission", "ring_resonance"):
+        else:
             spectrum = _mode_power(built, (obs.name, "mode"), port, obs.mode,
                                    outgoing=True) / incident["mode"]
-        else:
-            raise ValueError(f"unknown observable kind {obs.kind!r}")
         spectra[obs.name] = spectrum.tolist()
         if obs.kind == "ring_resonance":
             for key, val in ring_fit(wl, spectrum, obs.near or case.wavelengths.center).items():

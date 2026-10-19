@@ -92,6 +92,9 @@ class Observable:
     at: Optional[float] = None
     near: Optional[float] = None      # ring: resonance closest to this wavelength
     distance: float = 0.3             # monitor plane, um outside the port
+    # ring_resonance only: "mode" (|b|^2 of `mode`) or "flux" (net power; no
+    # per-frequency mode solves, right for single-mode buses with many points)
+    measure: str = "mode"
 
 
 @dataclasses.dataclass
@@ -111,10 +114,14 @@ class Wavelengths:
 
 @dataclasses.dataclass
 class Run:
-    """Run control. decay: stop when DFT fields change by less than `decay`
-    (relative) between checks, as Meep's stop_when_dft_decayed; until: fixed
-    time after sources (um/c). max_time caps decay runs."""
+    """Run control. stop="dft": stop when DFT fields change by less than
+    `decay` (relative) between checks (stop_when_dft_decayed); stop="energy":
+    when total field energy falls by `decay` from its peak (Tidy3D-style
+    shutoff, stop_when_energy_decayed every `check_dt`). until: fixed time
+    after sources (um/c). max_time caps decay runs."""
+    stop: str = "dft"
     decay: Optional[float] = 1e-5
+    check_dt: float = 50.0
     until: Optional[float] = None
     min_time: float = 0.0
     max_time: Optional[float] = None

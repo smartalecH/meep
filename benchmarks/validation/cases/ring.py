@@ -11,7 +11,10 @@ CASE = Case(
     wavelengths=Wavelengths(start=1.535, stop=1.565, step=0.0002, center=1.545),
     domain_xy=paper_domain("ring"),
     source=ModeSource("o1", "TE0"),
-    observables=[Observable("through", "ring_resonance", "o2", "TE0", near=1.545)],
+    # Flux readout: the bus is single-mode, and 151 per-frequency MPB solves
+    # took >25 min on the host at 10 cells/lambda.
+    observables=[Observable("through", "ring_resonance", "o2", "TE0", near=1.545,
+                            measure="flux")],
     # DFT-decay stopping quits before the high-Q ring rings down (seen at res 8:
     # stopped at t~420); run the paper's Tidy3D physical time, 6.4 ps.
     run=Run(until=1920.0),
