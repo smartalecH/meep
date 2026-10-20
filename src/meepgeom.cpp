@@ -1309,8 +1309,10 @@ void geom_epsilon::eff_chi1inv_matrix(meep::component c, symm_matrix *chi1inv_ma
       memcpy(&now, &d, sizeof d);
       while (d > 0 && now > old && !bits.compare_exchange_weak(old, now)) {}
       if (now > old)
-        master_printf("meep analytic prism fill: new max |cubature - exact| = %g "
-                            "(exact %g)\n", d, fill);
+        // fprintf, not master_printf: this runs on capture worker threads, and
+        // pymeep's master_printf callback re-enters Python without the GIL.
+        fprintf(stderr, "meep analytic prism fill: new max |cubature - exact| = %g (exact %g)\n",
+                d, fill);
     }
   }
   else
