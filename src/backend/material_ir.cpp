@@ -1049,6 +1049,88 @@ int object_subtype(const MaterialIRObject &object) {
   return 0;
 }
 
+/* Host-side cell index for vertical prisms with many vertices, used while
+   material IR capture classifies every pixel (point_in_polygon is O(vertices)
+   and dominated capture). The prism's bottom polygon bbox is covered by a
+   uniform grid: cells within about one cell of any edge are "boundary" and
+   use the full test; every other cell is inside or outside as a whole, taken
+   from the full test at one cell of each edge-free row run. Answers are
+   therefore those of point_in_polygon. MEEP_PRISM_INDEX=0 disables it;
+   MEEP_PRISM_INDEX_VERIFY=1 checks every indexed answer. */
+struct PrismCellIndex {
+  double x0, y0, inv_h;
+  uint32_t nx, ny;
+  std::vector<uint8_t> state; // 0 outside, 1 inside, 2 boundary
+};
+struct PrismIndexSet {
+  const MaterialIR *ir;
+  std::vector<std::unique_ptr<PrismCellIndex> > by_object;
+};
+std::atomic<const PrismIndexSet *> active_prism_indexes(nullptr);
+std::atomic<uint64_t> prism_index_checks(0), prism_index_mismatches(0);
+
+bool full_contains(const MaterialIR &ir, const MaterialIRObject &object,
+                   const material_geometry_numeric::vector &p) {
+  return material_geometry_numeric::contains(
+      object.kind, object_subtype(object), object.parameters.data(), object.vertices.data(),
+      object.kind == geometric_object::PRISM ? object.fixed_vertex_count
+                                             : object.vertices.size() / 3,
+      object.indices.data(), object.indices.size(),
+      object.auxiliary.data(), object.mesh_lengthscale, ir.lattice_metric, p,
+      ir.prism_include_boundaries);
+}
+
+std::unique_ptr<PrismCellIndex> build_prism_index(const MaterialIRObject &object) {
+  const size_t n = object.fixed_vertex_count;
+  if (object.kind != geometric_object::PRISM || n < 16 || object.parameters.size() < 20 ||
+      object.auxiliary.size() < 6 * n)
+    return nullptr;
+  const double *bottom = object.auxiliary.data(), *delta = bottom + 3 * n;
+  for (size_t i = 0; i < n; ++i) // sloped sidewalls: the polygon's x/y vary with z
+    if (delta[3 * i] != 0.0 || delta[3 * i + 1] != 0.0) return nullptr;
+  double x0 = bottom[0], x1 = bottom[0], y0 = bottom[1], y1 = bottom[1];
+  for (size_t i = 1; i < n; ++i) {
+    x0 = std::min(x0, bottom[3 * i]); x1 = std::max(x1, bottom[3 * i]);
+    y0 = std::min(y0, bottom[3 * i + 1]); y1 = std::max(y1, bottom[3 * i + 1]);
+  }
+  const double span = std::max(x1 - x0, y1 - y0);
+  if (!(span > 0)) return nullptr;
+  std::unique_ptr<PrismCellIndex> index(new PrismCellIndex);
+  const double h = std::max(span / 2048.0, 1e-3);
+  index->x0 = x0 - 2 * h; index->y0 = y0 - 2 * h; index->inv_h = 1.0 / h;
+  index->nx = uint32_t(std::ceil((x1 - x0) / h)) + 4;
+  index->ny = uint32_t(std::ceil((y1 - y0) / h)) + 4;
+  index->state.assign(size_t(index->nx) * index->ny, 0);
+  const auto mark = [&](double x, double y) {
+    const long cx = long(std::floor((x - index->x0) * index->inv_h));
+    const long cy = long(std::floor((y - index->y0) * index->inv_h));
+    for (long j = cy - 1; j <= cy + 1; ++j)
+      for (long i = cx - 1; i <= cx + 1; ++i)
+        if (i >= 0 && j >= 0 && i < long(index->nx) && j < long(index->ny))
+          index->state[size_t(j) * index->nx + size_t(i)] = 2;
+  };
+  for (size_t k = 0; k < n; ++k) { // sample each edge every h/2, mark a 3x3 neighborhood
+    const double ax = bottom[3 * k], ay = bottom[3 * k + 1];
+    const double bx = bottom[3 * ((k + 1) % n)], by = bottom[3 * ((k + 1) % n) + 1];
+    const size_t steps = size_t(std::ceil(std::hypot(bx - ax, by - ay) * 2 * index->inv_h)) + 1;
+    for (size_t t = 0; t <= steps; ++t)
+      mark(ax + (bx - ax) * double(t) / double(steps), ay + (by - ay) * double(t) / double(steps));
+  }
+  for (uint32_t j = 0; j < index->ny; ++j) {
+    uint32_t i = 0;
+    while (i < index->nx) {
+      if (index->state[size_t(j) * index->nx + i] == 2) { ++i; continue; }
+      const material_geometry_numeric::vector c = {index->x0 + (i + 0.5) * h,
+                                                   index->y0 + (j + 0.5) * h, 0.0};
+      const uint8_t inside =
+          material_geometry_numeric::point_in_polygon(c, bottom, delta, n, 0.0, false) ? 1 : 0;
+      for (; i < index->nx && index->state[size_t(j) * index->nx + i] != 2; ++i)
+        index->state[size_t(j) * index->nx + i] = inside;
+    }
+  }
+  return index;
+}
+
 bool image_contains(const MaterialIR &ir, uint32_t image_index, vector3 point) {
   const MaterialIRGeometryImage &image = ir.images[image_index];
   if (point.x < image.low[0] || point.x > image.high[0] || point.y < image.low[1] ||
@@ -1057,6 +1139,32 @@ bool image_contains(const MaterialIR &ir, uint32_t image_index, vector3 point) {
   const MaterialIRObject &object = ir.objects[image.object];
   const material_geometry_numeric::vector p = {
       point.x - image.shift[0], point.y - image.shift[1], point.z - image.shift[2]};
+  const PrismIndexSet *indexes = active_prism_indexes.load(std::memory_order_acquire);
+  if (indexes && indexes->ir == &ir && image.object < indexes->by_object.size() &&
+      indexes->by_object[image.object]) {
+    const PrismCellIndex &index = *indexes->by_object[image.object];
+    // same prism coordinates and height test as material_geometry_numeric::contains
+    const double *parameters = object.parameters.data();
+    const material_geometry_numeric::vector centroid = {parameters[8], parameters[9],
+                                                        parameters[10]};
+    const material_geometry_numeric::vector projected = material_geometry_numeric::matrix_vector(
+        parameters + 11, material_geometry_numeric::subtract(p, centroid));
+    if (!(projected.z < 0.0 || projected.z > parameters[3])) {
+      const double fx = (projected.x - index.x0) * index.inv_h;
+      const double fy = (projected.y - index.y0) * index.inv_h;
+      if (fx >= 0 && fy >= 0 && fx < index.nx && fy < index.ny) {
+        const uint8_t state = index.state[size_t(fy) * index.nx + size_t(fx)];
+        if (state != 2) {
+          static const bool verify = std::getenv("MEEP_PRISM_INDEX_VERIFY") != NULL;
+          if (verify) {
+            ++prism_index_checks;
+            if (full_contains(ir, object, p) != (state == 1)) ++prism_index_mismatches;
+          }
+          return state == 1;
+        }
+      }
+    }
+  }
   return material_geometry_numeric::contains(
       object.kind, object_subtype(object), object.parameters.data(), object.vertices.data(),
       object.kind == geometric_object::PRISM ? object.fixed_vertex_count
@@ -1854,6 +1962,20 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
       works[index].bulk.push_back(MaterialIRBulkSpan{index, 0, destination.point_count});
   }
   const MaterialIR &ir_view = *ir;
+  PrismIndexSet prism_indexes{ir.get(), {}};
+  {
+    const char *env = std::getenv("MEEP_PRISM_INDEX");
+    if (!(env && env[0] == '0')) {
+      prism_indexes.by_object.resize(ir->objects.size());
+      for (size_t k = 0; k < ir->objects.size(); ++k)
+        prism_indexes.by_object[k] = build_prism_index(ir->objects[k]);
+      active_prism_indexes.store(&prism_indexes, std::memory_order_release);
+    }
+  }
+  struct ClearPrismIndexes {
+    ~ClearPrismIndexes() { active_prism_indexes.store(nullptr, std::memory_order_release); }
+  } clear_prism_indexes;
+  material_ir_setup_mark("ir prism index");
   /* Points [first, last) of one destination; the loop still walks earlier
      points (cheap index arithmetic) so ordinals match a full traversal. */
   const auto traverse = [&](uint32_t destination_index, DestinationWork &work, uint64_t first,
@@ -2026,7 +2148,12 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
                               work.patches.end());
   }
   ir->requires_hybrid = !ir->hybrid_patches.empty();
+  active_prism_indexes.store(nullptr, std::memory_order_release);
   material_ir_setup_mark("ir capture traversal");
+  if (std::getenv("MEEP_PRISM_INDEX_VERIFY"))
+    fprintf(stderr, "meep prism index: %llu indexed answers checked, %llu differ\n",
+            (unsigned long long)prism_index_checks.load(),
+            (unsigned long long)prism_index_mismatches.load());
   if (std::getenv("MEEP_SETUP_TIMING"))
     master_printf("meep setup: ir destinations=%zu bulk_spans=%zu analytic=%zu patches=%zu\n",
                   ir->destinations.size(), ir->bulk_spans.size(),
