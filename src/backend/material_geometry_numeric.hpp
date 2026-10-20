@@ -108,7 +108,12 @@ MEEP_GEOMETRY_HD inline int intersect_line_with_segment(vector q0, vector q1, ve
     const vector d1 = subtract(q0, q1), d2 = subtract(q0, q2);
     if (norm(d1) <= 1e-12 * norm(q0) || norm(d2) <= 1e-12 * norm(q0)) return in_segment;
     const double n1 = norm(d1), n2 = norm(d2), product = dot(d1, d2);
-    if (fabs(product) < (1.0 - 1e-5) * n1 * n2) return non_intersecting;
+    /* On the line iff the perpendicular distance |cross|/|q1 - q2| is at most
+       1e-10 of the edge length, as libctl since NanoComp/libctl#99. The older
+       test on the cosine of the angle at q0 allowed sqrt(1e-5/8) of the edge
+       length (~0.05 um on a 44 um taper edge), fattening long edges. */
+    const double cross = m01 * rhsy - m11 * rhsx;
+    if (cross * cross > 1e-20 * length2 * length2) return non_intersecting;
     if (product < 0.0) {
       if (s) *s = 0.0;
       return in_segment;
