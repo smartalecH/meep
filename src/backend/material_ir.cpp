@@ -1302,7 +1302,119 @@ double grid_value_at_point(const MaterialIR &ir, vector3 point, uint32_t winning
          (tanh_beta_eta + tanh(beta * (1.0 - eta)));
 }
 
+/* Whether every sample point of `pixel` (all lie in the closed box) is
+   outside (0) or inside (1) an image, decided without per-point tests; 2 when
+   it cannot be decided cheaply. Uses the prism cell index for many-vertex
+   prisms and the bounds of axis-aligned rectangular prisms; the box is padded
+   so floating-point sample coordinates cannot escape it. */
+int image_pixel_state(const MaterialIR &ir, const PrismIndexSet &indexes, uint32_t image_index,
+                      const geom_box &pixel) {
+  const MaterialIRGeometryImage &image = ir.images[image_index];
+  const double scale = std::max({1.0, fabs(pixel.low.x), fabs(pixel.low.y), fabs(pixel.low.z),
+                                 fabs(pixel.high.x), fabs(pixel.high.y), fabs(pixel.high.z)});
+  const double eps = 1e-9 * scale;
+  const double lo[3] = {pixel.low.x - eps, pixel.low.y - eps, pixel.low.z - eps};
+  const double hi[3] = {pixel.high.x + eps, pixel.high.y + eps, pixel.high.z + eps};
+  for (int a = 0; a < 3; ++a)
+    if (hi[a] < image.low[a] || lo[a] > image.high[a]) return 0;
+  const MaterialIRObject &object = ir.objects[image.object];
+  const size_t n = object.fixed_vertex_count;
+  if (object.kind != geometric_object::PRISM || n < 3 || object.parameters.size() < 20) return 2;
+  const double *m = object.parameters.data() + 11;
+  for (int i = 0; i < 9; ++i)
+    if (m[i] != ((i % 4) == 0 ? 1.0 : 0.0)) return 2; // rotated prism
+  const double *bottom = object.auxiliary.data(), *delta = bottom + 3 * n;
+  for (size_t i = 0; i < n; ++i)
+    if (delta[3 * i] != 0.0 || delta[3 * i + 1] != 0.0) return 2;
+  double p0[3], p1[3];
+  for (int a = 0; a < 3; ++a) {
+    p0[a] = lo[a] - image.shift[a] - object.parameters[8 + a];
+    p1[a] = hi[a] - image.shift[a] - object.parameters[8 + a];
+  }
+  const double height = object.parameters[3];
+  if (p1[2] < 0.0 || p0[2] > height) return 0;
+  if (!(p0[2] >= 0.0 && p1[2] <= height)) return 2; // straddles a cap
+  if (image.object < indexes.by_object.size() && indexes.by_object[image.object]) {
+    const PrismCellIndex &index = *indexes.by_object[image.object];
+    const double fx0 = (p0[0] - index.x0) * index.inv_h, fx1 = (p1[0] - index.x0) * index.inv_h;
+    const double fy0 = (p0[1] - index.y0) * index.inv_h, fy1 = (p1[1] - index.y0) * index.inv_h;
+    if (!(fx0 >= 0 && fy0 >= 0 && fx1 < index.nx && fy1 < index.ny)) return 2;
+    const size_t i0 = size_t(fx0), i1 = size_t(fx1), j0 = size_t(fy0), j1 = size_t(fy1);
+    const uint8_t state = index.state[j0 * index.nx + i0];
+    if (state == 2) return 2;
+    for (size_t j = j0; j <= j1; ++j)
+      for (size_t i = i0; i <= i1; ++i)
+        if (index.state[j * index.nx + i] != state) return 2;
+    return state;
+  }
+  if (n == 4) { // axis-aligned rectangle: decide by its bounds (strictly, off the boundary)
+    double x0 = bottom[0], x1 = bottom[0], y0 = bottom[1], y1 = bottom[1];
+    for (size_t i = 1; i < 4; ++i) {
+      x0 = std::min(x0, bottom[3 * i]); x1 = std::max(x1, bottom[3 * i]);
+      y0 = std::min(y0, bottom[3 * i + 1]); y1 = std::max(y1, bottom[3 * i + 1]);
+    }
+    for (size_t i = 0; i < 4; ++i)
+      if ((bottom[3 * i] != x0 && bottom[3 * i] != x1) ||
+          (bottom[3 * i + 1] != y0 && bottom[3 * i + 1] != y1))
+        return 2;
+    if (p1[0] < x0 || p0[0] > x1 || p1[1] < y0 || p0[1] > y1) return 0;
+    if (p0[0] > x0 && p1[0] < x1 && p0[1] > y0 && p1[1] < y1 && p0[2] > 0.0 && p1[2] < height)
+      return 1;
+  }
+  return 2;
+}
+
+std::atomic<uint64_t> uniform_front_checks(0), uniform_front_mismatches(0);
+FrontObjectResult classify_front_object_sampled(const MaterialIR &ir, const meep::volume &v);
+
 FrontObjectResult classify_front_object(const MaterialIR &ir, const meep::volume &v) {
+  /* Pixels whose samples all fall in one image (or none) need no per-point
+     tests: object_at_point returns the first containing active image, the
+     same for every sample. */
+  const PrismIndexSet *indexes = active_prism_indexes.load(std::memory_order_acquire);
+  if (indexes && indexes->ir == &ir) {
+    const geom_box pixel = meep_geom::gv2box(v);
+    uint32_t winner = std::numeric_limits<uint32_t>::max();
+    bool decided = true;
+    for (uint32_t active : ir.active_images) {
+      const int state = image_pixel_state(ir, *indexes, active, pixel);
+      if (state == 2) { decided = false; break; }
+      if (state == 1) { winner = active; break; }
+    }
+    if (decided) {
+      PointObjectResult point = {std::numeric_limits<uint32_t>::max(),
+                                 std::numeric_limits<uint32_t>::max(), ir.default_material, 0};
+      if (winner != std::numeric_limits<uint32_t>::max()) {
+        const MaterialIRGeometryImage &image = ir.images[winner];
+        point = PointObjectResult{image.object, winner,
+                                  uint32_t(ir.objects[image.object].material), image.precedence};
+      }
+      uint32_t material = point.material;
+      if (point.object != std::numeric_limits<uint32_t>::max() &&
+          ir.materials[material].kind == meep_geom::material_data::MATERIAL_FILE)
+        material = ir.default_material;
+      const uint32_t causes = point_variable_cause(ir, point);
+      const FrontObjectResult result{point.object, point.image, material, material,
+                                     point.precedence, causes != material_variable_none,
+                                     causes != material_variable_none, causes};
+      static const bool verify = std::getenv("MEEP_UNIFORM_FRONT_VERIFY") != NULL;
+      if (verify) {
+        const FrontObjectResult full = classify_front_object_sampled(ir, v);
+        ++uniform_front_checks;
+        if (full.object != result.object || full.image != result.image ||
+            full.front != result.front || full.behind != result.behind ||
+            full.precedence != result.precedence || full.ambiguous != result.ambiguous ||
+            full.variable_material != result.variable_material ||
+            full.variable_causes != result.variable_causes)
+          ++uniform_front_mismatches;
+      }
+      return result;
+    }
+  }
+  return classify_front_object_sampled(ir, v);
+}
+
+FrontObjectResult classify_front_object_sampled(const MaterialIR &ir, const meep::volume &v) {
   const int num_neighbors[3] = {3, 5, 9};
   const int neighbors[3][9][3] = {{{0, 0, 0}, {0, 0, -1}, {0, 0, 1}},
                                   {{0, 0, 0}, {-1, -1, 0}, {1, 1, 0},
@@ -2154,6 +2266,10 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
   }
   ir->requires_hybrid = !ir->hybrid_patches.empty();
   material_ir_setup_mark("ir capture traversal");
+  if (std::getenv("MEEP_UNIFORM_FRONT_VERIFY"))
+    fprintf(stderr, "meep uniform front: %llu fast answers checked, %llu differ\n",
+            (unsigned long long)uniform_front_checks.load(),
+            (unsigned long long)uniform_front_mismatches.load());
   if (std::getenv("MEEP_PRISM_INDEX_VERIFY"))
     fprintf(stderr, "meep prism index: %llu indexed answers checked, %llu differ\n",
             (unsigned long long)prism_index_checks.load(),
@@ -2195,7 +2311,24 @@ bool material_ir_material_at(const MaterialIR &ir, double x, double y, double z,
                              uint32_t &material) {
   const PrismIndexSet *indexes = active_prism_indexes.load(std::memory_order_acquire);
   if (!indexes || indexes->ir != &ir) return false;
-  const PointObjectResult point = object_at_point(ir, vector3{x, y, z});
+  /* Only points clearly inside or outside every image (padded box decided by
+     image_pixel_state): boundary ties, where libctl's and the IR's inclusion
+     conventions can differ, stay on the classic path. */
+  geom_box box;
+  box.low = box.high = vector3{x, y, z};
+  uint32_t winner = std::numeric_limits<uint32_t>::max();
+  for (uint32_t active : ir.active_images) {
+    const int state = image_pixel_state(ir, *indexes, active, box);
+    if (state == 2) return false;
+    if (state == 1) { winner = active; break; }
+  }
+  PointObjectResult point = {std::numeric_limits<uint32_t>::max(),
+                             std::numeric_limits<uint32_t>::max(), ir.default_material, 0};
+  if (winner != std::numeric_limits<uint32_t>::max()) {
+    const MaterialIRGeometryImage &image = ir.images[winner];
+    point = PointObjectResult{image.object, winner, uint32_t(ir.objects[image.object].material),
+                              image.precedence};
+  }
   if (point_variable_cause(ir, point) != material_variable_none) return false;
   material = point.material;
   if (point.object != std::numeric_limits<uint32_t>::max() &&
