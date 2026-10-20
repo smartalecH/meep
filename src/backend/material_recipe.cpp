@@ -7,6 +7,7 @@
 */
 
 #include "backend/material_recipe.hpp"
+#include "backend/lifecycle.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1082,6 +1083,47 @@ material_recipe_setup_scope::~material_recipe_setup_scope() {
   if (--host_recipe_dense_cache.scopes == 0) host_recipe_dense_cache.rows.reset();
 }
 
+static MaterialRecipe build_host_reference_material_recipe_uncached(const fields &f);
+
+namespace {
+/* One setup builds the host-reference recipe several times (classification,
+   initialization plan, candidate promotion) from unchanged inputs. Recipes
+   without row payloads (device-native/hybrid/tiled routes clear them) are
+   cached on everything the build reads: material generations, each material
+   row's key, source address and size, and the IR's identity and signature. */
+struct HostRecipeCache {
+  std::vector<uint64_t> key;
+  std::shared_ptr<const MaterialRecipe> recipe;
+};
+HostRecipeCache host_recipe_cache;
+
+std::vector<uint64_t> host_recipe_cache_key(const fields &f) {
+  std::vector<uint64_t> key;
+  key.push_back(generation(f, MutationKind::material_values));
+  key.push_back(generation(f, MutationKind::material_region));
+  const MaterialIR *ir = material_ir_for(f);
+  key.push_back(uint64_t(reinterpret_cast<uintptr_t>(ir)));
+  key.push_back(ir ? ir->signature : 0);
+  key.push_back(ir ? ir->layout_signature : 0);
+  key.push_back(f.storage_plan->arrays.size());
+  const size_t host_rows = f.array_catalog->host_backed_size();
+  key.push_back(host_rows);
+  for (size_t i = 0; i < host_rows && i < f.storage_plan->arrays.size(); ++i) {
+    const ArraySpec &spec = f.storage_plan->arrays[i];
+    if (spec.role != array_role::material) continue;
+    const StorageKey &k = f.storage_plan->keys[i];
+    key.push_back(uint64_t(uint32_t(k.chunk)));
+    key.push_back((uint64_t(uint32_t(k.kind)) << 32) | uint64_t(uint32_t(k.component_)));
+    key.push_back(uint64_t(uint32_t(k.cmp)));
+    key.push_back(k.aux);
+    key.push_back(uint64_t(reinterpret_cast<uintptr_t>(f.array_catalog->resolve_untyped(spec.id))));
+    key.push_back(spec.elements);
+    key.push_back(uint64_t(spec.element_type));
+  }
+  return key;
+}
+} // namespace
+
 MaterialRecipe build_host_reference_material_recipe(const fields &f) {
   if (material_recipe_failure_rank_for_testing == my_rank()) {
     if (material_recipe_failure_mode_for_testing == 1)
@@ -1090,6 +1132,30 @@ MaterialRecipe build_host_reference_material_recipe(const fields &f) {
   }
   if (!f.storage_plan || !f.array_catalog)
     throw std::logic_error("material recipe requires a prepared storage catalog");
+  validate_plan_shape(*f.storage_plan);
+  const char *env = std::getenv("MEEP_HOST_RECIPE_CACHE");
+  const bool use_cache = !(env && env[0] == '0');
+  std::vector<uint64_t> key;
+  if (use_cache) {
+    key = host_recipe_cache_key(f);
+    if (host_recipe_cache.recipe && host_recipe_cache.key == key)
+      return MaterialRecipe(*host_recipe_cache.recipe);
+  }
+  MaterialRecipe recipe = build_host_reference_material_recipe_uncached(f);
+  if (use_cache) {
+    bool payload = false;
+    for (const MaterialRecipeRow &row : recipe.rows()) payload = payload || !row.values.empty();
+    if (!payload) {
+      host_recipe_cache.key = key;
+      host_recipe_cache.recipe = std::make_shared<const MaterialRecipe>(recipe);
+    }
+    else
+      host_recipe_cache = HostRecipeCache();
+  }
+  return recipe;
+}
+
+static MaterialRecipe build_host_reference_material_recipe_uncached(const fields &f) {
   validate_plan_shape(*f.storage_plan);
 
   SetupPhaseTimer timer;
