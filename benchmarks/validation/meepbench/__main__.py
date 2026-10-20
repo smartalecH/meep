@@ -59,6 +59,8 @@ def main(argv=None) -> int:
     r.add_argument("--no-avg", dest="avg", action="store_false")
     r.add_argument("--until", type=float, help="fixed run time (overrides the case)")
     r.add_argument("--stop", choices=["dft", "energy"], help="override the case's stop rule")
+    r.add_argument("--max-edge", type=float, default=None,
+                   help="polygon edge split length in um (0 disables; default: the case's)")
     r.add_argument("--verbosity", type=int, default=0)
     r.add_argument("--out", default="results")
     r.add_argument("--tag", default="", help="suffix for the result file name")
@@ -106,6 +108,10 @@ def main(argv=None) -> int:
         print(path)
         return 0
     case = _adhoc_gds(a) if a.case.endswith(".gds") else registry.load(a.case)
+    if a.max_edge is not None:
+        import dataclasses
+        case = dataclasses.replace(case, geometry=dataclasses.replace(
+            case.geometry, max_edge=a.max_edge or None))
     options = runner.Options(cells_per_wavelength=a.cpl, resolution=a.res, backend=a.backend,
                              precision=a.precision, materials=a.materials, eps_averaging=a.avg,
                              until=a.until, stop=a.stop, verbosity=a.verbosity)
