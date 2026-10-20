@@ -19,8 +19,10 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <cstring>
 #include "backend/adjoint_plan.hpp"
 #include "backend/backend.hpp"
 #include "backend/material_callback.hpp"
@@ -1176,6 +1178,83 @@ void geom_epsilon::eff_chi1inv_row_with_outcome(meep::component c, double chi1in
   }
 }
 
+/* Exact fraction of `pixel` inside a prism with vertical sidewalls along z
+   (sidewall_angle 0, no tilt): prism and box are both extrusions, so the
+   overlap factors into polygon-square area times z overlap. The polygon is
+   clipped to the pixel square (Sutherland-Hodgman, valid for concave
+   polygons against a convex window) and its area taken by the shoelace
+   formula. Returns false when the closed form does not apply, so the caller
+   falls back to box_overlap_with_object's cubature. MEEP_ANALYTIC_PRISM_FILL=0
+   disables it. */
+static bool analytic_prism_fill(const geom_box &pixel, const geometric_object &o, double &fill) {
+  static const bool enabled = [] {
+    const char *e = getenv("MEEP_ANALYTIC_PRISM_FILL");
+    return !(e && e[0] == '0');
+  }();
+  if (!enabled || o.which_subclass != geometric_object::PRISM) return false;
+  const prism *p = o.subclass.prism_data;
+  if (!p || p->sidewall_angle != 0 || p->vertices_p.num_items < 3 || p->height <= 0) return false;
+  const matrix3x3 &m = p->m_c2p;
+  if (!(m.c0.x == 1 && m.c0.y == 0 && m.c0.z == 0 && m.c1.x == 0 && m.c1.y == 1 &&
+        m.c1.z == 0 && m.c2.x == 0 && m.c2.y == 0 && m.c2.z == 1))
+    return false;
+  const double x0 = pixel.low.x - p->centroid.x, x1 = pixel.high.x - p->centroid.x;
+  const double y0 = pixel.low.y - p->centroid.y, y1 = pixel.high.y - p->centroid.y;
+  const double z0 = pixel.low.z - p->centroid.z, z1 = pixel.high.z - p->centroid.z;
+  if (!(x1 > x0 && y1 > y0)) return false; // needs a 2d square cross-section
+  double zfrac;
+  if (z1 > z0) zfrac = std::max(0.0, std::min(z1, p->height) - std::max(z0, 0.0)) / (z1 - z0);
+  else zfrac = (z0 >= 0 && z0 <= p->height) ? 1.0 : 0.0;
+  if (zfrac == 0) {
+    fill = 0;
+    return true;
+  }
+  std::vector<double> px, py, qx, qy;
+  const int n = p->vertices_p.num_items;
+  px.reserve(n + 8);
+  py.reserve(n + 8);
+  for (int i = 0; i < n; ++i) {
+    px.push_back(p->vertices_p.items[i].x);
+    py.push_back(p->vertices_p.items[i].y);
+  }
+  // clip against x >= x0, x <= x1, y >= y0, y <= y1
+  for (int side = 0; side < 4 && !px.empty(); ++side) {
+    const int axis = side / 2;
+    const double bound = side == 0 ? x0 : side == 1 ? x1 : side == 2 ? y0 : y1;
+    const bool keep_greater = (side % 2) == 0;
+    qx.clear();
+    qy.clear();
+    const size_t k = px.size();
+    for (size_t i = 0; i < k; ++i) {
+      const size_t j = (i + 1) % k;
+      const double ai = axis ? py[i] : px[i], aj = axis ? py[j] : px[j];
+      const bool in_i = keep_greater ? ai >= bound : ai <= bound;
+      const bool in_j = keep_greater ? aj >= bound : aj <= bound;
+      if (in_i) {
+        qx.push_back(px[i]);
+        qy.push_back(py[i]);
+      }
+      if (in_i != in_j) {
+        const double t = (bound - ai) / (aj - ai);
+        const double cx = axis ? px[i] + t * (px[j] - px[i]) : bound;
+        const double cy = axis ? bound : py[i] + t * (py[j] - py[i]);
+        qx.push_back(cx);
+        qy.push_back(cy);
+      }
+    }
+    px.swap(qx);
+    py.swap(qy);
+  }
+  double area2 = 0;
+  for (size_t i = 0, k = px.size(); i < k; ++i) {
+    const size_t j = (i + 1) % k;
+    area2 += px[i] * py[j] - px[j] * py[i];
+  }
+  const double area_fraction = std::min(1.0, fabs(0.5 * area2) / ((x1 - x0) * (y1 - y0)));
+  fill = area_fraction * zfrac;
+  return true;
+}
+
 void geom_epsilon::eff_chi1inv_matrix(meep::component c, symm_matrix *chi1inv_matrix,
                                       const meep::volume &v, double tol, int maxeval,
                                       bool &fallback) {
@@ -1219,7 +1298,23 @@ void geom_epsilon::eff_chi1inv_matrix(meep::component c, symm_matrix *chi1inv_ma
   pixel.low = vector3_minus(pixel.low, shiftby);
   pixel.high = vector3_minus(pixel.high, shiftby);
 
-  double fill = box_overlap_with_object(pixel, *o, tol, maxeval);
+  double fill;
+  if (analytic_prism_fill(pixel, *o, fill)) {
+    static const bool verify = getenv("MEEP_ANALYTIC_PRISM_VERIFY") != NULL;
+    if (verify) {
+      const double cubature = box_overlap_with_object(pixel, *o, tol, maxeval);
+      static std::atomic<uint64_t> bits(0);
+      const double d = fabs(cubature - fill);
+      uint64_t old = bits.load(), now;
+      memcpy(&now, &d, sizeof d);
+      while (d > 0 && now > old && !bits.compare_exchange_weak(old, now)) {}
+      if (now > old)
+        master_printf("meep analytic prism fill: new max |cubature - exact| = %g "
+                            "(exact %g)\n", d, fill);
+    }
+  }
+  else
+    fill = box_overlap_with_object(pixel, *o, tol, maxeval);
 
   material_epsmu(meep::type(c), mat, &meps, chi1inv_matrix);
   symm_matrix eps2, epsinv2;
@@ -2171,10 +2266,12 @@ static void material_setup_mark(const char *phase) {
 
 namespace {
 
-/* Interface entries the material IR capture already averaged (hybrid patches,
-   computed by the same eff_chi1inv_row), served to the host structure so
-   set_chi1inv does not repeat the cubature. Each destination's patches are in
-   traversal order, i.e. sorted by ordinal. */
+/* What the material IR capture already knows about each chi1inv entry, served
+   to the host structure: interface entries it averaged (hybrid patches,
+   computed by the same eff_chi1inv_row), so set_chi1inv does not repeat the
+   cubature, and bulk entries (one material over the pixel), which need only
+   the material at the pixel center. Patches and bulk spans are in traversal
+   order, i.e. sorted by ordinal. */
 class ir_chi1inv_patches : public meep::chi1inv_precomputed {
 public:
   ir_chi1inv_patches(const meep::structure &s, const meep::MaterialIR &ir) {
@@ -2186,8 +2283,14 @@ public:
       if (chunk < 0 || chunk >= s.num_chunks) continue;
       slot[k] = int(entries_.size());
       entries_.push_back(Entry{s.chunks[chunk], meep::component(d.component),
-                               meep::direction(d.key.aux), {}, {}});
+                               meep::direction(d.key.aux), {}, {}, {}, {}});
     }
+    for (const meep::MaterialIRBulkSpan &span : ir.bulk_spans)
+      if (span.destination < slot.size() && slot[span.destination] >= 0 && span.count) {
+        Entry &e = entries_[size_t(slot[span.destination])];
+        e.bulk_first.push_back(span.first_point);
+        e.bulk_count.push_back(span.count);
+      }
     for (const meep::MaterialIRHybridPatch &patch : ir.hybrid_patches)
       if (patch.destination < slot.size() && slot[patch.destination] >= 0) {
         Entry &e = entries_[size_t(slot[patch.destination])];
@@ -2195,19 +2298,28 @@ public:
         e.values.push_back(patch.value);
       }
     for (const Entry &e : entries_)
-      if (!std::is_sorted(e.points.begin(), e.points.end()))
+      if (!std::is_sorted(e.points.begin(), e.points.end()) ||
+          !std::is_sorted(e.bulk_first.begin(), e.bulk_first.end()))
         throw std::logic_error("material IR patches are not in traversal order");
   }
-  bool lookup(const meep::structure_chunk *chunk, meep::component c, meep::direction d,
-              size_t ordinal, double &value) const override {
+  int lookup(const meep::structure_chunk *chunk, meep::component c, meep::direction d,
+             size_t ordinal, double &value) const override {
     for (const Entry &e : entries_) {
       if (e.chunk != chunk || e.c != c || e.d != d) continue;
       const auto found = std::lower_bound(e.points.begin(), e.points.end(), uint64_t(ordinal));
-      if (found == e.points.end() || *found != ordinal) return false;
-      value = e.values[size_t(found - e.points.begin())];
-      return true;
+      if (found != e.points.end() && *found == ordinal) {
+        value = e.values[size_t(found - e.points.begin())];
+        return meep::chi1inv_value;
+      }
+      const auto span = std::upper_bound(e.bulk_first.begin(), e.bulk_first.end(),
+                                         uint64_t(ordinal));
+      if (span != e.bulk_first.begin()) {
+        const size_t k = size_t(span - e.bulk_first.begin()) - 1;
+        if (uint64_t(ordinal) - e.bulk_first[k] < e.bulk_count[k]) return meep::chi1inv_bulk;
+      }
+      return meep::chi1inv_unknown;
     }
-    return false;
+    return meep::chi1inv_unknown;
   }
 
 private:
@@ -2217,6 +2329,7 @@ private:
     meep::direction d;
     std::vector<uint64_t> points;
     std::vector<double> values;
+    std::vector<uint64_t> bulk_first, bulk_count;
   };
   std::vector<Entry> entries_;
 };

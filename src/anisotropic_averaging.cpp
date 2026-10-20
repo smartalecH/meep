@@ -271,34 +271,49 @@ breakout:
          the diagonal comes from the centered volume, off-diagonals from the
          shifted one, so each evaluation runs only if one of its entries is
          still missing. */
-      bool have[3] = {false, false, false};
+      /* Bulk entries (one material over the pixel) need only the material
+         at the center, which is what maxeval = 0 evaluates. */
+      const direction dj[3] = {d0, d1, d2};
+      int state[3] = {chi1inv_unknown, chi1inv_unknown, chi1inv_unknown};
       double known[3] = {0, 0, 0};
       if (precomputed) {
         const size_t ordinal = size_t((loop_i1 * loop_n2 + loop_i2) * loop_n3 + loop_i3);
-        const direction dj[3] = {d0, d1, d2};
         for (int j = 0; j < 3; ++j)
-          if (chi1inv[c][dj[j]]) have[j] = precomputed->lookup(this, c, dj[j], ordinal, known[j]);
+          if (chi1inv[c][dj[j]]) state[j] = precomputed->lookup(this, c, dj[j], ordinal, known[j]);
       }
-      const bool need_diag = !have[idiag] || verify_precomputed;
-      bool need_offdiag = verify_precomputed;
+      double reference[3] = {0, 0, 0};
+      if (verify_precomputed && precomputed) {
+        double row[3], row_offdiag[3];
+        medium.eff_chi1inv_row(c, row, gv.dV(here, smoothing_diameter), tol, maxeval);
+        medium.eff_chi1inv_row(c, row_offdiag, gv.dV(here - shift1, smoothing_diameter), tol,
+                               maxeval);
+        for (int j = 0; j < 3; ++j) reference[j] = j == idiag ? row[j] : row_offdiag[j];
+      }
+      const bool need_diag = state[idiag] != chi1inv_value;
+      bool need_offdiag = false, offdiag_bulk = true;
       for (int j = 0; j < 3; ++j)
-        if (j != idiag && !have[j] && chi1inv[c][j == 0 ? d0 : j == 1 ? d1 : d2])
+        if (j != idiag && chi1inv[c][dj[j]] && state[j] != chi1inv_value) {
           need_offdiag = true;
+          if (state[j] != chi1inv_bulk) offdiag_bulk = false;
+        }
       if (need_diag)
-        medium.eff_chi1inv_row(c, chi1invrow, gv.dV(here, smoothing_diameter), tol, maxeval);
+        medium.eff_chi1inv_row(c, chi1invrow, gv.dV(here, smoothing_diameter), tol,
+                               state[idiag] == chi1inv_bulk ? 0 : maxeval);
       if (need_offdiag)
         medium.eff_chi1inv_row(c, chi1invrow_offdiag, gv.dV(here - shift1, smoothing_diameter),
-                               tol, maxeval);
-      for (int j = 0; j < 3; ++j)
-        if (have[j]) {
-          ++precomputed_used;
-          if (verify_precomputed) {
-            const realnum classic = realnum(j == idiag ? chi1invrow[j] : chi1invrow_offdiag[j]);
-            if (classic != realnum(known[j])) ++precomputed_mismatch;
-          }
+                               tol, offdiag_bulk ? 0 : maxeval);
+      for (int j = 0; j < 3; ++j) {
+        if (state[j] == chi1inv_value) {
           if (j == idiag) chi1invrow[j] = known[j];
           else chi1invrow_offdiag[j] = known[j];
         }
+        if (state[j] != chi1inv_unknown) {
+          ++precomputed_used;
+          if (verify_precomputed &&
+              realnum(j == idiag ? chi1invrow[j] : chi1invrow_offdiag[j]) != realnum(reference[j]))
+            ++precomputed_mismatch;
+        }
+      }
       if (chi1inv[c][d0]) {
         chi1inv[c][d0][i] = (d0 == dc) ? chi1invrow[0] : chi1invrow_offdiag[0];
         trivial0 = trivial0 && (chi1inv[c][d0][i] == trivial_val[0]);
