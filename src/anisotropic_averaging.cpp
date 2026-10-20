@@ -17,6 +17,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <atomic>
 
 #include "meep_internals.hpp"
 
@@ -313,8 +314,18 @@ breakout:
         if (state[j] != chi1inv_unknown) {
           ++precomputed_used;
           if (verify_precomputed &&
-              realnum(j == idiag ? chi1invrow[j] : chi1invrow_offdiag[j]) != realnum(reference[j]))
+              realnum(j == idiag ? chi1invrow[j] : chi1invrow_offdiag[j]) != realnum(reference[j])) {
             ++precomputed_mismatch;
+            static std::atomic<int> shown(0);
+            if (shown.fetch_add(1) < 40) {
+              const vec at = j == idiag ? gv[here] : gv[here - shift1];
+              fprintf(stderr,
+                      "meep host averaging mismatch: %s column %s at (%.6f, %.6f, %.6f) state %d "
+                      "reused %.17g classic %.17g\n",
+                      component_name(c), direction_name(dj[j]), at.x(), at.y(), at.z(), state[j],
+                      j == idiag ? chi1invrow[j] : chi1invrow_offdiag[j], reference[j]);
+            }
+          }
         }
       }
       if (chi1inv[c][d0]) {
