@@ -53,6 +53,12 @@ class Geometry:
     cell: Optional[str] = None
     polygons: Optional[Callable[[], Tuple[Dict[LayerKey, list], Dict[str, "Port"]]]] = None
     port_extension: float = 10.0
+    # Split polygon edges longer than this (um) before building prisms. libctl's
+    # (and the GPU material IR's) point-on-edge test uses an angular tolerance,
+    # so points up to ~0.002 x edge length off a long edge count as inside:
+    # 44 um taper edges grew by ~0.05 um. Short edges bound that to ~1 nm.
+    # None disables.
+    max_edge: Optional[float] = 0.2
 
 
 @dataclasses.dataclass

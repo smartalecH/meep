@@ -20,9 +20,29 @@ def _from_component(component, extension: float):
     return polygons
 
 
+def densify(poly: np.ndarray, max_edge: float) -> np.ndarray:
+    """Insert vertices so no edge is longer than max_edge (shape unchanged)."""
+    poly = np.asarray(poly, dtype=float)
+    if len(poly) > 1 and np.allclose(poly[0], poly[-1]):
+        poly = poly[:-1]
+    out = []
+    for i in range(len(poly)):
+        a, b = poly[i], poly[(i + 1) % len(poly)]
+        n = max(1, int(np.ceil(np.hypot(*(b - a)) / max_edge)))
+        out.extend(a + (b - a) * (k / n) for k in range(n))
+    return np.array(out)
+
+
 def load(geometry: Geometry) -> Tuple[Dict[LayerKey, List[np.ndarray]], Dict[str, Port],
                                        Tuple[float, float, float, float]]:
     """Return (polygons by layer, ports, device bbox (xmin, ymin, xmax, ymax))."""
+    polygons, ports, bbox = _load(geometry)
+    if geometry.max_edge:
+        polygons = {k: [densify(p, geometry.max_edge) for p in v] for k, v in polygons.items()}
+    return polygons, ports, bbox
+
+
+def _load(geometry: Geometry):
     if geometry.polygons is not None:
         out = geometry.polygons()
         polygons, ports = out[0], out[1]
