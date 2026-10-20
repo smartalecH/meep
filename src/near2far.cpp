@@ -461,40 +461,41 @@ double *dft_near2far::get_farfields_array(const volume &where, int &rank, size_t
   double *EH = new double[6 * 2 * N * Nfreq];
   double *EH_ = new double[6 * 2 * N * Nfreq]; // temp array for sum_to_all
 
-  /* fields for farfield_lowlevel for a single output point x */
-  std::complex<double> *EH1 = new std::complex<double>[6 * Nfreq];
 
   double start = wall_time();
-  size_t last_point = 0;
 
-  vec x(where.dim);
-  for (size_t i0 = 0; i0 < dims[0]; ++i0) {
-    x.set_direction(dirs[0], where.in_direction_min(dirs[0]) + i0 * dx[0]);
-    for (size_t i1 = 0; i1 < dims[1]; ++i1) {
-      x.set_direction(dirs[1], where.in_direction_min(dirs[1]) + i1 * dx[1]);
-      for (size_t i2 = 0; i2 < dims[2]; ++i2) {
-        x.set_direction(dirs[2], where.in_direction_min(dirs[2]) + i2 * dx[2]);
-        double t;
-        if (verbosity > 0 && (t = wall_time()) > start + MEEP_MIN_OUTPUT_TIME) {
-          size_t this_point = (dims[1] * i0 + i1) * dims[2] + i2 + 1;
-          master_printf("get_farfields_array working on point %zu of %zu (%d%% done), %g s/point\n",
-                        this_point, N, (int)((double)this_point / N * 100),
-                        (t - start) / (std::max(1, (int)(this_point - last_point))));
-          start = t;
-          last_point = this_point;
+  /* Far points are independent: parallelize over them (farfield_lowlevel's
+     own loop is over frequencies, often just one). Each point's sum is
+     computed exactly as in a serial loop. */
+  const double where_min[3] = {where.in_direction_min(dirs[0]), where.in_direction_min(dirs[1]),
+                               where.in_direction_min(dirs[2])};
+#ifdef HAVE_OPENMP
+#pragma omp parallel
+#endif
+  {
+    std::complex<double> *EHp = new std::complex<double>[6 * Nfreq];
+    vec x(where.dim);
+#ifdef HAVE_OPENMP
+#pragma omp for schedule(dynamic, 1)
+#endif
+    for (ptrdiff_t idx = 0; idx < ptrdiff_t(N); ++idx) {
+      const size_t i2 = size_t(idx) % dims[2], i1 = (size_t(idx) / dims[2]) % dims[1],
+                   i0 = size_t(idx) / (dims[1] * dims[2]);
+      x.set_direction(dirs[0], where_min[0] + i0 * dx[0]);
+      x.set_direction(dirs[1], where_min[1] + i1 * dx[1]);
+      x.set_direction(dirs[2], where_min[2] + i2 * dx[2]);
+      farfield_lowlevel_from_host(F, freq, eps, mu, periodic_d, periodic_n, periodic_k, period,
+                                  EHp, x, greencyl_tol);
+      for (size_t i = 0; i < Nfreq; ++i)
+        for (int k = 0; k < 6; ++k) {
+          EH_[((k * 2 + 0) * N + idx) * Nfreq + i] = real(EHp[i * 6 + k]);
+          EH_[((k * 2 + 1) * N + idx) * Nfreq + i] = imag(EHp[i * 6 + k]);
         }
-        farfield_lowlevel_from_host(F, freq, eps, mu, periodic_d, periodic_n, periodic_k, period,
-                                    EH1, x, greencyl_tol);
-        if (verbosity > 1) all_wait(); // Allow consistent progress updates from master
-        ptrdiff_t idx = (i0 * dims[1] + i1) * dims[2] + i2;
-        for (size_t i = 0; i < Nfreq; ++i)
-          for (int k = 0; k < 6; ++k) {
-            EH_[((k * 2 + 0) * N + idx) * Nfreq + i] = real(EH1[i * 6 + k]);
-            EH_[((k * 2 + 1) * N + idx) * Nfreq + i] = imag(EH1[i * 6 + k]);
-          }
-      }
     }
+    delete[] EHp;
   }
+  if (verbosity > 0)
+    master_printf("get_farfields_array: %zu points in %g s\n", N, wall_time() - start);
   sum_to_all(EH_, EH, 6 * 2 * N * Nfreq);
 
   /* collapse singleton dimensions */
@@ -505,7 +506,6 @@ double *dft_near2far::get_farfields_array(const volume &where, int &rank, size_t
   rank = ireduced;
 
   delete[] EH_;
-  delete[] EH1;
   return EH;
 }
 
