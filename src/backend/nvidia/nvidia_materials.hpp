@@ -100,6 +100,16 @@ struct geometry_launch_common {
   size_t object_count;
   size_t image_offset;
   size_t image_count;
+  /* Optional x/y bins over the images (0 bins: scan all). CSR in compact
+     inputs: uint32 offsets[bin_nx * bin_ny + 1] at bin_offset, uint32 image
+     positions (ascending within a bin) at bin_items_offset. */
+  size_t bin_offset;
+  size_t bin_items_offset;
+  size_t bin_item_count;
+  uint32_t bin_nx;
+  uint32_t bin_ny;
+  double bin_origin[2];
+  double bin_inverse[2];
   size_t value_offset;
   size_t material_count;
   size_t absorber_header_offset;

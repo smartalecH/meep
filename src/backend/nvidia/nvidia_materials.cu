@@ -84,6 +84,14 @@ void validate_common(const geometry_launch_common &common, const unsigned char *
       (common.absorber_count &&
        !compact_range<material_absorber_header>(common.absorber_header_offset,
                                                 common.absorber_count, host_bytes)) ||
+      (common.bin_nx &&
+       (!common.bin_ny || !std::isfinite(common.bin_origin[0]) ||
+        !std::isfinite(common.bin_origin[1]) || !(common.bin_inverse[0] > 0.0) ||
+        !(common.bin_inverse[1] > 0.0) ||
+        !compact_range<uint32_t>(common.bin_offset,
+                                 size_t(common.bin_nx) * common.bin_ny + 1, host_bytes) ||
+        !compact_range<uint32_t>(common.bin_items_offset, common.bin_item_count,
+                                 host_bytes))) ||
       common.default_material >= common.material_count)
     throw std::invalid_argument(std::string(what) + " common descriptor is invalid");
   const size_t alignment = common.precision == scalar_precision::f32 ? alignof(float)
@@ -245,6 +253,21 @@ void validate_common(const geometry_launch_common &common, const unsigned char *
           image.low[axis] != objects[image.object].low[axis] + image.shift[axis] ||
           image.high[axis] != objects[image.object].high[axis] + image.shift[axis])
         throw std::invalid_argument(std::string(what) + " image bounds are invalid");
+  }
+  if (common.bin_nx) {
+    const uint32_t *offsets = reinterpret_cast<const uint32_t *>(host_inputs + common.bin_offset);
+    const uint32_t *items =
+        reinterpret_cast<const uint32_t *>(host_inputs + common.bin_items_offset);
+    const size_t bins = size_t(common.bin_nx) * common.bin_ny;
+    if (offsets[0] != 0 || offsets[bins] != common.bin_item_count)
+      throw std::invalid_argument(std::string(what) + " image bins are invalid");
+    for (size_t b = 0; b < bins; ++b) {
+      if (offsets[b + 1] < offsets[b])
+        throw std::invalid_argument(std::string(what) + " image bins are invalid");
+      for (uint32_t k = offsets[b]; k < offsets[b + 1]; ++k)
+        if (items[k] >= common.image_count || (k > offsets[b] && items[k] <= items[k - 1]))
+          throw std::invalid_argument(std::string(what) + " image bin items are invalid");
+    }
   }
   const geometry_value_record *values = reinterpret_cast<const geometry_value_record *>(
       host_inputs + common.value_offset);
@@ -573,6 +596,28 @@ __device__ uint32_t selected_material(const geometry_launch_common &common,
       common.compact_inputs + common.image_offset);
   const geometry_object_record *objects = reinterpret_cast<const geometry_object_record *>(
       common.compact_inputs + common.object_offset);
+  if (common.bin_nx) {
+    /* Each bin lists, in image order, the images overlapping it: its first
+       containing image is the first containing image overall. */
+    const double fx = (point.x - common.bin_origin[0]) * common.bin_inverse[0];
+    const double fy = (point.y - common.bin_origin[1]) * common.bin_inverse[1];
+    if (fx >= 0.0 && fy >= 0.0 && fx < double(common.bin_nx) && fy < double(common.bin_ny)) {
+      const uint32_t *offsets =
+          reinterpret_cast<const uint32_t *>(common.compact_inputs + common.bin_offset);
+      const uint32_t *items =
+          reinterpret_cast<const uint32_t *>(common.compact_inputs + common.bin_items_offset);
+      const size_t bin = size_t(fy) * common.bin_nx + size_t(fx);
+      for (uint32_t k = offsets[bin]; k < offsets[bin + 1]; ++k) {
+        const size_t i = items[k];
+        if (image_contains(common, images[i], point)) {
+          winning_image = i;
+          return objects[images[i].object].material;
+        }
+      }
+      winning_image = size_t(-1);
+      return common.default_material;
+    }
+  }
   for (size_t i = 0; i < common.image_count; ++i)
     if (image_contains(common, images[i], point)) {
       winning_image = i;

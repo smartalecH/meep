@@ -752,6 +752,11 @@ public:
   std::vector<nvidia::geometry_patch_launch> material_geometry_patch_launches_;
   std::vector<NvidiaMaterialGeometryAuthority> material_geometry_authorities_;
   uint64_t material_geometry_compact_hash_;
+  /* Image bins of the current material geometry (bin_nx == 0: none). */
+  size_t material_geometry_bin_offset_ = 0, material_geometry_bin_items_offset_ = 0;
+  size_t material_geometry_bin_item_count_ = 0;
+  uint32_t material_geometry_bin_nx_ = 0, material_geometry_bin_ny_ = 0;
+  double material_geometry_bin_origin_[2] = {0, 0}, material_geometry_bin_inverse_[2] = {0, 0};
   size_t initialization_compact_input_bytes_;
   size_t initialization_staging_bytes_;
   bool initialization_prepared_;
@@ -5563,6 +5568,49 @@ void size_material_medium(MaterialCompactSizer &compact, const OwnedMediumView &
         susceptibility_count, "sizing packed material susceptibility records");
 }
 
+/* x/y bins over the active images (0 bins below 64 images or when
+   MEEP_IMAGE_BINS=0): CSR offsets/items, items being image positions in
+   active order. Shared by the compact-input sizer and the packer. */
+struct ImageBinLayout {
+  uint32_t n = 0;
+  double x0 = 0, y0 = 0, ix = 0, iy = 0;
+  std::vector<uint32_t> offsets, items;
+};
+
+ImageBinLayout image_bin_layout(const MaterialIR &ir) {
+  ImageBinLayout bins;
+  const char *env = std::getenv("MEEP_IMAGE_BINS");
+  const double sx = ir.cell.size() >= 6 ? ir.cell[3] : 0.0;
+  const double sy = ir.cell.size() >= 6 ? ir.cell[4] : 0.0;
+  const size_t count = ir.active_images.size();
+  if (count < 64 || (env && env[0] == '0') || !(sx > 0) || !(sy > 0)) return bins;
+  const uint32_t n =
+      uint32_t(std::min(1024.0, std::ceil(std::sqrt(std::max(1.0, double(count) / 4.0)))));
+  bins.n = n;
+  bins.x0 = ir.cell[0] - 0.5 * sx; bins.y0 = ir.cell[1] - 0.5 * sy;
+  bins.ix = n / sx; bins.iy = n / sy;
+  std::vector<std::vector<uint32_t> > lists(size_t(n) * n);
+  const auto clamp = [n](double f) {
+    return long(std::max(0.0, std::min(double(n - 1), std::floor(f))));
+  };
+  for (size_t i = 0; i < count; ++i) {
+    const MaterialIRGeometryImage &image = ir.images[ir.active_images[i]];
+    const long i0 = clamp((image.low[0] - bins.x0) * bins.ix);
+    const long i1 = clamp((image.high[0] - bins.x0) * bins.ix);
+    const long j0 = clamp((image.low[1] - bins.y0) * bins.iy);
+    const long j1 = clamp((image.high[1] - bins.y0) * bins.iy);
+    for (long j = j0; j <= j1; ++j)
+      for (long k = i0; k <= i1; ++k) lists[size_t(j) * n + size_t(k)].push_back(uint32_t(i));
+  }
+  bins.offsets.assign(lists.size() + 1, 0);
+  for (size_t b = 0; b < lists.size(); ++b)
+    bins.offsets[b + 1] = bins.offsets[b] + uint32_t(lists[b].size());
+  bins.items.reserve(bins.offsets.back());
+  for (const std::vector<uint32_t> &list : lists)
+    bins.items.insert(bins.items.end(), list.begin(), list.end());
+  return bins;
+}
+
 size_t exact_material_compact_input_bytes(const MaterialIR &ir) {
   MaterialCompactSizer compact;
   if (ir.topology.empty()) return 0;
@@ -5616,6 +5664,13 @@ size_t exact_material_compact_input_bytes(const MaterialIR &ir) {
         ir.objects.size(), "sizing packed geometry objects");
     compact.append_records<nvidia::geometry_image_record>(
         ir.active_images.size(), "sizing packed geometry images");
+    {
+      const ImageBinLayout bins = image_bin_layout(ir);
+      if (bins.n) {
+        compact.append_records<uint32_t>(bins.offsets.size(), "sizing image bins");
+        compact.append_records<uint32_t>(bins.items.size(), "sizing image bin items");
+      }
+    }
 
     std::vector<uint8_t> used(ir.materials.size(), 0);
     used[ir.default_material] = 1;
@@ -6347,6 +6402,11 @@ bool same_geometry_common(nvidia::geometry_launch_common left,
       left.compact_input_bytes != right.compact_input_bytes ||
       left.object_offset != right.object_offset || left.object_count != right.object_count ||
       left.image_offset != right.image_offset || left.image_count != right.image_count ||
+      left.bin_offset != right.bin_offset || left.bin_items_offset != right.bin_items_offset ||
+      left.bin_item_count != right.bin_item_count || left.bin_nx != right.bin_nx ||
+      left.bin_ny != right.bin_ny || left.bin_origin[0] != right.bin_origin[0] ||
+      left.bin_origin[1] != right.bin_origin[1] || left.bin_inverse[0] != right.bin_inverse[0] ||
+      left.bin_inverse[1] != right.bin_inverse[1] ||
       left.value_offset != right.value_offset || left.material_count != right.material_count ||
       left.absorber_header_offset != right.absorber_header_offset ||
       left.absorber_count != right.absorber_count || left.default_material != right.default_material ||
@@ -6456,6 +6516,15 @@ nvidia::geometry_launch_common geometry_common_for(
   for (int i = 0; i < 9; ++i) common.metric[i] = ir.lattice_metric[i];
   common.inva = chunk.inva;
   common.dt = dt;
+  common.bin_offset = state.material_geometry_bin_offset_;
+  common.bin_items_offset = state.material_geometry_bin_items_offset_;
+  common.bin_item_count = state.material_geometry_bin_item_count_;
+  common.bin_nx = state.material_geometry_bin_nx_;
+  common.bin_ny = state.material_geometry_bin_ny_;
+  for (int axis = 0; axis < 2; ++axis) {
+    common.bin_origin[axis] = state.material_geometry_bin_origin_[axis];
+    common.bin_inverse[axis] = state.material_geometry_bin_inverse_[axis];
+  }
   common.trivial_value = default_material_row_value(destination.key);
   common.logical_single = sizeof(realnum) == sizeof(float);
   common.precision = scalar_precision_for(state.plan_, id, "NVIDIA geometry destination");
@@ -6649,6 +6718,29 @@ void compile_material_geometry(const MaterialIR &ir, NvidiaBackendState &state, 
   const size_t image_offset = compact.append_records(images, "packing geometry images");
   compact.geometry_image_bytes = material_checked_product(
       images.size(), sizeof(nvidia::geometry_image_record), "accounting geometry images");
+  /* Many images (e.g. tens of thousands of metalens fins): bin them over the
+     cell's x/y extent so each point scans only overlapping images, in image
+     order (same first containing image as the full scan). */
+  state.material_geometry_bin_nx_ = state.material_geometry_bin_ny_ = 0;
+  state.material_geometry_bin_offset_ = state.material_geometry_bin_items_offset_ = 0;
+  state.material_geometry_bin_item_count_ = 0;
+  {
+    const ImageBinLayout bins = image_bin_layout(ir);
+    if (bins.n) {
+      if (bins.items.size() && images.size() != ir.active_images.size())
+        throw std::logic_error("NVIDIA image bins do not match the packed images");
+      state.material_geometry_bin_offset_ =
+          compact.append_records(bins.offsets, "packing image bins");
+      state.material_geometry_bin_items_offset_ =
+          compact.append_records(bins.items, "packing image bin items");
+      state.material_geometry_bin_item_count_ = bins.items.size();
+      state.material_geometry_bin_nx_ = state.material_geometry_bin_ny_ = bins.n;
+      state.material_geometry_bin_origin_[0] = bins.x0;
+      state.material_geometry_bin_origin_[1] = bins.y0;
+      state.material_geometry_bin_inverse_[0] = bins.ix;
+      state.material_geometry_bin_inverse_[1] = bins.iy;
+    }
+  }
 
   std::vector<size_t> sample_offsets(ir.materials.size(), 0);
   std::vector<uint8_t> used(ir.materials.size(), 0);
@@ -7022,6 +7114,9 @@ void clear_material_initialization_launches(NvidiaBackendState &state) {
   state.material_geometry_patch_launches_.clear();
   state.material_geometry_authorities_.clear();
   state.material_geometry_compact_hash_ = 0;
+  state.material_geometry_bin_nx_ = state.material_geometry_bin_ny_ = 0;
+  state.material_geometry_bin_offset_ = state.material_geometry_bin_items_offset_ = 0;
+  state.material_geometry_bin_item_count_ = 0;
 }
 
 void compile_device_native_material_initialization(const MaterialRecipe &recipe,

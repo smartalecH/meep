@@ -1063,10 +1063,75 @@ struct PrismCellIndex {
   uint32_t nx, ny;
   std::vector<uint8_t> state; // 0 outside, 1 inside, 2 boundary
 };
+/* Active images binned over the cell's x/y extent; each bin lists, in active
+   (precedence) order, the images whose bounds overlap it, so scanning a bin
+   finds the same first containing image as scanning every active image. */
+struct ImageBins {
+  double x0 = 0, y0 = 0, inv_hx = 0, inv_hy = 0;
+  uint32_t nx = 0, ny = 0;
+  std::vector<uint32_t> offsets, items; // CSR: bin b holds items[offsets[b]..offsets[b+1])
+  bool bin_of(double x, double y, size_t &bin) const {
+    const double fx = (x - x0) * inv_hx, fy = (y - y0) * inv_hy;
+    if (!(fx >= 0 && fy >= 0 && fx < nx && fy < ny)) return false;
+    bin = size_t(fy) * nx + size_t(fx);
+    return true;
+  }
+};
 struct PrismIndexSet {
   const MaterialIR *ir;
   std::vector<std::unique_ptr<PrismCellIndex> > by_object;
+  ImageBins bins; // empty (nx == 0) for few images
 };
+
+ImageBins build_image_bins(const MaterialIR &ir) {
+  ImageBins bins;
+  const size_t count = ir.active_images.size();
+  const char *env = std::getenv("MEEP_IMAGE_BINS");
+  if (count < 64 || (env && env[0] == '0') || ir.cell.size() < 6) return bins;
+  const double sx = ir.cell[3], sy = ir.cell[4];
+  if (!(sx > 0) || !(sy > 0)) return bins;
+  const double target = std::max(1.0, double(count) / 4.0);
+  const uint32_t n = uint32_t(std::min(1024.0, std::ceil(std::sqrt(target))));
+  bins.nx = bins.ny = n;
+  bins.x0 = ir.cell[0] - 0.5 * sx; bins.y0 = ir.cell[1] - 0.5 * sy;
+  bins.inv_hx = n / sx; bins.inv_hy = n / sy;
+  std::vector<std::vector<uint32_t> > lists(size_t(n) * n);
+  for (uint32_t active : ir.active_images) {
+    const MaterialIRGeometryImage &image = ir.images[active];
+    const auto clamp = [n](double f) {
+      return long(std::max(0.0, std::min(double(n - 1), std::floor(f))));
+    };
+    const long i0 = clamp((image.low[0] - bins.x0) * bins.inv_hx);
+    const long i1 = clamp((image.high[0] - bins.x0) * bins.inv_hx);
+    const long j0 = clamp((image.low[1] - bins.y0) * bins.inv_hy);
+    const long j1 = clamp((image.high[1] - bins.y0) * bins.inv_hy);
+    for (long j = j0; j <= j1; ++j)
+      for (long i = i0; i <= i1; ++i) lists[size_t(j) * n + size_t(i)].push_back(active);
+  }
+  bins.offsets.assign(lists.size() + 1, 0);
+  for (size_t b = 0; b < lists.size(); ++b) bins.offsets[b + 1] = bins.offsets[b] + uint32_t(lists[b].size());
+  bins.items.reserve(bins.offsets.back());
+  for (const std::vector<uint32_t> &list : lists) bins.items.insert(bins.items.end(), list.begin(), list.end());
+  return bins;
+}
+
+/* Calls f(active image index) in active order for the images that can contain
+   a point of the box [x0,x1]x[y0,y1]; returns early when f returns true. */
+template <typename F>
+void for_each_candidate_image(const MaterialIR &ir, const PrismIndexSet *indexes, double x0,
+                              double y0, double x1, double y1, F f) {
+  if (indexes && indexes->ir == &ir && indexes->bins.nx) {
+    size_t b0 = 0, b1 = 0;
+    if (indexes->bins.bin_of(x0, y0, b0) && indexes->bins.bin_of(x1, y1, b1) && b0 == b1) {
+      const ImageBins &bins = indexes->bins;
+      for (uint32_t k = bins.offsets[b0]; k < bins.offsets[b0 + 1]; ++k)
+        if (f(bins.items[k])) return;
+      return;
+    }
+  }
+  for (uint32_t active : ir.active_images)
+    if (f(active)) return;
+}
 std::atomic<const PrismIndexSet *> active_prism_indexes(nullptr);
 /* Owner of the index between capture and host averaging (one capture at a
    time per process). */
@@ -1196,14 +1261,18 @@ uint32_t point_variable_cause(const MaterialIR &ir, const PointObjectResult &poi
 }
 
 PointObjectResult object_at_point(const MaterialIR &ir, vector3 point) {
-  for (uint32_t active : ir.active_images)
-    if (image_contains(ir, active, point)) {
-      const MaterialIRGeometryImage &image = ir.images[active];
-      return PointObjectResult{image.object, active, uint32_t(ir.objects[image.object].material),
-                               image.precedence};
-    }
-  return PointObjectResult{std::numeric_limits<uint32_t>::max(),
+  PointObjectResult result{std::numeric_limits<uint32_t>::max(),
                            std::numeric_limits<uint32_t>::max(), ir.default_material, 0};
+  for_each_candidate_image(
+      ir, active_prism_indexes.load(std::memory_order_acquire), point.x, point.y, point.x,
+      point.y, [&](uint32_t active) {
+        if (!image_contains(ir, active, point)) return false;
+        const MaterialIRGeometryImage &image = ir.images[active];
+        result = PointObjectResult{image.object, active,
+                                   uint32_t(ir.objects[image.object].material), image.precedence};
+        return true;
+      });
+  return result;
 }
 
 double grid_sample(const MaterialIRMaterial &material,
@@ -1376,11 +1445,13 @@ FrontObjectResult classify_front_object(const MaterialIR &ir, const meep::volume
     const geom_box pixel = meep_geom::gv2box(v);
     uint32_t winner = std::numeric_limits<uint32_t>::max();
     bool decided = true;
-    for (uint32_t active : ir.active_images) {
-      const int state = image_pixel_state(ir, *indexes, active, pixel);
-      if (state == 2) { decided = false; break; }
-      if (state == 1) { winner = active; break; }
-    }
+    for_each_candidate_image(ir, indexes, pixel.low.x, pixel.low.y, pixel.high.x, pixel.high.y,
+                             [&](uint32_t active) {
+                               const int state = image_pixel_state(ir, *indexes, active, pixel);
+                               if (state == 2) { decided = false; return true; }
+                               if (state == 1) { winner = active; return true; }
+                               return false;
+                             });
     if (decided) {
       PointObjectResult point = {std::numeric_limits<uint32_t>::max(),
                                  std::numeric_limits<uint32_t>::max(), ir.default_material, 0};
@@ -2089,6 +2160,7 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
       retained_prism_indexes->by_object.resize(ir->objects.size());
       for (size_t k = 0; k < ir->objects.size(); ++k)
         retained_prism_indexes->by_object[k] = build_prism_index(ir->objects[k]);
+      retained_prism_indexes->bins = build_image_bins(*ir);
       active_prism_indexes.store(retained_prism_indexes.get(), std::memory_order_release);
     }
   }
@@ -2317,11 +2389,14 @@ bool material_ir_material_at(const MaterialIR &ir, double x, double y, double z,
   geom_box box;
   box.low = box.high = vector3{x, y, z};
   uint32_t winner = std::numeric_limits<uint32_t>::max();
-  for (uint32_t active : ir.active_images) {
+  bool undecided = false;
+  for_each_candidate_image(ir, indexes, x, y, x, y, [&](uint32_t active) {
     const int state = image_pixel_state(ir, *indexes, active, box);
-    if (state == 2) return false;
-    if (state == 1) { winner = active; break; }
-  }
+    if (state == 2) { undecided = true; return true; }
+    if (state == 1) { winner = active; return true; }
+    return false;
+  });
+  if (undecided) return false;
   PointObjectResult point = {std::numeric_limits<uint32_t>::max(),
                              std::numeric_limits<uint32_t>::max(), ir.default_material, 0};
   if (winner != std::numeric_limits<uint32_t>::max()) {
