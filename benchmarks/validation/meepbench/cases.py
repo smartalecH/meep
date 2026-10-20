@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from typing import Dict, List
 
 from .spec import Case
@@ -16,6 +17,7 @@ def _load_file(path: str) -> Case:
     name = "meepbench_case_" + os.path.splitext(os.path.basename(path))[0]
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module   # lets derived cases reach a base case's module
     spec.loader.exec_module(module)
     if not hasattr(module, "CASE"):
         raise AttributeError(f"{path} does not define CASE")
