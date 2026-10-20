@@ -344,6 +344,18 @@ void fields::find_metals() {
   for (int i = 0; i < num_chunks; i++)
     if (chunks[i]->is_mine()) {
       const grid_volume vi = chunks[i]->gv;
+      /* on_metal_boundary only holds on user-volume faces with Metallic or
+         Magnetic boundaries; a chunk reaching none of them has no such point
+         and skips the per-point loop (one coordinate of slack per side). */
+      bool touches_metal_face = false;
+      LOOP_OVER_DIRECTIONS(gv.dim, d) {
+        if (user_volume.has_boundary(High, d) && boundaries[High][d] == Metallic &&
+            vi.big_corner().in_direction(d) + 2 >= user_volume.big_corner().in_direction(d))
+          touches_metal_face = true;
+        if ((boundaries[Low][d] == Metallic || boundaries[Low][d] == Magnetic) &&
+            vi.little_corner().in_direction(d) - 2 <= user_volume.little_corner().in_direction(d) + 1)
+          touches_metal_face = true;
+      }
       FOR_FIELD_TYPES(ft) {
         refs.clear();
         DOCMP FOR_COMPONENTS(c) {
@@ -351,7 +363,7 @@ void fields::find_metals() {
             const ArrayId id =
                 halos->arrays.intern({i, int(array_role::field), int(c), cmp, 0},
                                      chunks[i]->f[c][cmp], size_t(vi.ntot()), array_role::field);
-            LOOP_OVER_VOL_OWNED(vi, c, n) {
+            if (touches_metal_face) LOOP_OVER_VOL_OWNED(vi, c, n) {
               if (IVEC_LOOP_AT_BOUNDARY) { // todo: just loop over boundaries
                 IVEC_LOOP_ILOC(vi, here);
                 if (on_metal_boundary(here)) refs.push_back(ElementRef{id, ptrdiff_t(n)});
