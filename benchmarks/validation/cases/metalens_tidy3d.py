@@ -60,14 +60,16 @@ def hooks(case, ctx):
     if ctx["stage"] == "observables":
         sim, n2f = built.sim, built.monitors["n2f"]
 
-        def intensity(x, y, z):
-            e = np.array(sim.get_farfield(n2f, built._local(x, y, Z_TOP + z)))[:3]
-            return float(np.sum(np.abs(e) ** 2))
-        zs = np.linspace(F - 4, F + 4, 81)
-        axial = np.array([intensity(0, 0, z) for z in zs])
-        z_peak = float(zs[np.argmax(axial)])
-        xs = np.linspace(-2, 2, 161)
-        lateral = np.array([intensity(x, 0, z_peak) for x in xs])
+        def line_intensity(center, size, resolution):
+            # one get_farfields call per line (a per-point get_farfield loop
+            # re-reads the near-field DFT each time and took ~650 s)
+            ff = sim.get_farfields(n2f, resolution=resolution, center=center, size=size)
+            return np.squeeze(sum(np.abs(ff[k]) ** 2 for k in ("Ex", "Ey", "Ez")))
+        axial = line_intensity(built._local(0, 0, Z_TOP + F), mp.Vector3(0, 0, 8.0), 10)
+        zs = Z_TOP + F - 4.0 + np.arange(axial.size) * (8.0 / max(axial.size - 1, 1))
+        z_peak = float(zs[np.argmax(axial)] - Z_TOP)
+        lateral = line_intensity(built._local(0, 0, Z_TOP + z_peak), mp.Vector3(4.0, 0, 0), 40)
+        xs = -2.0 + np.arange(lateral.size) * (4.0 / max(lateral.size - 1, 1))
         half = lateral.max() / 2
         above = np.where(lateral >= half)[0]
         fwhm = float(xs[above[-1]] - xs[above[0]]) if len(above) else float("nan")
