@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <vector>
 #include <atomic>
+#include <unordered_map>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -2314,15 +2315,19 @@ public:
         e.points.push_back(patch.point);
         e.values.push_back(patch.value);
       }
-    for (const Entry &e : entries_)
+    for (size_t k = 0; k < entries_.size(); ++k) {
+      const Entry &e = entries_[k];
       if (!std::is_sorted(e.points.begin(), e.points.end()) ||
           !std::is_sorted(e.bulk_first.begin(), e.bulk_first.end()))
         throw std::logic_error("material IR patches are not in traversal order");
+      by_key_[key(e.chunk, e.c, e.d)] = k;
+    }
   }
   int lookup(const meep::structure_chunk *chunk, meep::component c, meep::direction d,
              size_t ordinal, const meep::vec &center, double &value) const override {
-    for (const Entry &e : entries_) {
-      if (e.chunk != chunk || e.c != c || e.d != d) continue;
+    const auto slot = by_key_.find(key(chunk, c, d));
+    if (slot != by_key_.end()) {
+      const Entry &e = entries_[slot->second];
       const auto found = std::lower_bound(e.points.begin(), e.points.end(), uint64_t(ordinal));
       if (found != e.points.end() && *found == ordinal) {
         value = e.values[size_t(found - e.points.begin())];
@@ -2338,6 +2343,10 @@ public:
       return meep::chi1inv_unknown;
     }
     return meep::chi1inv_unknown;
+  }
+
+  static uint64_t key(const meep::structure_chunk *chunk, meep::component c, meep::direction d) {
+    return (uint64_t(reinterpret_cast<uintptr_t>(chunk)) << 8) ^ (uint64_t(c) << 3) ^ uint64_t(d);
   }
 
 private:
@@ -2377,6 +2386,7 @@ private:
     std::vector<uint64_t> bulk_first, bulk_count;
   };
   std::vector<Entry> entries_;
+  std::unordered_map<uint64_t, size_t> by_key_;
 };
 
 } // namespace
