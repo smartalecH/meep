@@ -274,6 +274,7 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
     mp.verbosity(options.verbosity)
     t_wall = time.time()
     built = Built(case, options)
+    t_build = time.time() - t_wall
     sim = built.sim
     t0 = time.time()
     sim.init_sim()
@@ -312,6 +313,7 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
     t_run = time.time() - t0
     steps = int(sim.fields.t)
 
+    t_obs0 = time.time()
     wl = np.array(case.wavelengths.values())
     values: Dict[str, Any] = {}
     spectra: Dict[str, List[float]] = {}
@@ -346,6 +348,7 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
         if isinstance(extra, dict):
             values.update(extra)
 
+    t_observables = time.time() - t_obs0
     checks = {}
     for name, (expected, tol) in case.reference.values.items():
         if name in values:
@@ -378,8 +381,8 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
         "resolution": built.resolution,
         "grid": [nx, ny, nz], "cells": cells, "steps": steps,
         "ranks": mp.count_processors(),
-        "time_s": {"init_sim": t_init, "first_step": t_first, "run": t_run,
-                   "total": time.time() - t_wall},
+        "time_s": {"build": t_build, "init_sim": t_init, "first_step": t_first, "run": t_run,
+                   "observables": t_observables, "total": time.time() - t_wall},
         "gcell_steps_per_s": cells * (steps - 1) / t_run / 1e9 if t_run > 0 else None,
         "values": values, "checks": checks, "spectrum_checks": spectrum_checks,
         "wavelengths": wl.tolist(), "spectra": spectra,

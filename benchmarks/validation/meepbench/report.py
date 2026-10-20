@@ -30,7 +30,11 @@ def markdown(paths: Iterable[str]) -> str:
             f"{r['resolution']:g} ({_fmt(cpl, 'g')}) | {r['cells']:.3g} | {r['steps']} | "
             f"{r['time_s']['init_sim'] + r['time_s'].get('first_step', 0):.1f} | {r['time_s']['run']:.1f} | "
             f"{_fmt(r['gcell_steps_per_s'], '.3g')} | {refs} | {status or '-'} |")
-        extra = [f"{k}={v:.5g}" for k, v in r["values"].items() if k not in checks]
+        t = r["time_s"]
+        extra = [f"time build {t.get('build', 0):.1f} / init {t['init_sim']:.1f} / first step "
+                 f"{t.get('first_step', 0):.1f} / run {t['run']:.1f} / observables "
+                 f"{t.get('observables', 0):.1f} / total {t['total']:.1f} s"]
+        extra += [f"{k}={v:.5g}" for k, v in r["values"].items() if k not in checks]
         extra += [f"{k}: max {v['max_abs']:.4f} rms {v['rms']:.4f}" if v.get("available")
                   else f"{k}: reference data not found" for k, v in r.get("spectrum_checks", {}).items()]
         if extra:
