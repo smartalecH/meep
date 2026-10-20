@@ -653,6 +653,20 @@ public:
 };
 
 class structure;
+class structure_chunk;
+
+/* Precomputed chi1inv entries consulted by structure_chunk::set_chi1inv before
+   it evaluates a pixel, e.g. the subpixel-averaged interface values already
+   captured in the material IR. `ordinal` is the pixel's position in
+   LOOP_OVER_VOL(gv, c) order; lookup must be thread safe. */
+class chi1inv_precomputed {
+public:
+  virtual ~chi1inv_precomputed() {}
+  virtual bool lookup(const structure_chunk *chunk, component c, direction d, size_t ordinal,
+                      double &value) const = 0;
+};
+/* Install (or clear with NULL) the source used by subsequent set_chi1inv calls. */
+void set_chi1inv_precomputed(const chi1inv_precomputed *source);
 
 class structure_chunk {
 public:

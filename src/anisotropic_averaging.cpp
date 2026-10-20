@@ -15,6 +15,8 @@
 %  Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
 */
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include "meep_internals.hpp"
 
@@ -208,6 +210,12 @@ done : {
 }
 }
 
+static const chi1inv_precomputed *chi1inv_precomputed_source = NULL;
+
+void set_chi1inv_precomputed(const chi1inv_precomputed *source) {
+  chi1inv_precomputed_source = source;
+}
+
 void structure_chunk::set_chi1inv(component c, material_function &medium,
                                   bool use_anisotropic_averaging, double tol, int maxeval) {
   if (!is_mine() || !gv.has_field(c)) return;
@@ -249,16 +257,48 @@ breakout:
   // Use OpenMP parallelization when the material function is thread-safe
   // (i.e., pure C++ geometry, not a Python callback). The trivial[] flags
   // need a reduction since each thread computes its local subset.
+  const chi1inv_precomputed *precomputed = maxeval ? chi1inv_precomputed_source : NULL;
+  static const bool verify_precomputed = getenv("MEEP_HOST_AVERAGING_VERIFY") != NULL;
+  size_t precomputed_used = 0, precomputed_mismatch = 0;
   if (medium.is_thread_safe()) {
     bool trivial0 = true, trivial1 = true, trivial2 = true;
     PLOOP_OVER_IVECS_C(gv, gv.little_corner() + gv.iyee_shift(c),
                        gv.big_corner() + gv.iyee_shift(c), i,
-                       "omp parallel for collapse(3) reduction(&&:trivial0,trivial1,trivial2)") {
+                       "omp parallel for collapse(3) reduction(&&:trivial0,trivial1,trivial2) reduction(+:precomputed_used,precomputed_mismatch)") {
       double chi1invrow[3], chi1invrow_offdiag[3];
       IVEC_LOOP_ILOC(gv, here);
-      medium.eff_chi1inv_row(c, chi1invrow, gv.dV(here, smoothing_diameter), tol, maxeval);
-      medium.eff_chi1inv_row(c, chi1invrow_offdiag, gv.dV(here - shift1, smoothing_diameter), tol,
-                             maxeval);
+      /* Entries already averaged elsewhere (material IR) skip the cubature;
+         the diagonal comes from the centered volume, off-diagonals from the
+         shifted one, so each evaluation runs only if one of its entries is
+         still missing. */
+      bool have[3] = {false, false, false};
+      double known[3] = {0, 0, 0};
+      if (precomputed) {
+        const size_t ordinal = size_t((loop_i1 * loop_n2 + loop_i2) * loop_n3 + loop_i3);
+        const direction dj[3] = {d0, d1, d2};
+        for (int j = 0; j < 3; ++j)
+          if (chi1inv[c][dj[j]]) have[j] = precomputed->lookup(this, c, dj[j], ordinal, known[j]);
+      }
+      const bool need_diag = !have[idiag] || verify_precomputed;
+      bool need_offdiag = verify_precomputed;
+      for (int j = 0; j < 3; ++j)
+        if (j != idiag && !have[j] && chi1inv[c][j == 0 ? d0 : j == 1 ? d1 : d2])
+          need_offdiag = true;
+      if (need_diag)
+        medium.eff_chi1inv_row(c, chi1invrow, gv.dV(here, smoothing_diameter), tol, maxeval);
+      if (need_offdiag)
+        medium.eff_chi1inv_row(c, chi1invrow_offdiag, gv.dV(here - shift1, smoothing_diameter),
+                               tol, maxeval);
+      for (int j = 0; j < 3; ++j)
+        if (have[j]) {
+          ++precomputed_used;
+          if (verify_precomputed) {
+            const realnum classic = realnum(j == idiag ? chi1invrow[j] : chi1invrow_offdiag[j]);
+            if (classic != realnum(known[j])) ++precomputed_mismatch;
+          }
+          if (j == idiag) chi1invrow[j] = known[j];
+          else chi1invrow_offdiag[j] = known[j];
+        }
       if (chi1inv[c][d0]) {
         chi1inv[c][d0][i] = (d0 == dc) ? chi1invrow[0] : chi1invrow_offdiag[0];
         trivial0 = trivial0 && (chi1inv[c][d0][i] == trivial_val[0]);
@@ -275,6 +315,9 @@ breakout:
     trivial[0] = trivial0;
     trivial[1] = trivial1;
     trivial[2] = trivial2;
+    if (verify_precomputed && precomputed)
+      printf("meep host averaging: component %s reused %zu precomputed entries, %zu differ\n",
+             component_name(c), precomputed_used, precomputed_mismatch);
   }
   else {
     // Serial path for non-thread-safe material functions (Python callbacks)

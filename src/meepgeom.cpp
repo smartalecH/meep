@@ -2169,6 +2169,60 @@ static void material_setup_mark(const char *phase) {
   last = now;
 }
 
+namespace {
+
+/* Interface entries the material IR capture already averaged (hybrid patches,
+   computed by the same eff_chi1inv_row), served to the host structure so
+   set_chi1inv does not repeat the cubature. Each destination's patches are in
+   traversal order, i.e. sorted by ordinal. */
+class ir_chi1inv_patches : public meep::chi1inv_precomputed {
+public:
+  ir_chi1inv_patches(const meep::structure &s, const meep::MaterialIR &ir) {
+    std::vector<int> slot(ir.destinations.size(), -1);
+    for (size_t k = 0; k < ir.destinations.size(); ++k) {
+      const meep::MaterialIRDestination &d = ir.destinations[k];
+      if (d.property != meep::MaterialIRProperty::chi1inv || d.tensor_column < 0) continue;
+      const int chunk = ir.chunks[d.chunk_index].chunk;
+      if (chunk < 0 || chunk >= s.num_chunks) continue;
+      slot[k] = int(entries_.size());
+      entries_.push_back(Entry{s.chunks[chunk], meep::component(d.component),
+                               meep::direction(d.key.aux), {}, {}});
+    }
+    for (const meep::MaterialIRHybridPatch &patch : ir.hybrid_patches)
+      if (patch.destination < slot.size() && slot[patch.destination] >= 0) {
+        Entry &e = entries_[size_t(slot[patch.destination])];
+        e.points.push_back(patch.point);
+        e.values.push_back(patch.value);
+      }
+    for (const Entry &e : entries_)
+      if (!std::is_sorted(e.points.begin(), e.points.end()))
+        throw std::logic_error("material IR patches are not in traversal order");
+  }
+  bool lookup(const meep::structure_chunk *chunk, meep::component c, meep::direction d,
+              size_t ordinal, double &value) const override {
+    for (const Entry &e : entries_) {
+      if (e.chunk != chunk || e.c != c || e.d != d) continue;
+      const auto found = std::lower_bound(e.points.begin(), e.points.end(), uint64_t(ordinal));
+      if (found == e.points.end() || *found != ordinal) return false;
+      value = e.values[size_t(found - e.points.begin())];
+      return true;
+    }
+    return false;
+  }
+
+private:
+  struct Entry {
+    const meep::structure_chunk *chunk;
+    meep::component c;
+    meep::direction d;
+    std::vector<uint64_t> points;
+    std::vector<double> values;
+  };
+  std::vector<Entry> entries_;
+};
+
+} // namespace
+
 void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
                                      bool use_anisotropic_averaging, double tol, int maxeval,
                                      absorber_list alist) {
@@ -2233,7 +2287,24 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
   meep::backend_reconcile_host_access(capture_error,
                                       "set_materials material IR reconciliation");
   material_setup_mark("material ir reconcile");
-  s->set_materials(*geps, use_anisotropic_averaging, tol, maxeval);
+  /* The host structure is still filled by the classic path (its arrays feed
+     mode solves, get_array and host routes), but interface pixels reuse the
+     IR's averaged values instead of re-running the cubature.
+     MEEP_HOST_AVERAGING_FROM_IR=0 disables the reuse. */
+  std::unique_ptr<ir_chi1inv_patches> reuse;
+  const char *reuse_env = std::getenv("MEEP_HOST_AVERAGING_FROM_IR");
+  if (use_anisotropic_averaging && captured_ir && !captured_ir->hybrid_patches.empty() &&
+      !(reuse_env && std::string(reuse_env) == "0"))
+    reuse.reset(new ir_chi1inv_patches(*s, *captured_ir));
+  meep::set_chi1inv_precomputed(reuse.get());
+  try {
+    s->set_materials(*geps, use_anisotropic_averaging, tol, maxeval);
+  }
+  catch (...) {
+    meep::set_chi1inv_precomputed(NULL);
+    throw;
+  }
+  meep::set_chi1inv_precomputed(NULL);
   material_setup_mark("cpu set_materials");
   s->remove_susceptibilities();
   geps->add_susceptibilities(s);
