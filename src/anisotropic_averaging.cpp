@@ -278,8 +278,11 @@ breakout:
       double known[3] = {0, 0, 0};
       if (precomputed) {
         const size_t ordinal = size_t((loop_i1 * loop_n2 + loop_i2) * loop_n3 + loop_i3);
+        const vec center_diag = gv[here], center_offdiag = gv[here - shift1];
         for (int j = 0; j < 3; ++j)
-          if (chi1inv[c][dj[j]]) state[j] = precomputed->lookup(this, c, dj[j], ordinal, known[j]);
+          if (chi1inv[c][dj[j]])
+            state[j] = precomputed->lookup(this, c, dj[j], ordinal,
+                                           j == idiag ? center_diag : center_offdiag, known[j]);
       }
       double reference[3] = {0, 0, 0};
       if (verify_precomputed && precomputed) {

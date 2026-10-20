@@ -233,6 +233,7 @@ uint32_t capture_material(MaterialIR &ir, const meep_geom::material_data *md,
     }
   }
   ir.materials.push_back(record);
+  ir.host_material_sources.push_back(md);
   return id;
 }
 
@@ -1067,6 +1068,10 @@ struct PrismIndexSet {
   std::vector<std::unique_ptr<PrismCellIndex> > by_object;
 };
 std::atomic<const PrismIndexSet *> active_prism_indexes(nullptr);
+/* Owner of the index between capture and host averaging (one capture at a
+   time per process). */
+std::unique_ptr<PrismIndexSet> retained_prism_indexes;
+std::mutex retained_prism_indexes_mutex;
 std::atomic<uint64_t> prism_index_checks(0), prism_index_mismatches(0);
 
 bool full_contains(const MaterialIR &ir, const MaterialIRObject &object,
@@ -1962,19 +1967,19 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
       works[index].bulk.push_back(MaterialIRBulkSpan{index, 0, destination.point_count});
   }
   const MaterialIR &ir_view = *ir;
-  PrismIndexSet prism_indexes{ir.get(), {}};
   {
+    std::lock_guard<std::mutex> lock(retained_prism_indexes_mutex);
+    active_prism_indexes.store(nullptr, std::memory_order_release);
+    retained_prism_indexes.reset();
     const char *env = std::getenv("MEEP_PRISM_INDEX");
     if (!(env && env[0] == '0')) {
-      prism_indexes.by_object.resize(ir->objects.size());
+      retained_prism_indexes.reset(new PrismIndexSet{ir.get(), {}});
+      retained_prism_indexes->by_object.resize(ir->objects.size());
       for (size_t k = 0; k < ir->objects.size(); ++k)
-        prism_indexes.by_object[k] = build_prism_index(ir->objects[k]);
-      active_prism_indexes.store(&prism_indexes, std::memory_order_release);
+        retained_prism_indexes->by_object[k] = build_prism_index(ir->objects[k]);
+      active_prism_indexes.store(retained_prism_indexes.get(), std::memory_order_release);
     }
   }
-  struct ClearPrismIndexes {
-    ~ClearPrismIndexes() { active_prism_indexes.store(nullptr, std::memory_order_release); }
-  } clear_prism_indexes;
   material_ir_setup_mark("ir prism index");
   /* Points [first, last) of one destination; the loop still walks earlier
      points (cheap index arithmetic) so ordinals match a full traversal. */
@@ -2148,7 +2153,6 @@ std::shared_ptr<const void> capture_material_ir(const structure &s,
                               work.patches.end());
   }
   ir->requires_hybrid = !ir->hybrid_patches.empty();
-  active_prism_indexes.store(nullptr, std::memory_order_release);
   material_ir_setup_mark("ir capture traversal");
   if (std::getenv("MEEP_PRISM_INDEX_VERIFY"))
     fprintf(stderr, "meep prism index: %llu indexed answers checked, %llu differ\n",
@@ -2185,6 +2189,28 @@ material_ir_callback_owners(const MaterialIR &ir) {
   if (found == material_ir_owners.end()) return MaterialCallbackOwners();
   const std::shared_ptr<const MaterialCallbackOwners> owners = found->second.lock();
   return owners ? *owners : MaterialCallbackOwners();
+}
+
+bool material_ir_material_at(const MaterialIR &ir, double x, double y, double z,
+                             uint32_t &material) {
+  const PrismIndexSet *indexes = active_prism_indexes.load(std::memory_order_acquire);
+  if (!indexes || indexes->ir != &ir) return false;
+  const PointObjectResult point = object_at_point(ir, vector3{x, y, z});
+  if (point_variable_cause(ir, point) != material_variable_none) return false;
+  material = point.material;
+  if (point.object != std::numeric_limits<uint32_t>::max() &&
+      ir.materials[material].kind == meep_geom::material_data::MATERIAL_FILE)
+    material = ir.default_material;
+  return ir.materials[material].kind == meep_geom::material_data::MEDIUM;
+}
+
+void material_ir_release_point_index(const MaterialIR &ir) {
+  std::lock_guard<std::mutex> lock(retained_prism_indexes_mutex);
+  const PrismIndexSet *indexes = active_prism_indexes.load(std::memory_order_acquire);
+  if (indexes && indexes->ir == &ir) {
+    active_prism_indexes.store(nullptr, std::memory_order_release);
+    retained_prism_indexes.reset();
+  }
 }
 
 const MaterialIR *material_ir_for(const fields &f) {

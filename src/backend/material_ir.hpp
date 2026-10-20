@@ -294,6 +294,10 @@ struct MaterialIR {
   std::vector<MaterialIRBulkSpan> bulk_spans;
   std::vector<MaterialIRAnalyticInterface> analytic_interfaces;
   std::vector<MaterialIRHybridPatch> hybrid_patches;
+  /* Host-only, not part of identity or equality: the material_data each
+     material record was captured from (lets host averaging evaluate bulk
+     pixels without a libctl point search). */
+  std::vector<const void *> host_material_sources;
   uint64_t signature;
   uint64_t layout_signature;
 
@@ -330,6 +334,13 @@ struct OwnedMaterialCallback;
 std::vector<std::shared_ptr<const OwnedMaterialCallback> >
 material_ir_callback_owners(const MaterialIR &ir);
 const MaterialIR *material_ir_for(const fields &f);
+/* Material record at a point (host), using capture's prism cell index while it
+   is retained; returns false if the point's material is variable (grid, user,
+   file) or the index is not available. */
+bool material_ir_material_at(const MaterialIR &ir, double x, double y, double z,
+                             uint32_t &material);
+/* Drop the prism cell index capture kept for host averaging. */
+void material_ir_release_point_index(const MaterialIR &ir);
 /* Definition-only identity normalized to binary32 for checkpoint validation
    between f32 and f64 host builds. */
 uint64_t material_ir_portable_signature(const MaterialIR &ir);

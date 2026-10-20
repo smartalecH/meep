@@ -659,13 +659,14 @@ class structure_chunk;
    before it evaluates a pixel, e.g. from the material IR: chi1inv_value sets
    `value` (an already averaged entry); chi1inv_bulk says one material covers
    the pixel, so no averaging is needed. `ordinal` is the pixel's position in
-   LOOP_OVER_VOL(gv, c) order; lookup must be thread safe. */
+   LOOP_OVER_VOL(gv, c) order and `center` the center of the volume the entry
+   is evaluated on; lookup must be thread safe. */
 enum { chi1inv_unknown = 0, chi1inv_value = 1, chi1inv_bulk = 2 };
 class chi1inv_precomputed {
 public:
   virtual ~chi1inv_precomputed() {}
   virtual int lookup(const structure_chunk *chunk, component c, direction d, size_t ordinal,
-                     double &value) const = 0;
+                     const vec &center, double &value) const = 0;
 };
 /* Install (or clear with NULL) the source used by subsequent set_chi1inv calls. */
 void set_chi1inv_precomputed(const chi1inv_precomputed *source);

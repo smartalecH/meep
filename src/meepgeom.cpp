@@ -2276,7 +2276,22 @@ namespace {
    order, i.e. sorted by ordinal. */
 class ir_chi1inv_patches : public meep::chi1inv_precomputed {
 public:
-  ir_chi1inv_patches(const meep::structure &s, const meep::MaterialIR &ir) {
+  ir_chi1inv_patches(const meep::structure &s, const meep::MaterialIR &ir) : ir_(ir) {
+    /* chi1inv of each plain-medium material, as material_epsmu gives it to
+       the classic path, for bulk pixels resolved through the IR. */
+    for (int ft = 0; ft < 2; ++ft) {
+      inverse_[ft].resize(ir.materials.size());
+      known_[ft].assign(ir.materials.size(), false);
+    }
+    for (size_t m = 0; m < ir.materials.size() && m < ir.host_material_sources.size(); ++m) {
+      material_type md = (material_type)(ir.host_material_sources[m]);
+      if (!md || md->which_subclass != material_data::MEDIUM) continue;
+      for (int ft = 0; ft < 2; ++ft) {
+        symm_matrix epsmu;
+        material_epsmu(ft ? meep::H_stuff : meep::E_stuff, md, &epsmu, &inverse_[ft][m]);
+        known_[ft][m] = true;
+      }
+    }
     std::vector<int> slot(ir.destinations.size(), -1);
     for (size_t k = 0; k < ir.destinations.size(); ++k) {
       const meep::MaterialIRDestination &d = ir.destinations[k];
@@ -2305,7 +2320,7 @@ public:
         throw std::logic_error("material IR patches are not in traversal order");
   }
   int lookup(const meep::structure_chunk *chunk, meep::component c, meep::direction d,
-             size_t ordinal, double &value) const override {
+             size_t ordinal, const meep::vec &center, double &value) const override {
     for (const Entry &e : entries_) {
       if (e.chunk != chunk || e.c != c || e.d != d) continue;
       const auto found = std::lower_bound(e.points.begin(), e.points.end(), uint64_t(ordinal));
@@ -2317,7 +2332,8 @@ public:
                                          uint64_t(ordinal));
       if (span != e.bulk_first.begin()) {
         const size_t k = size_t(span - e.bulk_first.begin()) - 1;
-        if (uint64_t(ordinal) - e.bulk_first[k] < e.bulk_count[k]) return meep::chi1inv_bulk;
+        if (uint64_t(ordinal) - e.bulk_first[k] < e.bulk_count[k])
+          return bulk_value(c, d, center, value) ? meep::chi1inv_value : meep::chi1inv_bulk;
       }
       return meep::chi1inv_unknown;
     }
@@ -2325,6 +2341,33 @@ public:
   }
 
 private:
+  /* What the classic path computes for a one-material pixel (maxeval = 0:
+     the material at the center, material_epsmu, row of component c). */
+  bool bulk_value(meep::component c, meep::direction d, const meep::vec &center,
+                  double &value) const {
+    static const bool enabled = [] {
+      const char *e = getenv("MEEP_HOST_BULK_FROM_IR");
+      return !(e && e[0] == '0');
+    }();
+    if (!enabled) return false;
+    const vector3 p = vec_to_vector3(center);
+    uint32_t material = 0;
+    if (!meep::material_ir_material_at(ir_, p.x, p.y, p.z, material)) return false;
+    const int ft = meep::type(c) == meep::E_stuff ? 0 : 1;
+    if (material >= known_[ft].size() || !known_[ft][material]) return false;
+    const symm_matrix &m = inverse_[ft][material];
+    const int row = (meep::component_direction(c) == meep::X || meep::component_direction(c) == meep::R)
+                        ? 0
+                        : (meep::component_direction(c) == meep::Z ? 2 : 1);
+    const int column = (d == meep::X || d == meep::R) ? 0 : (d == meep::Z ? 2 : 1);
+    const double rows[3][3] = {{m.m00, m.m01, m.m02}, {m.m01, m.m11, m.m12}, {m.m02, m.m12, m.m22}};
+    value = rows[row][column];
+    return true;
+  }
+
+  const meep::MaterialIR &ir_;
+  std::vector<symm_matrix> inverse_[2];
+  std::vector<bool> known_[2];
   struct Entry {
     const meep::structure_chunk *chunk;
     meep::component c;
@@ -2417,9 +2460,11 @@ void set_materials_from_geom_epsilon(meep::structure *s, geom_epsilon *geps,
   }
   catch (...) {
     meep::set_chi1inv_precomputed(NULL);
+    if (captured_ir) meep::material_ir_release_point_index(*captured_ir);
     throw;
   }
   meep::set_chi1inv_precomputed(NULL);
+  if (captured_ir) meep::material_ir_release_point_index(*captured_ir);
   material_setup_mark("cpu set_materials");
   s->remove_susceptibilities();
   geps->add_susceptibilities(s);
