@@ -4,6 +4,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import json
+import os
 import math
 import platform
 import socket
@@ -309,9 +310,12 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
         # duration (last_source_time) to the transit.
         min_time = run_ctl.min_time or (sim.fields.last_source_time() + 1.2 * case.n_max *
                                         (built.domain[0] + built.domain[1]))
-        sim.run(until_after_sources=mp.stop_when_dft_decayed(
-            tol=run_ctl.decay, minimum_run_time=min_time,
-            maximum_run_time=run_ctl.max_time))
+        cond = mp.stop_when_dft_decayed(tol=run_ctl.decay, minimum_run_time=min_time,
+                                        maximum_run_time=run_ctl.max_time)
+        if os.environ.get("MEEPBENCH_NO_BATCH"):    # A/B: hide next_check_step -> 1-step batches
+            inner = cond
+            cond = lambda sim: inner(sim)
+        sim.run(until_after_sources=cond)
     t_run = time.time() - t0
     steps = int(sim.fields.t)
 
