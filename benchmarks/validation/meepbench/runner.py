@@ -290,6 +290,8 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
     run_ctl = case.run
     t0 = time.time()
     until = options.until if options.until is not None else run_ctl.until
+    if options.stop is not None and options.until is None:
+        until = None          # an explicit stop rule replaces the case's fixed run time
     if until is not None:
         if run_ctl.after_sources:
             sim.run(until_after_sources=until)
