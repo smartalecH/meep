@@ -299,8 +299,20 @@ def run(case: Case, options: Options) -> Dict[str, Any]:
         else:
             sim.run(until=until)
     elif (options.stop or run_ctl.stop) == "energy":
-        sim.run(until_after_sources=mp.stop_when_energy_decayed(dt=run_ctl.check_dt,
-                                                                decay_by=run_ctl.decay))
+        energy = mp.stop_when_energy_decayed(dt=run_ctl.check_dt, decay_by=run_ctl.decay)
+        # Cap: the case's fixed run time if it has one, else max_time, else a
+        # generous multiple of one device transit -- a field that never decays
+        # (e.g. trapped resonances) must not run forever.
+        cap = run_ctl.until or run_ctl.max_time or 20 * 1.2 * case.n_max * (
+            built.domain[0] + built.domain[1] + built.domain[2])
+        t_cap = cap + (0.0 if (run_ctl.until is not None and not run_ctl.after_sources)
+                       else sim.fields.last_source_time())
+
+        def capped(s):
+            return energy(s) or s.round_time() >= t_cap
+        if hasattr(energy, "next_check_step"):
+            capped.next_check_step = energy.next_check_step
+        sim.run(until=capped)
     else:
         # DFT decay must not be judged before light crosses the device: with a
         # short pulse the input monitor settles first and the check would stop

@@ -46,8 +46,10 @@ def hooks(case, ctx):
         fw = 1 / WL / 10
         src = mp.Source(mp.GaussianSource(1 / WL, fwidth=2 * math.pi * fw, is_integrated=True),
                         mp.Ex, center=built._local(0, 0, -SPACE / 2), size=mp.Vector3(cell.x, cell.y, 0))
-        return {"sources": [src], "boundary_layers": [mp.PML(case.pml, direction=mp.Z)],
-                "k_point": mp.Vector3()}           # periodic x/y, as the original
+        # PML on all sides, as the notebook's code (pml_layers = [npml]*3; its
+        # comment about "no PML in x, y" is stale). Periodic x/y traps guided
+        # modes of the fin array and the field energy never decays.
+        return {"sources": [src]}
     if ctx["stage"] == "monitors":
         sim = ctx["sim"]
         built.monitors["axis"] = sim.add_dft_fields(
