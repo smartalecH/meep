@@ -454,24 +454,42 @@ __global__ void material_classification_header_kernel(
   if (blockIdx.x == 0 && threadIdx.x == 0) *result = value;
 }
 
+__global__ void material_classification_row_init_kernel(
+    material_classification_row_result *result, material_classification_row_result value) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    value.missing = value.nontrivial = 0;
+    *result = value;
+  }
+}
+
+// Status byte: bit 0 = written, bit 1 = nontrivial. Rows reach 10^8 bytes, so scan
+// with the whole grid, 16 bytes per load, and OR each block's verdict into the result.
 __global__ void material_classification_row_kernel(
     const unsigned char *status, size_t elements,
-    material_classification_row_result *result,
-    material_classification_row_result value) {
-  __shared__ unsigned int missing;
-  __shared__ unsigned int nontrivial;
-  if (threadIdx.x == 0) missing = nontrivial = 0;
-  __syncthreads();
-  for (size_t i = threadIdx.x; i < elements; i += blockDim.x) {
-    const unsigned char state = status[i];
-    if (!(state & 1u)) atomicExch(&missing, 1u);
-    if (state & 2u) atomicExch(&nontrivial, 1u);
+    material_classification_row_result *result) {
+  const size_t thread = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  const size_t stride = size_t(gridDim.x) * blockDim.x;
+  const size_t misalign = (16 - reinterpret_cast<uintptr_t>(status) % 16) % 16;
+  const size_t head = misalign < elements ? misalign : elements;
+  const size_t words = (elements - head) / 16;
+  unsigned int missing = 0, nontrivial = 0;
+  const auto byte = [&](unsigned char state) {
+    missing |= !(state & 1u);
+    nontrivial |= (state >> 1) & 1u;
+  };
+  if (thread < head) byte(status[thread]);
+  const uint4 *body = reinterpret_cast<const uint4 *>(status + head);
+  for (size_t i = thread; i < words; i += stride) {
+    const uint4 w = body[i];
+    missing |= ((~w.x | ~w.y | ~w.z | ~w.w) & 0x01010101u) != 0;
+    nontrivial |= ((w.x | w.y | w.z | w.w) & 0x02020202u) != 0;
   }
-  __syncthreads();
+  for (size_t i = head + 16 * words + thread; i < elements; i += stride) byte(status[i]);
+  missing = __syncthreads_or(missing);
+  nontrivial = __syncthreads_or(nontrivial);
   if (threadIdx.x == 0) {
-    value.missing = missing;
-    value.nontrivial = nontrivial;
-    *result = value;
+    if (missing) atomicOr(&result->missing, 1u);
+    if (nontrivial) atomicOr(&result->nontrivial, 1u);
   }
 }
 
@@ -1120,8 +1138,12 @@ void launch_material_classification_row(
     material_classification_row_result value, const stream &stream) {
   if (!status || !elements || !result)
     throw std::invalid_argument("NVIDIA material classification row is invalid");
-  material_classification_row_kernel<<<1, 256, 0,
-      static_cast<cudaStream_t>(stream.opaque_handle())>>>(status, elements, result, value);
+  const cudaStream_t handle = static_cast<cudaStream_t>(stream.opaque_handle());
+  material_classification_row_init_kernel<<<1, 1, 0, handle>>>(result, value);
+  check_cuda(cudaPeekAtLastError(), "launching NVIDIA material classification row init kernel");
+  const size_t blocks = std::min<size_t>((elements + 4095) / 4096, 2048);
+  material_classification_row_kernel<<<unsigned(blocks), 256, 0, handle>>>(status, elements,
+                                                                            result);
   check_cuda(cudaPeekAtLastError(), "launching NVIDIA material classification row kernel");
 }
 
