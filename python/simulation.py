@@ -2976,14 +2976,24 @@ class Simulation:
                     cond[i]
                 )
 
+        dynamic_conds = [
+            c for c in cond if getattr(c, "__name__", "") != "stop_cond" and callable(c)
+        ]
+        # Dynamic stop conditions that declare when they next need evaluating
+        # (next_check_step) do not force one-step batches.
+        dynamic_batchable = all(hasattr(c, "next_check_step") for c in dynamic_conds)
+
         while not any([x(self) for x in cond]):
             for func in step_funcs:
                 _eval_step_func(self, func, "step")
 
             batch = 1
+            dynamic_boundaries = []
+            if dynamic_stop and dynamic_batchable:
+                dynamic_boundaries = [c.next_check_step(self) for c in dynamic_conds]
             if (
                 mp.count_processors() == 1
-                and not dynamic_stop
+                and (not dynamic_stop or (dynamic_batchable and None not in dynamic_boundaries))
                 and not _has_python_custom_source(self)
             ):
                 current_step = int(self.fields.t)
@@ -3003,6 +3013,7 @@ class Simulation:
                         )
                         if event is not None
                     )
+                    boundaries.extend(dynamic_boundaries)
                     if boundaries:
                         next_boundary = min(boundaries)
                         if next_boundary > current_step:
@@ -3050,10 +3061,22 @@ class Simulation:
             if isinstance(cond[i], numbers.Number):
                 new_conds.append((ts - self.round_time()) + cond[i])
             else:
+                inner = cond[i]
 
-                def f(sim):
-                    return cond[i](sim) and sim.round_time() >= ts
+                def f(sim, inner=inner):
+                    return inner(sim) and sim.round_time() >= ts
 
+                if hasattr(inner, "next_check_step"):
+                    # The wrapped condition cannot hold before the sources end,
+                    # so its next evaluation is the later of the two.
+                    def next_check(sim, inner=inner):
+                        step = inner.next_check_step(sim)
+                        if step is None:
+                            return None
+                        source_end = _first_step_at_or_after_time(sim, ts)
+                        return step if source_end is None else max(step, source_end)
+
+                    f.next_check_step = next_check
                 new_conds.append(f)
 
         self._run_until(new_conds, step_funcs)
@@ -5764,8 +5787,12 @@ def stop_when_energy_decayed(dt=None, decay_by=None):
         if sim.round_time() <= dt + closure["t0"]:
             return False
         else:
-            cell_volume = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
-            cur_abs = abs(sim.field_energy_in_box(box=cell_volume))
+            if hasattr(sim.fields, "field_energy_estimate"):
+                # one device reduction on GPU backends; exact energy otherwise
+                cur_abs = abs(sim.fields.field_energy_estimate())
+            else:
+                cell_volume = mp.Volume(center=sim.geometry_center, size=sim.cell_size)
+                cur_abs = abs(sim.field_energy_in_box(box=cell_volume))
             closure["max_abs"] = max(closure["max_abs"], cur_abs)
             closure["t0"] = sim.round_time()
             if closure["max_abs"] != 0 and verbosity.meep > 0:
@@ -5780,6 +5807,10 @@ def stop_when_energy_decayed(dt=None, decay_by=None):
                 )
             return cur_abs <= closure["max_abs"] * decay_by
 
+    # First step at which round_time() exceeds the next check time.
+    _stop.next_check_step = lambda sim: int(
+        math.floor((dt + closure["t0"]) / sim.fields.dt + 1e-9)
+    ) + 1
     return _stop
 
 
@@ -5865,6 +5896,10 @@ def stop_when_dft_decayed(tol=1e-11, minimum_run_time=0, maximum_run_time=None):
                 change / closure["maxchange"]
             ) <= tol and _sim.round_time() >= minimum_run_time
 
+    # Checks happen every closure["dt"] steps once the interval is known.
+    _stop.next_check_step = lambda _sim: (
+        int(closure["t0"] + closure["dt"]) + 1 if closure["dt"] else None
+    )
     return _stop
 
 

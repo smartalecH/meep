@@ -197,6 +197,9 @@ void launch_halo_scatter(const halo_launch &launch, const void *device_entries,
                          const void *device_buffer, const stream &stream);
 void launch_finite_check(const finite_check_launch &launch, void *device_first_bad,
                          const stream &stream);
+/* *device_sum += sum_i a[i] * b[i] (double accumulation; a == b allowed). */
+void launch_sum_products(const void *a, const void *b, size_t elements, bool single_precision,
+                         double *device_sum, const stream &stream);
 /* `scalars` may be null (always check) or the graph StepScalars (check only
    when finite_check_due). */
 void launch_finite_check_batch(const finite_check_batch_launch &launch, void *device_first_bad,

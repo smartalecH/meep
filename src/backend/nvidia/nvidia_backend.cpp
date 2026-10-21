@@ -14488,6 +14488,43 @@ void NvidiaBackend::write(ArrayRef ref, const void *host_buffer, size_t bytes) {
   }
 }
 
+bool NvidiaBackend::try_field_energy_estimate(double &local_sum) {
+  NvidiaBackendState *current = current_state();
+  if (!current || !current->initialized_ || current->transfer_failed_) return false;
+  NvidiaBackendState &state = *current;
+  nvidia::device_scope scope(state.device_);
+  state.ensure_dft_reduction_buffers(2 * sizeof(double), 2 * sizeof(double));
+  nvidia::fill_byte_async(state.dft_reduction_result_, 0, 0, sizeof(double), *state.transfer_);
+  double *device_sum = static_cast<double *>(state.dft_reduction_result_.opaque_handle());
+  for (size_t i = 0; i < state.plan_.arrays.size(); ++i) {
+    const StorageKey &key = state.plan_.keys[i];
+    if (key.kind != int(array_kind::f) || key.component_ < 0) continue;
+    const component c = component(key.component_);
+    if (!is_electric(c) && !is_magnetic(c)) continue;
+    const ArraySpec &spec = state.plan_.arrays[i];
+    const ArrayId self = is_valid(spec.alias_of) ? spec.alias_of : spec.id;
+    /* E pairs with D and H with B; where they alias (epsilon or mu = 1) the
+       partner is the field itself. */
+    const component pc = direction_component(is_electric(c) ? Dx : Bx, component_direction(c));
+    ArrayId partner = find_storage_key(
+        state.plan_, StorageKey{key.chunk, int(array_kind::f), int(pc), key.cmp, 0});
+    if (!is_valid(partner)) partner = self;
+    else if (is_valid(state.plan_.arrays[partner.value].alias_of))
+      partner = state.plan_.arrays[partner.value].alias_of;
+    const ArraySpec &partner_spec = state.plan_.arrays[partner.value];
+    if (partner_spec.storage != spec.storage || partner_spec.elements < spec.elements) return false;
+    nvidia::launch_sum_products(state.arenas_->resolve(self.value).address,
+                                state.arenas_->resolve(partner.value).address, spec.elements,
+                                spec.storage == Precision::f32, device_sum, *state.transfer_);
+  }
+  double host = 0.0;
+  nvidia::copy_device_to_host_async(&host, state.dft_reduction_result_, 0, sizeof(double),
+                                    *state.transfer_);
+  state.transfer_->synchronize();
+  local_sum = 0.5 * host;
+  return true;
+}
+
 void NvidiaBackend::reduce_dft(const DftReductionRequest &request,
                                std::complex<double> *local_result, size_t result_count) {
   NvidiaBackendState *current = current_state();

@@ -439,6 +439,7 @@ public:
   void read(ArrayRef ref, void *host_buffer, size_t bytes) override;
   void write(ArrayRef ref, const void *host_buffer, size_t bytes) override;
   bool supports_compact_dft_reductions() const override { return true; }
+  bool try_field_energy_estimate(double &local_sum) override;
   void reduce_dft(const DftReductionRequest &request, std::complex<double> *local_result,
                   size_t result_count) override;
   bool supports_adjoint_gradient(const AdjointGradientRequest &request,

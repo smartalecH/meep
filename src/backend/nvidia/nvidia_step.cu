@@ -557,6 +557,35 @@ void launch_finite_check_t(const finite_check_launch &launch, void *device_first
 
 } // namespace
 
+namespace {
+template <typename T>
+__global__ void sum_products_kernel(const T *a, const T *b, size_t n, double *sum) {
+  double acc = 0.0;
+  for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
+       i += size_t(gridDim.x) * blockDim.x)
+    acc += double(a[i]) * double(b[i]);
+  for (int offset = 16; offset > 0; offset >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  if ((threadIdx.x & 31) == 0) atomicAdd(sum, acc);
+}
+} // namespace
+
+void launch_sum_products(const void *a, const void *b, size_t elements, bool single_precision,
+                         double *device_sum, const stream &execution_stream) {
+  if (!elements) return;
+  if (!a || !b || !device_sum) throw std::invalid_argument("NVIDIA sum-products launch is incomplete");
+  const unsigned int threads = 256;
+  const unsigned int blocks =
+      unsigned(std::min<size_t>(4096, (elements + threads - 1) / threads));
+  cudaStream_t s = static_cast<cudaStream_t>(execution_stream.opaque_handle());
+  if (single_precision)
+    sum_products_kernel<float><<<blocks, threads, 0, s>>>(
+        static_cast<const float *>(a), static_cast<const float *>(b), elements, device_sum);
+  else
+    sum_products_kernel<double><<<blocks, threads, 0, s>>>(
+        static_cast<const double *>(a), static_cast<const double *>(b), elements, device_sum);
+  check_cuda(cudaPeekAtLastError(), "launch NVIDIA sum of products");
+}
+
 void launch_curl(const curl_launch &update, const stream &execution_stream) {
   if (!update.target || (!update.plus_source && !update.minus_source))
     throw std::invalid_argument("NVIDIA curl launch has incomplete operands");

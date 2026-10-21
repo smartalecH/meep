@@ -2565,6 +2565,10 @@ public:
   double field_energy_in_box(const volume &);
   double field_energy_in_box(component c, const volume &);
   double field_energy();
+  /* Fast field-energy proxy for decay-based stopping: sum of E.D + H.B over
+     the stored arrays, a single device reduction on GPU backends (no H
+     time-synchronization, ghost points included). Falls back to field_energy(). */
+  double field_energy_estimate();
   double flux_in_box_wrongH(direction d, const volume &);
   double flux_in_box(direction d, const volume &);
   flux_vol *add_flux_vol(direction d, const volume &where);

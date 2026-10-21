@@ -49,6 +49,19 @@ double fields::total_energy() { return energy_in_box(user_volume.surroundings())
 
 double fields::field_energy() { return field_energy_in_box(user_volume.surroundings()); }
 
+double fields::field_energy_estimate() {
+  double local = 0.0;
+  bool ok = false;
+  try {
+    ok = backend && backend->try_field_energy_estimate(local);
+  }
+  catch (const std::exception &) {
+    ok = false;
+  }
+  if (!and_to_all(ok)) return field_energy();
+  return sum_to_all(local);
+}
+
 double fields::energy_in_box(const volume &where) {
   return thermo_energy_in_box(where) + field_energy_in_box(where);
 }

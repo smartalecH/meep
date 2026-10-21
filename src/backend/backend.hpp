@@ -440,6 +440,12 @@ public:
   void poison() { poisoned_ = true; }
   bool is_poisoned() const { return poisoned_; }
   virtual bool supports_compact_dft_reductions() const { return false; }
+  /* Local sum of E.D + H.B over the field arrays (ghost points included), for
+     decay-based stop criteria; false if the backend cannot compute it. */
+  virtual bool try_field_energy_estimate(double &local_sum) {
+    (void)local_sum;
+    return false;
+  }
   virtual void reduce_dft(const DftReductionRequest &, std::complex<double> *, size_t) {
     throw std::logic_error("backend does not support compact DFT reductions");
   }
